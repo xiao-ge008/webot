@@ -6204,7 +6204,7 @@ async fn ensure_switched_to_session_label(
     Ok((original_session_id, target_session_id, switched))
 }
 
-fn resolve_agent_system_prompt(agent_id: &str) -> Result<Option<String>, ApiError> {
+fn resolve_agent_system_prompt(agent_id: &str, include_bootstrap: bool) -> Result<Option<String>, ApiError> {
     // 读取 profile 中保存的 system_prompt（系统提示词 Tab 内容）
     let profile = assignment_store::get_agent_profile_override(agent_id).map_err(storage_error)?;
     let base_system_prompt = profile
@@ -6228,12 +6228,19 @@ fn resolve_agent_system_prompt(agent_id: &str) -> Result<Option<String>, ApiErro
     ];
 
     let mut identity_blocks: Vec<String> = Vec::new();
+    let mut resolved_user_address: Option<String> = None;
     for (file_name, section_title) in identity_file_order {
+        if *file_name == "BOOTSTRAP.md" && !include_bootstrap {
+            continue;
+        }
         if let Some(record) = context_files.get(*file_name) {
             let content = record.content.trim();
             if !content.is_empty() {
                 // 使用结构化的强引导格式
                 identity_blocks.push(format!("<IDENTITY_FILE name=\"{}\" title=\"{}\">\n{}\n</IDENTITY_FILE>", file_name, section_title, content));
+                if *file_name == "USER.md" {
+                    resolved_user_address = extract_user_address_from_user_md(content);
+                }
             }
         }
     }
@@ -6248,6 +6255,17 @@ fn resolve_agent_system_prompt(agent_id: &str) -> Result<Option<String>, ApiErro
     if let Some(prompt) = base_system_prompt {
         final_parts.push(format!("[SYSTEM_BEHAVIOR_INSTRUCTION]\n{}\n[/SYSTEM_BEHAVIOR_INSTRUCTION]", prompt));
     }
+    if let Some(user_address) = resolved_user_address {
+        final_parts.push(format!(
+            "[SYSTEM_USER_ADDRESS_GUARD]\n当前 user_address 已确认为「{}」。后续称呼必须保持一致。\n[/SYSTEM_USER_ADDRESS_GUARD]",
+            user_address
+        ));
+    } else {
+        final_parts.push(
+            "[SYSTEM_USER_ADDRESS_GUARD]\n当前 user_address 为空。你必须使用中性表达，不得生成任何身份称谓式称呼；先询问用户希望的称呼，再写入 USER.md。\n[/SYSTEM_USER_ADDRESS_GUARD]"
+                .to_string(),
+        );
+    }
 
     if final_parts.is_empty() {
         return Ok(None);
@@ -6260,6 +6278,711 @@ fn resolve_agent_system_prompt(agent_id: &str) -> Result<Option<String>, ApiErro
     } else {
         Ok(Some(trimmed))
     }
+}
+
+fn extract_user_address_from_user_md(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = split_key_value_line(trimmed) {
+            let k = key.trim().to_ascii_lowercase();
+            if (k == "user_address" || k == "用户称呼" || k == "称呼")
+                && !value.trim().is_empty()
+            {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn clean_markdown_text(raw: &str) -> String {
+    raw.trim()
+        .trim_matches('#')
+        .trim_matches('-')
+        .trim_matches('*')
+        .trim()
+        .replace("**", "")
+        .replace('`', "")
+}
+
+fn split_key_value_line(line: &str) -> Option<(String, String)> {
+    let trimmed = clean_markdown_text(line);
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((k, v)) = trimmed.split_once(':') {
+        return Some((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+    }
+    if let Some((k, v)) = trimmed.split_once('：') {
+        return Some((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+    }
+    None
+}
+
+fn normalize_candidate_name(raw: &str) -> String {
+    clean_markdown_text(raw)
+        .trim_matches('「')
+        .trim_matches('」')
+        .trim_matches('(')
+        .trim_matches(')')
+        .trim()
+        .to_string()
+}
+
+fn looks_like_placeholder_name(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    normalized.contains("未命名")
+        || normalized == "智能体"
+        || normalized == "助手"
+        || normalized == "assistant"
+        || normalized == "agent"
+}
+
+fn extract_identity_name(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = split_key_value_line(trimmed) {
+            if key == "name" || key == "中文名" {
+                let candidate = normalize_candidate_name(&value);
+                if !candidate.is_empty() && !looks_like_placeholder_name(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        if let Some((_, suffix)) = trimmed.split_once("身份设定：") {
+            let candidate = normalize_candidate_name(suffix);
+            if !candidate.is_empty() && !looks_like_placeholder_name(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn has_user_address_info(content: &str) -> bool {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = split_key_value_line(trimmed) {
+            let has_key = key.contains("user_address")
+                || key.contains("useraddress")
+                || key.contains("用户称呼")
+                || key.contains("称呼");
+            if has_key && !value.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_default_stub_context(file_name: &str, content: &str) -> bool {
+    let normalized_name = file_name.trim().to_ascii_uppercase();
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match normalized_name.as_str() {
+        "IDENTITY.MD" => {
+            lower.contains("# identity")
+                && lower.contains("visual identity and personality at a glance")
+        }
+        "USER.MD" => {
+            lower.starts_with("# user")
+                && lower.contains("- name:")
+                && lower.contains("- timezone:")
+                && lower.contains("- preferences:")
+        }
+        "SOUL.MD" => lower.starts_with("# soul") && lower.contains("be genuinely helpful"),
+        "MEMORY.MD" => lower.starts_with("# long-term memory"),
+        "TOOLS.MD" => lower.starts_with("# tools & environment"),
+        "AGENTS.MD" => lower.starts_with("# agent behavioral guidelines"),
+        "BOOTSTRAP.MD" => lower.starts_with("# first-run bootstrap"),
+        "HEARTBEAT.MD" => trimmed.is_empty(),
+        _ => false,
+    }
+}
+
+fn has_meaningful_history(session: &Value) -> bool {
+    let Some(rows) = session.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    for row in rows {
+        let role = row
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if role != "user" && role != "assistant" && role != "agent" {
+            continue;
+        }
+        if let Some(content) = row.get("content") {
+            if let Some(text) = extract_text_from_json(content) {
+                if !looks_like_protocol_only_text(&text) {
+                    return true;
+                }
+            }
+        }
+        if let Some(message) = row.get("message") {
+            if let Some(text) = extract_text_from_json(message) {
+                if !looks_like_protocol_only_text(&text) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn build_agent_bootstrap_name(agent_id: &str, identity_content: &str) -> String {
+    if let Some(name) = extract_identity_name(identity_content) {
+        return name;
+    }
+    let normalized = agent_id
+        .trim()
+        .replace('-', " ")
+        .replace('_', " ")
+        .trim()
+        .to_string();
+    if normalized.is_empty() {
+        "你的专属智能体".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn build_first_run_identity_bundle(agent_name: &str) -> Vec<(&'static str, String)> {
+    let safe_name = if agent_name.trim().is_empty() {
+        "你的专属智能体"
+    } else {
+        agent_name.trim()
+    };
+
+    let soul = "# SOUL.md
+## 核心人格
+- 务实：输出以可落地为第一优先级。
+- 诚实：信息不足时直接说明，并给出补齐路径。
+- 进化：每次会话后提炼可复用经验并推动自我优化。
+
+## 边界与一致性
+- 禁止编造事实、进度、结果。
+- 高风险操作先确认，再执行。"
+        .to_string();
+    let user = format!(
+        "# USER.md
+## 用户画像
+- user_address:
+- relation: 长期协作伙伴
+- tone_preference: 简洁直接、先结论后解释
+
+## 交互约定
+- user_address 仅来源于用户明确指定，不做默认推断。
+- 当用户明确要求新的称呼时，立即更新并沿用。
+- 对同类任务优先复用用户历史偏好。"
+    );
+    let memory = "# MEMORY.md
+## 长期记忆策略
+- 记录：用户目标、偏好、禁忌、常用流程、验收标准。
+- 清理：过期或冲突记忆定期标记并剔除。
+- 应用：回答前优先匹配历史偏好，减少重复确认。"
+        .to_string();
+    let tools = "# TOOLS.md
+## 工具使用协议
+- 能用工具验证的事实，优先工具验证。
+- 多步骤操作优先批量执行，减少往返。
+- 失败时保留错误上下文并给出可执行回退方案。"
+        .to_string();
+    let agents = "# AGENTS.md
+## 多智能体协作
+- 复杂任务按职责拆解，明确输入/输出边界。
+- 汇总阶段统一结构与术语，避免信息冲突。
+- 对外只输出最终整合结论与关键证据。"
+        .to_string();
+    let bootstrap = format!(
+        "# BOOTSTRAP.md
+## 首次引导（仅在第一次对话执行）
+本文件只用于首次会话引导。首次会话完成后，不再加载本文件。
+当前智能体名称参考：{safe_name}
+
+## 引导流程
+### 1. 开场定位
+- 开场白：\"系统上线，记忆为空。咱们定一下规矩：我是谁？\"
+- 读取并遵循现有 `IDENTITY.md`，以既定身份进入协作。
+- 禁止覆写 `IDENTITY.md` 的已存在身份内容（除非用户明确要求改名或改定位）。
+
+### 2. 需求建档
+- 先询问并记录 user_address：仅接收用户明确指定，不做默认推断。
+- 再根据 `IDENTITY.md` 的角色定位，主动询问用户关键规则：
+  1) 输出风格（简洁/详细、结构化格式）
+  2) 交付标准（是否要步骤、表格、代码、风险提示）
+  3) 禁忌与边界（不希望出现的内容或行为）
+- 将确认结果写入 `USER.md` / `SOUL.md` / `MEMORY.md`。
+
+### 3. 连接渠道
+- 向用户确认后续协作方式：任务输入格式、交付格式、反馈节奏。
+- 产出一条可立即执行的首个任务建议，并进入常规协作。"
+    );
+    let heartbeat = "# HEARTBEAT.md
+## 周期自检清单
+- 检查是否沿用了最新用户称呼、语气偏好、交付格式偏好。
+- 检查当前规则是否仍匹配用户近期需求。
+- 检查工具使用策略是否可再提速或降错。
+
+## 自我优化闭环
+1. 观察：从最近会话提炼高频偏好与反馈。
+2. 决策：判断应更新哪个文件（IDENTITY/SOUL/USER/MEMORY/TOOLS/AGENTS/BOOTSTRAP）。
+3. 执行：写入更新并在下次会话生效。
+4. 复盘：验证更新是否提升用户满意度与任务成功率。"
+        .to_string();
+
+    vec![
+        ("SOUL.md", soul),
+        ("USER.md", user),
+        ("MEMORY.md", memory),
+        ("TOOLS.md", tools),
+        ("AGENTS.md", agents),
+        ("BOOTSTRAP.md", bootstrap),
+        ("HEARTBEAT.md", heartbeat),
+    ]
+}
+
+async fn maybe_auto_initialize_agent_identity_once(
+    state: &Arc<AppState>,
+    agent_id: &str,
+) -> Result<bool, ApiError> {
+    validate_agent_path_segment(agent_id)?;
+    let session_path = format!("/api/agents/{agent_id}/session");
+    let session_payload = match state.openfang.get_json(&session_path).await {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %err.message,
+                "auto-init: skip because session cannot be fetched"
+            );
+            return Ok(false);
+        }
+    };
+    let has_history = has_meaningful_history(&session_payload);
+    if has_history {
+        return Ok(false);
+    }
+
+    let context_files = assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
+    let identity_content = context_files
+        .get("IDENTITY.md")
+        .map(|v| v.content.as_str())
+        .unwrap_or("");
+    let user_content = context_files
+        .get("USER.md")
+        .map(|v| v.content.as_str())
+        .unwrap_or("");
+    let bootstrap_content = context_files
+        .get("BOOTSTRAP.md")
+        .map(|v| v.content.as_str())
+        .unwrap_or("");
+
+    let has_user_address = has_user_address_info(user_content);
+    let user_is_stub = is_default_stub_context("USER.md", user_content);
+    let bootstrap_is_stub = is_default_stub_context("BOOTSTRAP.md", bootstrap_content);
+    let should_initialize = !has_user_address || user_is_stub || bootstrap_is_stub;
+    if !should_initialize {
+        return Ok(false);
+    }
+
+    let agent_name = build_agent_bootstrap_name(agent_id, identity_content);
+    let bundle = build_first_run_identity_bundle(&agent_name);
+    let mut wrote_any = false;
+    for (file_name, content) in bundle {
+        let existing_content = context_files
+            .get(file_name)
+            .map(|v| v.content.as_str())
+            .unwrap_or("");
+        let replace_allowed =
+            existing_content.trim().is_empty() || is_default_stub_context(file_name, existing_content);
+        if !replace_allowed {
+            continue;
+        }
+        assignment_store::upsert_agent_context_file(agent_id, file_name, &content)
+            .map_err(storage_error)?;
+        write_context_file_to_openfang(state, agent_id, file_name, &content).await?;
+        wrote_any = true;
+    }
+    if wrote_any {
+        tracing::info!(
+            agent_id = %agent_id,
+            "auto-init: identity bundle initialized"
+        );
+    }
+    Ok(wrote_any)
+}
+
+async fn should_include_bootstrap_for_turn(state: &Arc<AppState>, agent_id: &str) -> bool {
+    if validate_agent_path_segment(agent_id).is_err() {
+        return false;
+    }
+    let session_path = format!("/api/agents/{agent_id}/session");
+    match state.openfang.get_json(&session_path).await {
+        Ok(payload) => !has_meaningful_history(&payload),
+        Err(err) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %err.message,
+                "bootstrap: failed to fetch session state, skip bootstrap injection"
+            );
+            false
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct UserProfilePatch {
+    user_address: Option<String>,
+    investment_preferences: Vec<String>,
+}
+
+fn trim_cn_modal_suffix(raw: &str) -> String {
+    let mut value = raw.trim().to_string();
+    let suffixes = ["吧", "呀", "啊", "哦", "呢", "哈", "啦", "嘛", "呗", "哇", "喔"];
+    loop {
+        let mut changed = false;
+        for suffix in suffixes {
+            if value.ends_with(suffix) {
+                value = value.trim_end_matches(suffix).trim().to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    value
+}
+
+fn take_short_token(raw: &str) -> String {
+    let trimmed = raw
+        .trim_start_matches([' ', '\t', '\n', '\r', '，', ',', '。', '.', '：', ':'])
+        .trim();
+    let mut out = String::new();
+    for ch in trimmed.chars() {
+        let is_delimiter = matches!(
+            ch,
+            ' ' | '\t' | '\n' | '\r' | '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?'
+                | '；' | ';' | '：' | ':' | '、' | '/'
+        );
+        if is_delimiter {
+            break;
+        }
+        out.push(ch);
+        if out.chars().count() >= 12 {
+            break;
+        }
+    }
+    trim_cn_modal_suffix(&out)
+}
+
+fn is_invalid_user_address(value: &str, agent_id: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if !agent_id.trim().is_empty() && trimmed.eq_ignore_ascii_case(agent_id.trim()) {
+        return true;
+    }
+    let blacklist = [
+        "我", "你", "我们", "大家", "一下", "这个", "那个", "短线", "长线", "a股", "A股", "股票",
+    ];
+    blacklist.iter().any(|item| item.eq_ignore_ascii_case(trimmed))
+}
+
+fn extract_user_message_segment(message: &str) -> String {
+    let normalized = message.replace("\r\n", "\n");
+    let segment = if let Some(index) = normalized.rfind("\n[user]\n") {
+        normalized[index + "\n[user]\n".len()..].trim().to_string()
+    } else if let Some(index) = normalized.rfind("[user]\n") {
+        normalized[index + "[user]\n".len()..].trim().to_string()
+    } else {
+        message.trim().to_string()
+    };
+    let lowered = segment.to_ascii_lowercase();
+    if lowered.starts_with("[system:auto-idle]")
+        || lowered.starts_with("[system:")
+    {
+        return String::new();
+    }
+    segment
+}
+
+fn extract_user_address_from_message(message: &str, agent_id: &str) -> Option<String> {
+    let patterns = [
+        "你可以叫我",
+        "你就叫我",
+        "以后叫我",
+        "请叫我",
+        "叫我",
+        "称呼我",
+        "喊我",
+        "我叫",
+        "我是",
+    ];
+    for pattern in patterns {
+        if let Some(index) = message.find(pattern) {
+            let rest = &message[index + pattern.len()..];
+            let candidate = take_short_token(rest);
+            if !is_invalid_user_address(&candidate, agent_id) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn push_unique_preference(out: &mut Vec<String>, value: &str) {
+    if out.iter().any(|item| item == value) {
+        return;
+    }
+    out.push(value.to_string());
+}
+
+fn collect_investment_preferences(message: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = message.to_ascii_lowercase();
+
+    if message.contains("短线") {
+        push_unique_preference(&mut out, "短线交易");
+    }
+    if message.contains("长线") || message.contains("价值投资") {
+        push_unique_preference(&mut out, "长线价值投资");
+    }
+    if message.contains("波段") {
+        push_unique_preference(&mut out, "波段交易");
+    }
+
+    if lower.contains("a股") || message.contains("沪深") {
+        push_unique_preference(&mut out, "A股");
+    }
+    if message.contains("港股") {
+        push_unique_preference(&mut out, "港股");
+    }
+    if message.contains("美股") {
+        push_unique_preference(&mut out, "美股");
+    }
+
+    if message.contains("科技") {
+        push_unique_preference(&mut out, "科技");
+    }
+    if message.contains("消费") {
+        push_unique_preference(&mut out, "消费");
+    }
+    if message.contains("新能源") {
+        push_unique_preference(&mut out, "新能源");
+    }
+    if message.contains("医药") {
+        push_unique_preference(&mut out, "医药");
+    }
+    if message.contains("金融") {
+        push_unique_preference(&mut out, "金融");
+    }
+    if message.contains("半导体") {
+        push_unique_preference(&mut out, "半导体");
+    }
+    let has_ai_keyword = message.contains("AI")
+        || message.contains("A I")
+        || message.contains("人工智能")
+        || lower.contains(" a.i")
+        || lower.contains(" ai ");
+    if has_ai_keyword {
+        push_unique_preference(&mut out, "AI");
+    }
+
+    out
+}
+
+fn extract_user_profile_patch_from_message(message: &str, agent_id: &str) -> Option<UserProfilePatch> {
+    let user_segment = extract_user_message_segment(message);
+    let trimmed = user_segment.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let user_address = extract_user_address_from_message(trimmed, agent_id);
+    let investment_preferences = collect_investment_preferences(trimmed);
+    if user_address.is_none() && investment_preferences.is_empty() {
+        return None;
+    }
+    Some(UserProfilePatch {
+        user_address,
+        investment_preferences,
+    })
+}
+
+fn replace_or_append_markdown_field(
+    content: &str,
+    key_aliases: &[&str],
+    canonical_key: &str,
+    value: &str,
+) -> String {
+    let aliases = key_aliases
+        .iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut output_lines = Vec::new();
+    let mut replaced = false;
+
+    for line in content.lines() {
+        let line_trimmed = line.trim();
+        if let Some((key, _)) = split_key_value_line(line_trimmed) {
+            if aliases.iter().any(|alias| alias == &key) {
+                if !replaced {
+                    output_lines.push(format!("- {canonical_key}: {value}"));
+                    replaced = true;
+                }
+                continue;
+            }
+        }
+        output_lines.push(line.to_string());
+    }
+
+    if !replaced {
+        if output_lines.last().map(|line| !line.trim().is_empty()).unwrap_or(false) {
+            output_lines.push(String::new());
+        }
+        output_lines.push(format!("- {canonical_key}: {value}"));
+    }
+
+    output_lines.join("\n")
+}
+
+fn merge_user_markdown(existing_content: &str, patch: &UserProfilePatch) -> String {
+    let mut next = if existing_content.trim().is_empty() || is_default_stub_context("USER.md", existing_content) {
+        "# USER.md\n## 用户画像\n- user_address:\n- relation: 长期协作伙伴\n- investment_preferences:\n- tone_preference: 简洁直接、先结论后解释".to_string()
+    } else {
+        existing_content.to_string()
+    };
+
+    if let Some(user_address) = patch.user_address.as_deref() {
+        next = replace_or_append_markdown_field(
+            &next,
+            &["user_address", "name", "用户称呼", "称呼"],
+            "user_address",
+            user_address,
+        );
+    }
+    if !patch.investment_preferences.is_empty() {
+        let value = patch.investment_preferences.join("、");
+        next = replace_or_append_markdown_field(
+            &next,
+            &["investment_preferences", "preferences", "偏好"],
+            "investment_preferences",
+            &value,
+        );
+    }
+    next
+}
+
+fn merge_memory_markdown(existing_content: &str, patch: &UserProfilePatch) -> String {
+    if patch.user_address.is_none() && patch.investment_preferences.is_empty() {
+        return existing_content.to_string();
+    }
+    let mut next = if existing_content.trim().is_empty() || is_default_stub_context("MEMORY.md", existing_content) {
+        "# MEMORY.md\n## 长期记忆策略\n- 记录用户长期目标、偏好与限制。\n- 定期清理冲突或过期信息。\n\n## 用户偏好快照".to_string()
+    } else {
+        existing_content.to_string()
+    };
+
+    let user_address = patch
+        .user_address
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("未指定");
+    let pref_text = if patch.investment_preferences.is_empty() {
+        "未指定".to_string()
+    } else {
+        patch.investment_preferences.join("、")
+    };
+    let dedup_key = format!("user_address: {user_address} | investment_preferences: {pref_text}");
+    if next.contains(&dedup_key) {
+        return next;
+    }
+
+    if !next.contains("## 用户偏好快照") {
+        if next.lines().last().map(|line| !line.trim().is_empty()).unwrap_or(false) {
+            next.push('\n');
+        }
+        next.push_str("\n## 用户偏好快照");
+    }
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    let snapshot = format!(
+        "- ts: {} | user_address: {} | investment_preferences: {}",
+        now_millis(),
+        user_address,
+        pref_text
+    );
+    next.push_str(&snapshot);
+    next
+}
+
+async fn maybe_persist_user_profile_patch(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    message: &str,
+) -> Result<bool, ApiError> {
+    validate_agent_path_segment(agent_id)?;
+    let Some(patch) = extract_user_profile_patch_from_message(message, agent_id) else {
+        return Ok(false);
+    };
+
+    let context_files = assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
+    let existing_user = context_files
+        .get("USER.md")
+        .map(|item| item.content.as_str())
+        .unwrap_or("");
+    let existing_memory = context_files
+        .get("MEMORY.md")
+        .map(|item| item.content.as_str())
+        .unwrap_or("");
+
+    let next_user = merge_user_markdown(existing_user, &patch);
+    let next_memory = merge_memory_markdown(existing_memory, &patch);
+
+    let mut changed = false;
+    if next_user.trim() != existing_user.trim() {
+        assignment_store::upsert_agent_context_file(agent_id, "USER.md", &next_user)
+            .map_err(storage_error)?;
+        write_context_file_to_openfang(state, agent_id, "USER.md", &next_user).await?;
+        changed = true;
+    }
+    if next_memory.trim() != existing_memory.trim() {
+        assignment_store::upsert_agent_context_file(agent_id, "MEMORY.md", &next_memory)
+            .map_err(storage_error)?;
+        write_context_file_to_openfang(state, agent_id, "MEMORY.md", &next_memory).await?;
+        changed = true;
+    }
+
+    if changed {
+        tracing::info!(
+            agent_id = %agent_id,
+            user_address = patch.user_address.clone().unwrap_or_default(),
+            preference_count = patch.investment_preferences.len(),
+            "auto-profile: persisted user profile patch"
+        );
+    }
+
+    Ok(changed)
 }
 
 fn to_trimmed_string(value: Option<&Value>) -> Option<String> {
@@ -6605,7 +7328,14 @@ pub async fn chat_message(
     if let Err(err) = sync_agent_context_files(&state, &id, false).await {
         tracing::warn!(agent_id = %id, error = %err.message, "chat_message: context sync skipped due to error");
     }
-    let system_prompt = resolve_agent_system_prompt(&id)?;
+    if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &id).await {
+        tracing::warn!(agent_id = %id, error = %err.message, "chat_message: auto-init skipped due to error");
+    }
+    if let Err(err) = maybe_persist_user_profile_patch(&state, &id, &payload.message).await {
+        tracing::warn!(agent_id = %id, error = %err.message, "chat_message: auto-profile skipped due to error");
+    }
+    let include_bootstrap = should_include_bootstrap_for_turn(&state, &id).await;
+    let system_prompt = resolve_agent_system_prompt(&id, include_bootstrap)?;
     let collaboration_prompt = match resolve_collaboration_prompt(&state, &id).await {
         Ok(value) => value,
         Err(error) => {
@@ -6667,7 +7397,14 @@ pub async fn chat_message_stream(
     if let Err(err) = sync_agent_context_files(&state, &id, false).await {
         tracing::warn!(agent_id = %id, error = %err.message, "chat_message_stream: context sync skipped due to error");
     }
-    let system_prompt = resolve_agent_system_prompt(&id)?;
+    if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &id).await {
+        tracing::warn!(agent_id = %id, error = %err.message, "chat_message_stream: auto-init skipped due to error");
+    }
+    if let Err(err) = maybe_persist_user_profile_patch(&state, &id, &payload.message).await {
+        tracing::warn!(agent_id = %id, error = %err.message, "chat_message_stream: auto-profile skipped due to error");
+    }
+    let include_bootstrap = should_include_bootstrap_for_turn(&state, &id).await;
+    let system_prompt = resolve_agent_system_prompt(&id, include_bootstrap)?;
     let collaboration_prompt = match resolve_collaboration_prompt(&state, &id).await {
         Ok(value) => value,
         Err(error) => {
