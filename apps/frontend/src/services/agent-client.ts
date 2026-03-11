@@ -1255,6 +1255,13 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
   const agentId = input.agentId;
   const controller = new AbortController();
   let outgoingMessage = await buildOutgoingMessage(input);
+  const attachmentRefs = (input.attachments ?? [])
+    .filter((item) => typeof item.fileId === 'string' && item.fileId.trim().length > 0)
+    .map((item) => ({
+      file_id: item.fileId!.trim(),
+      filename: (item.filename || '').trim(),
+      content_type: (item.contentType || '').trim(),
+    }));
 
   requestToAgentId.set(requestId, agentId);
   requestAbortControllers.set(requestId, controller);
@@ -1469,6 +1476,7 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
           method: 'POST',
           body: {
             message: outgoingMessage,
+            attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
             session_id: sessionId || undefined,
             session_label: sessionLabel || undefined,
           },
@@ -1641,7 +1649,11 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
 
             return false;
           },
-          { type: 'message', content: outgoingMessage },
+          {
+            type: 'message',
+            content: outgoingMessage,
+            attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
+          },
           { signal: controller.signal },
         );
       } catch (wsError) {
@@ -1660,7 +1672,10 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
             `/api/chat/${encodeURIComponent(agentId)}/message`,
             {
               method: 'POST',
-              body: { message: outgoingMessage },
+              body: {
+                message: outgoingMessage,
+                attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
+              },
               signal: controller.signal,
             },
           );
@@ -1832,6 +1847,13 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
 
   try {
     const outgoingMessage = input.message;
+    const attachmentRefs = (input.attachments ?? [])
+      .filter((item) => typeof item.fileId === 'string' && item.fileId.trim().length > 0)
+      .map((item) => ({
+        file_id: item.fileId!.trim(),
+        filename: (item.filename || '').trim(),
+        content_type: (item.contentType || '').trim(),
+      }));
     const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
     const sessionLabel = typeof input.sessionLabel === 'string' ? input.sessionLabel.trim() : '';
     if (import.meta.env.DEV) {
@@ -1844,6 +1866,7 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
       method: 'POST',
       body: {
         message: outgoingMessage,
+        attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
         session_id: sessionId || undefined,
         session_label: sessionLabel || undefined,
       },

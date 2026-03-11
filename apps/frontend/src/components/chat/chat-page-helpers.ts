@@ -574,7 +574,25 @@ export function buildHistory(messages: Message[]): AgentChatMessage[] {
     .filter((msg) => msg.role === 'user' || msg.role === 'agent')
     .map((msg) => ({
       role: msg.role === 'user' ? 'user' : 'assistant',
-      content: (msg.text || '').trim(),
+      content: (() => {
+        const text = (msg.text || '').trim();
+        if (msg.role !== 'user' || !msg.attachments || msg.attachments.length === 0) {
+          return text;
+        }
+        const attachmentLines = msg.attachments.map((attachment, index) => {
+          const parts = [
+            `${index + 1}. ${attachment.kind === 'image' ? '图片' : '附件'}：${attachment.name}`,
+            `- 相对路径：${attachment.relativePath}`,
+          ];
+          if (attachment.savedPath?.trim()) {
+            parts.push(`- 绝对路径：${attachment.savedPath.trim()}`);
+          }
+          return parts.join('\n');
+        });
+        return [text, '附件记录：', ...attachmentLines]
+          .filter((item) => item.trim().length > 0)
+          .join('\n');
+      })(),
     }))
     .filter((msg) => msg.content.length > 0 && !isHiddenSystemPromptText(msg.content))
     .slice(-20)

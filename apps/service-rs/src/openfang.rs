@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
 use serde_json::Value;
 
@@ -107,6 +108,64 @@ impl OpenFangClient {
         body: Value,
     ) -> Result<reqwest::Response, ApiError> {
         self.request_stream(Method::POST, path, Some(body)).await
+    }
+
+    pub async fn post_bytes_json(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+        extra_headers: &[(String, String)],
+    ) -> Result<Value, ApiError> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        let mut req = self.client.request(Method::POST, &url);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let mut headers = HeaderMap::new();
+        if let Some(value) = content_type.and_then(|item| HeaderValue::from_str(item).ok()) {
+            headers.insert(CONTENT_TYPE, value);
+        }
+        for (key, value) in extra_headers {
+            let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = HeaderValue::from_str(value) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
+        req = req.headers(headers).body(body);
+
+        let resp = req.send().await.map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("OpenFang 请求失败({url}): {e}"),
+            )
+        })?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("OpenFang 响应读取失败({url}): {e}"),
+            )
+        })?;
+
+        if !status.is_success() {
+            return Err(ApiError::new(
+                status,
+                format!("OpenFang 返回错误({url}): {}", text.trim()),
+            ));
+        }
+
+        serde_json::from_str::<Value>(&text).map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("OpenFang 返回非 JSON({url}): {e}; body={text}"),
+            )
+        })
     }
 
     pub async fn request_stream(

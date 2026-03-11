@@ -3,8 +3,8 @@ use std::convert::Infallible;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Cursor, Write};
 use std::hash::{Hash, Hasher};
+use std::io::{Cursor, Write};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,6 +75,18 @@ pub fn management_router() -> Router<Arc<AppState>> {
             post(upload_agent_avatar_inline),
         )
         .route("/agents/{id}/avatar/import", post(import_agent_avatar))
+        .route(
+            "/agents/{id}/chat-assets/file",
+            get(get_agent_chat_asset_file),
+        )
+        .route(
+            "/agents/{id}/chat-assets/upload",
+            post(upload_agent_chat_asset),
+        )
+        .route(
+            "/agents/{id}/chat-assets/upload-inline",
+            post(upload_agent_chat_asset_inline),
+        )
         .route("/agents/{id}/portrait/{filename}", get(get_agent_portrait))
         .route("/agents/{id}/portrait/upload", post(upload_agent_portrait))
         .route(
@@ -498,7 +510,12 @@ pub fn chat_router() -> Router<Arc<AppState>> {
 pub fn groups_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_chat_groups).post(create_chat_group))
-        .route("/{id}", get(get_chat_group).put(update_chat_group).delete(delete_chat_group))
+        .route(
+            "/{id}",
+            get(get_chat_group)
+                .put(update_chat_group)
+                .delete(delete_chat_group),
+        )
 }
 
 #[derive(Deserialize)]
@@ -821,7 +838,11 @@ fn merge_group_collaboration(
         .unwrap_or_default();
 
     let merged = normalize_collaboration_worker_keys(
-        &[existing, build_group_selected_workers(group_member_ids, self_agent_id)].concat(),
+        &[
+            existing,
+            build_group_selected_workers(group_member_ids, self_agent_id),
+        ]
+        .concat(),
     );
 
     obj.insert(
@@ -897,7 +918,11 @@ pub async fn create_chat_group(
 ) -> Result<Json<Value>, ApiError> {
     assignment_store::ensure_db().map_err(storage_error)?;
 
-    let mut group_id = payload.group_id.as_deref().map(normalize_group_id).unwrap_or_default();
+    let mut group_id = payload
+        .group_id
+        .as_deref()
+        .map(normalize_group_id)
+        .unwrap_or_default();
     if group_id.is_empty() {
         group_id = generate_group_id();
     }
@@ -909,7 +934,10 @@ pub async fn create_chat_group(
 
     let mut member_agent_ids = normalize_string_list(payload.member_agent_ids);
     if member_agent_ids.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "至少选择 1 个群成员"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "至少选择 1 个群成员",
+        ));
     }
 
     let leader_agent_id = payload
@@ -1009,7 +1037,10 @@ pub async fn update_chat_group(
 
     let mut member_agent_ids = normalize_string_list(payload.member_agent_ids);
     if member_agent_ids.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "至少选择 1 个群成员"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "至少选择 1 个群成员",
+        ));
     }
 
     let leader_agent_id = payload
@@ -1467,6 +1498,8 @@ fn merge_agent_profile_override(
 }
 
 const MAX_AVATAR_SIZE: usize = 15 * 1024 * 1024;
+const MAX_CHAT_ASSET_SIZE: usize = 64 * 1024 * 1024;
+const CHAT_UPLOAD_DIR_NAME: &str = "chat-uploads";
 const MAX_CONTEXT_FILE_SIZE: usize = 32 * 1024;
 const MAX_MEMORY_FILE_SIZE: usize = 512 * 1024;
 const DEFAULT_MEMORY_QUERY_DAYS: i64 = 7;
@@ -1919,9 +1952,7 @@ fn strip_provider_prefixes(model: &str, provider: &str) -> String {
 }
 
 fn is_probably_chat_model(provider: &str, model: &str) -> bool {
-    if provider
-        .trim()
-        .eq_ignore_ascii_case("nvidia-nim")
+    if provider.trim().eq_ignore_ascii_case("nvidia-nim")
         || provider.trim().eq_ignore_ascii_case("nvidia")
     {
         let lower = model.to_ascii_lowercase();
@@ -2500,8 +2531,217 @@ fn build_avatar_url(agent_id: &str, filename: &str) -> String {
     format!("/api/management/agents/{agent_id}/avatar/{filename}")
 }
 
+fn chat_asset_kind_from_name(filename: &str) -> &'static str {
+    let ext = StdPath::new(filename)
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" => "image",
+        _ => "file",
+    }
+}
+
+fn chat_asset_content_type(filename: &str) -> &'static str {
+    let ext = StdPath::new(filename)
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "txt" | "log" | "md" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "csv" => "text/csv; charset=utf-8",
+        "zip" => "application/zip",
+        "rar" => "application/vnd.rar",
+        "7z" => "application/x-7z-compressed",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn sanitize_chat_asset_filename(raw: Option<&str>) -> String {
+    let fallback = "upload.bin".to_string();
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return fallback;
+    };
+
+    let file_name = StdPath::new(value)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("upload.bin")
+        .trim();
+    if file_name.is_empty() {
+        return fallback;
+    }
+
+    let mut stem = String::new();
+    let mut ext = String::new();
+    let mut saw_dot = false;
+    for ch in file_name.chars() {
+        if ch == '.' && !saw_dot {
+            saw_dot = true;
+            continue;
+        }
+        let target = if saw_dot { &mut ext } else { &mut stem };
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            target.push(ch);
+        } else {
+            target.push('_');
+        }
+    }
+
+    stem = stem.trim_matches('_').to_string();
+    ext = ext.trim_matches('_').to_string();
+    if stem.is_empty() {
+        stem = "upload".to_string();
+    }
+    if ext.is_empty() {
+        format!("{stem}.bin")
+    } else {
+        format!("{stem}.{ext}")
+    }
+}
+
+fn build_agent_chat_asset_url(agent_id: &str, relative_path: &str) -> String {
+    format!("/api/management/agents/{agent_id}/chat-assets/file?path={relative_path}")
+}
+
 fn build_portrait_url(agent_id: &str, filename: &str) -> String {
     format!("/api/management/agents/{agent_id}/portrait/{filename}")
+}
+
+async fn resolve_agent_chat_upload_root(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    upstream_hint: Option<&Value>,
+) -> Result<PathBuf, ApiError> {
+    let binding = resolve_agent_workspace_binding(state, agent_id, upstream_hint).await?;
+    let data_root = binding.private_workspace.join("data");
+    let chat_root = data_root.join(CHAT_UPLOAD_DIR_NAME);
+    fs::create_dir_all(&chat_root).map_err(|e| {
+        storage_error(format!(
+            "创建聊天附件目录失败({}): {e}",
+            chat_root.display()
+        ))
+    })?;
+    Ok(chat_root)
+}
+
+async fn save_agent_chat_asset_bytes(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    filename_hint: Option<&str>,
+    bytes: &[u8],
+    upstream_hint: Option<&Value>,
+) -> Result<(String, String, String, String, String, String, usize, Option<String>), ApiError> {
+    if bytes.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "上传文件为空",
+        ));
+    }
+    if bytes.len() > MAX_CHAT_ASSET_SIZE {
+        return Err(ApiError::new(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "附件过大（最大 {} MB）",
+                MAX_CHAT_ASSET_SIZE / (1024 * 1024)
+            ),
+        ));
+    }
+
+    let safe_name = sanitize_chat_asset_filename(filename_hint);
+    let upload_root = resolve_agent_chat_upload_root(state, agent_id, upstream_hint).await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let day_bucket = now / 86_400_000;
+    let file_name = format!("{now}-{safe_name}");
+    let relative_path = format!("{CHAT_UPLOAD_DIR_NAME}/{day_bucket}/{file_name}");
+    let target = upload_root.join(day_bucket.to_string()).join(&file_name);
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| storage_error(format!("创建附件子目录失败({}): {e}", parent.display())))?;
+    }
+    fs::write(&target, bytes).map_err(|e| storage_error(format!("写入聊天附件失败: {e}")))?;
+
+    let kind = chat_asset_kind_from_name(&file_name).to_string();
+    let mime_type = chat_asset_content_type(&file_name).to_string();
+    let asset_url = build_agent_chat_asset_url(agent_id, &relative_path);
+    let upstream_file_id = mirror_agent_chat_asset_to_openfang(
+        state,
+        agent_id,
+        &file_name,
+        &mime_type,
+        bytes,
+    )
+    .await;
+    Ok((
+        asset_url,
+        file_name,
+        relative_path,
+        target.to_string_lossy().to_string(),
+        kind,
+        mime_type,
+        bytes.len(),
+        upstream_file_id,
+    ))
+}
+
+async fn mirror_agent_chat_asset_to_openfang(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    filename: &str,
+    mime_type: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    let path = format!("/api/agents/{agent_id}/upload");
+    let headers = vec![("X-Filename".to_string(), filename.to_string())];
+    match state
+        .openfang
+        .post_bytes_json(&path, bytes.to_vec(), Some(mime_type), &headers)
+        .await
+    {
+        Ok(payload) => payload
+            .get("file_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                filename = %filename,
+                mime_type = %mime_type,
+                error = %error.message,
+                "chat asset mirror to OpenFang upload skipped"
+            );
+            None
+        }
+    }
 }
 
 async fn save_agent_avatar_bytes(
@@ -3064,8 +3304,9 @@ pub async fn update_agent_model(
             "model 不能为空",
         ));
     };
-    let (target_provider, target_model) = resolve_provider_model_pair(provider.as_deref(), &raw_model)
-        .ok_or_else(|| ApiError::new(axum::http::StatusCode::BAD_REQUEST, "model 不能为空"))?;
+    let (target_provider, target_model) =
+        resolve_provider_model_pair(provider.as_deref(), &raw_model)
+            .ok_or_else(|| ApiError::new(axum::http::StatusCode::BAD_REQUEST, "model 不能为空"))?;
     let runtime_provider_ids = get_upstream_provider_ids_quick(&state).await;
     if !runtime_provider_ids.is_empty()
         && !runtime_provider_ids.contains(target_provider.as_str())
@@ -3157,7 +3398,10 @@ async fn normalize_agent_model_selector_if_needed(
     let path = format!("/api/agents/{agent_id}/config");
     state
         .openfang
-        .patch_json(&path, json!({ "provider": target_provider, "model": target_model }))
+        .patch_json(
+            &path,
+            json!({ "provider": target_provider, "model": target_model }),
+        )
         .await?;
     Ok(true)
 }
@@ -4681,6 +4925,147 @@ pub struct UploadInlineImageRequest {
     pub content_base64: String,
 }
 
+#[derive(Deserialize)]
+pub struct AgentChatAssetFileQuery {
+    pub path: String,
+}
+
+pub async fn get_agent_chat_asset_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<AgentChatAssetFileQuery>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    validate_agent_path_segment(&id)?;
+    let relative = sanitize_upload_relative_path(&query.path)?;
+    let binding = resolve_agent_workspace_binding(&state, &id, None).await?;
+    let file_path = binding.private_workspace.join("data").join(&relative);
+    let root = binding
+        .private_workspace
+        .join("data")
+        .join(CHAT_UPLOAD_DIR_NAME);
+    if !file_path.starts_with(&root) {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "附件路径非法",
+        ));
+    }
+    if !file_path.is_file() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "附件不存在",
+        ));
+    }
+
+    let bytes = fs::read(&file_path)
+        .map_err(|e| storage_error(format!("读取聊天附件失败({}): {e}", file_path.display())))?;
+    let file_name = file_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("attachment.bin");
+    Ok((
+        [
+            (header::CONTENT_TYPE, chat_asset_content_type(file_name)),
+            (header::CACHE_CONTROL, "private, max-age=300"),
+            (
+                header::CONTENT_DISPOSITION,
+                if chat_asset_kind_from_name(file_name) == "image" {
+                    "inline"
+                } else {
+                    "attachment"
+                },
+            ),
+        ],
+        bytes,
+    ))
+}
+
+pub async fn upload_agent_chat_asset(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let detail_path = format!("/api/agents/{id}");
+    let _ = state.openfang.get_json(&detail_path).await?;
+
+    let mut picked_name: Option<String> = None;
+    let mut picked_bytes: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("读取上传内容失败: {e}"),
+        )
+    })? {
+        let field_name = field.name().unwrap_or_default().to_string();
+        if field_name != "file" {
+            continue;
+        }
+        picked_name = field
+            .file_name()
+            .map(ToString::to_string)
+            .or_else(|| Some("upload.bin".to_string()));
+        let bytes = field.bytes().await.map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("读取上传文件失败: {e}"),
+            )
+        })?;
+        picked_bytes = Some(bytes.to_vec());
+        break;
+    }
+
+    let bytes = picked_bytes.ok_or_else(|| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "未检测到 file 字段，请检查上传参数",
+        )
+    })?;
+
+    let (asset_url, filename, relative_path, saved_path, kind, mime_type, size, upstream_file_id) =
+        save_agent_chat_asset_bytes(&state, &id, picked_name.as_deref(), &bytes, None).await?;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "mode": "upload",
+        "asset_url": asset_url,
+        "filename": filename,
+        "relative_path": relative_path,
+        "saved_path": saved_path,
+        "kind": kind,
+        "mime_type": mime_type,
+        "size": size,
+        "upstream_file_id": upstream_file_id
+    })))
+}
+
+pub async fn upload_agent_chat_asset_inline(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UploadInlineImageRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let detail_path = format!("/api/agents/{id}");
+    let _ = state.openfang.get_json(&detail_path).await?;
+
+    let bytes = decode_inline_upload_base64(&payload.content_base64)?;
+    let (asset_url, filename, relative_path, saved_path, kind, mime_type, size, upstream_file_id) =
+        save_agent_chat_asset_bytes(&state, &id, payload.filename.as_deref(), &bytes, None).await?;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "mode": "inline",
+        "asset_url": asset_url,
+        "filename": filename,
+        "relative_path": relative_path,
+        "saved_path": saved_path,
+        "kind": kind,
+        "mime_type": mime_type,
+        "size": size,
+        "upstream_file_id": upstream_file_id
+    })))
+}
+
 fn decode_inline_upload_base64(raw: &str) -> Result<Vec<u8>, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -5972,7 +6357,10 @@ fn normalize_memory_enhancement_config(mut config: Value) -> Value {
             .entry("group_memory_strategy".to_string())
             .or_insert_with(|| json!({}));
         if let Some(strategy_obj) = strategy.as_object_mut() {
-            strategy_obj.insert("mode".to_string(), Value::String("group_isolation".to_string()));
+            strategy_obj.insert(
+                "mode".to_string(),
+                Value::String("group_isolation".to_string()),
+            );
             strategy_obj.insert("personal_overlay".to_string(), Value::Bool(true));
             strategy_obj.insert(
                 "personal_types".to_string(),
@@ -5983,7 +6371,9 @@ fn normalize_memory_enhancement_config(mut config: Value) -> Value {
             );
             strategy_obj.insert(
                 "note".to_string(),
-                Value::String("群聊按群隔离；同时叠加当前发言人的个人记忆（与该人相关）。".to_string()),
+                Value::String(
+                    "群聊按群隔离；同时叠加当前发言人的个人记忆（与该人相关）。".to_string(),
+                ),
             );
         } else {
             obj.insert(
@@ -6087,10 +6477,19 @@ pub async fn run_workflow(
 }
 
 #[derive(Deserialize)]
+pub struct ChatMessageAttachmentRequest {
+    pub file_id: Option<String>,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct ChatMessageRequest {
     pub message: String,
     pub session_id: Option<String>,
     pub session_label: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<ChatMessageAttachmentRequest>,
 }
 
 fn normalize_session_label(raw: &str) -> String {
@@ -6113,7 +6512,10 @@ fn normalize_session_label(raw: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-async fn get_openfang_agent_session_id(state: &Arc<AppState>, agent_id: &str) -> Result<String, ApiError> {
+async fn get_openfang_agent_session_id(
+    state: &Arc<AppState>,
+    agent_id: &str,
+) -> Result<String, ApiError> {
     let path = format!("/api/agents/{agent_id}/session");
     let payload = state.openfang.get_json(&path).await?;
     let session_id = payload
@@ -6121,7 +6523,12 @@ async fn get_openfang_agent_session_id(state: &Arc<AppState>, agent_id: &str) ->
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "读取上游 session_id 失败"))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "读取上游 session_id 失败",
+            )
+        })?;
     Ok(session_id.to_string())
 }
 
@@ -6170,10 +6577,20 @@ async fn create_openfang_session_with_label(
         .get("session_id")
         .and_then(Value::as_str)
         .or_else(|| payload.get("id").and_then(Value::as_str))
-        .or_else(|| payload.get("id").and_then(|v| v.get("0")).and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .get("id")
+                .and_then(|v| v.get("0"))
+                .and_then(Value::as_str)
+        })
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "创建上游会话失败：缺少 session_id"))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "创建上游会话失败：缺少 session_id",
+            )
+        })?;
 
     Ok(session_id.to_string())
 }
@@ -6202,10 +6619,11 @@ async fn ensure_switched_to_session_label(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "session_label 无效"));
     }
     let original_session_id = get_openfang_agent_session_id(state, agent_id).await?;
-    let target_session_id = match find_openfang_session_by_label(state, agent_id, &safe_label).await? {
-        Some(existing) => existing,
-        None => create_openfang_session_with_label(state, agent_id, &safe_label).await?,
-    };
+    let target_session_id =
+        match find_openfang_session_by_label(state, agent_id, &safe_label).await? {
+            Some(existing) => existing,
+            None => create_openfang_session_with_label(state, agent_id, &safe_label).await?,
+        };
     let switched = original_session_id != target_session_id;
     if switched {
         switch_openfang_session(state, agent_id, &target_session_id).await?;
@@ -6245,7 +6663,10 @@ async fn ensure_switched_to_session_target(
     Ok((String::new(), String::new(), false))
 }
 
-fn resolve_agent_system_prompt(agent_id: &str, include_bootstrap: bool) -> Result<Option<String>, ApiError> {
+fn resolve_agent_system_prompt(
+    agent_id: &str,
+    include_bootstrap: bool,
+) -> Result<Option<String>, ApiError> {
     // 读取 profile 中保存的 system_prompt（系统提示词 Tab 内容）
     let profile = assignment_store::get_agent_profile_override(agent_id).map_err(storage_error)?;
     let base_system_prompt = profile
@@ -6254,7 +6675,8 @@ fn resolve_agent_system_prompt(agent_id: &str, include_bootstrap: bool) -> Resul
         .filter(|value| !value.is_empty());
 
     // 读取身份文件内容（IDENTITY.md, SOUL.md, USER.md 等）
-    let context_files = assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
+    let context_files =
+        assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
 
     // 按顺序拼装身份文件块（只拼接有内容的文件）
     let identity_file_order: &[(&str, &str)] = &[
@@ -6278,7 +6700,10 @@ fn resolve_agent_system_prompt(agent_id: &str, include_bootstrap: bool) -> Resul
             let content = record.content.trim();
             if !content.is_empty() {
                 // 使用结构化的强引导格式
-                identity_blocks.push(format!("<IDENTITY_FILE name=\"{}\" title=\"{}\">\n{}\n</IDENTITY_FILE>", file_name, section_title, content));
+                identity_blocks.push(format!(
+                    "<IDENTITY_FILE name=\"{}\" title=\"{}\">\n{}\n</IDENTITY_FILE>",
+                    file_name, section_title, content
+                ));
                 if *file_name == "USER.md" {
                     resolved_user_address = extract_user_address_from_user_md(content);
                 }
@@ -6288,13 +6713,19 @@ fn resolve_agent_system_prompt(agent_id: &str, include_bootstrap: bool) -> Resul
 
     // 合并：构造一个封闭的系统配置区域
     let mut final_parts = Vec::new();
-    
+
     if !identity_blocks.is_empty() {
-        final_parts.push(format!("[AGENT_IDENTITY_PROFILE]\n{}\n[/AGENT_IDENTITY_PROFILE]", identity_blocks.join("\n\n")));
+        final_parts.push(format!(
+            "[AGENT_IDENTITY_PROFILE]\n{}\n[/AGENT_IDENTITY_PROFILE]",
+            identity_blocks.join("\n\n")
+        ));
     }
-    
+
     if let Some(prompt) = base_system_prompt {
-        final_parts.push(format!("[SYSTEM_BEHAVIOR_INSTRUCTION]\n{}\n[/SYSTEM_BEHAVIOR_INSTRUCTION]", prompt));
+        final_parts.push(format!(
+            "[SYSTEM_BEHAVIOR_INSTRUCTION]\n{}\n[/SYSTEM_BEHAVIOR_INSTRUCTION]",
+            prompt
+        ));
     }
     if let Some(user_address) = resolved_user_address {
         final_parts.push(format!(
@@ -6329,8 +6760,7 @@ fn extract_user_address_from_user_md(content: &str) -> Option<String> {
         }
         if let Some((key, value)) = split_key_value_line(trimmed) {
             let k = key.trim().to_ascii_lowercase();
-            if (k == "user_address" || k == "用户称呼" || k == "称呼")
-                && !value.trim().is_empty()
+            if (k == "user_address" || k == "用户称呼" || k == "称呼") && !value.trim().is_empty()
             {
                 return Some(value.trim().to_string());
             }
@@ -6622,7 +7052,8 @@ async fn maybe_auto_initialize_agent_identity_once(
         return Ok(false);
     }
 
-    let context_files = assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
+    let context_files =
+        assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
     let identity_content = context_files
         .get("IDENTITY.md")
         .map(|v| v.content.as_str())
@@ -6652,8 +7083,8 @@ async fn maybe_auto_initialize_agent_identity_once(
             .get(file_name)
             .map(|v| v.content.as_str())
             .unwrap_or("");
-        let replace_allowed =
-            existing_content.trim().is_empty() || is_default_stub_context(file_name, existing_content);
+        let replace_allowed = existing_content.trim().is_empty()
+            || is_default_stub_context(file_name, existing_content);
         if !replace_allowed {
             continue;
         }
@@ -6697,7 +7128,9 @@ struct UserProfilePatch {
 
 fn trim_cn_modal_suffix(raw: &str) -> String {
     let mut value = raw.trim().to_string();
-    let suffixes = ["吧", "呀", "啊", "哦", "呢", "哈", "啦", "嘛", "呗", "哇", "喔"];
+    let suffixes = [
+        "吧", "呀", "啊", "哦", "呢", "哈", "啦", "嘛", "呗", "哇", "喔",
+    ];
     loop {
         let mut changed = false;
         for suffix in suffixes {
@@ -6721,8 +7154,23 @@ fn take_short_token(raw: &str) -> String {
     for ch in trimmed.chars() {
         let is_delimiter = matches!(
             ch,
-            ' ' | '\t' | '\n' | '\r' | '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?'
-                | '；' | ';' | '：' | ':' | '、' | '/'
+            ' ' | '\t'
+                | '\n'
+                | '\r'
+                | '，'
+                | ','
+                | '。'
+                | '.'
+                | '！'
+                | '!'
+                | '？'
+                | '?'
+                | '；'
+                | ';'
+                | '：'
+                | ':'
+                | '、'
+                | '/'
         );
         if is_delimiter {
             break;
@@ -6746,7 +7194,9 @@ fn is_invalid_user_address(value: &str, agent_id: &str) -> bool {
     let blacklist = [
         "我", "你", "我们", "大家", "一下", "这个", "那个", "短线", "长线", "a股", "A股", "股票",
     ];
-    blacklist.iter().any(|item| item.eq_ignore_ascii_case(trimmed))
+    blacklist
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case(trimmed))
 }
 
 fn extract_user_message_segment(message: &str) -> String {
@@ -6759,9 +7209,7 @@ fn extract_user_message_segment(message: &str) -> String {
         message.trim().to_string()
     };
     let lowered = segment.to_ascii_lowercase();
-    if lowered.starts_with("[system:auto-idle]")
-        || lowered.starts_with("[system:")
-    {
+    if lowered.starts_with("[system:auto-idle]") || lowered.starts_with("[system:") {
         return String::new();
     }
     segment
@@ -6852,7 +7300,10 @@ fn collect_investment_preferences(message: &str) -> Vec<String> {
     out
 }
 
-fn extract_user_profile_patch_from_message(message: &str, agent_id: &str) -> Option<UserProfilePatch> {
+fn extract_user_profile_patch_from_message(
+    message: &str,
+    agent_id: &str,
+) -> Option<UserProfilePatch> {
     let user_segment = extract_user_message_segment(message);
     let trimmed = user_segment.trim();
     if trimmed.is_empty() {
@@ -6897,7 +7348,11 @@ fn replace_or_append_markdown_field(
     }
 
     if !replaced {
-        if output_lines.last().map(|line| !line.trim().is_empty()).unwrap_or(false) {
+        if output_lines
+            .last()
+            .map(|line| !line.trim().is_empty())
+            .unwrap_or(false)
+        {
             output_lines.push(String::new());
         }
         output_lines.push(format!("- {canonical_key}: {value}"));
@@ -6907,7 +7362,9 @@ fn replace_or_append_markdown_field(
 }
 
 fn merge_user_markdown(existing_content: &str, patch: &UserProfilePatch) -> String {
-    let mut next = if existing_content.trim().is_empty() || is_default_stub_context("USER.md", existing_content) {
+    let mut next = if existing_content.trim().is_empty()
+        || is_default_stub_context("USER.md", existing_content)
+    {
         "# USER.md\n## 用户画像\n- user_address:\n- relation: 长期协作伙伴\n- investment_preferences:\n- tone_preference: 简洁直接、先结论后解释".to_string()
     } else {
         existing_content.to_string()
@@ -6937,7 +7394,9 @@ fn merge_memory_markdown(existing_content: &str, patch: &UserProfilePatch) -> St
     if patch.user_address.is_none() && patch.investment_preferences.is_empty() {
         return existing_content.to_string();
     }
-    let mut next = if existing_content.trim().is_empty() || is_default_stub_context("MEMORY.md", existing_content) {
+    let mut next = if existing_content.trim().is_empty()
+        || is_default_stub_context("MEMORY.md", existing_content)
+    {
         "# MEMORY.md\n## 长期记忆策略\n- 记录用户长期目标、偏好与限制。\n- 定期清理冲突或过期信息。\n\n## 用户偏好快照".to_string()
     } else {
         existing_content.to_string()
@@ -6959,7 +7418,12 @@ fn merge_memory_markdown(existing_content: &str, patch: &UserProfilePatch) -> St
     }
 
     if !next.contains("## 用户偏好快照") {
-        if next.lines().last().map(|line| !line.trim().is_empty()).unwrap_or(false) {
+        if next
+            .lines()
+            .last()
+            .map(|line| !line.trim().is_empty())
+            .unwrap_or(false)
+        {
             next.push('\n');
         }
         next.push_str("\n## 用户偏好快照");
@@ -6987,7 +7451,8 @@ async fn maybe_persist_user_profile_patch(
         return Ok(false);
     };
 
-    let context_files = assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
+    let context_files =
+        assignment_store::list_agent_context_files(agent_id).map_err(storage_error)?;
     let existing_user = context_files
         .get("USER.md")
         .map(|item| item.content.as_str())
@@ -7353,6 +7818,26 @@ fn extract_new_assistant_text(session: &Value, baseline_count: usize) -> Option<
     texts.into_iter().skip(baseline_count).last()
 }
 
+fn build_openfang_attachment_payload(
+    attachments: &[ChatMessageAttachmentRequest],
+) -> Vec<Value> {
+    attachments
+        .iter()
+        .filter_map(|item| {
+            let file_id = item
+                .file_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some(json!({
+                "file_id": file_id,
+                "filename": item.filename.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or_default(),
+                "content_type": item.content_type.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or_default()
+            }))
+        })
+        .collect()
+}
+
 pub async fn chat_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -7398,10 +7883,14 @@ pub async fn chat_message(
         system_prompt.as_deref(),
         collaboration_prompt.as_deref(),
     );
+    let attachments = build_openfang_attachment_payload(&payload.attachments);
     let path = format!("/api/agents/{id}/message");
     let data = match state
         .openfang
-        .post_json(&path, json!({ "message": outgoing_message }))
+        .post_json(&path, json!({
+            "message": outgoing_message,
+            "attachments": attachments
+        }))
         .await
     {
         Ok(value) => value,
@@ -7465,6 +7954,7 @@ pub async fn chat_message_stream(
         system_prompt.as_deref(),
         collaboration_prompt.as_deref(),
     );
+    let attachments = build_openfang_attachment_payload(&payload.attachments);
     let session_path = format!("/api/agents/{id}/session");
     let baseline_assistant_count = match state.openfang.get_json(&session_path).await {
         Ok(session) => extract_assistant_texts(&session).len(),
@@ -7474,7 +7964,10 @@ pub async fn chat_message_stream(
     let path = format!("/api/agents/{id}/message/stream");
     let upstream = match state
         .openfang
-        .post_stream(&path, json!({ "message": outgoing_message }))
+        .post_stream(&path, json!({
+            "message": outgoing_message,
+            "attachments": attachments
+        }))
         .await
     {
         Ok(stream) => stream,
@@ -8223,7 +8716,9 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Result<Json<Valu
         if display_name.is_empty()
             || display_name == model_id
             || display_name == raw_model
-            || display_name.to_ascii_lowercase().starts_with(&provider_prefix.to_ascii_lowercase())
+            || display_name
+                .to_ascii_lowercase()
+                .starts_with(&provider_prefix.to_ascii_lowercase())
         {
             obj.insert(
                 "display_name".to_string(),
@@ -8298,17 +8793,28 @@ pub async fn test_model_connection(
         ));
     }
 
-    let local_provider_config = assignment_store::get_provider_config(&provider_id).map_err(storage_error)?;
+    let local_provider_config =
+        assignment_store::get_provider_config(&provider_id).map_err(storage_error)?;
     if let Some(cfg) = local_provider_config {
         let protocol = normalize_protocol(&cfg.protocol).unwrap_or("openai");
-        let Some(base_url) = cfg.base_url.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        let Some(base_url) = cfg
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
             return Ok(Json(json!({
                 "ok": false,
                 "status": "missing_base_url",
                 "message": "未配置 Base URL，无法进行模型连通性测试"
             })));
         };
-        let Some(api_key) = cfg.api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        let Some(api_key) = cfg
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
             return Ok(Json(json!({
                 "ok": false,
                 "status": "missing_api_key",
@@ -8316,7 +8822,8 @@ pub async fn test_model_connection(
             })));
         };
 
-        return match discover_models_from_provider(&provider_id, protocol, base_url, api_key).await {
+        return match discover_models_from_provider(&provider_id, protocol, base_url, api_key).await
+        {
             Ok(found_models) => {
                 let matched = found_models.iter().any(|item| {
                     let normalized = strip_provider_prefixes(item, &provider_id);
@@ -9258,7 +9765,9 @@ fn select_latest_channel_bindings(
         let Some(candidate) = parse_channel_binding_candidate(profile) else {
             continue;
         };
-        let entry = output.entry(candidate.channel_type.clone()).or_insert(candidate.clone());
+        let entry = output
+            .entry(candidate.channel_type.clone())
+            .or_insert(candidate.clone());
         if candidate.updated_at > entry.updated_at
             || (candidate.updated_at == entry.updated_at && candidate.agent_id > entry.agent_id)
         {
@@ -9278,9 +9787,10 @@ fn read_string(value: Option<&Value>) -> Option<String> {
 
 fn read_u64(value: Option<&Value>) -> Option<u64> {
     match value {
-        Some(Value::Number(num)) => num
-            .as_u64()
-            .or_else(|| num.as_i64().and_then(|v| if v >= 0 { Some(v as u64) } else { None })),
+        Some(Value::Number(num)) => num.as_u64().or_else(|| {
+            num.as_i64()
+                .and_then(|v| if v >= 0 { Some(v as u64) } else { None })
+        }),
         Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
         _ => None,
     }
@@ -9317,9 +9827,10 @@ fn read_u64_list(value: Option<&Value>) -> Vec<u64> {
     let mut output = Vec::new();
     for item in items {
         let parsed = match item {
-            Value::Number(num) => num
-                .as_u64()
-                .or_else(|| num.as_i64().and_then(|v| if v >= 0 { Some(v as u64) } else { None })),
+            Value::Number(num) => num.as_u64().or_else(|| {
+                num.as_i64()
+                    .and_then(|v| if v >= 0 { Some(v as u64) } else { None })
+            }),
             Value::String(text) => text.trim().parse::<u64>().ok(),
             _ => None,
         };
@@ -9480,8 +9991,8 @@ fn channel_binding_to_toml(
     warnings: &mut Vec<String>,
 ) -> Option<toml::value::Table> {
     let config = binding.config.as_object()?;
-    let default_agent = read_string(config.get("default_agent"))
-        .unwrap_or_else(|| binding.agent_id.clone());
+    let default_agent =
+        read_string(config.get("default_agent")).unwrap_or_else(|| binding.agent_id.clone());
     let mut table = toml::value::Table::new();
     table.insert(
         "default_agent".to_string(),
@@ -9547,18 +10058,12 @@ fn channel_binding_to_toml(
                 folders.push("INBOX".to_string());
             }
             let allowed_senders = read_string_list(config.get("allowed_senders"));
-            table.insert(
-                "imap_host".to_string(),
-                toml::Value::String(imap_host),
-            );
+            table.insert("imap_host".to_string(), toml::Value::String(imap_host));
             table.insert(
                 "imap_port".to_string(),
                 toml::Value::Integer(to_toml_i64(Some(imap_port), 993)),
             );
-            table.insert(
-                "smtp_host".to_string(),
-                toml::Value::String(smtp_host),
-            );
+            table.insert("smtp_host".to_string(), toml::Value::String(smtp_host));
             table.insert(
                 "smtp_port".to_string(),
                 toml::Value::Integer(to_toml_i64(Some(smtp_port), 587)),
@@ -9582,10 +10087,7 @@ fn channel_binding_to_toml(
         "feishu" => {
             let app_id = read_string(config.get("app_id")).unwrap_or_default();
             if app_id.is_empty() {
-                warnings.push(format!(
-                    "飞书渠道({}) 缺少 App ID",
-                    binding.agent_id
-                ));
+                warnings.push(format!("飞书渠道({}) 缺少 App ID", binding.agent_id));
             }
             let app_secret_env = read_string(config.get("app_secret_env"))
                 .unwrap_or_else(|| "FEISHU_APP_SECRET".to_string());
@@ -9630,9 +10132,7 @@ fn channel_binding_to_toml(
     }
 }
 
-pub async fn sync_channel_bindings_to_runtime(
-    state: &Arc<AppState>,
-) -> Result<Value, ApiError> {
+pub async fn sync_channel_bindings_to_runtime(state: &Arc<AppState>) -> Result<Value, ApiError> {
     ensure_online(state).await?;
     let profiles = assignment_store::list_agent_profile_overrides().map_err(storage_error)?;
     let selected = select_latest_channel_bindings(&profiles);
@@ -9699,7 +10199,12 @@ pub async fn get_channel_status(
         let binding = selected.get(channel_type);
         let (configured, missing, missing_env, source_agent) = if let Some(binding) = binding {
             let (missing, missing_env) = validate_channel_binding_requirements(binding);
-            (missing.is_empty(), missing, missing_env, Some(binding.agent_id.clone()))
+            (
+                missing.is_empty(),
+                missing,
+                missing_env,
+                Some(binding.agent_id.clone()),
+            )
         } else {
             (false, Vec::new(), Vec::new(), None)
         };
@@ -9917,7 +10422,10 @@ pub async fn sync_provider_configs_to_runtime(state: &Arc<AppState>) -> Result<V
         }
 
         let mut provider_table = toml::value::Table::new();
-        provider_table.insert("id".to_string(), toml::Value::String(cfg.provider_id.clone()));
+        provider_table.insert(
+            "id".to_string(),
+            toml::Value::String(cfg.provider_id.clone()),
+        );
         provider_table.insert(
             "protocol".to_string(),
             toml::Value::String(cfg.protocol.clone()),

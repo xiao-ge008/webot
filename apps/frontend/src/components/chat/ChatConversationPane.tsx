@@ -14,6 +14,7 @@ import {
   RotateCcw,
   Image as ImageIcon,
   Paperclip,
+  X,
   Copy,
   Check,
   Zap,
@@ -26,13 +27,25 @@ import { looksLikeProtocolOnlyText, normalizeIncomingSpec, parseJsonSafely, extr
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Agent } from '@/types';
-import type { Message, MessageTrace } from '@/data/mock-chats';
+import type { ChatAttachment, Message, MessageTrace } from '@/data/mock-chats';
 import type { ChatTaskCardData } from '@/types/chat-task';
 import type { A2AWorkCardData } from '@/types/a2a';
 import { DynamicUIRenderer } from '@/components/chat/DynamicUIRenderer';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { uploadManagementAgentChatAsset } from '@/services/management-client';
 
 type UserActivitySource = 'input' | 'send' | 'focus' | 'keydown' | 'ui_action';
+
+const WEB_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+const APP_FILE_MAX_BYTES = 32 * 1024 * 1024;
+const A2A_PLACEHOLDER_AGENT_ID = 'unknown-agent';
+const A2A_PLACEHOLDER_AGENT_NAME = '子智能体';
+
+export interface ChatSendPayload {
+  displayText: string;
+  submitText: string;
+  attachments?: ChatAttachment[];
+}
 
 export interface ChatConversationPaneProps {
   agent: Agent;
@@ -45,7 +58,7 @@ export interface ChatConversationPaneProps {
   hideHeader?: boolean;
   inputToolbar?: ReactNode;
   onUserActivity?: (source: UserActivitySource) => void;
-  onSendMessage: (text: string) => void;
+  onSendMessage: (payload: ChatSendPayload) => void;
   onSendSilentMessage: (text: string) => void;
   onRegenerateMessage: (messageId: string) => void;
   onStopStreaming: () => void;
@@ -76,6 +89,152 @@ export interface GroupUpgradeActionPayload {
     description?: string;
   }>;
   tags?: string[];
+}
+
+interface ComposerAttachmentDraft {
+  id: string;
+  name: string;
+  kind: 'image' | 'file';
+  status: 'uploading' | 'ready' | 'error';
+  upstreamFileId?: string;
+  relativePath?: string;
+  savedPath?: string;
+  assetUrl?: string;
+  mimeType?: string;
+  size?: number;
+  previewUrl?: string;
+  error?: string;
+}
+
+function isPlaceholderA2aCard(card: A2AWorkCardData): boolean {
+  const name = (card.agentName || '').trim();
+  return card.agentId === A2A_PLACEHOLDER_AGENT_ID || !name || name === A2A_PLACEHOLDER_AGENT_NAME;
+}
+
+function mergeA2aCardLogs(left: A2AWorkCardData['logs'], right: A2AWorkCardData['logs']): A2AWorkCardData['logs'] {
+  const merged = [...left, ...right];
+  const seen = new Set<string>();
+  return merged
+    .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime())
+    .filter((item) => {
+      const key = `${item.title}::${item.detail || ''}::${item.at}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .slice(-80);
+}
+
+function mergeA2aCardsForDisplay(left: A2AWorkCardData, right: A2AWorkCardData): A2AWorkCardData {
+  const leftIsPlaceholder = isPlaceholderA2aCard(left);
+  const rightIsPlaceholder = isPlaceholderA2aCard(right);
+  const preferRight =
+    (!rightIsPlaceholder && leftIsPlaceholder)
+    || (left.status === 'working' && right.status !== 'working')
+    || right.logs.length > left.logs.length;
+  const primary = preferRight ? right : left;
+  const secondary = preferRight ? left : right;
+  return {
+    ...secondary,
+    ...primary,
+    agentId: !isPlaceholderA2aCard(primary) ? primary.agentId : secondary.agentId,
+    agentName: !isPlaceholderA2aCard(primary) ? primary.agentName : (primary.agentName || secondary.agentName),
+    agentAvatarUrl: primary.agentAvatarUrl || secondary.agentAvatarUrl,
+    agentColor: primary.agentColor || secondary.agentColor,
+    summary: primary.summary || secondary.summary,
+    startedAt: primary.startedAt || secondary.startedAt,
+    finishedAt: primary.finishedAt || secondary.finishedAt,
+    logs: mergeA2aCardLogs(secondary.logs, primary.logs),
+  };
+}
+
+function getVisibleA2aCards(cards: A2AWorkCardData[]): A2AWorkCardData[] {
+  if (cards.length === 0) {
+    return [];
+  }
+  const nonPlaceholderCards = cards.filter((card) => !isPlaceholderA2aCard(card));
+  const source = nonPlaceholderCards.length > 0 ? nonPlaceholderCards : cards;
+  const merged = new Map<string, A2AWorkCardData>();
+
+  for (const card of source) {
+    const normalizedName = (card.agentName || '').trim().toLowerCase();
+    const key = isPlaceholderA2aCard(card)
+      ? `placeholder:${card.id}`
+      : `agent:${card.agentId || normalizedName || card.id}`;
+    const current = merged.get(key);
+    merged.set(key, current ? mergeA2aCardsForDisplay(current, card) : card);
+  }
+
+  return Array.from(merged.values());
+}
+
+function getA2aCardDisplayName(card: A2AWorkCardData): string {
+  return isPlaceholderA2aCard(card) ? '协作任务' : (card.agentName || '协作任务');
+}
+
+function formatA2aTimeLabel(value?: string): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function isTauriRuntime(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  return Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+}
+
+function formatAttachmentSize(size?: number): string {
+  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) {
+    return '';
+  }
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const CHAT_ATTACHMENT_PROMPT_BEGIN = '[WEBOT_CHAT_ATTACHMENTS_BEGIN]';
+const CHAT_ATTACHMENT_PROMPT_END = '[WEBOT_CHAT_ATTACHMENTS_END]';
+
+function buildAttachmentPrompt(text: string, attachments: ChatAttachment[]): string {
+  const userText = text.trim();
+  const lines = attachments.map((attachment, index) => {
+    const parts = [
+      `${index + 1}. ${attachment.kind === 'image' ? '图片' : '附件'}：${attachment.name}`,
+      `- 相对路径：${attachment.relativePath}`,
+    ];
+    if (attachment.savedPath?.trim()) {
+      parts.push(`- 绝对路径：${attachment.savedPath.trim()}`);
+    }
+    if (attachment.mimeType?.trim()) {
+      parts.push(`- MIME：${attachment.mimeType.trim()}`);
+    }
+    if (attachment.upstreamFileId?.trim()) {
+      parts.push(`- OpenFang 文件ID：${attachment.upstreamFileId.trim()}`);
+    }
+    return parts.join('\n');
+  });
+
+  const attachmentBlock = attachments.length > 0
+    ? [
+      CHAT_ATTACHMENT_PROMPT_BEGIN,
+      '以下文件已上传到当前智能体工作区的 data/chat-uploads 目录，请按需读取：',
+      ...lines,
+      '处理要求：',
+      '- 若当前模型支持视觉，请优先直接查看图片附件。',
+      '- 若当前模型不支持视觉，或附件不是图片，请使用文件读取类工具按上述路径读取。',
+      '- 回复时优先引用文件名和关键结论，无需重复整段路径。',
+      CHAT_ATTACHMENT_PROMPT_END,
+    ].join('\n')
+    : '';
+
+  return [userText || '请先读取我刚上传的附件并继续处理。', attachmentBlock]
+    .filter((item) => item.trim().length > 0)
+    .join('\n\n');
 }
 
 
@@ -113,8 +272,26 @@ export function ChatConversationPane({
   const [traceOpen, setTraceOpen] = useState<Record<string, boolean>>({});
   const [copiedTraceKey, setCopiedTraceKey] = useState('');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const mixedSegmentsCacheRef = useRef<Map<string, MixedRenderSegment[]>>(new Map());
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const composerAttachmentsRef = useRef<ComposerAttachmentDraft[]>([]);
+  const isDesktopRuntime = isTauriRuntime();
+
+  const revokeComposerPreview = useCallback((previewUrl?: string) => {
+    if (!previewUrl || !previewUrl.startsWith('blob:')) {
+      return;
+    }
+    URL.revokeObjectURL(previewUrl);
+  }, []);
+
+  composerAttachmentsRef.current = composerAttachments;
+
+  useEffect(() => () => {
+    composerAttachmentsRef.current.forEach((item) => revokeComposerPreview(item.previewUrl));
+  }, [revokeComposerPreview]);
 
   const appendImageToInput = useCallback((source: string, altText?: string) => {
     const src = source.trim();
@@ -344,13 +521,119 @@ export function ChatConversationPane({
     onUserActivity,
   ]);
 
+  const validatePickedFile = useCallback((file: File, requestedKind: 'image' | 'file'): string | null => {
+    const isImage = file.type.startsWith('image/');
+    if (requestedKind === 'image' && !isImage) {
+      return '只能选择图片文件';
+    }
+    if (!isDesktopRuntime) {
+      if (!isImage) {
+        return 'Web 端当前只支持上传小图片';
+      }
+      if (file.size > WEB_IMAGE_MAX_BYTES) {
+        return `Web 端图片大小不能超过 ${Math.round(WEB_IMAGE_MAX_BYTES / (1024 * 1024))} MB`;
+      }
+      return null;
+    }
+    if (file.size > APP_FILE_MAX_BYTES) {
+      return `App 端单个附件大小不能超过 ${Math.round(APP_FILE_MAX_BYTES / (1024 * 1024))} MB`;
+    }
+    return null;
+  }, [isDesktopRuntime]);
+
+  const updateComposerAttachment = useCallback((attachmentId: string, updater: (draft: ComposerAttachmentDraft) => ComposerAttachmentDraft) => {
+    setComposerAttachments((prev) => prev.map((item) => (item.id === attachmentId ? updater(item) : item)));
+  }, []);
+
+  const handlePickedFiles = useCallback(async (
+    fileList: FileList | null,
+    requestedKind: 'image' | 'file',
+  ) => {
+    const files = Array.from(fileList ?? []);
+    if (files.length === 0 || inputLocked) {
+      return;
+    }
+
+    for (const file of files) {
+      const error = validatePickedFile(file, requestedKind);
+      const attachmentId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const draft: ComposerAttachmentDraft = {
+        id: attachmentId,
+        name: file.name || 'upload.bin',
+        kind: requestedKind === 'image' || file.type.startsWith('image/') ? 'image' : 'file',
+        status: error ? 'error' : 'uploading',
+        size: file.size,
+        mimeType: file.type || undefined,
+        previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
+        error: error || undefined,
+      };
+      setComposerAttachments((prev) => [...prev, draft]);
+      if (error) {
+        continue;
+      }
+
+      try {
+        const uploaded = await uploadManagementAgentChatAsset(agent.id, file);
+        updateComposerAttachment(attachmentId, (current) => ({
+          ...current,
+          status: 'ready',
+          kind: uploaded.kind,
+          name: uploaded.filename,
+          upstreamFileId: uploaded.upstreamFileId,
+          relativePath: uploaded.relativePath,
+          savedPath: uploaded.savedPath,
+          assetUrl: uploaded.assetUrl,
+          mimeType: uploaded.mimeType,
+          size: uploaded.size,
+        }));
+      } catch (uploadError) {
+        updateComposerAttachment(attachmentId, (current) => ({
+          ...current,
+          status: 'error',
+          error: uploadError instanceof Error ? uploadError.message : '上传失败',
+        }));
+      }
+    }
+  }, [agent.id, inputLocked, updateComposerAttachment, validatePickedFile]);
+
+  const handleRemoveComposerAttachment = useCallback((attachmentId: string) => {
+    setComposerAttachments((prev) => {
+      const target = prev.find((item) => item.id === attachmentId);
+      if (target) {
+        revokeComposerPreview(target.previewUrl);
+      }
+      return prev.filter((item) => item.id !== attachmentId);
+    });
+  }, [revokeComposerPreview]);
+
   const handleSend = () => {
-    if (!inputValue.trim() || inputLocked) return;
+    const readyAttachments = composerAttachments.filter((item) => item.status === 'ready');
+    const uploadingCount = composerAttachments.filter((item) => item.status === 'uploading').length;
+    if ((inputValue.trim().length === 0 && readyAttachments.length === 0) || inputLocked || uploadingCount > 0) return;
     if (typeof onUserActivity === 'function') {
       onUserActivity('send');
     }
-    onSendMessage(inputValue);
+    const attachments: ChatAttachment[] = readyAttachments.map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      name: item.name,
+      upstreamFileId: item.upstreamFileId,
+      relativePath: item.relativePath || '',
+      savedPath: item.savedPath,
+      assetUrl: item.assetUrl,
+      mimeType: item.mimeType,
+      size: item.size,
+    }));
+    onSendMessage({
+      displayText: inputValue.trim() || `已上传 ${attachments.length} 个附件`,
+      submitText: buildAttachmentPrompt(inputValue, attachments),
+      attachments,
+    });
     setInputValue('');
+    setComposerAttachments((prev) => {
+      prev.forEach((item) => revokeComposerPreview(item.previewUrl));
+      return [];
+    });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -646,33 +929,77 @@ export function ChatConversationPane({
     return '失败';
   };
 
-  const renderA2aCards = (msg: Message, cards: A2AWorkCardData[]) => (
-    <div className="mt-2 space-y-1">
-      {cards.map((card) => (
-        <button
-          key={card.id}
-          type="button"
-          className="w-full rounded-md px-2 py-2 text-left hover:bg-muted/35 transition-colors"
-          onClick={() => onOpenA2aCardDetails(msg.id, card.id)}
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <AgentAvatar
-              name={card.agentName}
-              avatarUrl={card.agentAvatarUrl}
-              color={card.agentColor}
-              size="sm"
-            />
-            <div className="min-w-0">
-              <p className="text-xs font-semibold truncate">{card.agentName}</p>
-              <p className={cn('text-[11px] truncate', card.status === 'working' ? 'text-primary animate-pulse' : 'text-muted-foreground')}>
-                {a2aStatusText(card)}
-              </p>
-            </div>
+  const renderA2aCards = (msg: Message, cards: A2AWorkCardData[]) => {
+    const visibleCards = getVisibleA2aCards(cards);
+    if (visibleCards.length === 0) {
+      return null;
+    }
+
+    return (
+      <div className="mt-3 rounded-2xl border border-border/60 bg-gradient-to-br from-muted/30 via-background to-muted/10 p-2.5 shadow-sm">
+        <div className="mb-2 flex items-center justify-between gap-3 px-1">
+          <div className="min-w-0">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/80">协作进度</p>
+            <p className="text-xs text-muted-foreground">点击查看子任务详情</p>
           </div>
-        </button>
-      ))}
-    </div>
-  );
+          <div className="rounded-full border border-border/70 bg-background/80 px-2.5 py-1 text-[11px] font-medium text-foreground/80">
+            {visibleCards.length} 项
+          </div>
+        </div>
+        <div className="space-y-2">
+          {visibleCards.map((card) => {
+            const displayName = getA2aCardDisplayName(card);
+            const timeLabel = formatA2aTimeLabel(card.finishedAt || card.startedAt);
+            return (
+              <button
+                key={card.id}
+                type="button"
+                className="group flex w-full items-center gap-3 rounded-xl border border-border/60 bg-background/85 px-3 py-2.5 text-left transition-all hover:border-primary/30 hover:bg-background hover:shadow-sm"
+                onClick={() => onOpenA2aCardDetails(msg.id, card.id)}
+              >
+                <AgentAvatar
+                  name={displayName}
+                  avatarUrl={card.agentAvatarUrl}
+                  color={card.agentColor}
+                  size="sm"
+                  className="ring-1 ring-border/60"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <p className="truncate text-sm font-semibold text-foreground/92">{displayName}</p>
+                    <span
+                      className={cn(
+                        'inline-flex h-2 w-2 shrink-0 rounded-full',
+                        card.status === 'working'
+                          ? 'bg-amber-500 shadow-[0_0_0_4px_rgba(245,158,11,0.15)]'
+                          : card.status === 'completed'
+                            ? 'bg-emerald-500 shadow-[0_0_0_4px_rgba(16,185,129,0.12)]'
+                            : 'bg-rose-500 shadow-[0_0_0_4px_rgba(244,63,94,0.12)]',
+                      )}
+                    />
+                  </div>
+                  <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+                    <span className={cn(card.status === 'working' ? 'text-amber-600 animate-pulse' : '')}>
+                      {card.summary || a2aStatusText(card)}
+                    </span>
+                    {timeLabel ? (
+                      <>
+                        <span className="text-muted-foreground/40">•</span>
+                        <span className="inline-flex items-center gap-1">
+                          <Clock3 className="h-3 w-3" />
+                          {timeLabel}
+                        </span>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
 
   const renderTraceItems = (rows: MessageTrace[]) => (
     <div className="space-y-2 min-w-0">
@@ -952,6 +1279,47 @@ export function ChatConversationPane({
 
   const renderMessageBody = (msg: Message, isUser: boolean) => (
     <>
+      {msg.attachments && msg.attachments.length > 0 ? (
+        <div className={cn('mb-3 grid gap-2', msg.attachments.length > 1 ? 'sm:grid-cols-2' : 'grid-cols-1')}>
+          {msg.attachments.map((attachment) => (
+            <div key={attachment.id} className="rounded-xl border border-border/60 bg-background/50 p-2.5">
+              {attachment.kind === 'image' && attachment.assetUrl ? (
+                <a
+                  href={attachment.assetUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block overflow-hidden rounded-lg border border-border/50 bg-muted/20"
+                >
+                  <img
+                    src={attachment.assetUrl}
+                    alt={attachment.name}
+                    className="h-40 w-full object-cover"
+                  />
+                </a>
+              ) : null}
+              <div className="mt-2 space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-xs font-semibold">{attachment.name}</span>
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
+                    {attachment.kind === 'image' ? '图片' : '附件'}
+                  </span>
+                </div>
+                <div className="text-[11px] text-muted-foreground break-all">{attachment.relativePath}</div>
+                {attachment.assetUrl ? (
+                  <a
+                    href={attachment.assetUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex text-[11px] text-accent hover:underline"
+                  >
+                    打开文件
+                  </a>
+                ) : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
       {!isUser && msg.taskCard ? (
         <>
           {renderTaskCard(msg, msg.taskCard)}
@@ -1147,6 +1515,10 @@ export function ChatConversationPane({
     </>
   ), [activeStreaming, agent.avatarUrl, agent.color, agent.name, canRegenerateAt, messageIndexMap, nowMs, onRegenerateMessage, renderMessageBody, stableMessages]);
 
+  const readyAttachmentCount = composerAttachments.filter((item) => item.status === 'ready').length;
+  const uploadingAttachmentCount = composerAttachments.filter((item) => item.status === 'uploading').length;
+  const canSendMessage = !inputLocked && uploadingAttachmentCount === 0 && (inputValue.trim().length > 0 || readyAttachmentCount > 0);
+
   return (
     <div className="chat-main">
       {!hideHeader ? (
@@ -1201,6 +1573,27 @@ export function ChatConversationPane({
       <div className="chat-input-area">
         <div className="chat-input-container">
           <div className="chat-input-box">
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(event) => {
+                void handlePickedFiles(event.target.files, 'image');
+                event.currentTarget.value = '';
+              }}
+            />
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(event) => {
+                void handlePickedFiles(event.target.files, 'file');
+                event.currentTarget.value = '';
+              }}
+            />
             {inputToolbar ? (
               <div className="px-3 pt-3 pb-2 border-b border-border/30 bg-background/40">
                 {inputToolbar}
@@ -1224,16 +1617,91 @@ export function ChatConversationPane({
               className="chat-input-field focus-visible:ring-0 focus-visible:ring-offset-0"
               disabled={inputLocked}
             />
+            {composerAttachments.length > 0 ? (
+              <div className="px-3 pb-3 space-y-2">
+                <div className="grid gap-2">
+                  {composerAttachments.map((attachment) => (
+                    <div key={attachment.id} className="rounded-xl border border-border/60 bg-muted/10 p-2.5">
+                      <div className="flex items-start gap-3">
+                        {attachment.kind === 'image' && attachment.previewUrl ? (
+                          <img
+                            src={attachment.previewUrl}
+                            alt={attachment.name}
+                            className="h-14 w-14 rounded-lg object-cover border border-border/50"
+                          />
+                        ) : (
+                          <div className="flex h-14 w-14 items-center justify-center rounded-lg border border-dashed border-border/60 bg-background/70">
+                            <Paperclip className="h-4 w-4 text-muted-foreground" />
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-medium">{attachment.name}</div>
+                              <div className="text-[11px] text-muted-foreground">
+                                {[attachment.kind === 'image' ? '图片' : '附件', formatAttachmentSize(attachment.size)].filter(Boolean).join(' · ')}
+                              </div>
+                            </div>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7 shrink-0"
+                              onClick={() => handleRemoveComposerAttachment(attachment.id)}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                          <div className="mt-1 text-[11px]">
+                            {attachment.status === 'uploading' ? (
+                              <span className="inline-flex items-center gap-1 text-muted-foreground">
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                                上传中...
+                              </span>
+                            ) : attachment.status === 'ready' ? (
+                              <span className="text-emerald-600 break-all">{attachment.relativePath}</span>
+                            ) : (
+                              <span className="text-destructive break-all">{attachment.error || '上传失败'}</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <div className="flex items-center justify-between px-3 py-2 border-t border-border/30 bg-muted/10">
               <div className="flex items-center gap-0.5">
-                <Button variant="ghost" size="icon" className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors" disabled={inputLocked}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
+                  disabled={inputLocked}
+                  title={isDesktopRuntime ? '上传图片' : 'Web 端支持上传小图片'}
+                  onClick={() => imageInputRef.current?.click()}
+                >
                   <ImageIcon className="w-4 h-4" />
                 </Button>
-                <Button variant="ghost" size="icon" className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors" disabled={inputLocked}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
+                  disabled={inputLocked || !isDesktopRuntime}
+                  title={isDesktopRuntime ? '上传附件' : 'Web 端暂不支持通用附件'}
+                  onClick={() => fileInputRef.current?.click()}
+                >
                   <Paperclip className="w-4 h-4" />
                 </Button>
               </div>
               <div className="flex items-center gap-2">
+                {uploadingAttachmentCount > 0 ? (
+                  <span className="text-[11px] text-muted-foreground">
+                    附件上传中 {uploadingAttachmentCount}
+                  </span>
+                ) : null}
                 {isSending ? (
                   <Button onClick={onStopStreaming} size="sm" variant="outline" className="chat-stop-button" title="终止输出">
                     <span className="inline-flex items-center gap-1.5 text-xs">
@@ -1244,7 +1712,7 @@ export function ChatConversationPane({
                 ) : (
                   <Button
                     onClick={handleSend}
-                    disabled={inputLocked || !inputValue.trim()}
+                    disabled={!canSendMessage}
                     size="icon"
                     className="h-8 w-8 rounded-full shadow-md bg-black text-white hover:bg-zinc-800 active:scale-95 transition-all disabled:opacity-30"
                   >

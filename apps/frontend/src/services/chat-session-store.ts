@@ -1,8 +1,10 @@
-import type { Message, MessageToolCall, MessageTrace } from '@/data/mock-chats';
+import type { ChatAttachment, Message, MessageToolCall, MessageTrace } from '@/data/mock-chats';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 
 const STORAGE_KEY = 'webot-chat-sessions-v1';
+const A2A_PLACEHOLDER_AGENT_ID = 'unknown-agent';
+const A2A_PLACEHOLDER_AGENT_NAME = '子智能体';
 let webStoragePurged = false;
 
 export interface StoredChatSession {
@@ -11,6 +13,7 @@ export interface StoredChatSession {
   updatedAt: number;
   messages: Message[];
   remoteSessionId?: string;
+  remoteSessionOwnerAgentId?: string;
   sessionLabel?: string;
   sessionSource?: 'app' | 'web' | 'unknown';
   autoTitle?: boolean;
@@ -69,6 +72,7 @@ function createSessionId(): string {
 function cloneMessage(message: Message): Message {
   return {
     ...message,
+    attachments: message.attachments?.map((attachment) => ({ ...attachment })),
     tools: message.tools?.map((tool) => ({ ...tool, running: false })),
     thinkingTrace: message.thinkingTrace?.map((trace) => ({ ...trace })),
     toolTrace: message.toolTrace?.map((trace) => ({ ...trace })),
@@ -98,6 +102,27 @@ function cloneMessage(message: Message): Message {
   };
 }
 
+function normalizeAttachment(raw: unknown, index: number): ChatAttachment | null {
+  const item = isRecord(raw) ? raw : null;
+  if (!item) return null;
+  const name = typeof item.name === 'string' ? item.name.trim() : '';
+  const relativePath = typeof item.relativePath === 'string' ? item.relativePath.trim() : '';
+  if (!name || !relativePath) {
+    return null;
+  }
+  return {
+    id: typeof item.id === 'string' && item.id.trim() ? item.id : `attachment_${Date.now()}_${index}`,
+    kind: item.kind === 'image' ? 'image' : 'file',
+    name,
+    relativePath,
+    savedPath: typeof item.savedPath === 'string' ? item.savedPath : undefined,
+    assetUrl: typeof item.assetUrl === 'string' ? item.assetUrl : undefined,
+    mimeType: typeof item.mimeType === 'string' ? item.mimeType : undefined,
+    size: typeof item.size === 'number' && Number.isFinite(item.size) ? item.size : undefined,
+    upstreamFileId: typeof item.upstreamFileId === 'string' ? item.upstreamFileId : undefined,
+  };
+}
+
 function normalizeA2aLog(raw: unknown, index: number): A2AWorkLogItem | null {
   const item = isRecord(raw) ? raw : null;
   if (!item) return null;
@@ -117,8 +142,9 @@ function normalizeA2aCard(raw: unknown, index: number): A2AWorkCardData | null {
   const item = isRecord(raw) ? raw : null;
   if (!item) return null;
   const id = typeof item.id === 'string' && item.id.trim() ? item.id : `a2a_${Date.now()}_${index}`;
-  const agentId = typeof item.agentId === 'string' && item.agentId.trim() ? item.agentId.trim() : 'unknown-agent';
-  const agentName = typeof item.agentName === 'string' && item.agentName.trim() ? item.agentName.trim() : '子智能体';
+  const agentId = typeof item.agentId === 'string' && item.agentId.trim() ? item.agentId.trim() : A2A_PLACEHOLDER_AGENT_ID;
+  const rawAgentName = typeof item.agentName === 'string' ? item.agentName.trim() : '';
+  const agentName = rawAgentName === A2A_PLACEHOLDER_AGENT_NAME ? '' : rawAgentName;
   const status =
     item.status === 'working' || item.status === 'completed' || item.status === 'failed'
       ? item.status
@@ -200,6 +226,14 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
 
   if (typeof item.meta === 'string') {
     message.meta = item.meta;
+  }
+  if (Array.isArray(item.attachments)) {
+    const attachments = item.attachments
+      .map((attachment, attachmentIndex) => normalizeAttachment(attachment, attachmentIndex))
+      .filter((attachment): attachment is ChatAttachment => attachment != null);
+    if (attachments.length > 0) {
+      message.attachments = attachments;
+    }
   }
   if (typeof item.thinking === 'boolean') {
     message.thinking = item.thinking;
@@ -315,6 +349,7 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
     || Boolean(message.uiRawText?.trim())
     || Boolean(message.taskCard)
     || Boolean(message.a2aCards?.length)
+    || Boolean(message.attachments?.length)
     || Boolean(message.tools?.length)
     || Boolean(message.toolTrace?.length)
     || Boolean(message.thinkingTrace?.length);
@@ -330,6 +365,9 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
   const id = typeof item.id === 'string' && item.id.trim() ? item.id : createSessionId();
   const remoteSessionId = typeof item.remoteSessionId === 'string' && item.remoteSessionId.trim()
     ? item.remoteSessionId.trim()
+    : undefined;
+  const remoteSessionOwnerAgentId = typeof item.remoteSessionOwnerAgentId === 'string' && item.remoteSessionOwnerAgentId.trim()
+    ? item.remoteSessionOwnerAgentId.trim()
     : undefined;
   const sessionLabel = typeof item.sessionLabel === 'string' && item.sessionLabel.trim()
     ? item.sessionLabel.trim()
@@ -356,6 +394,7 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
     updatedAt,
     messages,
     remoteSessionId,
+    remoteSessionOwnerAgentId,
     sessionLabel,
     sessionSource,
     autoTitle: autoTitle || undefined,

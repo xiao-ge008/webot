@@ -18,6 +18,18 @@ export interface MessageToolCall {
     is_error?: boolean;
 }
 
+export interface ChatAttachment {
+    id: string;
+    kind: 'image' | 'file';
+    name: string;
+    relativePath: string;
+    savedPath?: string;
+    assetUrl?: string;
+    mimeType?: string;
+    size?: number;
+    upstreamFileId?: string;
+}
+
 export interface Message {
     id: string;
     role: 'user' | 'agent' | 'system';
@@ -28,6 +40,7 @@ export interface Message {
     agentPortraitUrl?: string;
     text: string;
     meta?: string;
+    attachments?: ChatAttachment[];
     tools?: MessageToolCall[];
     thinking?: boolean;
     streaming?: boolean;

@@ -2,7 +2,7 @@ import { memo } from 'react';
 import type { ReactNode } from 'react';
 import type { Agent } from '@/types';
 import type { Message } from '@/data/mock-chats';
-import type { GroupUpgradeActionPayload } from '@/components/chat/ChatConversationPane';
+import type { ChatSendPayload, GroupUpgradeActionPayload } from '@/components/chat/ChatConversationPane';
 import { ChatConversationPane } from '@/components/chat/ChatConversationPane';
 
 export interface ChatRendererProps {
@@ -16,7 +16,7 @@ export interface ChatRendererProps {
   hideHeader?: boolean;
   inputToolbar?: ReactNode;
   onUserActivity?: (source: 'input' | 'send' | 'focus' | 'keydown' | 'ui_action') => void;
-  onSendMessage: (text: string) => void;
+  onSendMessage: (payload: ChatSendPayload) => void;
   onSendSilentMessage: (text: string) => void;
   onRegenerateMessage: (messageId: string) => void;
   onStopStreaming: () => void;

@@ -366,6 +366,18 @@ export interface AgentChatMessage {
   content: string;
 }
 
+export interface AgentChatAttachmentInput {
+  id?: string;
+  kind?: 'image' | 'file';
+  filename: string;
+  fileId?: string;
+  contentType?: string;
+  relativePath?: string;
+  savedPath?: string;
+  assetUrl?: string;
+  size?: number;
+}
+
 export const CHAT_CHANNELS = {
   app: 'app',
   web: 'web',
@@ -390,6 +402,7 @@ export interface AgentChatInput {
   agentId: string;
   message: string;
   history?: readonly AgentChatMessage[];
+  attachments?: readonly AgentChatAttachmentInput[];
   stream?: boolean;
   requestId?: string;
   channel?: string;

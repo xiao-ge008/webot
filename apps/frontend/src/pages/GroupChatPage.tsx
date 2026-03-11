@@ -953,6 +953,7 @@ export function GroupChatPage() {
                         <ChatPage
                             agentId={selectedTargetIds.length ? (speakerId || group.leaderAgentId) : group.leaderAgentId}
                             runtimeKey={runtimeKey}
+                            sessionOwnerAgentId={group.leaderAgentId}
                             fixedSessionTitle={group.name}
                             sessionLabel={sessionLabel}
                             systemPreamble={dynamicSystemPreamble}

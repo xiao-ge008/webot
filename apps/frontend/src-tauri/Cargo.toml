@@ -1,6 +1,6 @@
 [package]
 name = "webot-frontend"
-version = "6.0.0-1"
+version = "1.8.0-beta"
 description = "WeBot frontend desktop app powered by Tauri 2.0"
 edition = "2021"
 

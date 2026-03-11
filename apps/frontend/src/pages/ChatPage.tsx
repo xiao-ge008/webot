@@ -12,11 +12,11 @@ import { AgentAvatar } from '@/components/ui/agent-avatar';
 import { Badge } from '@/components/ui/badge';
 import { Search, Plus, GripVertical, X } from 'lucide-react';
 import { mockAgents } from '@/data/mock-agents';
-import { type Message, type MessageToolCall, type MessageTrace } from '@/data/mock-chats';
+import { type ChatAttachment, type Message, type MessageToolCall, type MessageTrace } from '@/data/mock-chats';
 import { cn } from '@/lib/utils';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 import { ChatRenderer } from '@/components/chat/ChatRenderer';
-import type { GroupUpgradeActionPayload } from '@/components/chat/ChatConversationPane';
+import type { ChatSendPayload, GroupUpgradeActionPayload } from '@/components/chat/ChatConversationPane';
 import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog';
 import { A2AWorkDetailsDialog } from '@/components/tasks/A2AWorkDetailsDialog';
 import type { Agent } from '@/types';
@@ -106,6 +106,9 @@ function buildGroupUpgradeSystemPreamble(): string {
     return GROUP_UPGRADE_SYSTEM_PREAMBLE;
 }
 
+const A2A_PLACEHOLDER_AGENT_ID = 'unknown-agent';
+const A2A_PLACEHOLDER_AGENT_NAME = '子智能体';
+
 function areMessagesEquivalent(left: Message[], right: Message[]): boolean {
     if (left === right) {
         return true;
@@ -123,6 +126,7 @@ function areMessagesEquivalent(left: Message[], right: Message[]): boolean {
             l.text !== r.text ||
             l.streaming !== r.streaming ||
             l.cardPending !== r.cardPending ||
+            JSON.stringify(l.attachments ?? null) !== JSON.stringify(r.attachments ?? null) ||
             JSON.stringify(l.taskCard ?? null) !== JSON.stringify(r.taskCard ?? null) ||
             JSON.stringify(l.a2aCards ?? null) !== JSON.stringify(r.a2aCards ?? null)
         ) {
@@ -192,28 +196,144 @@ function parseBackendMessageRole(value: unknown): Message['role'] {
     return 'system';
 }
 
-function normalizeBackendMessageText(role: Message['role'], raw: string): string {
+const CHAT_ATTACHMENT_PROMPT_BEGIN = '[WEBOT_CHAT_ATTACHMENTS_BEGIN]';
+const CHAT_ATTACHMENT_PROMPT_END = '[WEBOT_CHAT_ATTACHMENTS_END]';
+const CHAT_ATTACHMENT_LEGACY_HEADER = '以下文件已上传到当前智能体工作区的 data/chat-uploads 目录，请按需读取：';
+
+function buildRecoveredChatAssetUrl(agentId: string | undefined, relativePath: string): string | undefined {
+    const normalizedAgentId = agentId?.trim();
+    const normalizedPath = relativePath.trim();
+    if (!normalizedAgentId || !normalizedPath) {
+        return undefined;
+    }
+    return `/api/management/agents/${encodeURIComponent(normalizedAgentId)}/chat-assets/file?path=${encodeURIComponent(normalizedPath)}`;
+}
+
+function parseEmbeddedChatAttachments(text: string, ownerAgentId?: string): {
+    displayText: string;
+    attachments?: ChatAttachment[];
+} {
+    const normalized = text.replace(/\r\n/g, '\n').trim();
+    if (!normalized) {
+        return { displayText: '' };
+    }
+
+    let blockStart = normalized.lastIndexOf(CHAT_ATTACHMENT_PROMPT_BEGIN);
+    let blockEnd = blockStart >= 0 ? normalized.indexOf(CHAT_ATTACHMENT_PROMPT_END, blockStart) : -1;
+    if (blockStart < 0) {
+        blockStart = normalized.indexOf(CHAT_ATTACHMENT_LEGACY_HEADER);
+        blockEnd = normalized.length;
+    }
+    if (blockStart < 0) {
+        return { displayText: normalized };
+    }
+
+    const displayText = normalized.slice(0, blockStart).trim();
+    const rawBlock = normalized
+        .slice(blockStart + (normalized.startsWith(CHAT_ATTACHMENT_PROMPT_BEGIN, blockStart) ? CHAT_ATTACHMENT_PROMPT_BEGIN.length : 0), blockEnd >= 0 ? blockEnd : undefined)
+        .trim();
+    const lines = rawBlock
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    const attachments: ChatAttachment[] = [];
+    let current: Partial<ChatAttachment> | null = null;
+    for (const line of lines) {
+        const headMatch = line.match(/^(\d+)\.\s*(图片|附件)：(.+)$/);
+        if (headMatch) {
+            if (current?.name && current.relativePath) {
+                attachments.push({
+                    id: current.id || `remote_attachment_${attachments.length}`,
+                    kind: current.kind === 'image' ? 'image' : 'file',
+                    name: current.name,
+                    relativePath: current.relativePath,
+                    savedPath: current.savedPath,
+                    assetUrl: current.assetUrl,
+                    mimeType: current.mimeType,
+                    size: current.size,
+                    upstreamFileId: current.upstreamFileId,
+                });
+            }
+            current = {
+                id: `remote_attachment_${headMatch[1]}`,
+                kind: headMatch[2] === '图片' ? 'image' : 'file',
+                name: headMatch[3].trim(),
+            };
+            continue;
+        }
+        if (!current || !line.startsWith('- ')) {
+            continue;
+        }
+        if (line.startsWith('- 相对路径：')) {
+            const relativePath = line.slice('- 相对路径：'.length).trim();
+            current.relativePath = relativePath;
+            current.assetUrl = buildRecoveredChatAssetUrl(ownerAgentId, relativePath);
+            continue;
+        }
+        if (line.startsWith('- 绝对路径：')) {
+            current.savedPath = line.slice('- 绝对路径：'.length).trim();
+            continue;
+        }
+        if (line.startsWith('- MIME：')) {
+            current.mimeType = line.slice('- MIME：'.length).trim();
+            continue;
+        }
+        if (line.startsWith('- OpenFang 文件ID：')) {
+            current.upstreamFileId = line.slice('- OpenFang 文件ID：'.length).trim();
+        }
+    }
+    if (current?.name && current.relativePath) {
+        attachments.push({
+            id: current.id || `remote_attachment_${attachments.length}`,
+            kind: current.kind === 'image' ? 'image' : 'file',
+            name: current.name,
+            relativePath: current.relativePath,
+            savedPath: current.savedPath,
+            assetUrl: current.assetUrl,
+            mimeType: current.mimeType,
+            size: current.size,
+            upstreamFileId: current.upstreamFileId,
+        });
+    }
+
+    return {
+        displayText,
+        attachments: attachments.length > 0 ? attachments : undefined,
+    };
+}
+
+function normalizeBackendMessage(role: Message['role'], raw: string, ownerAgentId?: string): {
+    text: string;
+    attachments?: ChatAttachment[];
+} {
     const text = raw.replace(/\r\n/g, '\n').trim();
     if (!text) {
-        return '';
+        return { text: '' };
     }
     if (role === 'agent') {
         const cleaned = sanitizeAssistantText(stripThinkingBlocks(text)).trim();
-        return isHiddenSystemPromptText(cleaned) ? '' : cleaned;
+        return { text: isHiddenSystemPromptText(cleaned) ? '' : cleaned };
     }
     if (role === 'user') {
         const lower = text.toLowerCase();
         const marker = lower.lastIndexOf('[user]');
         if (marker >= 0) {
             const extracted = text.slice(marker + '[user]'.length).trim();
-            return isHiddenSystemPromptText(extracted) ? '' : extracted;
+            if (isHiddenSystemPromptText(extracted)) {
+                return { text: '' };
+            }
+            const parsed = parseEmbeddedChatAttachments(extracted, ownerAgentId);
+            return { text: parsed.displayText, attachments: parsed.attachments };
         }
         // OpenFang session 里带系统前缀但没有 user 段时，不回填这类上下文注入内容。
         if (lower.includes('[system:')) {
-            return '';
+            return { text: '' };
         }
+        const parsed = parseEmbeddedChatAttachments(text, ownerAgentId);
+        return { text: isHiddenSystemPromptText(parsed.displayText) ? '' : parsed.displayText, attachments: parsed.attachments };
     }
-    return isHiddenSystemPromptText(text) ? '' : text;
+    return { text: isHiddenSystemPromptText(text) ? '' : text };
 }
 
 function parseBackendToolCalls(raw: unknown): MessageToolCall[] | undefined {
@@ -284,6 +404,44 @@ function getRemoteSessionId(session: StoredChatSession | null | undefined): stri
         return sid.slice('remote_'.length).trim();
     }
     return '';
+}
+
+function getRemoteSessionOwnerAgentId(session: StoredChatSession | null | undefined): string {
+    if (!session) return '';
+    return typeof session.remoteSessionOwnerAgentId === 'string' ? session.remoteSessionOwnerAgentId.trim() : '';
+}
+
+function sanitizeSessionForFixedLabel(session: StoredChatSession, fixedLabel: string): StoredChatSession {
+    const normalizedLabel = fixedLabel.trim();
+    if (!normalizedLabel) {
+        return session;
+    }
+    const currentLabel = (session.sessionLabel || '').trim();
+    const hasRemoteBinding = Boolean(
+        (session.remoteSessionId || '').trim()
+        || (session.remoteSessionOwnerAgentId || '').trim(),
+    );
+    if (currentLabel === normalizedLabel && !hasRemoteBinding) {
+        return session;
+    }
+    return {
+        ...session,
+        remoteSessionId: undefined,
+        remoteSessionOwnerAgentId: undefined,
+        sessionLabel: normalizedLabel,
+    };
+}
+
+function sanitizeSessionsForFixedLabel(sessions: StoredChatSession[], fixedLabel: string): StoredChatSession[] {
+    let changed = false;
+    const next = sessions.map((session) => {
+        const sanitized = sanitizeSessionForFixedLabel(session, fixedLabel);
+        if (sanitized !== session) {
+            changed = true;
+        }
+        return sanitized;
+    });
+    return changed ? next : sessions;
 }
 
 function toRemoteStorageSessionId(remoteSessionId: string): string {
@@ -374,6 +532,7 @@ function parseBackendSessionSummaries(payload: unknown): BackendSessionSummary[]
 function buildSessionFromBackendPayload(
     payload: unknown,
     fallback?: Partial<BackendSessionSummary>,
+    ownerAgentId?: string,
 ): StoredChatSession | null {
     const source = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
     const rows = Array.isArray(source.messages)
@@ -387,15 +546,17 @@ function buildSessionFromBackendPayload(
                 ? row.content
                 : (typeof row.message === 'string' ? row.message : '');
             const role = parseBackendMessageRole(row.role);
-            const text = normalizeBackendMessageText(role, rawText);
+            const normalized = normalizeBackendMessage(role, rawText, ownerAgentId);
+            const text = normalized.text;
             const tools = parseBackendToolCalls(row.tools);
-            if (!text.trim() && (!tools || tools.length === 0)) {
+            if (!text.trim() && (!normalized.attachments || normalized.attachments.length === 0) && (!tools || tools.length === 0)) {
                 return null;
             }
             return {
                 id: `remote_msg_${Date.now()}_${index}`,
                 role,
                 text,
+                attachments: normalized.attachments,
                 tools,
                 timestamp: new Date(startAt + index * 1000).toISOString(),
             } as Message;
@@ -434,6 +595,7 @@ function buildSessionFromBackendPayload(
         updatedAt,
         messages,
         remoteSessionId: rawSessionId,
+        remoteSessionOwnerAgentId: ownerAgentId?.trim() || undefined,
         sessionLabel: rawSessionLabel || undefined,
         sessionSource: sourceType,
         autoTitle: messages.length === 0 ? true : undefined,
@@ -490,6 +652,7 @@ function mergeRemoteSessions(current: StoredChatSession[], incoming: StoredChatS
                 updatedAt: Math.max(matched.updatedAt, remote.updatedAt),
                 messages: remote.messages.length > 0 ? remote.messages : matched.messages,
                 remoteSessionId,
+                remoteSessionOwnerAgentId: remote.remoteSessionOwnerAgentId ?? matched.remoteSessionOwnerAgentId,
                 sessionLabel: remote.sessionLabel ?? matched.sessionLabel,
                 sessionSource: remote.sessionSource ?? matched.sessionSource,
                 autoTitle: matched.autoTitle ?? remote.autoTitle,
@@ -523,18 +686,58 @@ function mergeRemoteSessions(current: StoredChatSession[], incoming: StoredChatS
     return next;
 }
 
-function buildRemoteSessionStub(summary: BackendSessionSummary): StoredChatSession {
+function buildRemoteSessionStub(summary: BackendSessionSummary, ownerAgentId?: string): StoredChatSession {
     return {
         id: toRemoteStorageSessionId(summary.sessionId),
         title: summary.displayTitle,
         updatedAt: summary.updatedAt,
         messages: [],
         remoteSessionId: summary.sessionId,
+        remoteSessionOwnerAgentId: ownerAgentId?.trim() || undefined,
         sessionLabel: summary.sessionLabel || undefined,
         sessionSource: summary.source,
         autoTitle: true,
         streamState: 'idle',
     };
+}
+
+function mergeFixedLabelRestoredSession(
+    current: StoredChatSession[],
+    restored: StoredChatSession | null,
+    fixedLabel: string,
+    preferredSessionId: string,
+): StoredChatSession[] {
+    const sanitizedCurrent = sanitizeSessionsForFixedLabel(current, fixedLabel);
+    if (!restored) {
+        return sanitizedCurrent;
+    }
+    const sanitizedRestored = sanitizeSessionForFixedLabel(restored, fixedLabel);
+    if (sanitizedCurrent.length === 0) {
+        return [sanitizedRestored];
+    }
+    const preferredId = preferredSessionId.trim();
+    const targetIndex = preferredId
+        ? sanitizedCurrent.findIndex((session) => session.id === preferredId)
+        : -1;
+    const resolvedIndex = targetIndex >= 0 ? targetIndex : 0;
+    const target = sanitizedCurrent[resolvedIndex];
+    const keepCustomTitle = Boolean(target.title?.trim()) && target.autoTitle === false;
+    const nextTarget: StoredChatSession = {
+        ...target,
+        title: keepCustomTitle ? target.title : (sanitizedRestored.title || target.title),
+        updatedAt: Math.max(target.updatedAt, sanitizedRestored.updatedAt),
+        messages: sanitizedRestored.messages.length > 0 ? sanitizedRestored.messages : target.messages,
+        sessionLabel: fixedLabel,
+        remoteSessionId: undefined,
+        remoteSessionOwnerAgentId: undefined,
+        sessionSource: sanitizedRestored.sessionSource ?? target.sessionSource,
+        streamState: target.streamState && target.streamState !== 'idle'
+            ? target.streamState
+            : sanitizedRestored.streamState,
+    };
+    const next = [...sanitizedCurrent];
+    next[resolvedIndex] = nextTarget;
+    return next;
 }
 
 async function mapAsyncWithConcurrency<TInput, TResult>(
@@ -1041,8 +1244,8 @@ function extractAgentTargetFromToolPayload(
         directoryHit = findAgentByAlias(directory, agentId);
     }
 
-    const resolvedAgentId = directoryHit?.id || agentId || agentName || 'unknown-agent';
-    const resolvedAgentName = directoryHit?.name || agentName || agentId || '子智能体';
+    const resolvedAgentId = directoryHit?.id || agentId || agentName || A2A_PLACEHOLDER_AGENT_ID;
+    const resolvedAgentName = directoryHit?.name || agentName || agentId || '';
     return {
         agentId: resolvedAgentId,
         agentName: resolvedAgentName,
@@ -1082,9 +1285,57 @@ function ensureA2aCard(
         summary?: string;
     },
 ): { cards: A2AWorkCardData[]; index: number } {
-    const idx = cards.findIndex((item) => item.id === incoming.cardId);
+    const isIncomingPlaceholder =
+        incoming.agentId === A2A_PLACEHOLDER_AGENT_ID
+        || !incoming.agentName.trim()
+        || incoming.agentName.trim() === A2A_PLACEHOLDER_AGENT_NAME;
+    const normalizedIncomingName = normalizeLookupKey(incoming.agentName);
+    const idx = cards.findIndex((item) => {
+        if (item.id === incoming.cardId) {
+            return true;
+        }
+        const itemIsPlaceholder =
+            item.agentId === A2A_PLACEHOLDER_AGENT_ID
+            || !item.agentName.trim()
+            || item.agentName.trim() === A2A_PLACEHOLDER_AGENT_NAME;
+        if (!isIncomingPlaceholder && !itemIsPlaceholder && item.agentId === incoming.agentId) {
+            return true;
+        }
+        if (!isIncomingPlaceholder && !itemIsPlaceholder && normalizedIncomingName) {
+            return normalizeLookupKey(item.agentName) === normalizedIncomingName;
+        }
+        return false;
+    });
     if (idx >= 0) {
         return { cards: [...cards], index: idx };
+    }
+
+    if (!isIncomingPlaceholder) {
+        const workingPlaceholderIndexes = cards.reduce<number[]>((indexes, item, index) => {
+            const itemIsPlaceholder =
+                item.agentId === A2A_PLACEHOLDER_AGENT_ID
+                || !item.agentName.trim()
+                || item.agentName.trim() === A2A_PLACEHOLDER_AGENT_NAME;
+            if (itemIsPlaceholder && item.status === 'working') {
+                indexes.push(index);
+            }
+            return indexes;
+        }, []);
+        if (workingPlaceholderIndexes.length === 1) {
+            const nextCards = [...cards];
+            const placeholderIndex = workingPlaceholderIndexes[0];
+            const placeholder = nextCards[placeholderIndex];
+            nextCards[placeholderIndex] = {
+                ...placeholder,
+                id: incoming.cardId,
+                agentId: incoming.agentId,
+                agentName: incoming.agentName,
+                agentAvatarUrl: placeholder.agentAvatarUrl || incoming.agentAvatarUrl,
+                agentColor: placeholder.agentColor || incoming.agentColor,
+                summary: placeholder.summary || incoming.summary,
+            };
+            return { cards: nextCards, index: placeholderIndex };
+        }
     }
 
     const now = new Date().toISOString();
@@ -1146,6 +1397,7 @@ function upsertA2aFinalResultLog(card: A2AWorkCardData, detail: string): A2AWork
 interface ChatPageProps {
     agentId?: string;
     runtimeKey?: string;
+    sessionOwnerAgentId?: string;
     sessionLabel?: string;
     systemPreamble?: string;
     groupUpgradeEnabled?: boolean;
@@ -1181,6 +1433,7 @@ function buildFallbackAgent(agentId?: string): Agent {
 export function ChatPage({
     agentId: agentIdProp,
     runtimeKey: runtimeKeyProp,
+    sessionOwnerAgentId: sessionOwnerAgentIdProp,
     sessionLabel: sessionLabelProp,
     systemPreamble: systemPreambleProp,
     groupUpgradeEnabled: groupUpgradeEnabledProp,
@@ -1269,6 +1522,7 @@ export function ChatPage({
     const lastIdleAutoTriggeredAtRef = useRef<number>(0);
     const idleAutoTriggerCountRef = useRef<number>(0);
     const chatAgentId = id || agent.id;
+    const sessionOwnerAgentId = (sessionOwnerAgentIdProp ?? chatAgentId).trim() || chatAgentId;
     const runtimeAgentId = (runtimeKeyProp ?? chatAgentId).trim() || chatAgentId;
     const runtimeAgentIdRef = useRef(runtimeAgentId);
     runtimeAgentIdRef.current = runtimeAgentId;
@@ -1498,7 +1752,16 @@ export function ChatPage({
     };
 
     const setSessions = (updater: SetStateAction<ChatSession[]>) => {
-        chatRuntimeStore.updateSessions(runtimeAgentIdRef.current, updater);
+        chatRuntimeStore.updateSessions(runtimeAgentIdRef.current, (prev) => {
+            const next = typeof updater === 'function'
+                ? (updater as (items: ChatSession[]) => ChatSession[])(prev)
+                : updater;
+            const fixedLabel = baseSessionLabelRef.current;
+            if (!fixedLabel) {
+                return next;
+            }
+            return sanitizeSessionsForFixedLabel(next, fixedLabel);
+        });
     };
 
     const setActiveSessionId = (nextId: string) => {
@@ -1546,7 +1809,7 @@ export function ChatPage({
             if (syncToken !== remoteSyncTokenRef.current) {
                 return;
             }
-            setSessions((prev) => mergeRemoteSessions(prev, batch.map(buildRemoteSessionStub)));
+            setSessions((prev) => mergeRemoteSessions(prev, batch.map((summary) => buildRemoteSessionStub(summary, chatAgentId))));
 
             const restoredSessions = await mapAsyncWithConcurrency(
                 batch,
@@ -1556,7 +1819,7 @@ export function ChatPage({
                         const detail = await requestJson<unknown>(
                             `/api/chat/${encodeURIComponent(chatAgentId)}/session?session_id=${encodeURIComponent(summary.sessionId)}`,
                         );
-                        return buildSessionFromBackendPayload(detail, summary) ?? buildRemoteSessionStub(summary);
+                        return buildSessionFromBackendPayload(detail, summary, chatAgentId) ?? buildRemoteSessionStub(summary, chatAgentId);
                     } catch (error) {
                         console.warn('[ChatPage] 拉取远端会话详情失败:', summary.sessionId, error);
                         return buildRemoteSessionStub(summary);
@@ -1583,6 +1846,11 @@ export function ChatPage({
     const resolveRequestSessionTarget = (sessionId?: string): { sessionId?: string; sessionLabel?: string } => {
         const sid = (sessionId || activeSessionIdRef.current || '').trim();
         if (!sid) return {};
+        const label = resolveSessionLabel(sid);
+        const fixedLabel = baseSessionLabelRef.current;
+        if (fixedLabel) {
+            return { sessionLabel: label ? label : undefined };
+        }
         const targetSession = sessions.find((session) => session.id === sid) ?? null;
         const remoteSessionId = getRemoteSessionId(targetSession);
         if (remoteSessionId) {
@@ -1591,7 +1859,6 @@ export function ChatPage({
                 sessionLabel: targetSession?.sessionLabel || undefined,
             };
         }
-        const label = resolveSessionLabel(sid);
         return { sessionLabel: label ? label : undefined };
     };
 
@@ -1954,8 +2221,13 @@ export function ChatPage({
         remoteSyncTokenRef.current += 1;
         const currentRemoteSyncToken = remoteSyncTokenRef.current;
         resetRemoteSyncState();
+        if (baseSessionLabel) {
+            setSessions((prev) => prev);
+        }
 
-        const syncKey = `${runtimeAgentId}::${baseSessionLabel ? `label:${baseSessionLabel}` : 'all'}`;
+        const syncKey = baseSessionLabel
+            ? `${runtimeAgentId}::agent:${sessionOwnerAgentId}::label:${baseSessionLabel}`
+            : `${runtimeAgentId}::all`;
         const hasSyncedHistory = remoteHistorySyncedKeysRef.current.has(syncKey);
 
         void (async () => {
@@ -1967,19 +2239,22 @@ export function ChatPage({
                 if (baseSessionLabel) {
                     if (!hasSyncedHistory) {
                         const payload = await requestJson<unknown>(
-                            `/api/chat/${encodeURIComponent(chatAgentId)}/session?session_label=${encodeURIComponent(baseSessionLabel)}`,
+                            `/api/chat/${encodeURIComponent(sessionOwnerAgentId)}/session?session_label=${encodeURIComponent(baseSessionLabel)}`,
                         );
                         const restored = buildSessionFromBackendPayload(payload, {
                             sessionLabel: baseSessionLabel,
                             displayTitle: normalizeSessionDisplayTitle(baseSessionLabel, '') || '当前会话',
                             source: inferSessionSource(baseSessionLabel),
-                        });
-                        if (restored) {
-                            setSessions((prev) => mergeRemoteSessions(prev, [restored]));
-                        }
+                        }, sessionOwnerAgentId);
+                        setSessions((prev) => mergeFixedLabelRestoredSession(
+                            prev,
+                            restored,
+                            baseSessionLabel,
+                            activeSessionIdRef.current,
+                        ));
                     }
                 } else {
-                    const sessionsPayload = await requestJson<unknown>(`/api/chat/${encodeURIComponent(chatAgentId)}/sessions`);
+                    const sessionsPayload = await requestJson<unknown>(`/api/chat/${encodeURIComponent(sessionOwnerAgentId)}/sessions`);
                     const summaries = parseBackendSessionSummaries(sessionsPayload);
                     const summaryMap = new Map<string, BackendSessionSummary>();
                     for (const item of summaries) {
@@ -2019,7 +2294,7 @@ export function ChatPage({
         return () => {
             cancelled = true;
         };
-    }, [runtimeAgentId, chatAgentId, baseSessionLabel]);
+    }, [runtimeAgentId, chatAgentId, sessionOwnerAgentId, baseSessionLabel]);
 
     useEffect(() => {
         if (!sessions.length) {
@@ -2498,6 +2773,8 @@ export function ChatPage({
             appendUser?: boolean;
             agentIdOverride?: string;
             agentOverride?: Agent;
+            userDisplayText?: string;
+            userAttachments?: Message['attachments'];
         },
     ) => {
         const text = rawText.trim();
@@ -2515,7 +2792,8 @@ export function ChatPage({
             ? {
                 id: generateId(),
                 role: 'user',
-                text,
+                text: options?.userDisplayText?.trim() || text,
+                attachments: options?.userAttachments?.map((item) => ({ ...item })),
                 timestamp: new Date().toISOString(),
             }
             : null;
@@ -2546,6 +2824,20 @@ export function ChatPage({
             return;
         }
         const history = buildHistory(messagesRef.current);
+        const outgoingAttachments = (options?.userAttachments ?? [])
+            .filter((item): item is NonNullable<Message['attachments']>[number] => Boolean(item))
+            .map((item) => ({
+                id: item.id,
+                kind: item.kind,
+                filename: item.name,
+                fileId: item.upstreamFileId,
+                contentType: item.mimeType,
+                relativePath: item.relativePath,
+                savedPath: item.savedPath,
+                assetUrl: item.assetUrl,
+                size: item.size,
+            }))
+            .filter((item) => Boolean(item.fileId));
         const draft: Message = {
             id: generateId(),
             role: 'agent',
@@ -2634,6 +2926,7 @@ export function ChatPage({
                 agentId: dispatchAgentId,
                 message: text,
                 history,
+                attachments: outgoingAttachments,
                 stream: true,
                 requestId,
                 sessionId: requestSessionTarget.sessionId,
@@ -3247,14 +3540,20 @@ export function ChatPage({
         })();
     }, [chatAgentId, mentionDispatchMaxDepth, mentionDispatchMaxTargets, messages]);
 
-    const handleSendMessage = async (rawText: string) => {
+    const handleSendMessage = async (payload: ChatSendPayload) => {
         if (inputLocked) return;
-        const text = rawText.trim();
+        const submitText = payload.submitText.trim();
+        const displayText = payload.displayText.trim();
+        const text = submitText || displayText;
         if (!text) return;
         markUserActivity('send');
-        const transformed = transformUserMessageRef.current ? transformUserMessageRef.current(rawText) : rawText;
+        const transformed = transformUserMessageRef.current ? transformUserMessageRef.current(text) : text;
         resetTurnBudget(chatAgentId);
-        await sendMessageInternal(transformed, { appendUser: true });
+        await sendMessageInternal(transformed, {
+            appendUser: true,
+            userDisplayText: displayText || transformed,
+            userAttachments: payload.attachments,
+        });
 
         const extras = resolveExtraReplyAgents(transformed)
             .filter((item) => item?.id && item.id.trim() && item.id.trim() !== chatAgentId)
@@ -3974,7 +4273,10 @@ export function ChatPage({
         setStreamingMessage(null);
 
         const selected = sessions.find((session) => session.id === sessionId) ?? null;
-        const remoteSessionId = getRemoteSessionId(selected);
+        const remoteOwnerAgentId = getRemoteSessionOwnerAgentId(selected);
+        const remoteSessionId = remoteOwnerAgentId && remoteOwnerAgentId !== chatAgentId
+            ? ''
+            : getRemoteSessionId(selected);
         if (!remoteSessionId || (selected?.messages.length ?? 0) > 0) {
             return;
         }

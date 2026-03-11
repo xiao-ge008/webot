@@ -1584,6 +1584,160 @@ export interface AgentPortraitUploadResult {
   size?: number;
 }
 
+export interface AgentChatAssetUploadResult {
+  assetUrl: string;
+  filename: string;
+  relativePath: string;
+  savedPath?: string;
+  kind: 'image' | 'file';
+  mimeType?: string;
+  size?: number;
+  upstreamFileId?: string;
+}
+
+const VISION_IMAGE_MAX_EDGE = 1568;
+const VISION_IMAGE_REENCODE_MIN_BYTES = 900 * 1024;
+const VISION_IMAGE_QUALITY = 0.82;
+
+function canvasToBlob(
+  canvas: HTMLCanvasElement,
+  mimeType: string,
+  quality?: number,
+): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => resolve(blob), mimeType, quality);
+  });
+}
+
+function buildOptimizedImageName(fileName: string, mimeType: string): string {
+  const safeBase = fileName.replace(/\.[^.]+$/, '') || 'upload';
+  if (mimeType === 'image/webp') {
+    return `${safeBase}.webp`;
+  }
+  if (mimeType === 'image/jpeg') {
+    return `${safeBase}.jpg`;
+  }
+  if (mimeType === 'image/png') {
+    return `${safeBase}.png`;
+  }
+  return fileName || 'upload';
+}
+
+async function loadImageElement(file: File): Promise<{ image: HTMLImageElement; dispose: () => void }> {
+  const objectUrl = URL.createObjectURL(file);
+  const image = new Image();
+  image.decoding = 'async';
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error('图片解码失败'));
+    image.src = objectUrl;
+  });
+  return {
+    image,
+    dispose: () => URL.revokeObjectURL(objectUrl),
+  };
+}
+
+async function optimizeChatImageForVision(file: File): Promise<File> {
+  if (!file.type.startsWith('image/') || file.type === 'image/gif') {
+    return file;
+  }
+  if (typeof document === 'undefined') {
+    return file;
+  }
+
+  let width = 0;
+  let height = 0;
+  let drawToCanvas: ((ctx: CanvasRenderingContext2D, targetWidth: number, targetHeight: number) => void) | null = null;
+  let dispose: (() => void) | null = null;
+
+  try {
+    if (typeof createImageBitmap === 'function' && file.type !== 'image/svg+xml') {
+      const bitmap = await createImageBitmap(file);
+      width = bitmap.width;
+      height = bitmap.height;
+      drawToCanvas = (ctx, targetWidth, targetHeight) => {
+        ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+      };
+      dispose = () => bitmap.close();
+    } else {
+      const loaded = await loadImageElement(file);
+      const image = loaded.image;
+      width = image.naturalWidth || image.width;
+      height = image.naturalHeight || image.height;
+      drawToCanvas = (ctx, targetWidth, targetHeight) => {
+        ctx.drawImage(image, 0, 0, targetWidth, targetHeight);
+      };
+      dispose = loaded.dispose;
+    }
+
+    if (!drawToCanvas || width <= 0 || height <= 0) {
+      return file;
+    }
+
+    const maxEdge = Math.max(width, height);
+    const needsResize = maxEdge > VISION_IMAGE_MAX_EDGE;
+    const needsReencode = file.size > VISION_IMAGE_REENCODE_MIN_BYTES;
+    if (!needsResize && !needsReencode) {
+      return file;
+    }
+
+    const scale = needsResize ? VISION_IMAGE_MAX_EDGE / maxEdge : 1;
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return file;
+    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    drawToCanvas(ctx, targetWidth, targetHeight);
+
+    const mimeCandidates = file.type === 'image/png'
+      ? ['image/webp', 'image/png']
+      : ['image/webp', 'image/jpeg'];
+
+    let blob: Blob | null = null;
+    let usedMimeType = file.type;
+    for (const mimeType of mimeCandidates) {
+      const nextBlob = await canvasToBlob(
+        canvas,
+        mimeType,
+        mimeType === 'image/png' ? undefined : VISION_IMAGE_QUALITY,
+      );
+      if (nextBlob && nextBlob.size > 0) {
+        blob = nextBlob;
+        usedMimeType = nextBlob.type || mimeType;
+        break;
+      }
+    }
+
+    if (!blob) {
+      return file;
+    }
+    if (!needsResize && blob.size >= file.size * 0.95) {
+      return file;
+    }
+
+    return new File(
+      [blob],
+      buildOptimizedImageName(file.name || 'upload', usedMimeType),
+      {
+        type: usedMimeType,
+        lastModified: Date.now(),
+      },
+    );
+  } catch {
+    return file;
+  } finally {
+    dispose?.();
+  }
+}
+
 async function fileToBase64(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
   const bytes = new Uint8Array(buffer);
@@ -1695,6 +1849,35 @@ function parseAgentPortraitUploadResult(
   };
 }
 
+function parseAgentChatAssetUploadResult(
+  payload: unknown,
+  baseUrl?: string,
+): AgentChatAssetUploadResult {
+  if (!isRecord(payload)) {
+    throw new Error('聊天附件上传返回异常');
+  }
+  const assetRaw = asString(payload.asset_url).trim();
+  const assetUrl = baseUrl
+    ? normalizeManagementAssetUrl(assetRaw, baseUrl) || assetRaw
+    : assetRaw;
+  const filename = asString(payload.filename).trim();
+  const relativePath = asString(payload.relative_path).trim();
+  const kind = asString(payload.kind).trim().toLowerCase() === 'image' ? 'image' : 'file';
+  if (!assetUrl || !filename || !relativePath) {
+    throw new Error('聊天附件上传成功但返回字段不完整');
+  }
+  return {
+    assetUrl,
+    filename,
+    relativePath,
+    savedPath: asString(payload.saved_path) || undefined,
+    kind,
+    mimeType: asString(payload.mime_type) || undefined,
+    size: typeof payload.size === 'number' ? payload.size : undefined,
+    upstreamFileId: asString(payload.upstream_file_id) || undefined,
+  };
+}
+
 export async function importManagementAgentAvatar(
   agentId: string,
   sourcePath: string,
@@ -1787,6 +1970,37 @@ export async function uploadManagementAgentPortrait(
   }
   const baseUrl = await getApiBaseUrl({ forceRefresh: true });
   return parseAgentPortraitUploadResult(payload, baseUrl);
+}
+
+export async function uploadManagementAgentChatAsset(
+  agentId: string,
+  file: File,
+): Promise<AgentChatAssetUploadResult> {
+  const uploadFile = await optimizeChatImageForVision(file);
+  let payload: unknown;
+  try {
+    const contentBase64 = await fileToBase64(uploadFile);
+    payload = await requestJson<unknown>(`/api/management/agents/${encodeURIComponent(agentId)}/chat-assets/upload-inline`, {
+      method: 'POST',
+      body: {
+        filename: uploadFile.name || file.name || 'upload.bin',
+        content_base64: contentBase64,
+      },
+    });
+  } catch (inlineError) {
+    const message = inlineError instanceof Error ? inlineError.message : '';
+    if (!message.includes('HTTP 404')) {
+      throw toUploadFriendlyError(inlineError);
+    }
+    const formData = new FormData();
+    formData.append('file', uploadFile, uploadFile.name || file.name || 'upload.bin');
+    payload = await postMultipartJson(
+      `/api/management/agents/${encodeURIComponent(agentId)}/chat-assets/upload`,
+      formData,
+    );
+  }
+  const baseUrl = await getApiBaseUrl({ forceRefresh: true });
+  return parseAgentChatAssetUploadResult(payload, baseUrl);
 }
 
 export interface AgentAssignmentInfo {
