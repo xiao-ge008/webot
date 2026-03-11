@@ -75,8 +75,16 @@ if (process.platform !== 'win32') {
   chmodSync(path.join(resourceRoot, binaryName), 0o755);
 }
 
-run(
-  'npm',
-  ['run', 'build:tauri', '--workspace', '@webot/frontend'],
-  { cwd: webotRoot }
-);
+if (process.platform === 'win32') {
+  run(
+    'cmd.exe',
+    ['/d', '/s', '/c', 'npm', 'run', 'build:tauri', '--workspace', '@webot/frontend'],
+    { cwd: webotRoot }
+  );
+} else {
+  run(
+    'npm',
+    ['run', 'build:tauri', '--workspace', '@webot/frontend'],
+    { cwd: webotRoot }
+  );
+}

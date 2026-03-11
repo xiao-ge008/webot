@@ -572,7 +572,7 @@ export function buildInitialMessages(_agentName: string): Message[] {
 export function buildHistory(messages: Message[]): AgentChatMessage[] {
   return messages
     .filter((msg) => msg.role === 'user' || msg.role === 'agent')
-    .map((msg) => ({
+    .map<AgentChatMessage>((msg) => ({
       role: msg.role === 'user' ? 'user' : 'assistant',
       content: (() => {
         const text = (msg.text || '').trim();
@@ -595,11 +595,7 @@ export function buildHistory(messages: Message[]): AgentChatMessage[] {
       })(),
     }))
     .filter((msg) => msg.content.length > 0 && !isHiddenSystemPromptText(msg.content))
-    .slice(-20)
-    .map((msg) => ({
-      role: msg.role,
-      content: msg.content,
-    }));
+    .slice(-20);
 }
 
 export function pushTrace(list: MessageTrace[] | undefined, row: MessageTrace): MessageTrace[] {

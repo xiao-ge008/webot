@@ -5144,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "webot-frontend"
-version = "6.0.0-1"
+version = "1.8.0-1"
 dependencies = [
  "base64 0.22.1",
  "rfd",
