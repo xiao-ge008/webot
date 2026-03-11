@@ -45,7 +45,10 @@ jobs:
 
       - name: Build Tauri (macOS)
         if: runner.os == 'macOS'
-        run: npx tauri build --bundles dmg,app
+        run: |
+          npx tauri build --bundles app
+          APP_PATH="apps/frontend/src-tauri/target/release/bundle/macos/WeBot VI.0 Beta.app"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "${APP_PATH}.zip"
         working-directory: apps/frontend
         shell: bash
 
@@ -75,5 +78,5 @@ jobs:
           target_commitish: main
           files: |
             dist/**/msi/*.msi
-            dist/**/dmg/*.dmg
+            dist/**/macos/*.app.zip
           fail_on_unmatched_files: false
