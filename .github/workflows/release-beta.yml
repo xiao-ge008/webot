@@ -64,6 +64,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+      - name: List dist
+        run: ls -R dist
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -72,6 +74,5 @@ jobs:
           name: ${{ inputs.tag || github.ref_name }}
           target_commitish: main
           files: |
-            dist/**/bundle/msi/*.msi
-            dist/**/bundle/dmg/*.dmg
+            dist/**/bundle/**/*
           fail_on_unmatched_files: false
