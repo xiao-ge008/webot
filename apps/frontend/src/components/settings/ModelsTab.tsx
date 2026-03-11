@@ -13,11 +13,13 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
-import { RefreshCw, Search } from 'lucide-react';
+import { Circle, RefreshCw, Search } from 'lucide-react';
+import { pushInAppNotice } from '@/services/in-app-notifier';
 import {
   listManagementModels,
   listManagementProviders,
   setManagementDefaultModel,
+  testManagementModelConnection,
   toggleManagementModelEnabled,
   type ManagementModelOption,
 } from '@/services/management-client';
@@ -41,6 +43,8 @@ export function ModelsTab() {
   const [searchQuery, setSearchQuery] = useState('');
   const [enabledOnly, setEnabledOnly] = useState(false);
   const [selectedProviderId, setSelectedProviderId] = useState('');
+  const [testingModelId, setTestingModelId] = useState<string | null>(null);
+  const [testStatusMap, setTestStatusMap] = useState<Record<string, { ok: boolean; message: string }>>({});
 
   const loadData = async () => {
     setLoading(true);
@@ -58,6 +62,12 @@ export function ModelsTab() {
         })),
       );
       setModels(modelRows);
+      setTestStatusMap((prev) => {
+        const visibleModelIds = new Set(modelRows.map((item) => item.modelId));
+        return Object.fromEntries(
+          Object.entries(prev).filter(([modelId]) => visibleModelIds.has(modelId)),
+        );
+      });
       setSelectedProviderId((prev) => {
         const linkedProviders = providerRows
           .filter((item) => item.enabled && item.linked)
@@ -210,6 +220,47 @@ export function ModelsTab() {
     }
   };
 
+  const handleTestModel = async (model: ManagementModelOption) => {
+    setTestingModelId(model.modelId);
+    try {
+      const result = await testManagementModelConnection({
+        provider: model.providerId,
+        model: model.modelName,
+        modelId: model.modelId,
+      });
+      setTestStatusMap((current) => ({
+        ...current,
+        [model.modelId]: {
+          ok: result.ok,
+          message: result.message,
+        },
+      }));
+      if (!result.ok) {
+        pushInAppNotice({
+          title: '模型连接测试失败',
+          message: result.message || '未知错误',
+          level: 'error',
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '测试请求失败';
+      setTestStatusMap((current) => ({
+        ...current,
+        [model.modelId]: {
+          ok: false,
+          message,
+        },
+      }));
+      pushInAppNotice({
+        title: '模型连接测试失败',
+        message,
+        level: 'error',
+      });
+    } finally {
+      setTestingModelId(null);
+    }
+  };
+
   return (
     <div className="max-w-3xl animate-fade-in opacity-0">
       <div className="mb-6 space-y-3">
@@ -302,49 +353,72 @@ export function ModelsTab() {
                   </div>
 
                   <div className="bg-background-secondary/30 rounded-xl overflow-hidden border border-border-light/50">
-                    {providerModels.map((model, index) => (
-                      <div
-                        key={model.modelId}
-                        className={cn(
-                          'flex items-center justify-between px-4 py-3',
-                          index !== providerModels.length - 1 && 'border-b border-border-light',
-                        )}
-                      >
-                        <div className="min-w-0">
-                          <div className="text-sm font-medium text-foreground truncate">
-                            {model.displayName}
+                    {providerModels.map((model, index) => {
+                      const testStatus = testStatusMap[model.modelId];
+                      return (
+                        <div
+                          key={model.modelId}
+                          className={cn(
+                            'flex items-center justify-between px-4 py-3',
+                            index !== providerModels.length - 1 && 'border-b border-border-light',
+                          )}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium text-foreground truncate">
+                              {model.displayName}
+                            </div>
+                            <div className="flex items-center gap-2 mt-1">
+                              <Badge variant="outline" className="text-[10px]">{model.modelId}</Badge>
+                              <Badge variant={model.enabled ? 'success' : 'secondary'} className="text-[10px]">
+                                {model.enabled ? t('settings.models.enabled') : t('settings.models.disabled')}
+                              </Badge>
+                              {model.isDefault && (
+                                <Badge variant="outline" className="text-[10px]">{t('settings.models.default')}</Badge>
+                              )}
+                              {testStatus?.ok && (
+                                <span className="inline-flex items-center gap-1 text-xs text-success">
+                                  <Circle className="w-2.5 h-2.5 fill-current" />
+                                  正常
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <div className="flex items-center gap-2 mt-1">
-                            <Badge variant="outline" className="text-[10px]">{model.modelId}</Badge>
-                            <Badge variant={model.enabled ? 'success' : 'secondary'} className="text-[10px]">
-                              {model.enabled ? t('settings.models.enabled') : t('settings.models.disabled')}
-                            </Badge>
-                            {model.isDefault && (
-                              <Badge variant="outline" className="text-[10px]">{t('settings.models.default')}</Badge>
-                            )}
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {!model.isDefault && (
+                          <div className="flex items-center gap-2">
                             <Button
                               variant="outline"
                               size="sm"
-                              className="h-7 px-2.5"
-                              onClick={() => handleSetDefault(model.modelId)}
-                              disabled={actionLoading === model.modelId}
+                              className={cn(
+                                'h-7 px-2.5',
+                                testStatus && !testStatus.ok && 'border-destructive/40 text-destructive hover:text-destructive',
+                              )}
+                              onClick={() => handleTestModel(model)}
+                              disabled={testingModelId === model.modelId}
+                              title={testStatus && !testStatus.ok ? testStatus.message : '测试模型连接'}
                             >
-                              {t('settings.models.setDefault')}
+                              <RefreshCw className={cn('w-3.5 h-3.5 mr-1', testingModelId === model.modelId && 'animate-spin')} />
+                              测试
                             </Button>
-                          )}
-                          <Switch
-                            checked={model.enabled}
-                            onCheckedChange={(checked) => handleToggleModel(model.modelId, checked)}
-                            className="data-[state=checked]:bg-accent"
-                            disabled={actionLoading === model.modelId}
-                          />
+                            {!model.isDefault && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2.5"
+                                onClick={() => handleSetDefault(model.modelId)}
+                                disabled={actionLoading === model.modelId || testingModelId === model.modelId}
+                              >
+                                {t('settings.models.setDefault')}
+                              </Button>
+                            )}
+                            <Switch
+                              checked={model.enabled}
+                              onCheckedChange={(checked) => handleToggleModel(model.modelId, checked)}
+                              className="data-[state=checked]:bg-accent"
+                              disabled={actionLoading === model.modelId || testingModelId === model.modelId}
+                            />
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               );

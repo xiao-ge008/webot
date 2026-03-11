@@ -37,6 +37,36 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      - name: Build OpenFang (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build -p openfang-cli --release
+        working-directory: vendor/openfang
+        shell: bash
+
+      - name: Stage OpenFang (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p apps/frontend/src-tauri/resources/openfang/win
+          cp vendor/openfang/target/release/openfang.exe apps/frontend/src-tauri/resources/openfang/openfang.exe
+          cp vendor/openfang/target/release/openfang.exe apps/frontend/src-tauri/resources/openfang/win/openfang.exe
+        shell: bash
+
+      - name: Build OpenFang (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build -p openfang-cli --release
+        working-directory: vendor/openfang
+        shell: bash
+
+      - name: Stage OpenFang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ARCH="$(uname -m)"
+          DEST="apps/frontend/src-tauri/resources/openfang/macos-${ARCH}"
+          mkdir -p "$DEST"
+          cp vendor/openfang/target/release/openfang "$DEST/openfang"
+          chmod +x "$DEST/openfang"
+        shell: bash
+
       - name: Build Tauri (Windows)
         if: runner.os == 'Windows'
         run: npx tauri build --bundles msi

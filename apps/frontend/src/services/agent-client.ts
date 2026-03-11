@@ -1340,10 +1340,11 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
       console.debug('[Chat] outgoing message prepared', { agentId, outgoingMessage });
     }
 
+    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
     const sessionLabel = typeof input.sessionLabel === 'string' ? input.sessionLabel.trim() : '';
 
-    // Tauri 下默认走 WS，但群聊需要 session label 隔离时，强制走 service-rs 的 SSE 代理，确保 label 生效。
-    if (!isTauriRuntime() || sessionLabel) {
+    // Tauri 下默认走 WS；但会话隔离需要 session_id/session_label 时，强制走 service-rs SSE 代理，确保命中目标会话。
+    if (!isTauriRuntime() || sessionId || sessionLabel) {
       await requestSse(
         `/api/chat/${encodeURIComponent(agentId)}/message/stream`,
         (frame) => {
@@ -1466,7 +1467,11 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
         },
         {
           method: 'POST',
-          body: { message: outgoingMessage, session_label: sessionLabel || undefined },
+          body: {
+            message: outgoingMessage,
+            session_id: sessionId || undefined,
+            session_label: sessionLabel || undefined,
+          },
           signal: controller.signal,
         },
       );
@@ -1827,6 +1832,7 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
 
   try {
     const outgoingMessage = input.message;
+    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
     const sessionLabel = typeof input.sessionLabel === 'string' ? input.sessionLabel.trim() : '';
     if (import.meta.env.DEV) {
       console.debug('[Chat] non-stream outgoing message prepared', {
@@ -1836,7 +1842,11 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
     }
     const result = await requestJson<unknown>(`/api/chat/${encodeURIComponent(input.agentId)}/message`, {
       method: 'POST',
-      body: { message: outgoingMessage, session_label: sessionLabel || undefined },
+      body: {
+        message: outgoingMessage,
+        session_id: sessionId || undefined,
+        session_label: sessionLabel || undefined,
+      },
     });
     const body = isRecord(result) ? result : {};
     const content = toStringValue(body.response, toStringValue(body.content));

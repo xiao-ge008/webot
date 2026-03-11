@@ -277,6 +277,80 @@ export async function setManagementDefaultModel(modelId: string): Promise<void> 
   });
 }
 
+export interface ManagementModelTestResult {
+  ok: boolean;
+  status: string;
+  message: string;
+  model_id?: string;
+}
+
+function isHttp404Error(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return /HTTP\s+404\b/i.test(error.message);
+}
+
+export async function testManagementModelConnection(input: {
+  provider: string;
+  model: string;
+  modelId?: string;
+}): Promise<ManagementModelTestResult> {
+  try {
+    const payload = await requestJson<unknown>('/api/management/models/test', {
+      method: 'POST',
+      body: {
+        provider: input.provider,
+        model: input.model,
+        model_id: input.modelId,
+      },
+    });
+    if (!isRecord(payload)) {
+      return { ok: false, status: 'invalid_response', message: '模型测试返回格式异常' };
+    }
+    return {
+      ok: asBool(payload.ok),
+      status: asString(payload.status),
+      message: asString(payload.message, '模型测试失败'),
+      model_id: asString(payload.model_id) || undefined,
+    };
+  } catch (error) {
+    if (!isHttp404Error(error)) {
+      throw error;
+    }
+    // 兼容旧后端：新接口不存在时，回退到已有的 optimize 路径做真实模型通信探测。
+    const fallbackPayload = await requestJson<unknown>('/api/management/models/optimize-prompt', {
+      method: 'POST',
+      body: {
+        input: '请只回复：OK',
+        target: 'agent_profile',
+        provider: input.provider,
+        model: input.model,
+      },
+    });
+    if (!isRecord(fallbackPayload)) {
+      return { ok: false, status: 'invalid_response', message: '模型测试返回格式异常' };
+    }
+    const isFallback = asBool(fallbackPayload.fallback);
+    const upstreamError = asString(fallbackPayload.error).trim();
+    const content = asString(fallbackPayload.content).trim();
+    if (!isFallback && content.length > 0) {
+      return {
+        ok: true,
+        status: 'ok',
+        message: '连接正常，模型通信可用',
+        model_id: input.modelId,
+      };
+    }
+    return {
+      ok: false,
+      status: 'connection_error',
+      message: upstreamError || '模型通信失败，请检查 Base URL / API Key / 模型名',
+      model_id: input.modelId,
+    };
+  }
+}
+
 export type DeleteManagementAgentMode = 'purge' | 'local_only';
 
 export interface DeleteManagementAgentResult {

@@ -166,6 +166,7 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/channels/status", get(get_channel_status))
         .route("/channels/test", post(test_channel_connection))
         .route("/models", get(list_models))
+        .route("/models/test", post(test_model_connection))
         .route(
             "/models/optimize-prompt",
             post(optimize_prompt_with_default_model),
@@ -488,6 +489,7 @@ pub async fn optimize_prompt_with_default_model(
 
 pub fn chat_router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/{id}/sessions", get(chat_sessions))
         .route("/{id}/session", get(chat_session))
         .route("/{id}/message", post(chat_message))
         .route("/{id}/message/stream", post(chat_message_stream))
@@ -499,46 +501,52 @@ pub fn groups_router() -> Router<Arc<AppState>> {
         .route("/{id}", get(get_chat_group).put(update_chat_group).delete(delete_chat_group))
 }
 
+#[derive(Deserialize)]
+pub struct ChatSessionQuery {
+    pub session_label: Option<String>,
+    pub session_id: Option<String>,
+}
+
+pub async fn chat_sessions(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let path = format!("/api/agents/{id}/sessions");
+    let data = state.openfang.get_json(&path).await?;
+    Ok(Json(data))
+}
+
 pub async fn chat_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
+    Query(query): Query<ChatSessionQuery>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let session_label = query
-        .get("session_label")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let (original_session_id, _target_session_id, switched) = ensure_switched_to_session_target(
+        &state,
+        &id,
+        query.session_id.as_deref(),
+        query.session_label.as_deref(),
+    )
+    .await?;
 
-    if let Some(label) = session_label {
-        let safe_label = normalize_session_label(&label);
-        if safe_label.is_empty() {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "session_label 无效"));
-        }
-        let (original_session_id, _target_session_id, switched) =
-            ensure_switched_to_session_label(&state, &id, &safe_label).await?;
-
-        let path = format!("/api/agents/{id}/session");
-        let data = match state.openfang.get_json(&path).await {
-            Ok(value) => value,
-            Err(err) => {
-                if switched {
-                    let _ = switch_openfang_session(&state, &id, &original_session_id).await;
-                }
-                return Err(err);
+    let path = format!("/api/agents/{id}/session");
+    let data = match state.openfang.get_json(&path).await {
+        Ok(value) => value,
+        Err(err) => {
+            if switched {
+                let _ = switch_openfang_session(&state, &id, &original_session_id).await;
             }
-        };
-
-        if switched {
-            let _ = switch_openfang_session(&state, &id, &original_session_id).await;
+            return Err(err);
         }
+    };
 
-        Ok(Json(data))
-    } else {
-        let path = format!("/api/agents/{id}/session");
-        let data = state.openfang.get_json(&path).await?;
-        Ok(Json(data))
+    if switched {
+        let _ = switch_openfang_session(&state, &id, &original_session_id).await;
     }
+
+    Ok(Json(data))
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -6081,6 +6089,7 @@ pub async fn run_workflow(
 #[derive(Deserialize)]
 pub struct ChatMessageRequest {
     pub message: String,
+    pub session_id: Option<String>,
     pub session_label: Option<String>,
 }
 
@@ -6202,6 +6211,38 @@ async fn ensure_switched_to_session_label(
         switch_openfang_session(state, agent_id, &target_session_id).await?;
     }
     Ok((original_session_id, target_session_id, switched))
+}
+
+async fn ensure_switched_to_session_id(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    session_id: &str,
+) -> Result<(String, String, bool), ApiError> {
+    let target_session_id = session_id.trim();
+    if target_session_id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "session_id 无效"));
+    }
+    let original_session_id = get_openfang_agent_session_id(state, agent_id).await?;
+    let switched = original_session_id != target_session_id;
+    if switched {
+        switch_openfang_session(state, agent_id, target_session_id).await?;
+    }
+    Ok((original_session_id, target_session_id.to_string(), switched))
+}
+
+async fn ensure_switched_to_session_target(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    session_id: Option<&str>,
+    session_label: Option<&str>,
+) -> Result<(String, String, bool), ApiError> {
+    if let Some(sid) = session_id.map(str::trim).filter(|v| !v.is_empty()) {
+        return ensure_switched_to_session_id(state, agent_id, sid).await;
+    }
+    if let Some(label) = session_label.map(str::trim).filter(|v| !v.is_empty()) {
+        return ensure_switched_to_session_label(state, agent_id, label).await;
+    }
+    Ok((String::new(), String::new(), false))
 }
 
 fn resolve_agent_system_prompt(agent_id: &str, include_bootstrap: bool) -> Result<Option<String>, ApiError> {
@@ -7344,15 +7385,13 @@ pub async fn chat_message(
         }
     };
 
-    let (original_session_id, _target_session_id, switched) = match payload
-        .session_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        Some(label) => ensure_switched_to_session_label(&state, &id, label).await?,
-        None => (String::new(), String::new(), false),
-    };
+    let (original_session_id, _target_session_id, switched) = ensure_switched_to_session_target(
+        &state,
+        &id,
+        payload.session_id.as_deref(),
+        payload.session_label.as_deref(),
+    )
+    .await?;
 
     let outgoing_message = apply_system_prompt_guard(
         &payload.message,
@@ -7413,15 +7452,13 @@ pub async fn chat_message_stream(
         }
     };
 
-    let (original_session_id, _target_session_id, switched) = match payload
-        .session_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        Some(label) => ensure_switched_to_session_label(&state, &id, label).await?,
-        None => (String::new(), String::new(), false),
-    };
+    let (original_session_id, _target_session_id, switched) = ensure_switched_to_session_target(
+        &state,
+        &id,
+        payload.session_id.as_deref(),
+        payload.session_label.as_deref(),
+    )
+    .await?;
 
     let outgoing_message = apply_system_prompt_guard(
         &payload.message,
@@ -8226,6 +8263,146 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             "reachable": upstream.is_some()
         }
     })))
+}
+
+#[derive(Deserialize)]
+pub struct ModelTestRequest {
+    pub provider: String,
+    pub model: String,
+    pub model_id: Option<String>,
+}
+
+pub async fn test_model_connection(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ModelTestRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let provider_id = payload.provider.trim().to_string();
+    if provider_id.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "provider 不能为空",
+        ));
+    }
+    let raw_model = payload.model.trim().to_string();
+    if raw_model.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "model 不能为空",
+        ));
+    }
+    let normalized_model = strip_provider_prefixes(&raw_model, &provider_id);
+    if normalized_model.trim().is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "model 无效",
+        ));
+    }
+
+    let local_provider_config = assignment_store::get_provider_config(&provider_id).map_err(storage_error)?;
+    if let Some(cfg) = local_provider_config {
+        let protocol = normalize_protocol(&cfg.protocol).unwrap_or("openai");
+        let Some(base_url) = cfg.base_url.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(Json(json!({
+                "ok": false,
+                "status": "missing_base_url",
+                "message": "未配置 Base URL，无法进行模型连通性测试"
+            })));
+        };
+        let Some(api_key) = cfg.api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(Json(json!({
+                "ok": false,
+                "status": "missing_api_key",
+                "message": "未配置 API Key，无法进行模型连通性测试"
+            })));
+        };
+
+        return match discover_models_from_provider(&provider_id, protocol, base_url, api_key).await {
+            Ok(found_models) => {
+                let matched = found_models.iter().any(|item| {
+                    let normalized = strip_provider_prefixes(item, &provider_id);
+                    normalized.eq_ignore_ascii_case(normalized_model.as_str())
+                });
+                if matched {
+                    Ok(Json(json!({
+                        "ok": true,
+                        "status": "ok",
+                        "message": "连接正常，模型通信可用"
+                    })))
+                } else {
+                    Ok(Json(json!({
+                        "ok": false,
+                        "status": "model_not_found",
+                        "message": format!("连接成功，但提供商返回的模型列表中未找到 `{}`", normalized_model)
+                    })))
+                }
+            }
+            Err(error) => Ok(Json(json!({
+                "ok": false,
+                "status": "connection_error",
+                "message": error
+            }))),
+        };
+    }
+
+    let runtime_online = probe_openfang_health(&state).await.is_ok();
+    if !runtime_online {
+        return Ok(Json(json!({
+            "ok": false,
+            "status": "runtime_offline",
+            "message": "OpenFang 运行时离线，无法进行连接测试"
+        })));
+    }
+
+    let models_payload = match state.openfang.get_json("/api/models").await {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Json(json!({
+                "ok": false,
+                "status": "runtime_error",
+                "message": error.message
+            })));
+        }
+    };
+    let rows = models_payload
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let matched = rows.iter().any(|row| {
+        let row_provider = row
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !row_provider.eq_ignore_ascii_case(&provider_id) {
+            return false;
+        }
+        let row_model = row
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| row.get("id").and_then(Value::as_str))
+            .unwrap_or_default();
+        let normalized = strip_provider_prefixes(row_model, row_provider);
+        normalized.eq_ignore_ascii_case(normalized_model.as_str())
+    });
+
+    if matched {
+        Ok(Json(json!({
+            "ok": true,
+            "status": "ok",
+            "message": "连接正常，模型通信可用"
+        })))
+    } else {
+        Ok(Json(json!({
+            "ok": false,
+            "status": "model_not_found",
+            "message": format!(
+                "运行时未发现模型 `{}`（provider: `{}`）",
+                normalized_model,
+                provider_id
+            ),
+            "model_id": payload.model_id
+        })))
+    }
 }
 
 #[derive(Deserialize)]

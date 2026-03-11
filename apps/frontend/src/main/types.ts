@@ -394,6 +394,7 @@ export interface AgentChatInput {
   requestId?: string;
   channel?: string;
   renderMode?: (typeof CHAT_RENDER_MODES)[keyof typeof CHAT_RENDER_MODES] | string;
+  sessionId?: string;
   sessionLabel?: string;
   systemPreamble?: string;
   homeDirOverride?: string;

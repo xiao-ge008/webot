@@ -1,5 +1,6 @@
 import type { Message, MessageToolCall, MessageTrace } from '@/data/mock-chats';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
+import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 
 const STORAGE_KEY = 'webot-chat-sessions-v1';
 let webStoragePurged = false;
@@ -9,6 +10,9 @@ export interface StoredChatSession {
   title: string;
   updatedAt: number;
   messages: Message[];
+  remoteSessionId?: string;
+  sessionLabel?: string;
+  sessionSource?: 'app' | 'web' | 'unknown';
   autoTitle?: boolean;
   streamState?: 'idle' | 'streaming' | 'waiting';
 }
@@ -182,7 +186,8 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
   if (!role) return null;
 
   const id = typeof item.id === 'string' && item.id.trim() ? item.id : `msg_${Date.now()}_${index}`;
-  const text = typeof item.text === 'string' ? item.text : '';
+  const rawText = typeof item.text === 'string' ? item.text : '';
+  const text = isHiddenSystemPromptText(rawText) ? '' : rawText;
   const timestamp = typeof item.timestamp === 'string' && item.timestamp.trim()
     ? item.timestamp
     : new Date().toISOString();
@@ -304,12 +309,35 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
     }
   }
 
+  const hasRenderableText = Boolean(message.text.trim());
+  const hasRenderablePayload =
+    message.spec !== undefined
+    || Boolean(message.uiRawText?.trim())
+    || Boolean(message.taskCard)
+    || Boolean(message.a2aCards?.length)
+    || Boolean(message.tools?.length)
+    || Boolean(message.toolTrace?.length)
+    || Boolean(message.thinkingTrace?.length);
+  if (!hasRenderableText && !hasRenderablePayload) {
+    return null;
+  }
+
   return cloneMessage(message);
 }
 
 function normalizeSession(raw: unknown, index: number): StoredChatSession {
   const item = isRecord(raw) ? raw : {};
   const id = typeof item.id === 'string' && item.id.trim() ? item.id : createSessionId();
+  const remoteSessionId = typeof item.remoteSessionId === 'string' && item.remoteSessionId.trim()
+    ? item.remoteSessionId.trim()
+    : undefined;
+  const sessionLabel = typeof item.sessionLabel === 'string' && item.sessionLabel.trim()
+    ? item.sessionLabel.trim()
+    : undefined;
+  const sessionSourceRaw = typeof item.sessionSource === 'string' ? item.sessionSource.trim() : '';
+  const sessionSource = sessionSourceRaw === 'app' || sessionSourceRaw === 'web' || sessionSourceRaw === 'unknown'
+    ? sessionSourceRaw
+    : undefined;
   const titleRaw = typeof item.title === 'string' ? item.title.trim() : '';
   const title = titleRaw || `新对话 ${index + 1}`;
   const updatedAt = typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt) ? item.updatedAt : Date.now();
@@ -327,6 +355,9 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
     title,
     updatedAt,
     messages,
+    remoteSessionId,
+    sessionLabel,
+    sessionSource,
     autoTitle: autoTitle || undefined,
     streamState,
   };

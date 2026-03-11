@@ -3,6 +3,7 @@ import type { MessageTrace, Message } from '@/data/mock-chats';
 import type { Agent } from '@/types';
 import type { AgentChatMessage, AgentChatStreamChunk } from '@/main/types';
 import type { ManagementAgentDetail, ManagementAgentSummary } from '@/services/management-client';
+import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 
 const HIDDEN_COLLAB_TAGS = new Set(['webot:collab_discoverable', 'webot:collab_dispatcher']);
 
@@ -571,10 +572,15 @@ export function buildInitialMessages(_agentName: string): Message[] {
 export function buildHistory(messages: Message[]): AgentChatMessage[] {
   return messages
     .filter((msg) => msg.role === 'user' || msg.role === 'agent')
-    .slice(-20)
     .map((msg) => ({
       role: msg.role === 'user' ? 'user' : 'assistant',
-      content: msg.text,
+      content: (msg.text || '').trim(),
+    }))
+    .filter((msg) => msg.content.length > 0 && !isHiddenSystemPromptText(msg.content))
+    .slice(-20)
+    .map((msg) => ({
+      role: msg.role,
+      content: msg.content,
     }));
 }
 
@@ -1296,6 +1302,7 @@ ${row.detail || ''}`));
 export function looksLikeProtocolOnlyText(text: string): boolean {
   const normalized = unwrapResponseEnvelopeText(text).trim();
   if (!normalized) return true;
+  if (isHiddenSystemPromptText(normalized)) return true;
   if (/^<tool_call>/im.test(normalized)) return true;
   if (/^```(?:json)?[\s\S]*```$/i.test(normalized) && /"type"\s*:|"root"\s*:/i.test(normalized)) return true;
   if (/^\{[\s\S]*\}$/i.test(normalized) && /"type"\s*:|"root"\s*:/i.test(normalized)) return true;
