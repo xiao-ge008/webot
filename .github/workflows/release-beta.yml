@@ -74,5 +74,6 @@ jobs:
           name: ${{ inputs.tag || github.ref_name }}
           target_commitish: main
           files: |
-            dist/**/bundle/**/*
+            dist/**/msi/*.msi
+            dist/**/dmg/*.dmg
           fail_on_unmatched_files: false
