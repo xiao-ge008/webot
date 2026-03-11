@@ -47,7 +47,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           npx tauri build --bundles app
-          APP_PATH="apps/frontend/src-tauri/target/release/bundle/macos/WeBot VI.0 Beta.app"
+          APP_PATH="src-tauri/target/release/bundle/macos/WeBot VI.0 Beta.app"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "${APP_PATH}.zip"
         working-directory: apps/frontend
         shell: bash
