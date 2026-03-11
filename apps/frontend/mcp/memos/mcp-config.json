@@ -1,0 +1,6 @@
+{
+  "name": "Memory MCP",
+  "type": "builtin",
+  "enabled": true,
+  "description": "记忆系统服务"
+}

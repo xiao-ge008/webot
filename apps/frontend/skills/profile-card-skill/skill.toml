@@ -1,0 +1,15 @@
+name = "profile-card-skill"
+version = "1.0.0"
+description = "为聊天中的人物资料输出提供 ProfileIntroCard 动态组件"
+
+prompt_context = """
+当场景是 GUI / json-render / A2UI 渲染时，可使用 ProfileIntroCard。
+
+强约束：
+1. 组件 type 只能使用 components.manifest.json 中声明的 `ProfileIntroCard`
+2. 输出格式只能是：Markdown，或 Markdown + <UI_JSON>...</UI_JSON>
+3. <UI_JSON> 内必须是单个合法 JSON 对象
+4. 必须使用半角 JSON 标点，不要输出全角冒号、全角逗号
+5. 不要将整条消息再包裹成 response JSON / tool_call / XML / YAML
+6. 如果字段很多，优先填充 sections，而不是拼接成长文本
+"""

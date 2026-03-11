@@ -1,0 +1,6 @@
+{
+  "name": "Vision MCP",
+  "type": "builtin",
+  "enabled": true,
+  "description": "图片和视频内容分析服务"
+}

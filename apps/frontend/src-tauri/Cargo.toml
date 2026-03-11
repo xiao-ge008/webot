@@ -1,0 +1,23 @@
+[package]
+name = "webot-frontend"
+version = "6.0.0-1"
+description = "WeBot frontend desktop app powered by Tauri 2.0"
+edition = "2021"
+
+[lib]
+name = "webot_frontend_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.8.5", features = ["tray-icon"] }
+webot-service-rs = { path = "../../service-rs" }
+rfd = "0.15.4"
+base64 = "0.22.1"
+
+[features]
+default = []

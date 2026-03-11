@@ -1,0 +1,29 @@
+{
+  "name": "webot-app",
+  "private": true,
+  "version": "6.0.0-1",
+  "description": "Webot 基础工程（以 mvptest 为参考）",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build:shared",
+    "build:all": "npm run build --workspaces",
+    "build:shared": "npm run build --workspace @webot/shared-types",
+    "build:desktop": "node scripts/build-desktop.mjs",
+    "dev:start": "node scripts/start-dev.mjs",
+    "dev:start:web": "node scripts/start-dev.mjs web",
+    "dev:start:app": "node scripts/start-dev.mjs app --qqbot",
+    "check:service-rs": "cargo check --manifest-path apps/service-rs/Cargo.toml",
+    "dev:frontend": "npm run dev --workspace @webot/frontend",
+    "dev:service-rs": "cargo run --manifest-path apps/service-rs/Cargo.toml",
+    "typecheck": "npm run typecheck:shared",
+    "typecheck:all": "npm run typecheck --workspaces",
+    "typecheck:shared": "npm run typecheck --workspace @webot/shared-types"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  }
+}

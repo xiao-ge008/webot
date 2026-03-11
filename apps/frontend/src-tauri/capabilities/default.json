@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Default desktop capability for WeBot frontend",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

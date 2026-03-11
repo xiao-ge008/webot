@@ -1,0 +1,6 @@
+{
+  "name": "YouTube MCP",
+  "type": "builtin",
+  "enabled": true,
+  "description": "YouTube 视频搜索和播放服务"
+}

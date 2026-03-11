@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default desktop capability for WeBot frontend","local":true,"windows":["main"],"permissions":["core:default"]}}
