@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-13, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -47,8 +47,10 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           npx tauri build --bundles app
+          ARCH="$(uname -m)"
           APP_PATH="src-tauri/target/release/bundle/macos/WeBot VI.0 Beta.app"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "${APP_PATH}.zip"
+          ZIP_PATH="src-tauri/target/release/bundle/macos/WeBot VI.0 Beta_${ARCH}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
         working-directory: apps/frontend
         shell: bash
 
