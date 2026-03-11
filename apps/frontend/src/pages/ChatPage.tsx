@@ -145,6 +145,25 @@ function buildSessionMessageSignature(messages: Message[]): string {
     return rows.join('\n');
 }
 
+function normalizeLabelComponent(raw: string, maxLen: number): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    let out = '';
+    for (const ch of trimmed) {
+        if (out.length >= maxLen) break;
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '-' || ch === '_') {
+            out += ch;
+        } else {
+            out += '_';
+        }
+    }
+    return out.replace(/^_+|_+$/g, '');
+}
+
+function buildLocalSessionLabel(sessionId: string): string {
+    return normalizeLabelComponent(sessionId, 96);
+}
+
 function isWebRuntime(): boolean {
     if (typeof window === 'undefined') {
         return false;
@@ -257,6 +276,67 @@ function buildSessionFromBackendPayload(payload: unknown): StoredChatSession | n
         updatedAt: Date.now(),
         messages,
         streamState: 'idle',
+    };
+}
+
+function mergeRemoteSession(
+    current: StoredChatSession[],
+    remote: StoredChatSession,
+    targetSessionId?: string,
+): { sessions: StoredChatSession[]; activeSessionId: string } {
+    if (current.length === 0) {
+        const seedId = targetSessionId || remote.id;
+        return {
+            sessions: [{ ...remote, id: seedId }],
+            activeSessionId: seedId,
+        };
+    }
+
+    const remoteSignature = buildSessionMessageSignature(remote.messages);
+    let matchedIndex = targetSessionId ? current.findIndex((session) => session.id === targetSessionId) : -1;
+    if (matchedIndex < 0 && remoteSignature) {
+        matchedIndex = current.findIndex((session) => buildSessionMessageSignature(session.messages) === remoteSignature);
+    }
+
+    let nextSessions = [...current];
+    let activeSessionId = targetSessionId || remote.id;
+
+    if (matchedIndex >= 0) {
+        const matched = current[matchedIndex];
+        const keepTitle = Boolean(matched.title && matched.title.trim());
+        const keepCustomTitle = keepTitle && matched.autoTitle === false;
+        const preferStreamState = matched.streamState && matched.streamState !== 'idle';
+
+        const merged: StoredChatSession = {
+            ...matched,
+            ...remote,
+            id: targetSessionId || matched.id || remote.id,
+            title: keepCustomTitle ? matched.title : (remote.title || matched.title),
+            autoTitle: matched.autoTitle ?? remote.autoTitle,
+            streamState: preferStreamState ? matched.streamState : remote.streamState,
+        };
+
+        nextSessions[matchedIndex] = merged;
+        activeSessionId = merged.id;
+    } else {
+        const seedId = targetSessionId || remote.id;
+        nextSessions = [{ ...remote, id: seedId }, ...nextSessions];
+        activeSessionId = seedId;
+    }
+
+    const seen = new Set<string>();
+    nextSessions = nextSessions.filter((session) => {
+        if (!session.id) return false;
+        if (seen.has(session.id)) return false;
+        seen.add(session.id);
+        return true;
+    });
+
+    nextSessions.sort((a, b) => b.updatedAt - a.updatedAt);
+
+    return {
+        sessions: nextSessions,
+        activeSessionId: activeSessionId || nextSessions[0]?.id || '',
     };
 }
 
@@ -951,7 +1031,7 @@ export function ChatPage({
     const pendingSilentCountRef = useRef(0);
     const agentDirectoryRef = useRef<Map<string, AgentDirectoryItem>>(new Map());
     const agentReadinessRef = useRef<Map<string, AgentChatReadinessMeta>>(new Map());
-    const remoteHistorySyncedAgentsRef = useRef<Set<string>>(new Set());
+    const remoteHistorySyncedKeysRef = useRef<Set<string>>(new Set());
     const lastUserActivityAtRef = useRef<number>(Date.now());
     const lastIdleAutoTriggeredAtRef = useRef<number>(0);
     const idleAutoTriggerCountRef = useRef<number>(0);
@@ -959,9 +1039,14 @@ export function ChatPage({
     const runtimeAgentId = (runtimeKeyProp ?? chatAgentId).trim() || chatAgentId;
     const runtimeAgentIdRef = useRef(runtimeAgentId);
     runtimeAgentIdRef.current = runtimeAgentId;
-    const sessionLabel = (sessionLabelProp ?? '').trim();
-    const sessionLabelRef = useRef(sessionLabel);
-    sessionLabelRef.current = sessionLabel;
+    const baseSessionLabel = (sessionLabelProp ?? '').trim();
+    const baseSessionLabelRef = useRef(baseSessionLabel);
+    baseSessionLabelRef.current = baseSessionLabel;
+    const resolveSessionLabel = useCallback((sessionId: string) => {
+        const base = baseSessionLabelRef.current;
+        if (base) return base;
+        return buildLocalSessionLabel(sessionId);
+    }, []);
     const transformUserMessageRef = useRef(transformUserMessageProp);
     transformUserMessageRef.current = transformUserMessageProp;
     const groupUpgradeEnabled = groupUpgradeEnabledProp ?? true;
@@ -1181,6 +1266,13 @@ export function ChatPage({
 
     const setActiveSessionId = (nextId: string) => {
         chatRuntimeStore.setActiveSessionId(runtimeAgentIdRef.current, nextId);
+    };
+
+    const resolveRequestSessionLabel = (sessionId?: string) => {
+        const sid = (sessionId || activeSessionIdRef.current || '').trim();
+        if (!sid) return undefined;
+        const label = resolveSessionLabel(sid);
+        return label ? label : undefined;
     };
 
     const enqueueSilentMessage = (text: string) => {
@@ -1542,11 +1634,15 @@ export function ChatPage({
         thinkingSnapshotRef.current = '';
         pendingSilentMessagesRef.current = [];
 
-        if (isWebRuntime() && !remoteHistorySyncedAgentsRef.current.has(runtimeAgentId)) {
+        const syncSessionId = activeSessionIdRef.current || activeSessionId || '';
+        const syncSessionLabel = syncSessionId ? resolveSessionLabel(syncSessionId) : '';
+        const syncKey = syncSessionId ? `${runtimeAgentId}::${syncSessionLabel || syncSessionId}` : '';
+
+        if (syncKey && !remoteHistorySyncedKeysRef.current.has(syncKey)) {
             void (async () => {
                 try {
-                    const suffix = sessionLabelRef.current
-                        ? `?session_label=${encodeURIComponent(sessionLabelRef.current)}`
+                    const suffix = syncSessionLabel
+                        ? `?session_label=${encodeURIComponent(syncSessionLabel)}`
                         : '';
                     const payload = await requestJson<unknown>(`/api/chat/${encodeURIComponent(chatAgentId)}/session${suffix}`);
                     if (cancelled) {
@@ -1556,9 +1652,16 @@ export function ChatPage({
                     if (!restored) {
                         return;
                     }
-                    setSessions([restored]);
-                    setActiveSessionId(restored.id);
-                    remoteHistorySyncedAgentsRef.current.add(runtimeAgentId);
+                    let nextActiveId = '';
+                    setSessions((prev) => {
+                        const merged = mergeRemoteSession(prev, restored, syncSessionId);
+                        nextActiveId = merged.activeSessionId;
+                        return merged.sessions;
+                    });
+                    if (nextActiveId) {
+                        setActiveSessionId(nextActiveId);
+                    }
+                    remoteHistorySyncedKeysRef.current.add(syncKey);
                 } catch (error) {
                     console.warn('[ChatPage] 同步后端聊天记录失败:', error);
                 }
@@ -1568,7 +1671,7 @@ export function ChatPage({
         return () => {
             cancelled = true;
         };
-    }, [runtimeAgentId, chatAgentId, sessionLabel]);
+    }, [runtimeAgentId, chatAgentId, baseSessionLabel, activeSessionId, resolveSessionLabel]);
 
     useEffect(() => {
         if (!sessions.length) {
@@ -2184,7 +2287,7 @@ export function ChatPage({
                 history,
                 stream: true,
                 requestId,
-                sessionLabel: sessionLabelRef.current || undefined,
+                sessionLabel: resolveRequestSessionLabel(activeRequestSessionIdRef.current),
                 systemPreamble: systemPreambleRef.current || undefined,
             }, {
                 channel: CHAT_CHANNELS.app,
@@ -2739,7 +2842,7 @@ export function ChatPage({
                             message: (msg.text || '').trim(),
                             history,
                             stream: false,
-                            sessionLabel: sessionLabelRef.current || undefined,
+                            sessionLabel: resolveRequestSessionLabel(),
                             systemPreamble: systemPreambleRef.current || undefined,
                         }, {
                             channel: CHAT_CHANNELS.app,
@@ -2890,7 +2993,7 @@ export function ChatPage({
                     message: transformed.trim(),
                     history,
                     stream: false,
-                    sessionLabel: sessionLabelRef.current || undefined,
+                    sessionLabel: resolveRequestSessionLabel(),
                     systemPreamble: systemPreambleRef.current || undefined,
                 }, {
                     channel: CHAT_CHANNELS.app,

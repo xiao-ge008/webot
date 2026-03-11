@@ -416,7 +416,7 @@ async function main() {
       currentConfig = next;
     },
     getDataDir() {
-      return path.join(os.homedir(), '.openclaw', 'qqbot');
+      return path.join(WEBOT_HOME, 'qqbot');
     },
     channel: {
       activity: {
