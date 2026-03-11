@@ -7,8 +7,9 @@
   "scripts": {
     "dev": "vite",
     "dev:tauri": "tauri dev",
-    "build:tauri": "tauri build --bundles msi",
+    "build:tauri": "tauri build",
     "build": "tsc -b && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "preview": "vite preview"
   },
