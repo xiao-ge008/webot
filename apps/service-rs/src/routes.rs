@@ -3289,9 +3289,8 @@ pub async fn update_agent_model(
     let provider = object
         .get("provider")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .map(canonical_provider_id)
+        .filter(|value| !value.is_empty());
     let raw_model = object
         .get("model")
         .and_then(Value::as_str)
@@ -8484,6 +8483,10 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> Result<Json<V
         .cloned()
         .unwrap_or_default();
     let mut seen = HashSet::new();
+    let upstream_provider_ids = upstream
+        .as_ref()
+        .map(extract_provider_ids_from_payload)
+        .unwrap_or_default();
 
     for row in &mut providers {
         let Some(obj) = row.as_object_mut() else {
@@ -8527,11 +8530,40 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> Result<Json<V
             .and_then(|cfg| cfg.api_key.as_ref())
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false);
+        let has_base_url = config_map
+            .get(&provider_id)
+            .and_then(|cfg| cfg.base_url.as_ref())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
         let configured =
-            has_key || (!auth_status.contains("missing") && !auth_status.contains("none"));
+            has_key || has_base_url || (!auth_status.contains("missing") && !auth_status.contains("none"));
+        let runtime_loaded = upstream_provider_ids.contains(&provider_id);
+        let model_discovered = obj
+            .get("model_count")
+            .and_then(Value::as_u64)
+            .map(|value| value > 0)
+            .unwrap_or(false);
+        let healthy = enabled && configured && runtime_loaded && model_discovered;
         let linked = enabled && configured;
+        let health_status = if !enabled {
+            "disabled"
+        } else if !configured {
+            "incomplete"
+        } else if !runtime_loaded {
+            "configured"
+        } else if !model_discovered {
+            "no_models"
+        } else {
+            "healthy"
+        };
         obj.insert("enabled".to_string(), json!(enabled));
         obj.insert("has_api_key".to_string(), json!(has_key));
+        obj.insert("has_base_url".to_string(), json!(has_base_url));
+        obj.insert("configured".to_string(), json!(configured));
+        obj.insert("runtime_loaded".to_string(), json!(runtime_loaded));
+        obj.insert("model_discovered".to_string(), json!(model_discovered));
+        obj.insert("healthy".to_string(), json!(healthy));
+        obj.insert("health_status".to_string(), json!(health_status));
         obj.insert("linked".to_string(), json!(linked));
         obj.insert("source".to_string(), json!("upstream"));
     }
@@ -8545,16 +8577,38 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> Result<Json<V
             .copied()
             .unwrap_or(true);
         let has_key = cfg.api_key.as_deref().unwrap_or("").trim().len() > 0;
-        let linked = enabled && has_key;
+        let has_base_url = cfg.base_url.as_deref().unwrap_or("").trim().len() > 0;
+        let configured = has_key || has_base_url;
+        let runtime_loaded = upstream_provider_ids.contains(&cfg.provider_id);
+        let model_discovered = !cfg.models.is_empty();
+        let healthy = enabled && configured && runtime_loaded && model_discovered;
+        let linked = enabled && configured;
+        let health_status = if !enabled {
+            "disabled"
+        } else if !configured {
+            "incomplete"
+        } else if !runtime_loaded {
+            "configured"
+        } else if !model_discovered {
+            "no_models"
+        } else {
+            "healthy"
+        };
         providers.push(json!({
             "id": cfg.provider_id,
             "display_name": cfg.display_name.clone().unwrap_or_else(|| cfg.provider_id.clone()),
-            "auth_status": if has_key { "configured" } else { "missing" },
+            "auth_status": if configured { "configured" } else { "missing" },
             "base_url": cfg.base_url.clone().unwrap_or_default(),
             "model_count": cfg.models.len(),
             "enabled": enabled,
             "linked": linked,
             "has_api_key": has_key,
+            "has_base_url": has_base_url,
+            "configured": configured,
+            "runtime_loaded": runtime_loaded,
+            "model_discovered": model_discovered,
+            "healthy": healthy,
+            "health_status": health_status,
             "source": if cfg.is_custom { "custom" } else { "local" },
             "is_custom": cfg.is_custom,
             "protocol": cfg.protocol
@@ -8750,10 +8804,18 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             None
         }
     });
+    let default_model_valid = default_model_visible.is_some();
+    let default_model_reason = if default_model_valid {
+        "ok"
+    } else {
+        "missing_or_unavailable"
+    };
 
     Ok(Json(json!({
         "models": filtered_models,
         "default_model_id": default_model_visible,
+        "default_model_valid": default_model_valid,
+        "default_model_reason": default_model_reason,
         "upstream": {
             "reachable": upstream.is_some()
         }
@@ -8962,7 +9024,7 @@ pub async fn create_custom_provider(
     State(_state): State<Arc<AppState>>,
     Json(payload): Json<CreateCustomProviderRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let provider_id = payload.id.trim().to_string();
+    let provider_id = canonical_provider_id(&payload.id);
     if provider_id.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9031,7 +9093,7 @@ pub async fn update_provider_config(
     Path(id): Path<String>,
     Json(payload): Json<UpdateProviderConfigRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let provider_id = id.trim().to_string();
+    let provider_id = canonical_provider_id(&id);
     if provider_id.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9128,7 +9190,7 @@ pub async fn delete_provider_config(
     State(_state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let provider_id = id.trim().to_string();
+    let provider_id = canonical_provider_id(&id);
     if provider_id.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9153,7 +9215,7 @@ pub async fn update_provider_enabled(
     Path(id): Path<String>,
     Json(payload): Json<UpdateEnabledRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let provider_id = id.trim();
+    let provider_id = canonical_provider_id(&id);
     if provider_id.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9161,7 +9223,7 @@ pub async fn update_provider_enabled(
         ));
     }
 
-    assignment_store::set_provider_enabled(provider_id, payload.enabled).map_err(storage_error)?;
+    assignment_store::set_provider_enabled(&provider_id, payload.enabled).map_err(storage_error)?;
     let _ = sync_provider_configs_to_runtime(&_state).await;
     Ok(Json(json!({
         "status": "ok",
@@ -9175,7 +9237,7 @@ pub async fn update_model_enabled(
     Path(id): Path<String>,
     Json(payload): Json<UpdateEnabledRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let model_id = id.trim();
+    let model_id = canonical_model_id(&id);
     if model_id.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9183,11 +9245,11 @@ pub async fn update_model_enabled(
         ));
     }
 
-    assignment_store::set_model_enabled(model_id, payload.enabled).map_err(storage_error)?;
+    assignment_store::set_model_enabled(&model_id, payload.enabled).map_err(storage_error)?;
 
     if !payload.enabled {
         let current_default = assignment_store::get_default_model().map_err(storage_error)?;
-        if current_default.as_deref() == Some(model_id) {
+        if current_default.as_deref() == Some(model_id.as_str()) {
             assignment_store::clear_default_model().map_err(storage_error)?;
         }
     }
@@ -9203,7 +9265,7 @@ pub async fn update_default_model(
     State(_state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let model_id = id.trim();
+    let model_id = canonical_model_id(&id);
     if model_id.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9211,8 +9273,56 @@ pub async fn update_default_model(
         ));
     }
 
-    assignment_store::set_model_enabled(model_id, true).map_err(storage_error)?;
-    assignment_store::set_default_model(model_id).map_err(storage_error)?;
+    let model_assignments = assignment_store::list_model_assignments().map_err(storage_error)?;
+    let hit = model_assignments.iter().find(|item| item.model_id == model_id).ok_or_else(|| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "默认模型不存在，请先配置并启用对应供应商/模型",
+        )
+    })?;
+    if !hit.enabled {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "默认模型已被禁用，请先启用后再设置为默认模型",
+        ));
+    }
+    let provider_enabled = assignment_store::list_provider_enabled_map().map_err(storage_error)?;
+    if !provider_enabled.get(&hit.provider_id).copied().unwrap_or(true) {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "默认模型所属供应商已被禁用，请先启用供应商",
+        ));
+    }
+    let provider_config = assignment_store::get_provider_config(&hit.provider_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "默认模型所属供应商不存在，请先重新配置供应商",
+            )
+        })?;
+    let provider_ready = provider_config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || provider_config
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+    if !provider_ready {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "默认模型所属供应商尚未完成配置，请先填写可用的 API Key 或 Base URL",
+        ));
+    }
+
+    assignment_store::set_model_enabled(&model_id, true).map_err(storage_error)?;
+    assignment_store::set_default_model(&model_id).map_err(storage_error)?;
+    sync_provider_configs_to_runtime(&_state).await?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -9723,6 +9833,14 @@ fn convert_mcp_entry_to_toml(name: &str, value: &Value) -> Option<toml::value::T
 
 fn resolve_openfang_config_path() -> Result<PathBuf, ApiError> {
     path_resolver::openfang_config_path().map_err(storage_error)
+}
+
+fn canonical_provider_id(value: &str) -> String {
+    assignment_store::normalize_provider_id(value)
+}
+
+fn canonical_model_id(value: &str) -> String {
+    assignment_store::normalize_model_id(value)
 }
 
 #[derive(Clone)]
@@ -10410,65 +10528,17 @@ async fn trigger_openfang_reload(state: &Arc<AppState>) -> Result<Value, ApiErro
 }
 
 pub async fn sync_provider_configs_to_runtime(state: &Arc<AppState>) -> Result<Value, ApiError> {
-    ensure_online(state).await?;
-    let provider_configs = assignment_store::list_provider_configs().map_err(storage_error)?;
-    let enabled_map = assignment_store::list_provider_enabled_map().map_err(storage_error)?;
-
-    let mut toml_providers = Vec::new();
-    for cfg in provider_configs {
-        let enabled = enabled_map.get(&cfg.provider_id).copied().unwrap_or(true);
-        if !enabled {
-            continue;
-        }
-
-        let mut provider_table = toml::value::Table::new();
-        provider_table.insert(
-            "id".to_string(),
-            toml::Value::String(cfg.provider_id.clone()),
-        );
-        provider_table.insert(
-            "protocol".to_string(),
-            toml::Value::String(cfg.protocol.clone()),
-        );
-        if let Some(base_url) = cfg.base_url.as_deref() {
-            if !base_url.trim().is_empty() {
-                provider_table.insert(
-                    "base_url".to_string(),
-                    toml::Value::String(base_url.trim().to_string()),
-                );
-            }
-        }
-        if let Some(api_key) = cfg.api_key.as_deref() {
-            if !api_key.trim().is_empty() {
-                provider_table.insert(
-                    "api_key".to_string(),
-                    toml::Value::String(api_key.trim().to_string()),
-                );
-            }
-        }
-        toml_providers.push(toml::Value::Table(provider_table));
-    }
-
-    let config_path = resolve_openfang_config_path()?;
-    let mut root: toml::value::Table = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .map_err(|e| storage_error(format!("读取 OpenFang 配置失败: {e}")))?;
-        toml::from_str::<toml::value::Table>(&content).unwrap_or_default()
+    crate::reconcile_runtime_config_from_storage().map_err(storage_error)?;
+    let online = ensure_online(state).await.is_ok();
+    let reload = if online {
+        Some(trigger_openfang_reload(state).await?)
     } else {
-        toml::value::Table::new()
+        None
     };
-
-    root.insert("providers".to_string(), toml::Value::Array(toml_providers));
-    let output = toml::to_string_pretty(&root)
-        .map_err(|e| storage_error(format!("序列化 OpenFang 配置失败: {e}")))?;
-    fs::write(&config_path, output)
-        .map_err(|e| storage_error(format!("写入 OpenFang 配置失败: {e}")))?;
-
-    let reload = trigger_openfang_reload(state).await?;
     // Provider 配置变更需要重启 OpenFang 才能生效（内核不支持热更新 providers）
     let mut restarted = false;
     let mut restart_error: Option<String> = None;
-    if state.config.openfang_auto_start {
+    if state.config.openfang_auto_start && online {
         if let Err(err) = state.shutdown_managed_openfang().await {
             restart_error = Some(format!("停止 OpenFang 失败: {err}"));
         }
@@ -10485,6 +10555,7 @@ pub async fn sync_provider_configs_to_runtime(state: &Arc<AppState>) -> Result<V
     }
     Ok(json!({
         "status": "ok",
+        "online": online,
         "reload": reload,
         "restarted": restarted,
         "restart_error": restart_error

@@ -69,6 +69,7 @@ import {
   downloadManagementAgentExport,
   type ManagementAgentExportOptions,
   listManagementModels,
+  type ManagementModelsPayload,
   type ManagementMemoryFileItem,
   optimizePromptWithDefaultModel,
   patchManagementAgentConfig,
@@ -801,7 +802,7 @@ let cachedGlobalSkillCatalog: SkillCatalog | null = null;
 let cachedGlobalSkillCatalogAt = 0;
 let cachedMcpServers: Awaited<ReturnType<typeof getManagementMcpServers>> | null = null;
 let cachedMcpServersAt = 0;
-let cachedModelsPayload: ManagementModelOption[] | null = null;
+let cachedModelsPayload: ManagementModelsPayload | null = null;
 let cachedModelsPayloadAt = 0;
 
 function isCacheFresh(timestamp: number): boolean {
@@ -1573,8 +1574,8 @@ export function EditAgentPage() {
       cachedModelsPayload = modelsPayload;
       cachedModelsPayloadAt = Date.now();
 
-      const enabledModels = modelsPayload.filter((item) => item.enabled);
-      const options = enabledModels.length > 0 ? enabledModels : modelsPayload;
+      const enabledModels = modelsPayload.models.filter((item) => item.enabled);
+      const options = enabledModels.length > 0 ? enabledModels : modelsPayload.models;
       let nextOptions: ModelOption[] = options.map((item) => ({
         modelId: item.modelId,
         providerId: item.providerId,

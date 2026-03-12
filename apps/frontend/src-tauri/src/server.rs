@@ -97,7 +97,7 @@ fn apply_no_window(command: &mut std::process::Command) {
 #[cfg(not(target_os = "windows"))]
 fn apply_no_window(_command: &mut std::process::Command) {}
 
-fn ensure_openfang_config(webot_home: &PathBuf, openfang_bin: &PathBuf) -> Result<(), String> {
+fn ensure_openfang_config(webot_home: &PathBuf) -> Result<(), String> {
     let config_path = webot_home.join("config.toml");
     if config_path.is_file() {
         return Ok(());
@@ -107,41 +107,23 @@ fn ensure_openfang_config(webot_home: &PathBuf, openfang_bin: &PathBuf) -> Resul
         return Err(format!("创建 WEBOT_HOME 目录失败: {err}"));
     }
 
+    let config_text = [
+        "api_listen = \"127.0.0.1:4200\"",
+        "language = \"en\"",
+        "",
+        "[channels]",
+        "",
+        "[memory]",
+        "decay_rate = 0.05",
+        "",
+    ]
+    .join("\n");
+    fs::write(&config_path, config_text)
+        .map_err(|err| format!("写入初始 OpenFang 配置失败: {err}"))?;
+
     let log_path = webot_home.join("openfang-setup.log");
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|err| format!("无法写入初始化日志: {err}"))?;
-
-    let log_file_err = log_file
-        .try_clone()
-        .map_err(|err| format!("无法写入初始化日志: {err}"))?;
-
-    let mut command = std::process::Command::new(openfang_bin);
-    command
-        .arg("setup")
-        .arg("--quick")
-        .arg("--config")
-        .arg(&config_path)
-        .env("OPENFANG_HOME", webot_home)
-        .env("WEBOT_HOME", webot_home)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(log_file_err));
-    apply_no_window(&mut command);
-
-    let status = command
-        .status()
-        .map_err(|err| format!("运行 OpenFang 初始化失败: {err}"))?;
-
-    if !status.success() {
-        return Err(format!(
-            "OpenFang 初始化失败（exit={:?}），详情见 {}",
-            status.code(),
-            log_path.display()
-        ));
-    }
+    let setup_note = "Initialized minimal OpenFang config for WeBot package. No default provider or default model is preconfigured.\n";
+    fs::write(&log_path, setup_note).map_err(|err| format!("无法写入初始化日志: {err}"))?;
 
     Ok(())
 }
@@ -167,7 +149,7 @@ pub fn bootstrap() -> Result<DesktopState, String> {
             "未找到 openfang 可执行文件，请将 openfang.exe 放到 resources/openfang 目录".to_string()
         })?;
 
-        ensure_openfang_config(&webot_home, &command)?;
+        ensure_openfang_config(&webot_home)?;
 
         env::set_var("OPENFANG_START_COMMAND", &command);
         env::set_var("OPENFANG_START_ARGS", "start");
@@ -177,6 +159,11 @@ pub fn bootstrap() -> Result<DesktopState, String> {
         config.openfang_start_args = vec!["start".to_string()];
         config.openfang_workdir = Some(workdir);
     }
+
+    ensure_openfang_config(&webot_home)?;
+
+    webot_service_rs::reconcile_runtime_config_from_storage()
+        .map_err(|err| format!("重建 OpenFang 运行时配置失败: {err}"))?;
 
     env::set_var("WEBOT_HOME", &webot_home);
     env::set_var("OPENFANG_HOME", &webot_home);

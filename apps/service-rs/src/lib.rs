@@ -22,6 +22,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use toml::value::Table as TomlTable;
 use tracing::{error, info, warn};
 
 #[cfg(target_os = "windows")]
@@ -91,6 +92,122 @@ pub fn init_tracing() {
             )
             .init();
     });
+}
+
+pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
+    assignment_store::bootstrap_storage()?;
+    let provider_configs = assignment_store::list_provider_configs()?;
+    let provider_enabled = assignment_store::list_provider_enabled_map()?;
+    let model_enabled = assignment_store::list_model_enabled_map()?;
+    let mut default_model = assignment_store::get_default_model()?;
+
+    let config_path = path_resolver::openfang_config_path()?;
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建 OpenFang 配置目录失败: {e}"))?;
+    }
+
+    let mut root: TomlTable = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("读取 OpenFang 配置失败: {e}"))?;
+        toml::from_str::<TomlTable>(&content).unwrap_or_default()
+    } else {
+        TomlTable::new()
+    };
+
+    let mut toml_providers = Vec::new();
+    let mut valid_default = false;
+    for cfg in provider_configs {
+        let provider_id = assignment_store::normalize_provider_id(&cfg.provider_id);
+        if provider_id.is_empty() {
+            continue;
+        }
+        if !provider_enabled.get(&provider_id).copied().unwrap_or(true) {
+            continue;
+        }
+        let provider_ready = cfg
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+            || cfg
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some();
+
+        let mut models = cfg
+            .models
+            .iter()
+            .map(|item| assignment_store::normalize_model_name(item))
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        models.sort_by_key(|item| item.to_ascii_lowercase());
+        models.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+        let mut provider_table = TomlTable::new();
+        provider_table.insert("id".to_string(), toml::Value::String(provider_id.clone()));
+        provider_table.insert(
+            "protocol".to_string(),
+            toml::Value::String(cfg.protocol.trim().to_ascii_lowercase()),
+        );
+        if let Some(base_url) = cfg.base_url.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            provider_table.insert(
+                "base_url".to_string(),
+                toml::Value::String(base_url.trim_end_matches('/').to_string()),
+            );
+        }
+        if let Some(api_key) = cfg.api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            provider_table.insert("api_key".to_string(), toml::Value::String(api_key.to_string()));
+        }
+        toml_providers.push(toml::Value::Table(provider_table));
+
+        if let Some(default_id) = default_model.as_deref() {
+            for model_name in &models {
+                let model_id = assignment_store::make_model_id(&provider_id, model_name);
+                if !model_enabled.get(&model_id).copied().unwrap_or(true) {
+                    continue;
+                }
+                if provider_ready && model_id == default_id {
+                    valid_default = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !valid_default {
+        if default_model.is_some() {
+            assignment_store::clear_default_model()?;
+        }
+        default_model = None;
+    }
+
+    root.insert("providers".to_string(), toml::Value::Array(toml_providers));
+    if let Some(default_id) = default_model {
+        if let Some((provider_id, model_name)) = default_id.split_once("::") {
+            let mut default_table = TomlTable::new();
+            default_table.insert(
+                "provider".to_string(),
+                toml::Value::String(assignment_store::normalize_provider_id(provider_id)),
+            );
+            default_table.insert(
+                "model".to_string(),
+                toml::Value::String(assignment_store::normalize_model_name(model_name)),
+            );
+            root.insert("default_model".to_string(), toml::Value::Table(default_table));
+        } else {
+            root.remove("default_model");
+        }
+    } else {
+        root.remove("default_model");
+    }
+
+    let output = toml::to_string_pretty(&root)
+        .map_err(|e| format!("序列化 OpenFang 配置失败: {e}"))?;
+    fs::write(&config_path, output).map_err(|e| format!("写入 OpenFang 配置失败: {e}"))?;
+    Ok(())
 }
 
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {

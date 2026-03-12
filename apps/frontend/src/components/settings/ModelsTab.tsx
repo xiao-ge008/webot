@@ -21,6 +21,7 @@ import {
   setManagementDefaultModel,
   testManagementModelConnection,
   toggleManagementModelEnabled,
+  type ManagementModelsPayload,
   type ManagementModelOption,
 } from '@/services/management-client';
 
@@ -36,8 +37,13 @@ function groupModelsByProvider(models: ManagementModelOption[]) {
 
 export function ModelsTab() {
   const { t } = useTranslation();
-  const [providers, setProviders] = useState<{ providerId: string; displayName: string; enabled: boolean; linked: boolean }[]>([]);
+  const [providers, setProviders] = useState<{ providerId: string; displayName: string; enabled: boolean; linked: boolean; configured: boolean; healthy: boolean }[]>([]);
   const [models, setModels] = useState<ManagementModelOption[]>([]);
+  const [modelsMeta, setModelsMeta] = useState<Pick<ManagementModelsPayload, 'defaultModelId' | 'defaultModelValid' | 'defaultModelReason'>>({
+    defaultModelId: undefined,
+    defaultModelValid: true,
+    defaultModelReason: undefined,
+  });
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -59,18 +65,25 @@ export function ModelsTab() {
           displayName: item.displayName,
           enabled: item.enabled,
           linked: item.linked,
+          configured: item.configured,
+          healthy: item.healthy,
         })),
       );
-      setModels(modelRows);
+      setModels(modelRows.models);
+      setModelsMeta({
+        defaultModelId: modelRows.defaultModelId,
+        defaultModelValid: modelRows.defaultModelValid,
+        defaultModelReason: modelRows.defaultModelReason,
+      });
       setTestStatusMap((prev) => {
-        const visibleModelIds = new Set(modelRows.map((item) => item.modelId));
+        const visibleModelIds = new Set(modelRows.models.map((item) => item.modelId));
         return Object.fromEntries(
           Object.entries(prev).filter(([modelId]) => visibleModelIds.has(modelId)),
         );
       });
       setSelectedProviderId((prev) => {
         const linkedProviders = providerRows
-          .filter((item) => item.enabled && item.linked)
+          .filter((item) => item.enabled && item.configured)
           .map((item) => item.providerId);
         if (linkedProviders.includes(prev)) {
           return prev;
@@ -78,7 +91,7 @@ export function ModelsTab() {
         if (linkedProviders.length > 0) {
           return linkedProviders[0];
         }
-        const providersFromModels = Array.from(new Set(modelRows.map((item) => item.providerId)));
+        const providersFromModels = Array.from(new Set(modelRows.models.map((item) => item.providerId)));
         if (providersFromModels.includes(prev)) {
           return prev;
         }
@@ -138,7 +151,7 @@ export function ModelsTab() {
   }, [filteredModels]);
 
   const selectableProviders = useMemo(() => {
-    return providers.filter((item) => item.enabled && item.linked);
+    return providers.filter((item) => item.enabled && item.configured);
   }, [providers]);
 
   const providerIds = useMemo(() => {
@@ -277,6 +290,12 @@ export function ModelsTab() {
             {t('settings.models.refreshAll')}
           </Button>
         </div>
+        {!modelsMeta.defaultModelValid && (
+          <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
+            当前没有有效默认模型，请先启用一个模型并设为默认。原因：{modelsMeta.defaultModelReason || 'missing_or_unavailable'}
+          </div>
+        )}
+
         <div className="flex items-center gap-2">
           <div className="w-52">
             <Select value={selectedProviderId} onValueChange={setSelectedProviderId}>

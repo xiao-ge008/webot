@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,6 +98,155 @@ pub struct ChatGroupRecord {
     pub updated_at: String,
 }
 
+pub fn normalize_provider_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+pub fn normalize_model_name(value: &str) -> String {
+    value.trim().to_string()
+}
+
+pub fn make_model_id(provider_id: &str, model_name: &str) -> String {
+    format!(
+        "{}::{}",
+        normalize_provider_id(provider_id),
+        normalize_model_name(model_name)
+    )
+}
+
+pub fn normalize_model_id(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some((provider_id, model_name)) = trimmed.split_once("::") {
+        return make_model_id(provider_id, model_name);
+    }
+    trimmed.to_string()
+}
+
+fn normalize_provider_record(record: ProviderConfigRecord) -> ProviderConfigRecord {
+    let mut seen = HashSet::new();
+    let models = record
+        .models
+        .into_iter()
+        .map(|item| normalize_model_name(&item))
+        .filter(|item| !item.is_empty())
+        .filter(|item| seen.insert(item.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    ProviderConfigRecord {
+        provider_id: normalize_provider_id(&record.provider_id),
+        display_name: record
+            .display_name
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        protocol: record.protocol.trim().to_ascii_lowercase(),
+        base_url: record
+            .base_url
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty()),
+        api_key: record
+            .api_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        models,
+        is_custom: record.is_custom,
+        updated_at: record.updated_at,
+    }
+}
+
+fn merge_provider_records(current: &mut ProviderConfigRecord, incoming: ProviderConfigRecord) {
+    let prefer_incoming = incoming.updated_at >= current.updated_at;
+    if prefer_incoming {
+        if incoming.display_name.is_some() {
+            current.display_name = incoming.display_name.clone();
+        }
+        if !incoming.protocol.trim().is_empty() {
+            current.protocol = incoming.protocol.clone();
+        }
+        if incoming.base_url.is_some() {
+            current.base_url = incoming.base_url.clone();
+        }
+        if incoming.api_key.is_some() {
+            current.api_key = incoming.api_key.clone();
+        }
+        current.updated_at = incoming.updated_at.clone();
+    } else {
+        if current.display_name.is_none() {
+            current.display_name = incoming.display_name.clone();
+        }
+        if current.base_url.is_none() {
+            current.base_url = incoming.base_url.clone();
+        }
+        if current.api_key.is_none() {
+            current.api_key = incoming.api_key.clone();
+        }
+        if current.protocol.trim().is_empty() {
+            current.protocol = incoming.protocol.clone();
+        }
+    }
+    current.is_custom = current.is_custom && incoming.is_custom;
+    let mut seen = current
+        .models
+        .iter()
+        .map(|item| item.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for item in incoming.models {
+        if seen.insert(item.to_ascii_lowercase()) {
+            current.models.push(item);
+        }
+    }
+}
+
+fn normalize_provider_toggle_map(input: HashMap<String, bool>) -> HashMap<String, bool> {
+    let mut output = HashMap::new();
+    for (provider_id, enabled) in input {
+        let normalized = normalize_provider_id(&provider_id);
+        if normalized.is_empty() {
+            continue;
+        }
+        output
+            .entry(normalized)
+            .and_modify(|value| *value = *value || enabled)
+            .or_insert(enabled);
+    }
+    output
+}
+
+fn normalize_model_toggle_map(input: HashMap<String, bool>) -> HashMap<String, bool> {
+    let mut output = HashMap::new();
+    for (model_id, enabled) in input {
+        let normalized = normalize_model_id(&model_id);
+        if normalized.is_empty() {
+            continue;
+        }
+        output
+            .entry(normalized)
+            .and_modify(|value| *value = *value || enabled)
+            .or_insert(enabled);
+    }
+    output
+}
+
+fn normalize_provider_config_records(rows: Vec<ProviderConfigRecord>) -> Vec<ProviderConfigRecord> {
+    let mut merged = BTreeMap::<String, ProviderConfigRecord>::new();
+    for row in rows {
+        let normalized = normalize_provider_record(row);
+        if normalized.provider_id.is_empty() {
+            continue;
+        }
+        if let Some(existing) = merged.get_mut(&normalized.provider_id) {
+            merge_provider_records(existing, normalized);
+        } else {
+            merged.insert(normalized.provider_id.clone(), normalized);
+        }
+    }
+    merged.into_values().collect()
+}
+
+fn normalize_default_model_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|item| normalize_model_id(&item))
+        .filter(|item| !item.is_empty())
+}
+
 pub fn ensure_db() -> Result<PathBuf, String> {
     let db_path = db_path()?;
     let parent = db_path
@@ -105,7 +254,7 @@ pub fn ensure_db() -> Result<PathBuf, String> {
         .ok_or_else(|| "数据库目录无效".to_string())?;
     fs::create_dir_all(parent).map_err(|e| format!("创建数据库目录失败: {e}"))?;
 
-    let conn = Connection::open(&db_path).map_err(|e| format!("打开数据库失败: {e}"))?;
+    let mut conn = Connection::open(&db_path).map_err(|e| format!("打开数据库失败: {e}"))?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS agent_skill_toggles (
@@ -238,8 +387,174 @@ pub fn ensure_db() -> Result<PathBuf, String> {
     .map_err(|e| format!("初始化数据库结构失败: {e}"))?;
     ensure_agent_profile_override_columns(&conn)?;
     ensure_chat_group_columns(&conn)?;
+    migrate_provider_model_state(&mut conn)?;
 
     Ok(db_path)
+}
+
+fn migrate_provider_model_state(conn: &mut Connection) -> Result<(), String> {
+    let provider_rows = {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT provider_id, display_name, protocol, base_url, api_key, models_json, is_custom, updated_at
+                FROM provider_configs
+                ORDER BY updated_at ASC, provider_id ASC
+                "#,
+            )
+            .map_err(|e| format!("查询 provider 配置列表失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let models_json: String = row.get(5)?;
+                let models = serde_json::from_str::<Vec<String>>(&models_json).unwrap_or_default();
+                Ok(ProviderConfigRecord {
+                    provider_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    protocol: row.get(2)?,
+                    base_url: row.get(3)?,
+                    api_key: row.get(4)?,
+                    models,
+                    is_custom: row.get::<_, i64>(6)? != 0,
+                    updated_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| format!("读取 provider 配置列表失败: {e}"))?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row.map_err(|e| format!("解析 provider 配置记录失败: {e}"))?);
+        }
+        output
+    };
+    let normalized_providers = normalize_provider_config_records(provider_rows);
+
+    let provider_toggles = {
+        let mut stmt = conn
+            .prepare("SELECT provider_id, enabled FROM provider_toggles")
+            .map_err(|e| format!("查询 provider 开关失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let provider_id: String = row.get(0)?;
+                let enabled: i64 = row.get(1)?;
+                Ok((provider_id, enabled != 0))
+            })
+            .map_err(|e| format!("读取 provider 开关失败: {e}"))?;
+        let mut output = HashMap::new();
+        for row in rows {
+            let (provider_id, enabled) = row.map_err(|e| format!("解析 provider 开关失败: {e}"))?;
+            output.insert(provider_id, enabled);
+        }
+        normalize_provider_toggle_map(output)
+    };
+
+    let model_toggles = {
+        let mut stmt = conn
+            .prepare("SELECT model_id, enabled FROM model_toggles")
+            .map_err(|e| format!("查询 model 开关失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let model_id: String = row.get(0)?;
+                let enabled: i64 = row.get(1)?;
+                Ok((model_id, enabled != 0))
+            })
+            .map_err(|e| format!("读取 model 开关失败: {e}"))?;
+        let mut output = HashMap::new();
+        for row in rows {
+            let (model_id, enabled) = row.map_err(|e| format!("解析 model 开关失败: {e}"))?;
+            output.insert(model_id, enabled);
+        }
+        normalize_model_toggle_map(output)
+    };
+
+    let default_model = {
+        let mut stmt = conn
+            .prepare("SELECT value FROM app_prefs WHERE key = 'default_model_id'")
+            .map_err(|e| format!("查询默认模型失败: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("读取默认模型失败: {e}"))?;
+        match rows
+            .next()
+            .map_err(|e| format!("读取默认模型行失败: {e}"))?
+        {
+            Some(row) => Some(
+                row.get::<_, String>(0)
+                    .map_err(|e| format!("解析默认模型失败: {e}"))?,
+            ),
+            None => None,
+        }
+    };
+    let normalized_default_model = normalize_default_model_value(default_model);
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("开启 provider/model 迁移事务失败: {e}"))?;
+
+    tx.execute("DELETE FROM provider_configs", [])
+        .map_err(|e| format!("清理 provider 配置失败: {e}"))?;
+    for record in normalized_providers {
+        tx.execute(
+            r#"
+            INSERT INTO provider_configs(
+                provider_id, display_name, protocol, base_url, api_key, models_json, is_custom, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)
+            "#,
+            params![
+                record.provider_id,
+                record.display_name,
+                record.protocol,
+                record.base_url,
+                record.api_key,
+                serde_json::to_string(&record.models)
+                    .map_err(|e| format!("序列化模型列表失败: {e}"))?,
+                if record.is_custom { 1 } else { 0 },
+            ],
+        )
+        .map_err(|e| format!("回写 provider 配置失败: {e}"))?;
+    }
+
+    tx.execute("DELETE FROM provider_toggles", [])
+        .map_err(|e| format!("清理 provider 开关失败: {e}"))?;
+    for (provider_id, enabled) in provider_toggles {
+        tx.execute(
+            r#"
+            INSERT INTO provider_toggles(provider_id, enabled, updated_at)
+            VALUES (?1, ?2, CURRENT_TIMESTAMP)
+            "#,
+            params![provider_id, if enabled { 1 } else { 0 }],
+        )
+        .map_err(|e| format!("回写 provider 开关失败: {e}"))?;
+    }
+
+    tx.execute("DELETE FROM model_toggles", [])
+        .map_err(|e| format!("清理 model 开关失败: {e}"))?;
+    for (model_id, enabled) in model_toggles {
+        tx.execute(
+            r#"
+            INSERT INTO model_toggles(model_id, enabled, updated_at)
+            VALUES (?1, ?2, CURRENT_TIMESTAMP)
+            "#,
+            params![model_id, if enabled { 1 } else { 0 }],
+        )
+        .map_err(|e| format!("回写 model 开关失败: {e}"))?;
+    }
+
+    tx.execute("DELETE FROM app_prefs WHERE key = 'default_model_id'", [])
+        .map_err(|e| format!("清理默认模型失败: {e}"))?;
+    if let Some(model_id) = normalized_default_model {
+        tx.execute(
+            r#"
+            INSERT INTO app_prefs(key, value, updated_at)
+            VALUES ('default_model_id', ?1, CURRENT_TIMESTAMP)
+            "#,
+            params![model_id],
+        )
+        .map_err(|e| format!("回写默认模型失败: {e}"))?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("提交 provider/model 迁移事务失败: {e}"))?;
+    Ok(())
 }
 
 pub fn bootstrap_storage() -> Result<(), String> {
@@ -658,6 +973,10 @@ pub fn clear_global_mcp_config() -> Result<(), String> {
 }
 
 pub fn set_provider_enabled(provider_id: &str, enabled: bool) -> Result<(), String> {
+    let provider_id = normalize_provider_id(provider_id);
+    if provider_id.is_empty() {
+        return Err("provider id 不能为空".to_string());
+    }
     let conn = open_conn()?;
     conn.execute(
         r#"
@@ -692,10 +1011,14 @@ pub fn list_provider_enabled_map() -> Result<HashMap<String, bool>, String> {
         let (provider_id, enabled) = row.map_err(|e| format!("解析 provider 开关失败: {e}"))?;
         output.insert(provider_id, enabled);
     }
-    Ok(output)
+    Ok(normalize_provider_toggle_map(output))
 }
 
 pub fn set_model_enabled(model_id: &str, enabled: bool) -> Result<(), String> {
+    let model_id = normalize_model_id(model_id);
+    if model_id.is_empty() {
+        return Err("model id 不能为空".to_string());
+    }
     let conn = open_conn()?;
     conn.execute(
         r#"
@@ -730,10 +1053,14 @@ pub fn list_model_enabled_map() -> Result<HashMap<String, bool>, String> {
         let (model_id, enabled) = row.map_err(|e| format!("解析 model 开关失败: {e}"))?;
         output.insert(model_id, enabled);
     }
-    Ok(output)
+    Ok(normalize_model_toggle_map(output))
 }
 
 pub fn set_default_model(model_id: &str) -> Result<(), String> {
+    let model_id = normalize_model_id(model_id);
+    if model_id.is_empty() {
+        return Err("默认模型不能为空".to_string());
+    }
     let conn = open_conn()?;
     conn.execute(
         r#"
@@ -812,7 +1139,7 @@ pub fn get_default_model() -> Result<Option<String>, String> {
         return Ok(None);
     };
     let value: String = row.get(0).map_err(|e| format!("解析默认模型失败: {e}"))?;
-    Ok(Some(value))
+    Ok(normalize_default_model_value(Some(value)))
 }
 
 pub fn list_model_assignments() -> Result<Vec<ModelAssignmentRecord>, String> {
@@ -826,7 +1153,7 @@ pub fn list_model_assignments() -> Result<Vec<ModelAssignmentRecord>, String> {
             if normalized_name.is_empty() {
                 continue;
             }
-            let model_id = format!("{}::{}", provider.provider_id, normalized_name);
+            let model_id = make_model_id(&provider.provider_id, &normalized_name);
             output.push(ModelAssignmentRecord {
                 model_id: model_id.clone(),
                 provider_id: provider.provider_id.clone(),
@@ -840,6 +1167,10 @@ pub fn list_model_assignments() -> Result<Vec<ModelAssignmentRecord>, String> {
 }
 
 pub fn upsert_provider_config(record: &ProviderConfigRecord) -> Result<(), String> {
+    let record = normalize_provider_record(record.clone());
+    if record.provider_id.is_empty() {
+        return Err("provider id 不能为空".to_string());
+    }
     let conn = open_conn()?;
     conn.execute(
         r#"
@@ -871,6 +1202,10 @@ pub fn upsert_provider_config(record: &ProviderConfigRecord) -> Result<(), Strin
 }
 
 pub fn get_provider_config(provider_id: &str) -> Result<Option<ProviderConfigRecord>, String> {
+    let provider_id = normalize_provider_id(provider_id);
+    if provider_id.is_empty() {
+        return Ok(None);
+    }
     let conn = open_conn()?;
     let mut stmt = conn
         .prepare(
@@ -897,7 +1232,7 @@ pub fn get_provider_config(provider_id: &str) -> Result<Option<ProviderConfigRec
         .map_err(|e| format!("读取 provider models_json 失败: {e}"))?;
     let models = serde_json::from_str::<Vec<String>>(&models_json)
         .map_err(|e| format!("反序列化 provider models_json 失败: {e}"))?;
-    Ok(Some(ProviderConfigRecord {
+    Ok(Some(normalize_provider_record(ProviderConfigRecord {
         provider_id: row
             .get(0)
             .map_err(|e| format!("读取 provider_id 失败: {e}"))?,
@@ -915,7 +1250,7 @@ pub fn get_provider_config(provider_id: &str) -> Result<Option<ProviderConfigRec
         updated_at: row
             .get(7)
             .map_err(|e| format!("读取 updated_at 失败: {e}"))?,
-    }))
+    })))
 }
 
 pub fn list_provider_configs() -> Result<Vec<ProviderConfigRecord>, String> {
@@ -951,10 +1286,14 @@ pub fn list_provider_configs() -> Result<Vec<ProviderConfigRecord>, String> {
     for row in rows {
         output.push(row.map_err(|e| format!("解析 provider 配置记录失败: {e}"))?);
     }
-    Ok(output)
+    Ok(normalize_provider_config_records(output))
 }
 
 pub fn delete_provider_config(provider_id: &str) -> Result<(), String> {
+    let provider_id = normalize_provider_id(provider_id);
+    if provider_id.is_empty() {
+        return Ok(());
+    }
     let conn = open_conn()?;
     conn.execute(
         "DELETE FROM provider_configs WHERE provider_id = ?1",

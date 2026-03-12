@@ -78,8 +78,8 @@ jobs:
         run: |
           npx tauri build --bundles app
           ARCH="$(uname -m)"
-          APP_PATH="src-tauri/target/release/bundle/macos/WeBot VI.0 Beta.app"
-          ZIP_PATH="src-tauri/target/release/bundle/macos/WeBot VI.0 Beta_${ARCH}.app.zip"
+          APP_PATH="src-tauri/target/release/bundle/macos/WeBot.app"
+          ZIP_PATH="src-tauri/target/release/bundle/macos/WeBot_${ARCH}.app.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
         working-directory: apps/frontend
         shell: bash

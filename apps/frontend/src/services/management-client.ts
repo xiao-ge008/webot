@@ -188,12 +188,19 @@ export interface ManagementModelOption {
   source?: string;
 }
 
-export async function listManagementModels(): Promise<ManagementModelOption[]> {
+export interface ManagementModelsPayload {
+  models: ManagementModelOption[];
+  defaultModelId?: string;
+  defaultModelValid: boolean;
+  defaultModelReason?: string;
+}
+
+export async function listManagementModels(): Promise<ManagementModelsPayload> {
   const payload = await requestJson<unknown>('/api/management/models');
   const rows = isRecord(payload) && Array.isArray(payload.models) ? payload.models : [];
   const defaultModelId = isRecord(payload) ? asString(payload.default_model_id) : '';
 
-  return rows
+  const models = rows
     .filter(isRecord)
     .map((row) => {
       const modelId = asString(row.id, asString(row.model));
@@ -216,6 +223,13 @@ export async function listManagementModels(): Promise<ManagementModelOption[]> {
       };
     })
     .filter((item) => item.modelId.length > 0);
+
+  return {
+    models,
+    defaultModelId: defaultModelId || undefined,
+    defaultModelValid: isRecord(payload) ? asBool(payload.default_model_valid, Boolean(defaultModelId)) : Boolean(defaultModelId),
+    defaultModelReason: isRecord(payload) ? asString(payload.default_model_reason) || undefined : undefined,
+  };
 }
 
 export interface ManagementProviderOption {
@@ -227,6 +241,12 @@ export interface ManagementProviderOption {
   enabled: boolean;
   linked: boolean;
   hasApiKey: boolean;
+  hasBaseUrl: boolean;
+  configured: boolean;
+  runtimeLoaded: boolean;
+  modelDiscovered: boolean;
+  healthy: boolean;
+  healthStatus?: string;
   source?: string;
   protocol?: string;
   isCustom?: boolean;
@@ -246,6 +266,12 @@ export async function listManagementProviders(): Promise<ManagementProviderOptio
       enabled: typeof row.enabled === 'boolean' ? row.enabled : true,
       linked: typeof row.linked === 'boolean' ? row.linked : true,
       hasApiKey: Boolean(row.has_api_key),
+      hasBaseUrl: Boolean(row.has_base_url),
+      configured: typeof row.configured === 'boolean' ? row.configured : Boolean(row.has_api_key),
+      runtimeLoaded: typeof row.runtime_loaded === 'boolean' ? row.runtime_loaded : false,
+      modelDiscovered: typeof row.model_discovered === 'boolean' ? row.model_discovered : false,
+      healthy: typeof row.healthy === 'boolean' ? row.healthy : false,
+      healthStatus: asString(row.health_status) || undefined,
       source: asString(row.source) || undefined,
       protocol: asString(row.protocol) || undefined,
       isCustom: typeof row.is_custom === 'boolean' ? row.is_custom : undefined,

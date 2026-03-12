@@ -69,15 +69,33 @@ function parseModelsText(text: string): string[] {
 }
 
 function authConfigured(provider: ManagementProviderOption, cfg?: ProviderConfigItem): boolean {
+  if (provider.configured) {
+    return true;
+  }
   const auth = provider.authStatus.toLowerCase();
   if (!auth.includes('missing') && !auth.includes('none')) {
     return true;
   }
-  return cfg?.has_api_key === true;
+  return cfg?.has_api_key === true || provider.hasBaseUrl;
 }
 
 function authStatusLabel(configured: boolean, t: (key: string) => string): string {
   return configured ? t('settings.providers.apiKeySet') : t('settings.providers.apiKeyMissing');
+}
+
+function providerHealthLabel(provider: ManagementProviderOption): { text: string; tone: string } {
+  switch (provider.healthStatus) {
+    case 'healthy':
+      return { text: '已就绪', tone: 'text-success' };
+    case 'no_models':
+      return { text: '无模型', tone: 'text-amber-600' };
+    case 'configured':
+      return { text: '待加载', tone: 'text-amber-600' };
+    case 'disabled':
+      return { text: '已禁用', tone: 'text-foreground-tertiary' };
+    default:
+      return { text: '待配置', tone: 'text-amber-600' };
+  }
 }
 
 function createFormFromProvider(
@@ -150,7 +168,7 @@ export function ProvidersTab() {
     void loadProviders();
   }, []);
 
-  const connectedProviders = providers.filter((item) => item.linked);
+  const connectedProviders = providers.filter((item) => item.enabled || item.configured || item.linked);
 
   const filteredCatalog = PROVIDER_CATALOG.filter((item) => {
     const keyword = search.trim().toLowerCase();
@@ -346,9 +364,9 @@ export function ProvidersTab() {
                 <div className="space-y-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-[15px] font-medium text-foreground">{provider.displayName}</span>
-                    <span className="inline-flex items-center gap-1 text-xs text-success">
+                    <span className={cn('inline-flex items-center gap-1 text-xs', providerHealthLabel(provider).tone)}>
                       <Circle className="w-2.5 h-2.5 fill-current" />
-                      正常
+                      {providerHealthLabel(provider).text}
                     </span>
                     <Badge variant="outline" className="text-[10px]">
                       {toProtocol(provider.protocol)}
@@ -356,6 +374,13 @@ export function ProvidersTab() {
                   </div>
                   <p className="text-xs text-foreground-tertiary truncate">
                     {authStatusLabel(authConfigured(provider, configMap.get(provider.providerId)), t)} · {provider.providerId}
+                  </p>
+                  <p className="text-xs text-foreground-tertiary truncate">
+                    {provider.healthy
+                      ? '运行时已加载，可用于模型与智能体。'
+                      : provider.modelDiscovered
+                        ? '已保存配置，但建议执行一次模型测试。'
+                        : '请补充模型列表或自动发现模型后再使用。'}
                   </p>
                 </div>
               </div>

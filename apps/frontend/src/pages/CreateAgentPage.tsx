@@ -425,8 +425,8 @@ export function CreateAgentPage() {
     const loadModels = async () => {
       try {
         const loaded = await listManagementModels();
-        const enabledModels = loaded.filter((item) => item.enabled);
-        const options = enabledModels.length > 0 ? enabledModels : loaded;
+        const enabledModels = loaded.models.filter((item) => item.enabled);
+        const options = enabledModels.length > 0 ? enabledModels : loaded.models;
         setModelOptions(options);
         if (options.length > 0) {
           const preferred = options.find((item) => item.isDefault) ?? options[0];
@@ -627,8 +627,8 @@ export function CreateAgentPage() {
       let effectiveModel = selectedModel;
       if (!effectiveModel) {
         const loaded = await listManagementModels();
-        const enabledModels = loaded.filter((item) => item.enabled);
-        const options = enabledModels.length > 0 ? enabledModels : loaded;
+        const enabledModels = loaded.models.filter((item) => item.enabled);
+        const options = enabledModels.length > 0 ? enabledModels : loaded.models;
         setModelOptions(options);
         effectiveModel = pickPreferredModel(options);
         if (effectiveModel) {
