@@ -600,6 +600,31 @@ function toToolJsonString(value: unknown): string {
   }
 }
 
+function getToolResultPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const tool = toStringValue(payload.tool);
+  const input = payload.input;
+  const result = payload.output
+    ?? payload.result
+    ?? payload.content
+    ?? payload.message
+    ?? payload.data
+    ?? payload.response
+    ?? payload.value;
+
+  const serialized: Record<string, unknown> = {};
+  if (tool) serialized.tool = tool;
+  if (input !== undefined) serialized.input = input;
+  if (result !== undefined) {
+    serialized.output = result;
+  } else {
+    for (const [key, value] of Object.entries(payload)) {
+      if (key === 'type' || key === 'tool' || key === 'input') continue;
+      serialized[key] = value;
+    }
+  }
+  return serialized;
+}
+
 interface ParsedTextToolCall {
   tool: string;
   input: Record<string, unknown>;
@@ -1587,10 +1612,7 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
               emitChunk({
                 requestId,
                 kind: 'log',
-                value: JSON.stringify({
-                  tool: toStringValue(payload.tool),
-                  input: toToolJsonString(payload.input),
-                }),
+                value: toToolJsonString(getToolResultPayload(payload)),
                 event: 'tool_result',
                 meta: {
                   rawEvent: type,

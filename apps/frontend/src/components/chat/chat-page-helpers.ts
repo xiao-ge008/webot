@@ -1238,9 +1238,31 @@ export function extractReadableText(value: unknown): string | undefined {
   return undefined;
 }
 
-export function extractReadableTextFromLog(raw: string): string | undefined {
+function parseToolLogPayload(raw: string): Record<string, unknown> | undefined {
   const payload = parseJsonSafely<Record<string, unknown>>(raw);
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return undefined;
+  }
+  return payload;
+}
+
+function hasMeaningfulToolLogContent(payload: Record<string, unknown>): boolean {
+  const ignoredKeys = new Set(['tool', 'input', 'args', 'arguments', 'name', 'id', 'type']);
+  return Object.keys(payload).some((key) => {
+    if (ignoredKeys.has(key)) return false;
+    const value = payload[key];
+    if (value == null) return false;
+    if (typeof value === 'string') return value.trim().length > 0;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === 'object') return Object.keys(value as Record<string, unknown>).length > 0;
+    return true;
+  });
+}
+
+export function extractReadableTextFromLog(raw: string): string | undefined {
+  const payload = parseToolLogPayload(raw);
   if (!payload) return undefined;
+  if (!hasMeaningfulToolLogContent(payload)) return undefined;
   const text = extractReadableText(payload);
   if (!text) return undefined;
   return text.slice(0, 2400);
@@ -1273,13 +1295,17 @@ ${row.detail || ''}`));
 
   const detail = (latestTool.detail || '').trim();
   const title = latestTool.title.trim() || '工具结果';
+  const payload = parseToolLogPayload(detail);
   const readable = extractReadableTextFromLog(detail);
 
   const queryMatch = detail.match(/(?:^|\n)\s*query\s*:\s*(.+)$/im);
   const toolMatch = detail.match(/<tool_call>\s*=?\s*([^\n\r]+)/i);
 
   const query = queryMatch?.[1]?.trim();
-  const toolName = toolMatch?.[1]?.trim();
+  const toolName = toolMatch?.[1]?.trim() || (typeof payload?.tool === 'string' ? payload.tool.trim() : '');
+  const fallbackDetail = hasMeaningfulToolLogContent(payload || {})
+    ? detail.replace(/<tool_call>\s*=?\s*/gi, '').trim()
+    : '';
 
   const weatherLike = query && /天气|气温|温度|降雨|下雨|预报/i.test(query);
   if (weatherLike) {
@@ -1300,7 +1326,7 @@ ${row.detail || ''}`));
 
   const content = readable
     || query
-    || detail.replace(/<tool_call>\s*=?\s*/gi, '').trim()
+    || fallbackDetail
     || '本次工具已执行，但后端未返回可解析的最终展示内容。';
 
   return {
