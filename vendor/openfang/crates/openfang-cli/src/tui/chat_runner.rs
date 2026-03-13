@@ -601,7 +601,7 @@ impl StandaloneChat {
         }
 
         // Auto-spawn from template
-        let target_name = agent_name.unwrap_or("assistant");
+        let target_name = agent_name.unwrap_or("nuwa");
         let all_templates = crate::templates::load_all_templates();
         let template = all_templates
             .iter()
@@ -646,7 +646,7 @@ impl StandaloneChat {
 
         // Spawn from template
         let target_name = if self.agent_name.is_empty() {
-            "assistant"
+            "nuwa"
         } else {
             &self.agent_name
         };
@@ -654,7 +654,7 @@ impl StandaloneChat {
         let template = all_templates
             .iter()
             .find(|t| t.name == target_name)
-            .or_else(|| all_templates.iter().find(|t| t.name == "assistant"))
+            .or_else(|| all_templates.iter().find(|t| t.name == "nuwa"))
             .or_else(|| all_templates.first());
 
         match template {

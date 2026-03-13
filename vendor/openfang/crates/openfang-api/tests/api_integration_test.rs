@@ -270,7 +270,7 @@ async fn test_spawn_list_kill_agent() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "killed");
 
-    // --- List (only default assistant remains) ---
+    // --- List (only default built-in agent remains) ---
     let resp = client
         .get(format!("{}/api/agents", server.base_url))
         .send()
@@ -279,7 +279,7 @@ async fn test_spawn_list_kill_agent() {
     assert_eq!(resp.status(), 200);
     let agents: Vec<serde_json::Value> = resp.json().await.unwrap();
     assert_eq!(agents.len(), 1);
-    assert_eq!(agents[0]["name"], "assistant");
+    assert_eq!(agents[0]["name"], "女娲");
 }
 
 #[tokio::test]

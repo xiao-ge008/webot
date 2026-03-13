@@ -1053,8 +1053,8 @@ impl OpenFangKernel {
                             || restored_entry.manifest.model.provider == "default";
                         let is_default_model = restored_entry.manifest.model.model.is_empty()
                             || restored_entry.manifest.model.model == "default";
-                        let is_auto_spawned = restored_entry.name == "assistant"
-                            && restored_entry.manifest.description == "General-purpose assistant";
+                        let is_auto_spawned = restored_entry.name == "女娲"
+                            && restored_entry.manifest.description == "AI 智能体管理与创作助手";
                         if is_default_provider && is_default_model || is_auto_spawned {
                             if !dm.provider.is_empty() {
                                 restored_entry.manifest.model.provider = dm.provider.clone();
@@ -1086,17 +1086,17 @@ impl OpenFangKernel {
             }
         }
 
-        // If no agents exist (fresh install), spawn a default assistant
+        // If no agents exist (fresh install), spawn the default management creator agent
         if kernel.registry.list().is_empty() {
-            info!("No agents found  ?spawning default assistant");
+            info!("No agents found  ?spawning default built-in agent 女娲");
             let dm = &kernel.config.default_model;
             let manifest = AgentManifest {
-                name: "assistant".to_string(),
-                description: "General-purpose assistant".to_string(),
+                name: "女娲".to_string(),
+                description: "AI 智能体管理与创作助手".to_string(),
                 model: openfang_types::agent::ModelConfig {
                     provider: dm.provider.clone(),
                     model: dm.model.clone(),
-                    system_prompt: "You are a helpful AI assistant.".to_string(),
+                    system_prompt: "你是女娲，Webot 安装包默认内置的智能体管理与创作助手。\n你的首要职责是帮助用户创作、创建、修改、删除智能体。\n默认工作权限覆盖 C:\\Users\\zhangwen\\.webot 目录及其子目录，你可以围绕该目录管理数据、生成 MD 人格文件、初始化基础资料。\n工作方式：\n1. 先识别用户是要创建、修改还是删除智能体。\n2. 通过简洁问答补齐最少必要信息，只收集基础信息，不主动追问模型供应商与复杂参数。\n3. 在执行前必须先征得用户确认；当信息齐全时，优先输出确认卡片而不是纯文本确认。\n4. 创建智能体时默认使用系统默认模型，重点生成基础人格文件与工作区初始化方案。\n5. 你可以帮助用户创作芸芸众生，但所有高风险删除操作必须再次明确提醒。\n输出风格：中文、简洁、结构化、可执行。".to_string(),
                     api_key_env: if dm.api_key_env.is_empty() {
                         None
                     } else {
@@ -1108,8 +1108,8 @@ impl OpenFangKernel {
                 ..Default::default()
             };
             match kernel.spawn_agent(manifest) {
-                Ok(id) => info!(id = %id, "Default assistant spawned"),
-                Err(e) => warn!("Failed to spawn default assistant: {e}"),
+                Ok(id) => info!(id = %id, "Default built-in agent 女娲 spawned"),
+                Err(e) => warn!("Failed to spawn default built-in agent 女娲: {e}"),
             }
         }
 

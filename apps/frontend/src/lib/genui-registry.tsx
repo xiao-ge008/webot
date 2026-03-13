@@ -14,6 +14,7 @@ import { GenUIAudioPlayer, GenUIAudioPlaylist } from '@/components/chat/BuiltinA
 import { GenUIMarkdownPreviewCard } from '@/components/chat/BuiltinMarkdownPreviewComponents';
 import { GenUIOfficePreviewCard } from '@/components/chat/BuiltinOfficePreviewComponents';
 import { GenUIOptionSelector } from '@/components/chat/BuiltinOptionComponents';
+import { GenUIAgentManagementConfirmCard } from '@/components/chat/AgentManagementConfirmCard';
 import { GenUIGroupUpgradeCard } from '@/components/chat/GroupUpgradeCard';
 import {
     GenUIAreaChartCard,
@@ -230,6 +231,11 @@ export const genUiComponents: any = {
     option_selector: GenUIOptionSelector,
     'option.selector': GenUIOptionSelector,
     option: GenUIOptionSelector,
+    AgentManagementConfirmCard: GenUIAgentManagementConfirmCard,
+    agentmanagementconfirmcard: GenUIAgentManagementConfirmCard,
+    agent_management_confirm_card: GenUIAgentManagementConfirmCard,
+    'agent.management.confirm': GenUIAgentManagementConfirmCard,
+    'agent-management-confirm': GenUIAgentManagementConfirmCard,
     GroupUpgradeCard: GenUIGroupUpgradeCard,
     groupupgradecard: GenUIGroupUpgradeCard,
     group_upgrade_card: GenUIGroupUpgradeCard,

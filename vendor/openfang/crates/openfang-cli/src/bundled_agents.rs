@@ -9,7 +9,6 @@ pub fn bundled_agents() -> Vec<(&'static str, &'static str)> {
     vec![
         ("analyst", include_str!("../../../agents/analyst/agent.toml")),
         ("architect", include_str!("../../../agents/architect/agent.toml")),
-        ("assistant", include_str!("../../../agents/assistant/agent.toml")),
         ("coder", include_str!("../../../agents/coder/agent.toml")),
         ("code-reviewer", include_str!("../../../agents/code-reviewer/agent.toml")),
         ("customer-support", include_str!("../../../agents/customer-support/agent.toml")),
@@ -23,6 +22,7 @@ pub fn bundled_agents() -> Vec<(&'static str, &'static str)> {
         ("home-automation", include_str!("../../../agents/home-automation/agent.toml")),
         ("legal-assistant", include_str!("../../../agents/legal-assistant/agent.toml")),
         ("meeting-assistant", include_str!("../../../agents/meeting-assistant/agent.toml")),
+        ("nuwa", include_str!("../../../agents/nuwa/agent.toml")),
         ("ops", include_str!("../../../agents/ops/agent.toml")),
         ("orchestrator", include_str!("../../../agents/orchestrator/agent.toml")),
         ("personal-finance", include_str!("../../../agents/personal-finance/agent.toml")),

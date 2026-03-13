@@ -674,8 +674,8 @@ async fn dispatch_message(
     let agent_id = match agent_id {
         Some(id) => id,
         None => {
-            // Fallback: try "assistant" agent, then first available agent
-            let fallback = handle.find_agent_by_name("assistant").await.ok().flatten();
+            // Fallback: try "女娲" agent, then first available agent
+            let fallback = handle.find_agent_by_name("女娲").await.ok().flatten();
             let fallback = match fallback {
                 Some(id) => Some(id),
                 None => handle

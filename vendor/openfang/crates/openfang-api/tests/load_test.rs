@@ -541,7 +541,7 @@ async fn load_spawn_kill_cycle() {
         .await
         .unwrap();
     let remaining = agents.as_array().map(|a| a.len()).unwrap_or(0);
-    assert_eq!(remaining, 1, "Only default assistant should remain");
+    assert_eq!(remaining, 1, "Only default built-in agent should remain");
 }
 
 /// Test: Prometheus metrics endpoint under sustained load.

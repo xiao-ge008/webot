@@ -160,7 +160,7 @@ pub async fn start_whatsapp_gateway(kernel: &Arc<super::kernel::OpenFangKernel>)
     let default_agent = wa_config
         .default_agent
         .as_deref()
-        .unwrap_or("assistant")
+        .unwrap_or("女娲")
         .to_string();
 
     // Auto-set the env var so the rest of the system finds the gateway

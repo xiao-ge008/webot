@@ -28,6 +28,8 @@ export interface ChatRendererProps {
   onOpenA2aCardDetails: (messageId: string, cardId: string) => void;
   onConfirmGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
   onCancelGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
+  onConfirmAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
+  onCancelAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (v: boolean) => void;
   infoSidebarCollapsed: boolean;
@@ -57,6 +59,8 @@ export const ChatRenderer = memo(function ChatRenderer({
   onOpenA2aCardDetails,
   onConfirmGroupUpgrade,
   onCancelGroupUpgrade,
+  onConfirmAgentManagement,
+  onCancelAgentManagement,
   sidebarCollapsed,
   setSidebarCollapsed,
   infoSidebarCollapsed,
@@ -86,6 +90,8 @@ export const ChatRenderer = memo(function ChatRenderer({
       onOpenA2aCardDetails={onOpenA2aCardDetails}
       onConfirmGroupUpgrade={onConfirmGroupUpgrade}
       onCancelGroupUpgrade={onCancelGroupUpgrade}
+      onConfirmAgentManagement={onConfirmAgentManagement}
+      onCancelAgentManagement={onCancelAgentManagement}
       sidebarCollapsed={sidebarCollapsed}
       onToggleSidebar={() => setSidebarCollapsed(!sidebarCollapsed)}
       infoSidebarCollapsed={infoSidebarCollapsed}
@@ -105,6 +111,8 @@ export const ChatRenderer = memo(function ChatRenderer({
   && prev.onUserActivity === next.onUserActivity
   && prev.onConfirmGroupUpgrade === next.onConfirmGroupUpgrade
   && prev.onCancelGroupUpgrade === next.onCancelGroupUpgrade
+  && prev.onConfirmAgentManagement === next.onConfirmAgentManagement
+  && prev.onCancelAgentManagement === next.onCancelAgentManagement
   && prev.sidebarCollapsed === next.sidebarCollapsed
   && prev.infoSidebarCollapsed === next.infoSidebarCollapsed
 ));

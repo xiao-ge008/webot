@@ -70,6 +70,8 @@ export interface ChatConversationPaneProps {
   onOpenA2aCardDetails: (messageId: string, cardId: string) => void;
   onConfirmGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
   onCancelGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
+  onConfirmAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
+  onCancelAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
   infoSidebarCollapsed: boolean;
@@ -262,6 +264,8 @@ export function ChatConversationPane({
   onOpenA2aCardDetails,
   onConfirmGroupUpgrade,
   onCancelGroupUpgrade,
+  onConfirmAgentManagement,
+  onCancelAgentManagement,
   sidebarCollapsed,
   onToggleSidebar,
   infoSidebarCollapsed,
@@ -365,6 +369,18 @@ export function ChatConversationPane({
       || normalized === 'group-upgrade-cancel'
       || normalized === 'group.upgrade.cancel'
     );
+    const isAgentManagementConfirmAction = (
+      normalized === 'confirm_agent_management'
+      || normalized === 'agent_management_confirm'
+      || normalized === 'agent-management-confirm'
+      || normalized === 'agent.management.confirm'
+    );
+    const isAgentManagementCancelAction = (
+      normalized === 'cancel_agent_management'
+      || normalized === 'agent_management_cancel'
+      || normalized === 'agent-management-cancel'
+      || normalized === 'agent.management.cancel'
+    );
     const isOptionSubmitAction = (
       normalized === 'submit_option'
       || normalized === 'option_submit'
@@ -377,7 +393,16 @@ export function ChatConversationPane({
       || normalized === 'option.submit'
       || normalized === 'option.select'
     );
-    if (!isImageInsertAction && !isVideoInsertAction && !isAudioInsertAction && !isOptionSubmitAction && !isGroupUpgradeConfirmAction && !isGroupUpgradeCancelAction) return;
+    if (
+      !isImageInsertAction
+      && !isVideoInsertAction
+      && !isAudioInsertAction
+      && !isOptionSubmitAction
+      && !isGroupUpgradeConfirmAction
+      && !isGroupUpgradeCancelAction
+      && !isAgentManagementConfirmAction
+      && !isAgentManagementCancelAction
+    ) return;
 
     if (typeof onUserActivity === 'function') {
       onUserActivity('ui_action');
@@ -389,6 +414,16 @@ export function ChatConversationPane({
         onConfirmGroupUpgrade?.(payloadRecord, ctx);
       } else {
         onCancelGroupUpgrade?.(payloadRecord, ctx);
+      }
+      return;
+    }
+
+    if (isAgentManagementConfirmAction || isAgentManagementCancelAction) {
+      const payloadRecord = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+      if (isAgentManagementConfirmAction) {
+        onConfirmAgentManagement?.(payloadRecord, ctx);
+      } else {
+        onCancelAgentManagement?.(payloadRecord, ctx);
       }
       return;
     }
@@ -514,8 +549,12 @@ export function ChatConversationPane({
     appendImageToInput,
     appendVideoToInput,
     messages,
+    onCancelAgentManagement,
     onCancelTaskCard,
+    onCancelGroupUpgrade,
+    onConfirmAgentManagement,
     onConfirmCreateTaskCard,
+    onConfirmGroupUpgrade,
     onCreateTaskCard,
     onSendSilentMessage,
     onUserActivity,

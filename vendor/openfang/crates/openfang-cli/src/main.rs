@@ -476,7 +476,7 @@ enum ConfigCommands {
 enum AgentCommands {
     /// Spawn a new agent from a template (interactive or by name).
     New {
-        /// Template name (e.g., "coder", "assistant"). Interactive picker if omitted.
+        /// Template name (e.g., "coder", "nuwa"). Interactive picker if omitted.
         template: Option<String>,
     },
     /// Spawn a new agent from a manifest file.

@@ -181,17 +181,18 @@ async function resolveDefaultModel(homeDirOverride?: string): Promise<{
 function getDefaultAgentSeeds(): DefaultAgentSeed[] {
   return [
     {
-      agentId: 'agent-dev',
-      name: '开发',
-      title: '核心开发工程师',
-      tags: ['开发', '架构', '交付'],
-      summary: '负责核心功能开发与交付，强调工程质量与可维护性。',
-      soul: '严谨务实，重视结构与细节，能把需求落地为代码。',
+      agentId: 'nuwa',
+      name: '女娲',
+      title: '默认智能体管理与创作助手',
+      tags: ['默认', '智能体管理', '创作'],
+      summary: '负责引导用户创建、修改、删除智能体，并生成基础人格文件与初始化数据。',
+      soul: '善于塑形与引导，既能满足创作需求，也重视确认与边界。',
       systemPrompt: [
-        '你是核心开发工程师，负责功能实现与技术落地。',
-        '回答需包含可执行步骤、关键技术细节与风险提醒。',
+        '你是女娲，默认内置的智能体管理与创作助手。',
+        '你负责帮助用户创建、修改、删除智能体，默认使用系统默认模型。',
+        '在执行前先确认信息，在确认后生成基础人格文件、初始化工作区与基础数据。',
       ].join('\n'),
-      color: '#60a5fa',
+      color: '#d97706',
     },
   ];
 }
@@ -214,7 +215,7 @@ async function seedDefaultAgents(homeDirOverride?: string): Promise<AgentProfile
       sharedSkills: [],
       privateMcpServers: [],
       sharedMcpServers: [],
-      teamMembers: seed.agentId === 'agent-dev' ? createDefaultTeamMembers(providerId, modelName) : [],
+      teamMembers: [],
       defaultProviderId: providerId,
       defaultModelName: modelName,
       avatarUrl: undefined,
@@ -311,7 +312,7 @@ async function ensureProfileTeamData(
     profile.defaultLlm.modelName,
   );
 
-  const shouldBackfillDefaults = profile.agentId === 'agent-dev' && normalizedTeam.length === 0;
+  const shouldBackfillDefaults = false;
   const nextTeam = shouldBackfillDefaults
     ? createDefaultTeamMembers(profile.defaultLlm.providerId, profile.defaultLlm.modelName)
     : normalizedTeam;

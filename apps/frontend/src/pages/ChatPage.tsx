@@ -30,6 +30,7 @@ import { chatRuntimeStore, useChatRuntimeSelector } from '@/services/chat-runtim
 import { ensureChatRuntimeStreamPump } from '@/services/chat-runtime-stream-pump';
 import { getManagementAgentDetail, listManagementAgents } from '@/services/management-client';
 import { createChatGroup } from '@/services/group-client';
+import { executeAgentManagementAction } from '@/services/agent-management-workflow';
 import { requestJson } from '@/services/transport';
 import {
     createTask,
@@ -3925,6 +3926,30 @@ export function ChatPage({
         appendLocalAgentMessage('已取消拉群请求。如需多智能体协作，请随时告知。');
     }, [appendLocalAgentMessage, groupUpgradeEnabled]);
 
+    const handleConfirmAgentManagement = useCallback(async (payload: Record<string, unknown>) => {
+        try {
+            const result = await executeAgentManagementAction(payload);
+            appendLocalAgentMessage(result.summary);
+            pushInAppNotice({
+                title: `智能体${result.mode === 'create' ? '创建' : result.mode === 'update' ? '更新' : '删除'}成功`,
+                message: `${result.displayName} (${result.agentId})`,
+                level: 'success',
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            appendLocalAgentMessage(`智能体管理操作失败：${message || '未知错误'}`);
+            pushInAppNotice({
+                title: '智能体管理失败',
+                message: message || '未知错误',
+                level: 'error',
+            });
+        }
+    }, [appendLocalAgentMessage]);
+
+    const handleCancelAgentManagement = useCallback(() => {
+        appendLocalAgentMessage('已取消本次智能体管理操作，需要时我可以继续帮你整理新的创建或修改方案。');
+    }, [appendLocalAgentMessage]);
+
     const handleConfirmCreateTask = async () => {
         const sourceMessageId = pendingCreateTaskMessage?.id;
         if (!sourceMessageId) return;
@@ -4364,6 +4389,8 @@ export function ChatPage({
             onOpenA2aCardDetails={handleOpenA2aCardDetails}
             onConfirmGroupUpgrade={handleConfirmGroupUpgrade}
             onCancelGroupUpgrade={handleCancelGroupUpgrade}
+            onConfirmAgentManagement={handleConfirmAgentManagement}
+            onCancelAgentManagement={handleCancelAgentManagement}
             sidebarCollapsed={sidebarCollapsed}
             setSidebarCollapsed={setSidebarCollapsed}
             infoSidebarCollapsed={infoSidebarCollapsed}

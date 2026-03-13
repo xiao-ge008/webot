@@ -1497,6 +1497,58 @@ fn merge_agent_profile_override(
     }
 }
 
+const BUILTIN_NUWA_NAME: &str = "女娲";
+const BUILTIN_NUWA_AVATAR_URL: &str = "/agent_profile/avatar.png";
+const BUILTIN_NUWA_PORTRAIT_URL: &str = "/agent_profile/portrait.png";
+
+fn is_builtin_nuwa_agent_payload(payload: &Value) -> bool {
+    payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|value| value == BUILTIN_NUWA_NAME)
+        .unwrap_or(false)
+}
+
+fn merge_builtin_nuwa_defaults(row: &mut Value) {
+    if !is_builtin_nuwa_agent_payload(row) {
+        return;
+    }
+    let Some(object) = row.as_object_mut() else {
+        return;
+    };
+    let identity = object
+        .entry("identity".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(identity_obj) = identity.as_object_mut() else {
+        return;
+    };
+    let needs_avatar = identity_obj
+        .get("avatar_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|value| value.is_empty())
+        .unwrap_or(true);
+    if needs_avatar {
+        identity_obj.insert(
+            "avatar_url".to_string(),
+            Value::String(BUILTIN_NUWA_AVATAR_URL.to_string()),
+        );
+    }
+    let needs_portrait = identity_obj
+        .get("portrait_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|value| value.is_empty())
+        .unwrap_or(true);
+    if needs_portrait {
+        identity_obj.insert(
+            "portrait_url".to_string(),
+            Value::String(BUILTIN_NUWA_PORTRAIT_URL.to_string()),
+        );
+    }
+}
+
 const MAX_AVATAR_SIZE: usize = 15 * 1024 * 1024;
 const MAX_CHAT_ASSET_SIZE: usize = 64 * 1024 * 1024;
 const CHAT_UPLOAD_DIR_NAME: &str = "chat-uploads";
@@ -2216,6 +2268,26 @@ async fn resolve_agent_workspace_binding(
         }
     }
 
+    let is_builtin_nuwa = if let Some(hint) = upstream_hint {
+        is_builtin_nuwa_agent_payload(hint)
+    } else {
+        let detail_path = format!("/api/agents/{agent_id}");
+        state
+            .openfang
+            .get_json(&detail_path)
+            .await
+            .ok()
+            .map(|detail| is_builtin_nuwa_agent_payload(&detail))
+            .unwrap_or(false)
+    };
+    if is_builtin_nuwa {
+        let webot_home = path_resolver::webot_home_dir().map_err(storage_error)?;
+        let key = path_identity_key(&webot_home);
+        if seen.insert(key) {
+            extra_workspaces.push(webot_home);
+        }
+    }
+
     let mut all_paths = vec![private_workspace.clone(), shared_workspace.clone()];
     all_paths.extend(extra_workspaces.iter().cloned());
     ensure_workspace_dirs(&all_paths)?;
@@ -2865,6 +2937,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             if let Some(profile) = profiles.get(&agent_id) {
                 merge_agent_profile_override(row, profile);
             }
+            merge_builtin_nuwa_defaults(row);
         }
     }
     Ok(Json(data))
@@ -3132,6 +3205,7 @@ pub async fn get_agent(
     {
         merge_agent_profile_override(&mut data, &profile);
     }
+    merge_builtin_nuwa_defaults(&mut data);
     Ok(Json(data))
 }
 
