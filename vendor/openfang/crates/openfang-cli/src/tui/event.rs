@@ -1107,15 +1107,21 @@ pub fn spawn_fetch_agent_mcp_servers(
                     .get(aid)
                     .map(|e| e.manifest.mcp_servers.clone())
                     .unwrap_or_default();
-                let mut available = Vec::new();
-                let connections = kernel.mcp_connections.lock().await;
-                let mut seen = std::collections::HashSet::new();
-                for conn in connections.iter() {
-                    let server = conn.name();
-                    if seen.insert(server.to_string()) {
-                        available.push(server.to_string());
-                    }
-                }
+                let available = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt.block_on(async move {
+                        let connections = kernel.mcp_connections.lock().await;
+                        let mut available = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for conn in connections.iter() {
+                            let server = conn.name();
+                            if seen.insert(server.to_string()) {
+                                available.push(server.to_string());
+                            }
+                        }
+                        available
+                    }),
+                    Err(_) => Vec::new(),
+                };
                 let _ = tx.send(AppEvent::AgentMcpServersLoaded {
                     assigned,
                     available,

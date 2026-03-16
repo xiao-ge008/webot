@@ -414,11 +414,20 @@ pub async fn execute_tool(
             if mcp::is_mcp_tool(other) {
                 if let Some(mcp_conns) = mcp_connections {
                     let mut conns = mcp_conns.lock().await;
-                    let known_servers = conns.iter().map(|conn| conn.name()).collect::<Vec<_>>();
+                    let known_servers = conns
+                        .iter()
+                        .map(|conn| conn.name().to_string())
+                        .collect::<Vec<_>>();
                     if let Some(server_name) =
-                        mcp::resolve_mcp_server_from_known(other, known_servers.iter().copied())
+                        mcp::resolve_mcp_server_from_known(
+                            other,
+                            known_servers.iter().map(String::as_str),
+                        )
                     {
-                        if let Some(conn) = conns.iter_mut().find(|c| c.name() == server_name) {
+                        if let Some(conn_index) =
+                            conns.iter().position(|conn| conn.name() == server_name)
+                        {
+                            let conn = &mut conns[conn_index];
                             debug!(
                                 tool = other,
                                 server = server_name,
