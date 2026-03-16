@@ -36,7 +36,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Dependencies
-        run: npm ci
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "npm ci failed on attempt $attempt, retrying..."
+            npm cache verify || true
+            sleep $((attempt * 15))
+          done
+        shell: bash
 
       - name: Build OpenFang (Windows)
         if: runner.os == 'Windows'
