@@ -2659,14 +2659,11 @@ impl OpenFangKernel {
     ) -> KernelResult<()> {
         // Validate server names if allowlist is non-empty
         if !servers.is_empty() {
-            if let Ok(mcp_tools) = self.mcp_tools.lock() {
-                let mut known_servers: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for tool in mcp_tools.iter() {
-                    if let Some(s) = openfang_runtime::mcp::extract_mcp_server(&tool.name) {
-                        known_servers.insert(s.to_string());
-                    }
-                }
+            if let Ok(configured) = self.effective_mcp_servers.read() {
+                let known_servers = configured
+                    .iter()
+                    .map(|server| openfang_runtime::mcp::normalize_name(&server.name))
+                    .collect::<std::collections::HashSet<_>>();
                 for name in &servers {
                     let normalized = openfang_runtime::mcp::normalize_name(name);
                     if !known_servers.contains(&normalized) {
@@ -4420,9 +4417,10 @@ impl OpenFangKernel {
                     mcp_tools
                         .iter()
                         .filter(|t| {
-                            openfang_runtime::mcp::extract_mcp_server(&t.name)
-                                .map(|s| normalized.iter().any(|n| n == s))
-                                .unwrap_or(false)
+                            normalized.iter().any(|server| {
+                                let prefix = format!("mcp_{}_", server);
+                                t.name.starts_with(&prefix)
+                            })
                         })
                         .cloned(),
                 );

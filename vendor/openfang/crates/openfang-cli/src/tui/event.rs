@@ -1108,15 +1108,12 @@ pub fn spawn_fetch_agent_mcp_servers(
                     .map(|e| e.manifest.mcp_servers.clone())
                     .unwrap_or_default();
                 let mut available = Vec::new();
-                if let Ok(mcp_tools) = kernel.mcp_tools.lock() {
-                    let mut seen = std::collections::HashSet::new();
-                    for tool in mcp_tools.iter() {
-                        if let Some(server) = openfang_runtime::mcp::extract_mcp_server(&tool.name)
-                        {
-                            if seen.insert(server.to_string()) {
-                                available.push(server.to_string());
-                            }
-                        }
+                let connections = kernel.mcp_connections.lock().await;
+                let mut seen = std::collections::HashSet::new();
+                for conn in connections.iter() {
+                    let server = conn.name();
+                    if seen.insert(server.to_string()) {
+                        available.push(server.to_string());
                     }
                 }
                 let _ = tx.send(AppEvent::AgentMcpServersLoaded {

@@ -841,6 +841,7 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
     const looksLikeUi = sourceType.includes('ui') || /(^ui[-_])|([-_]ui$)|(^system-ui$)/i.test(name);
     if (looksLikeUi) {
       runtimeUi.push(name);
+      continue;
     }
     if (sourceType.includes('bundled') || sourceType.includes('builtin') || sourceType.includes('system')) {
       runtimeBuiltin.push(name);

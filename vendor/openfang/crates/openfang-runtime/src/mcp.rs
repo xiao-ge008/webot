@@ -552,6 +552,34 @@ pub fn extract_mcp_server(tool_name: &str) -> Option<&str> {
     rest.find('_').map(|pos| &rest[..pos])
 }
 
+/// Resolve server name from an MCP tool name using known server names.
+pub fn resolve_mcp_server_from_known<'a, I>(tool_name: &str, server_names: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let rest = tool_name.strip_prefix("mcp_")?;
+    let mut best: Option<(&'a str, usize)> = None;
+
+    for server_name in server_names {
+        let normalized = normalize_name(server_name);
+        if normalized.is_empty() {
+            continue;
+        }
+        if !rest.starts_with(&normalized) {
+            continue;
+        }
+        if rest.len() <= normalized.len() || rest.as_bytes()[normalized.len()] != b'_' {
+            continue;
+        }
+        let score = normalized.len();
+        if best.map(|(_, current)| score > current).unwrap_or(true) {
+            best = Some((server_name, score));
+        }
+    }
+
+    best.map(|(server_name, _)| server_name)
+}
+
 /// Strip the MCP namespace prefix from a tool name.
 fn strip_mcp_prefix<'a>(server: &str, tool_name: &'a str) -> Option<&'a str> {
     let prefix = format!("mcp_{}_", normalize_name(server));
@@ -612,6 +640,24 @@ mod tests {
             Some("github")
         );
         assert_eq!(extract_mcp_server("file_read"), None);
+    }
+
+    #[test]
+    fn test_resolve_mcp_server_from_known_with_hyphenated_server_name() {
+        let known = ["stock-agent", "github"];
+        assert_eq!(
+            resolve_mcp_server_from_known("mcp_stock_agent_qmt_service_status", known.iter().copied()),
+            Some("stock-agent")
+        );
+    }
+
+    #[test]
+    fn test_resolve_mcp_server_from_known_prefers_longest_match() {
+        let known = ["stock", "stock-agent"];
+        assert_eq!(
+            resolve_mcp_server_from_known("mcp_stock_agent_quote_pull", known.iter().copied()),
+            Some("stock-agent")
+        );
     }
 
     #[test]

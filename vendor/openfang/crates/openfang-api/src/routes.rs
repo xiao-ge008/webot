@@ -6902,14 +6902,12 @@ pub async fn get_agent_mcp_servers(
     };
     // Collect known MCP server names from connected tools
     let mut available: Vec<String> = Vec::new();
-    if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
-        let mut seen = std::collections::HashSet::new();
-        for tool in mcp_tools.iter() {
-            if let Some(server) = openfang_runtime::mcp::extract_mcp_server(&tool.name) {
-                if seen.insert(server.to_string()) {
-                    available.push(server.to_string());
-                }
-            }
+    let connections = state.kernel.mcp_connections.lock().await;
+    let mut seen = std::collections::HashSet::new();
+    for conn in connections.iter() {
+        let server_name = conn.name();
+        if seen.insert(server_name.to_string()) {
+            available.push(server_name.to_string());
         }
     }
     let mode = if entry.manifest.mcp_servers.is_empty() {

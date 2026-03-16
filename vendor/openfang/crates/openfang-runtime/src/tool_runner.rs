@@ -413,8 +413,11 @@ pub async fn execute_tool(
             // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
             if mcp::is_mcp_tool(other) {
                 if let Some(mcp_conns) = mcp_connections {
-                    if let Some(server_name) = mcp::extract_mcp_server(other) {
-                        let mut conns = mcp_conns.lock().await;
+                    let mut conns = mcp_conns.lock().await;
+                    let known_servers = conns.iter().map(|conn| conn.name()).collect::<Vec<_>>();
+                    if let Some(server_name) =
+                        mcp::resolve_mcp_server_from_known(other, known_servers.iter().copied())
+                    {
                         if let Some(conn) = conns.iter_mut().find(|c| c.name() == server_name) {
                             debug!(
                                 tool = other,
