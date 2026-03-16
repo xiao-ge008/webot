@@ -128,7 +128,8 @@ fn embedding_circuit_record_failure(error: &str) {
         .unwrap_or_else(|e| e.into_inner());
     state.consecutive_failures = state.consecutive_failures.saturating_add(1);
     if state.consecutive_failures >= EMBEDDING_CIRCUIT_FAILURE_THRESHOLD {
-        state.cooldown_until = Some(Instant::now() + Duration::from_secs(EMBEDDING_CIRCUIT_COOLDOWN_SECS));
+        state.cooldown_until =
+            Some(Instant::now() + Duration::from_secs(EMBEDDING_CIRCUIT_COOLDOWN_SECS));
         warn!(
             failures = state.consecutive_failures,
             cooldown_secs = EMBEDDING_CIRCUIT_COOLDOWN_SECS,
@@ -174,6 +175,89 @@ fn memory_conversation_scope(session: &Session) -> Option<String> {
         .map(str::trim)
         .filter(|label| label.starts_with(GROUP_SESSION_LABEL_PREFIX))
         .map(str::to_string)
+}
+
+fn looks_like_recap_request(text: &str) -> bool {
+    let raw = text.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    let lower = raw.to_ascii_lowercase();
+
+    // English cues
+    if lower.contains("recap")
+        || lower.contains("summary")
+        || lower.contains("what did we talk about")
+        || lower.contains("what have we talked about")
+        || lower.contains("remind me what we discussed")
+    {
+        return true;
+    }
+
+    // Chinese cues (high-precision heuristics)
+    // Examples: "我们最近交流了什么信息？" / "回顾一下我们之前聊过什么"
+    if raw.contains("回顾")
+        || raw.contains("复盘")
+        || raw.contains("总结")
+        || raw.contains("梳理")
+        || raw.contains("概括")
+        || raw.contains("汇总")
+        || raw.contains("回忆")
+    {
+        return true;
+    }
+    if raw.contains("最近")
+        && (raw.contains("聊")
+            || raw.contains("交流")
+            || raw.contains("讨论")
+            || raw.contains("说过"))
+    {
+        return true;
+    }
+    if raw.contains("之前") && (raw.contains("聊") || raw.contains("讨论") || raw.contains("说过"))
+    {
+        return true;
+    }
+    if raw.contains("上次") && (raw.contains("聊") || raw.contains("讨论") || raw.contains("说过"))
+    {
+        return true;
+    }
+    if raw.contains("第一次")
+        && raw.contains("我们")
+        && (raw.contains("交流")
+            || raw.contains("聊天")
+            || raw.contains("对话")
+            || raw.contains("见面")
+            || raw.contains("沟通")
+            || raw.contains("联系"))
+    {
+        return true;
+    }
+    if raw.contains("我们") && raw.contains("聊过") {
+        return true;
+    }
+    if raw.contains("我们") && raw.contains("交流") && raw.contains("什么") {
+        return true;
+    }
+
+    false
+}
+
+fn strip_injected_system_context(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n");
+    let mut remaining = normalized.trim();
+
+    loop {
+        if !remaining.starts_with("[system:") {
+            break;
+        }
+        let Some(split_at) = remaining.find("\n\n") else {
+            return String::new();
+        };
+        remaining = remaining[split_at + 2..].trim_start();
+    }
+
+    remaining.trim().to_string()
 }
 
 fn is_personal_memory_type(memory_type: &str) -> bool {
@@ -239,7 +323,10 @@ fn merge_recall_with_participant_weight(
             .then_with(|| a.2.cmp(&b.2))
     });
     scored.truncate(limit);
-    scored.into_iter().map(|(_, _, _, fragment)| fragment).collect()
+    scored
+        .into_iter()
+        .map(|(_, _, _, fragment)| fragment)
+        .collect()
 }
 
 /// Agent lifecycle phase within the execution loop.
@@ -307,6 +394,12 @@ async fn recall_memories_for_turn(
         .and_then(|ctx| ctx.participant_scope.clone())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
+    let cleaned_user_message = strip_injected_system_context(user_message);
+    let recall_source = if cleaned_user_message.is_empty() {
+        user_message.trim()
+    } else {
+        cleaned_user_message.as_str()
+    };
 
     let mut shared_filter = MemoryFilter {
         agent_id: Some(session.agent_id),
@@ -324,7 +417,7 @@ async fn recall_memories_for_turn(
             debug!("Embedding circuit open; skip vector recall and use text recall");
             None
         } else {
-            match emb.embed_one(user_message).await {
+            match emb.embed_one(recall_source).await {
                 Ok(vec) => {
                     embedding_circuit_record_success();
                     debug!("Using orchestrated vector recall (dims={})", vec.len());
@@ -341,6 +434,15 @@ async fn recall_memories_for_turn(
         None
     };
 
+    // Without embeddings, the SQLite fallback uses a lexical `LIKE` pre-filter.
+    // Generic recap prompts (e.g. "我们最近聊了什么") won't match any stored memory content,
+    // causing false "no memory" results. For recap-style queries, relax to recency-based recall.
+    let recall_query = if query_vec.is_none() && looks_like_recap_request(recall_source) {
+        ""
+    } else {
+        recall_source
+    };
+
     if let Some(participant_scope) = participant_scope {
         let mut participant_filter = MemoryFilter {
             agent_id: Some(session.agent_id),
@@ -355,7 +457,7 @@ async fn recall_memories_for_turn(
             .clamp(MEMORY_RECALL_LIMIT, RECALL_CANDIDATE_LIMIT_MAX);
         let personal = recall_with_filter(
             memory,
-            user_message,
+            recall_query,
             participant_filter,
             query_vec.as_deref(),
             candidate_limit,
@@ -363,7 +465,7 @@ async fn recall_memories_for_turn(
         .await;
         let shared = recall_with_filter(
             memory,
-            user_message,
+            recall_query,
             shared_filter,
             query_vec.as_deref(),
             candidate_limit,
@@ -373,12 +475,12 @@ async fn recall_memories_for_turn(
     } else {
         recall_with_filter(
             memory,
-            user_message,
+            recall_query,
             shared_filter,
             query_vec.as_deref(),
             MEMORY_RECALL_LIMIT,
         )
-            .await
+        .await
     }
 }
 
@@ -517,10 +619,16 @@ fn build_memory_candidates(
     final_response: &str,
     session: &Session,
 ) -> Vec<MemoryWriteCandidate> {
+    let cleaned_user_message = strip_injected_system_context(user_message);
+    let user_memory_text = if cleaned_user_message.is_empty() {
+        user_message.trim()
+    } else {
+        cleaned_user_message.as_str()
+    };
     let mut candidates = vec![MemoryWriteCandidate {
         content: format!(
             "User asked: {}\nI responded: {}",
-            truncate_for_memory(user_message, 600),
+            truncate_for_memory(user_memory_text, 600),
             truncate_for_memory(final_response, 900)
         ),
         scope: "episodic".to_string(),
@@ -531,23 +639,23 @@ fn build_memory_candidates(
         expires_days: Some(7),
     }];
 
-    if is_preference_statement(user_message) {
+    if is_preference_statement(user_memory_text) {
         candidates.push(MemoryWriteCandidate {
-            content: format!("用户偏好: {}", truncate_for_memory(user_message, 300)),
+            content: format!("用户偏好: {}", truncate_for_memory(user_memory_text, 300)),
             scope: "long_term".to_string(),
             memory_type: "preference".to_string(),
             importance: 0.9,
             confidence: 0.9,
-            entity_key: detect_preference_entity_key(user_message),
+            entity_key: detect_preference_entity_key(user_memory_text),
             expires_days: Some(365),
         });
     }
 
-    if is_task_state_statement(user_message) {
+    if is_task_state_statement(user_memory_text) {
         candidates.push(MemoryWriteCandidate {
             content: format!(
                 "任务状态更新: 用户:{} | 助手:{}",
-                truncate_for_memory(user_message, 220),
+                truncate_for_memory(user_memory_text, 220),
                 truncate_for_memory(final_response, 260)
             ),
             scope: "working_state".to_string(),
@@ -559,9 +667,9 @@ fn build_memory_candidates(
         });
     }
 
-    if is_fact_statement(user_message) {
+    if is_fact_statement(user_memory_text) {
         candidates.push(MemoryWriteCandidate {
-            content: format!("用户事实: {}", truncate_for_memory(user_message, 320)),
+            content: format!("用户事实: {}", truncate_for_memory(user_memory_text, 320)),
             scope: "long_term".to_string(),
             memory_type: "fact".to_string(),
             importance: 0.72,
@@ -2046,6 +2154,7 @@ pub async fn run_agent_loop_streaming(
                             name: tool_call.name.clone(),
                             result_preview: preview,
                             is_error: result.is_error,
+                            input: Some(tool_call.input.clone()),
                         })
                         .await
                         .is_err()

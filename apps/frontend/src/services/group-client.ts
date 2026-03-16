@@ -45,6 +45,9 @@ function mapLimits(value: unknown): ChatGroupLimits {
   const base = DEFAULT_GROUP_LIMITS;
   if (!value || typeof value !== 'object') return base;
   const obj = value as Record<string, unknown>;
+  const MAX_GROUP_SPEAKERS = 64;
+  const MAX_GROUP_MENTIONS = 64;
+  const MAX_GROUP_MENTION_DEPTH = 16;
   const clampInt = (raw: number | undefined, min: number, max: number): number => {
     if (!Number.isFinite(raw ?? NaN)) return min;
     return Math.min(max, Math.max(min, Math.round(raw ?? min)));
@@ -54,9 +57,9 @@ function mapLimits(value: unknown): ChatGroupLimits {
     return Math.min(max, Math.max(min, raw ?? min));
   };
 
-  const maxSpeakers = clampInt(asNumber(obj.maxSpeakers ?? obj.max_speakers), 1, base.maxSpeakers);
-  const maxMentions = clampInt(asNumber(obj.maxMentions ?? obj.max_mentions), 1, base.maxMentions);
-  const mentionMaxDepth = clampInt(asNumber(obj.mentionMaxDepth ?? obj.mention_max_depth), 1, base.mentionMaxDepth);
+  const maxSpeakers = clampInt(asNumber(obj.maxSpeakers ?? obj.max_speakers), 1, MAX_GROUP_SPEAKERS);
+  const maxMentions = clampInt(asNumber(obj.maxMentions ?? obj.max_mentions), 1, MAX_GROUP_MENTIONS);
+  const mentionMaxDepth = clampInt(asNumber(obj.mentionMaxDepth ?? obj.mention_max_depth), 1, MAX_GROUP_MENTION_DEPTH);
   const cooldownMs = Math.max(base.cooldownMs, asNumber(obj.cooldownMs ?? obj.cooldown_ms) ?? base.cooldownMs);
   const duplicateThreshold = Math.max(
     base.duplicateThreshold,

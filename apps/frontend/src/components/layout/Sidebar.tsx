@@ -58,6 +58,7 @@ export function Sidebar() {
       <div className="p-3 border-t border-border-light">
         <Link
           to="/settings"
+          state={{ backgroundLocation: location }}
           className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-foreground-secondary hover:text-foreground hover:bg-background-secondary transition-apple"
         >
           <Settings className="w-[18px] h-[18px]" />

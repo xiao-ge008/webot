@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::Client;
 use serde_json::Value;
 

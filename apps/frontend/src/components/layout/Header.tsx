@@ -41,6 +41,8 @@ export function Header() {
   const { t } = useTranslation();
   const { activeTab, setActiveTab } = useHomeTab();
   const location = useLocation();
+  // 设置页是全屏独立布局（参考系统设置样式），不显示顶部 Header，避免遮挡内容。
+  if (location.pathname === '/settings') return null;
   const isHome = location.pathname === '/' || location.pathname === '/home';
   const isTaskLanding = location.pathname.startsWith('/tasks');
   const [serviceState, setServiceState] = useState<ServicePowerState>({

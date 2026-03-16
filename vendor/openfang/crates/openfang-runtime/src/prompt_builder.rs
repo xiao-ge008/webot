@@ -275,7 +275,8 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 pub fn build_memory_section(memories: &[(String, String)]) -> String {
     let mut out = String::from(
         "## Memory\n\
-         - When the user asks about something from a previous conversation, use memory_recall first.\n\
+         - Recalled memories may already be provided below; use them before asking the user to repeat context.\n\
+         - Use memory_recall only when you know the exact shared memory key you need.\n\
          - Store important preferences, decisions, and context with memory_store for future use.",
     );
     if !memories.is_empty() {
@@ -522,7 +523,7 @@ pub fn tool_hint(name: &str) -> &'static str {
 
         // Memory
         "memory_store" => "save a key-value pair to memory",
-        "memory_recall" => "search memory for relevant context",
+        "memory_recall" => "read a known shared memory key",
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
 

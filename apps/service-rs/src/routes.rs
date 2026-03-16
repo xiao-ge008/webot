@@ -6,7 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Write};
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -21,6 +21,7 @@ use futures_util::{future::join_all, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
 use crate::assignment_store;
@@ -43,12 +44,378 @@ async fn probe_openfang_health(state: &Arc<AppState>) -> Result<Value, ApiError>
 }
 
 async fn ensure_online(state: &Arc<AppState>) -> Result<(), ApiError> {
-    probe_openfang_health(state).await.map(|_| ())
+    probe_openfang_health(state).await?;
+    if let Err(err) = maybe_ensure_default_agents(state).await {
+        tracing::warn!(error = %err.message, "auto-create default agents failed");
+    }
+    Ok(())
+}
+
+async fn maybe_ensure_default_agents(state: &Arc<AppState>) -> Result<(), ApiError> {
+    let guard = DEFAULT_AGENT_INIT.get_or_init(|| Mutex::new(DefaultAgentInitState::default()));
+    {
+        let mut state_guard = guard.lock().await;
+        if state_guard.done || state_guard.in_progress {
+            return Ok(());
+        }
+        state_guard.in_progress = true;
+    }
+
+    let result = ensure_nuwa_agent(state).await;
+
+    let mut state_guard = guard.lock().await;
+    state_guard.in_progress = false;
+    if result.is_ok() {
+        state_guard.done = true;
+    }
+    result.map(|_| ())
+}
+
+async fn ensure_nuwa_agent(state: &Arc<AppState>) -> Result<Option<String>, ApiError> {
+    assignment_store::ensure_db().map_err(storage_error)?;
+    let upstream = state.openfang.get_json("/api/agents").await?;
+    if let Some(existing) = find_nuwa_agent_id(&upstream) {
+        cache_nuwa_agent_id(&existing).await;
+        ensure_nuwa_profile_defaults(&existing)?;
+        return Ok(Some(existing));
+    }
+
+    let (provider, model) = resolve_default_model_tuple()
+        .await
+        .unwrap_or_else(|_| ("openai".to_string(), "gpt-4o-mini".to_string()));
+    let manifest_toml = build_nuwa_manifest_toml(&provider, &model);
+    let created = state
+        .openfang
+        .post_json("/api/agents", json!({ "manifest_toml": manifest_toml }))
+        .await?;
+    let agent_id = created
+        .get("agent_id")
+        .or_else(|| created.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "创建女娲智能体成功但未返回 agent_id",
+            )
+        })?;
+
+    validate_agent_path_segment(&agent_id)?;
+    cache_nuwa_agent_id(&agent_id).await;
+    assignment_store::set_agent_hidden(&agent_id, false).map_err(storage_error)?;
+    ensure_nuwa_profile_defaults(&agent_id)?;
+
+    let mut warnings = Vec::new();
+    if let Err(err) = resolve_agent_workspace_binding(state, &agent_id, Some(&created)).await {
+        warnings.push(format!("创建默认工作空间失败：{}", err.message));
+    }
+    if let Err(err) = normalize_agent_model_selector_if_needed(state, &agent_id).await {
+        warnings.push(format!("初始化模型配置失败：{}", err.message));
+    }
+    if let Err(err) = sync_agent_context_files(state, &agent_id, true).await {
+        warnings.push(format!("初始化身份文件失败：{}", err.message));
+    }
+    if let Err(err) = enable_default_global_skills_for_agent(&agent_id) {
+        warnings.push(format!("默认启用 ui-skill 失败：{err}"));
+    }
+    if let Err(err) = sync_provider_configs_to_runtime_with_online(state, true).await {
+        warnings.push(format!("同步供应商配置失败：{}", err.message));
+    }
+    if let Err(err) = sync_active_mcp_servers_to_runtime_inner(state).await {
+        warnings.push(format!("同步 MCP 配置失败：{}", err.message));
+    }
+    if let Err(err) = sync_agent_mcp_assignments(state, &agent_id).await {
+        warnings.push(format!("同步 Agent MCP 分配失败：{}", err.message));
+    }
+    if !warnings.is_empty() {
+        tracing::warn!(agent_id = %agent_id, warnings = ?warnings, "auto-create nuwa warnings");
+    }
+
+    Ok(Some(agent_id))
+}
+
+fn ensure_nuwa_profile_defaults(agent_id: &str) -> Result<(), ApiError> {
+    assignment_store::upsert_agent_profile_override(
+        agent_id,
+        Some(
+            DEFAULT_NUWA_AGENT_TAGS
+                .iter()
+                .map(|item| item.to_string())
+                .collect(),
+        ),
+        Some(DEFAULT_NUWA_AGENT_SUMMARY.to_string()),
+        Some(DEFAULT_NUWA_AGENT_SYSTEM_PROMPT.to_string()),
+        None,
+        None,
+        Some(DEFAULT_NUWA_AGENT_AVATAR_URL.to_string()),
+        Some(DEFAULT_NUWA_AGENT_PORTRAIT_URL.to_string()),
+        None,
+        Some(DEFAULT_NUWA_AGENT_NAME.to_string()),
+    )
+    .map_err(storage_error)
+}
+
+async fn cache_nuwa_agent_id(agent_id: &str) {
+    let cache = NUWA_AGENT_ID_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().await;
+    *guard = Some(agent_id.to_string());
+}
+
+async fn clear_nuwa_agent_id_cache() {
+    let cache = NUWA_AGENT_ID_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().await;
+    *guard = None;
+}
+
+async fn resolve_nuwa_agent_id(state: &Arc<AppState>) -> Result<String, ApiError> {
+    let cache = NUWA_AGENT_ID_CACHE.get_or_init(|| Mutex::new(None));
+    if let Some(agent_id) = cache.lock().await.clone() {
+        return Ok(agent_id);
+    }
+    ensure_nuwa_agent(state)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "女娲智能体不存在"))
+}
+
+struct ResolvedAgentId {
+    requested: String,
+    resolved: String,
+    alias_used: bool,
+}
+
+async fn resolve_agent_id_alias(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<ResolvedAgentId, ApiError> {
+    let trimmed = id.trim();
+    if trimmed.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID) {
+        let resolved = resolve_nuwa_agent_id(state).await?;
+        return Ok(ResolvedAgentId {
+            requested: DEFAULT_NUWA_AGENT_ID.to_string(),
+            resolved,
+            alias_used: true,
+        });
+    }
+    Ok(ResolvedAgentId {
+        requested: trimmed.to_string(),
+        resolved: trimmed.to_string(),
+        alias_used: false,
+    })
+}
+
+async fn resolve_nuwa_alias_in_list(
+    state: &Arc<AppState>,
+    ids: &[String],
+) -> Result<Vec<String>, ApiError> {
+    if !ids
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID))
+    {
+        return Ok(ids.to_vec());
+    }
+    let resolved = resolve_nuwa_agent_id(state).await?;
+    Ok(ids
+        .iter()
+        .map(|value| {
+            if value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID) {
+                resolved.clone()
+            } else {
+                value.clone()
+            }
+        })
+        .collect())
+}
+
+fn is_nuwa_agent_row(row: &Value) -> bool {
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let name = row
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let english_name = row
+        .get("english_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    id.map(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID))
+        .unwrap_or(false)
+        || name == DEFAULT_NUWA_AGENT_NAME
+        || name.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID)
+        || english_name.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID)
+}
+
+fn rewrite_agent_id_fields(payload: &mut Value, public_id: &str) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    for key in ["id", "agent_id", "agentId"] {
+        if object.contains_key(key) {
+            object.insert(key.to_string(), Value::String(public_id.to_string()));
+        }
+    }
+}
+
+fn replace_payload_agent_id(payload: &mut Value, paths: &[&[&str]], from_id: &str, to_id: &str) {
+    for path in paths {
+        replace_payload_agent_id_at_path(payload, path, from_id, to_id);
+    }
+}
+
+fn replace_payload_agent_id_at_path(
+    payload: &mut Value,
+    path: &[&str],
+    from_id: &str,
+    to_id: &str,
+) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() == 1 {
+        let Some(object) = payload.as_object_mut() else {
+            return;
+        };
+        if let Some(value) = object.get_mut(path[0]) {
+            if value
+                .as_str()
+                .map(|v| v.eq_ignore_ascii_case(from_id))
+                .unwrap_or(false)
+            {
+                *value = Value::String(to_id.to_string());
+            }
+        }
+        return;
+    }
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let Some(next) = object.get_mut(path[0]) else {
+        return;
+    };
+    replace_payload_agent_id_at_path(next, &path[1..], from_id, to_id);
+}
+
+fn find_nuwa_agent_id(payload: &Value) -> Option<String> {
+    let rows = payload.as_array()?;
+    for row in rows {
+        let id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let english_name = row
+            .get("english_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let matched = id
+            .map(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID))
+            .unwrap_or(false)
+            || name == DEFAULT_NUWA_AGENT_NAME
+            || name.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID)
+            || english_name.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID);
+        if matched {
+            if let Some(agent_id) = id {
+                return Some(agent_id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_nuwa_manifest_toml(provider: &str, model: &str) -> String {
+    let mut lines = vec![
+        format!("name = \"{}\"", escape_toml_string(DEFAULT_NUWA_AGENT_ID)),
+        format!(
+            "description = \"{}\"",
+            escape_toml_string(DEFAULT_NUWA_AGENT_SUMMARY)
+        ),
+        "profile = \"full\"".to_string(),
+        String::new(),
+        "[model]".to_string(),
+        format!("provider = \"{}\"", escape_toml_string(provider)),
+        format!("model = \"{}\"", escape_toml_string(model)),
+        format!(
+            "system_prompt = \"{}\"",
+            escape_toml_string(DEFAULT_NUWA_AGENT_SYSTEM_PROMPT)
+        ),
+    ];
+    lines.push(String::new());
+    lines.push(format!(
+        "tags = [{}]",
+        DEFAULT_NUWA_AGENT_TAGS
+            .iter()
+            .map(|tag| format!("\"{}\"", escape_toml_string(tag)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    lines.join("\n")
 }
 
 fn storage_error(message: impl Into<String>) -> ApiError {
     ApiError::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR, message)
 }
+
+const DEFAULT_GLOBAL_SKILLS: &[&str] = &["ui-skill"];
+const DEFAULT_NUWA_AGENT_ID: &str = "nuwa";
+const DEFAULT_NUWA_AGENT_NAME: &str = "女娲";
+const DEFAULT_NUWA_AGENT_AVATAR_URL: &str = "/agent_profile/avatar.png";
+const DEFAULT_NUWA_AGENT_PORTRAIT_URL: &str = "/agent_profile/portrait.png";
+const DEFAULT_NUWA_AGENT_SUMMARY: &str =
+    "负责通过本地管理接口引导用户创建和修改智能体，并在确认后同步身份文件与属性。";
+const DEFAULT_NUWA_AGENT_TAGS: [&str; 3] = ["默认", "智能体管理", "本地接口"];
+const DEFAULT_NUWA_AGENT_SYSTEM_PROMPT: &str = r#"你是女娲，默认内置的智能体管理与创作助手。
+你的职责只包括：创建智能体、修改本地智能体配置与身份文件。
+严禁执行删除操作。若用户想删除智能体，只能明确告知用户去界面 UI 手动删除。
+
+你的本地管理能力包括：
+- 创建智能体
+- 修改基础属性：nickname / english_name / description / tags / provider / model / avatar_url / portrait_url / color / extra workspaces
+- 修改身份文件：IDENTITY.md / SOUL.md / USER.md / MEMORY.md / TOOLS.md / AGENTS.md / BOOTSTRAP.md / HEARTBEAT.md
+- 修改 system prompt
+
+交互规则：
+1. 不允许一上来直接创建或修改，必须先分多轮询问，逐步补齐信息。
+2. 每轮最多追问 1 到 2 个关键缺失项，优先确认目标智能体、英文名、角色定位、标签、工作区、模型和要改的身份文件。
+3. 创建前至少确认：显示昵称、英文名称、角色简介或目标、标签，以及人格语气、世界观、服务对象、记忆策略、工具边界、协作方式、首次会话流程、周期巡检任务中的关键设定；如涉及工作区、模型、身份文件，也要单独确认。
+4. 修改前至少确认：目标智能体是谁、要改哪些属性、是否改身份文件、最终变更摘要；若角色核心设定变化，必须确认是否重写整套身份文件。
+5. 在用户明确确认之前，你只能继续提问、整理摘要、展示确认信息，不能执行任何写入。
+6. 一旦信息齐备，必须先输出一个 AgentManagementConfirmCard 确认卡，再等待用户点击确认。
+7. 禁止输出删除确认卡，禁止引导用户通过你删除智能体。
+
+确认卡要求：
+- 组件类型：AgentManagementConfirmCard
+- 确认卡必须放在 <UI_JSON>{"type":"AgentManagementConfirmCard","props":{...}}</UI_JSON> 中；不要只输出“现在输出确认卡，请确认是否创建”之类的纯文本
+- confirmAction: confirm_agent_management
+- cancelAction: cancel_agent_management
+- mode 只能是 create 或 update
+- payload 允许字段：mode / agentId / targetName / englishName / nickname / description / tags / workspaces / provider / model / avatarUrl / portraitUrl / color / rewriteContextFiles / contextFiles
+- 如果一次要创建多个智能体，必须在 payload.items 中按数组逐个给出每个智能体的 nickname / englishName / description / tags / workspaces / provider / model / contextFiles，不要把多个角色混成一个智能体，也不要使用未声明字段
+- payload.nickname 只能填写一个最终显示昵称；多个别名请写进 IDENTITY.md，不要把别名串直接塞进 nickname
+- 若要修改系统提示词，请放到 payload.contextFiles.SYSTEM_PROMPT
+- 若要修改身份文件，请把对应文件内容放进 payload.contextFiles
+- 创建智能体或整套重写身份文件时，你必须直接在 payload.contextFiles 或 payload.items[].contextFiles 中给出完整的 IDENTITY / SOUL / USER / MEMORY / TOOLS / AGENTS / BOOTSTRAP / HEARTBEAT 与 SYSTEM_PROMPT；不要依赖后续再调用模型生成
+- 如果身份文件内容还没准备完整，就继续追问，不要输出确认卡"#;
+
+#[derive(Default)]
+struct DefaultAgentInitState {
+    done: bool,
+    in_progress: bool,
+}
+
+static DEFAULT_AGENT_INIT: OnceLock<Mutex<DefaultAgentInitState>> = OnceLock::new();
+static NUWA_AGENT_ID_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 pub fn management_router() -> Router<Arc<AppState>> {
     Router::new()
@@ -117,7 +484,10 @@ pub fn management_router() -> Router<Arc<AppState>> {
             "/agents/{id}/workspaces",
             get(get_agent_workspaces).put(set_agent_workspaces),
         )
-        .route("/agents/{id}/context-files", get(list_agent_context_files))
+        .route(
+            "/agents/{id}/context-files",
+            get(list_agent_context_files).post(generate_and_apply_agent_context_bundle),
+        )
         .route(
             "/agents/{id}/context-files/reconcile",
             post(reconcile_agent_context_files),
@@ -169,6 +539,7 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/workflows/{id}/run", post(run_workflow))
         .route("/providers", get(list_providers))
         .route("/providers/configs", get(list_provider_configs))
+        .route("/providers/test", post(test_provider_connection))
         .route("/providers/{id}/enabled", put(update_provider_enabled))
         .route(
             "/providers/{id}/config",
@@ -177,6 +548,7 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/providers/custom", post(create_custom_provider))
         .route("/channels/status", get(get_channel_status))
         .route("/channels/test", post(test_channel_connection))
+        .route("/channels/notify", post(send_channel_notification))
         .route("/models", get(list_models))
         .route("/models/test", post(test_model_connection))
         .route(
@@ -286,6 +658,15 @@ pub struct OptimizePromptRequest {
     pub agent_id: Option<String>,
 }
 
+struct OptimizePromptExecutionResult {
+    content: String,
+    provider: String,
+    model: String,
+    target: String,
+    fallback: bool,
+    error: Option<String>,
+}
+
 async fn resolve_default_model_tuple() -> Result<(String, String), ApiError> {
     let models_value = assignment_store::list_model_assignments().map_err(storage_error)?;
     let default_id = assignment_store::get_default_model().map_err(storage_error)?;
@@ -320,10 +701,89 @@ fn build_optimize_fallback_content(raw_input: &str, target: &str) -> String {
     )
 }
 
-pub async fn optimize_prompt_with_default_model(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<OptimizePromptRequest>,
-) -> Result<Json<Value>, ApiError> {
+fn build_optimize_instruction(target: &str) -> &'static str {
+    match target {
+        "identity_bundle" => {
+            "请基于用户输入，整理为适合 OpenFang 智能体创建/编辑界面直接保存的中文 Markdown。\
+输出必须且仅包含以下一级标题：\
+# IDENTITY.md\
+# SOUL.md\
+# USER.md\
+# MEMORY.md\
+# TOOLS.md\
+# AGENTS.md\
+# BOOTSTRAP.md\
+# HEARTBEAT.md\
+# 系统提示词\
+写作要求：\
+1) 每节内容都可直接落地，不要空话；\
+2) 优先使用简洁条目与小标题；\
+3) 不要解释过程，不要代码块，不要额外章节；\
+4) IDENTITY.md 包含身份摘要与可编辑字段（如 name/archetype/vibe/avatar_url/greeting_style/color）；\
+5) SOUL/USER/MEMORY/TOOLS/AGENTS/BOOTSTRAP/HEARTBEAT 分别体现人格边界、用户关系、记忆策略、工具协议、多智能体协作、首次会话流程、周期性任务清单；\
+6) 系统提示词给出运行时硬约束与输出风格。"
+        }
+        _ => {
+            "请基于用户输入，优化为适合智能体创建/编辑界面使用的高质量中文 Markdown 文案。\
+输出按以下小节组织：# 身份设定、# 灵魂规则、# 用户关系、# 系统提示词。\
+内容要具体、可直接使用、风格统一，不要解释过程，不要代码块。"
+        }
+    }
+}
+
+fn pick_optimize_agent_model_ref(
+    agent_rows: &[Value],
+    requested_provider: &Option<String>,
+    requested_model: &Option<String>,
+    requested_agent_id: &Option<String>,
+    default_model_tuple: &Option<(String, String)>,
+) -> Option<String> {
+    if let Some(requested) = requested_agent_id {
+        return Some(requested.clone());
+    }
+
+    let desired_provider = requested_provider
+        .clone()
+        .or_else(|| default_model_tuple.as_ref().map(|(p, _)| p.clone()));
+    let desired_model = requested_model
+        .clone()
+        .or_else(|| default_model_tuple.as_ref().map(|(_, m)| m.clone()));
+
+    if let (Some(provider_name), Some(model_name)) =
+        (desired_provider.as_deref(), desired_model.as_deref())
+    {
+        if let Some(hit) = agent_rows.iter().find_map(|row| {
+            let id = row.get("id").and_then(Value::as_str)?;
+            let row_model = row.get("model")?;
+            let row_provider = row_model
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let row_model_name = row_model
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if row_provider == provider_name && row_model_name == model_name {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        }) {
+            return Some(hit);
+        }
+    }
+
+    agent_rows.iter().find_map(|row| {
+        row.get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
+async fn execute_optimize_prompt_request(
+    state: &Arc<AppState>,
+    payload: &OptimizePromptRequest,
+) -> Result<OptimizePromptExecutionResult, ApiError> {
     let raw_input = payload.input.trim();
     if raw_input.is_empty() {
         return Err(ApiError::new(
@@ -360,91 +820,37 @@ pub async fn optimize_prompt_with_default_model(
         .clone()
         .or_else(|| default_model_tuple.as_ref().map(|(_, m)| m.clone()))
         .unwrap_or_else(|| "auto".to_string());
-
     let target = payload
         .target
+        .clone()
         .unwrap_or_else(|| "agent_profile".to_string());
-    let instruction = match target.as_str() {
-        "identity_bundle" => "请基于用户输入，整理为适合 OpenFang 智能体创建/编辑界面直接保存的中文 Markdown。\
-输出必须且仅包含以下一级标题：\
-# IDENTITY.md\
-# SOUL.md\
-# USER.md\
-# MEMORY.md\
-# TOOLS.md\
-# AGENTS.md\
-# BOOTSTRAP.md\
-# HEARTBEAT.md\
-# 系统提示词\
-写作要求：\
-1) 每节内容都可直接落地，不要空话；\
-2) 优先使用简洁条目与小标题；\
-3) 不要解释过程，不要代码块，不要额外章节；\
-4) IDENTITY.md 包含身份摘要与可编辑字段（如 name/archetype/vibe/avatar_url/greeting_style/color）；\
-5) SOUL/USER/MEMORY/TOOLS/AGENTS/BOOTSTRAP/HEARTBEAT 分别体现人格边界、用户关系、记忆策略、工具协议、多智能体协作、首次会话流程、周期性任务清单；\
-6) 系统提示词给出运行时硬约束与输出风格。",
-        _ => "请基于用户输入，优化为适合智能体创建/编辑界面使用的高质量中文 Markdown 文案。\
-输出按以下小节组织：# 身份设定、# 灵魂规则、# 用户关系、# 系统提示词。\
-内容要具体、可直接使用、风格统一，不要解释过程，不要代码块。",
-    };
 
     let agents_payload = state.openfang.get_json("/api/agents").await?;
     let agent_rows = agents_payload.as_array().cloned().unwrap_or_default();
-
-    let mut selected_agent_id = requested_agent_id.clone();
-    if selected_agent_id.is_none() {
-        let desired_provider = requested_provider
-            .clone()
-            .or_else(|| default_model_tuple.as_ref().map(|(p, _)| p.clone()));
-        let desired_model = requested_model
-            .clone()
-            .or_else(|| default_model_tuple.as_ref().map(|(_, m)| m.clone()));
-
-        if let (Some(provider_name), Some(model_name)) =
-            (desired_provider.as_deref(), desired_model.as_deref())
-        {
-            selected_agent_id = agent_rows.iter().find_map(|row| {
-                let id = row.get("id").and_then(Value::as_str)?;
-                let row_model = row.get("model")?;
-                let row_provider = row_model
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let row_model_name = row_model
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if row_provider == provider_name && row_model_name == model_name {
-                    Some(id.to_string())
-                } else {
-                    None
-                }
-            });
-        }
-    }
-    if selected_agent_id.is_none() {
-        selected_agent_id = agent_rows.iter().find_map(|row| {
-            row.get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        });
-    }
+    let selected_agent_id = pick_optimize_agent_model_ref(
+        &agent_rows,
+        &requested_provider,
+        &requested_model,
+        &requested_agent_id,
+        &default_model_tuple,
+    );
 
     let Some(agent_model_ref) = selected_agent_id else {
         let fallback = build_optimize_fallback_content(raw_input, target.as_str());
-        return Ok(Json(json!({
-            "content": fallback,
-            "provider": provider,
-            "model": model,
-            "target": target,
-            "fallback": true
-        })));
+        return Ok(OptimizePromptExecutionResult {
+            content: fallback,
+            provider,
+            model,
+            target,
+            fallback: true,
+            error: None,
+        });
     };
 
     let upstream_payload = json!({
         "model": agent_model_ref,
         "messages": [
-            {"role": "user", "content": format!("{instruction}\n\n## 用户输入\n{raw_input}\n\n请仅输出最终 Markdown，不要解释。")}
+            {"role": "user", "content": format!("{}\n\n## 用户输入\n{}\n\n请仅输出最终 Markdown，不要解释。", build_optimize_instruction(target.as_str()), raw_input)}
         ],
         "temperature": 0.7,
         "stream": false
@@ -458,14 +864,14 @@ pub async fn optimize_prompt_with_default_model(
         Ok(value) => value,
         Err(error) => {
             let fallback = build_optimize_fallback_content(raw_input, target.as_str());
-            return Ok(Json(json!({
-                "content": fallback,
-                "provider": provider,
-                "model": model,
-                "target": target,
-                "fallback": true,
-                "error": error.message
-            })));
+            return Ok(OptimizePromptExecutionResult {
+                content: fallback,
+                provider,
+                model,
+                target,
+                fallback: true,
+                error: Some(error.message),
+            });
         }
     };
 
@@ -482,20 +888,38 @@ pub async fn optimize_prompt_with_default_model(
 
     if content.is_empty() {
         let fallback = build_optimize_fallback_content(raw_input, target.as_str());
-        return Ok(Json(json!({
-            "content": fallback,
-            "provider": provider,
-            "model": model,
-            "target": target,
-            "fallback": true
-        })));
+        return Ok(OptimizePromptExecutionResult {
+            content: fallback,
+            provider,
+            model,
+            target,
+            fallback: true,
+            error: None,
+        });
     }
 
+    Ok(OptimizePromptExecutionResult {
+        content,
+        provider,
+        model,
+        target,
+        fallback: false,
+        error: None,
+    })
+}
+
+pub async fn optimize_prompt_with_default_model(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<OptimizePromptRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let result = execute_optimize_prompt_request(&state, &payload).await?;
     Ok(Json(json!({
-        "content": content,
-        "provider": provider,
-        "model": model,
-        "target": target
+        "content": result.content,
+        "provider": result.provider,
+        "model": result.model,
+        "target": result.target,
+        "fallback": result.fallback,
+        "error": result.error
     })))
 }
 
@@ -503,6 +927,7 @@ pub fn chat_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{id}/sessions", get(chat_sessions))
         .route("/{id}/session", get(chat_session))
+        .route("/{id}/session/compact", post(chat_session_compact))
         .route("/{id}/message", post(chat_message))
         .route("/{id}/message/stream", post(chat_message_stream))
 }
@@ -518,8 +943,297 @@ pub fn groups_router() -> Router<Arc<AppState>> {
         )
 }
 
+pub fn tasks_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/meta", post(upsert_task_runtime_meta))
+        .route("/meta/{id}", get(get_task_runtime_meta))
+        .route("/deliveries", post(create_task_delivery))
+        .route(
+            "/deliveries/pending",
+            get(list_pending_task_deliveries_route),
+        )
+        .route("/deliveries/{id}", get(get_task_delivery_route))
+        .route("/deliveries/{id}/status", post(update_task_delivery_status))
+}
+
+#[derive(Deserialize)]
+pub struct UpsertTaskRuntimeMetaRequest {
+    pub task_id: String,
+    pub owner_agent_id: String,
+    pub runtime_key: Option<String>,
+    pub source_type: Option<String>,
+    pub display_name: Option<String>,
+    pub origin_conversation_type: Option<String>,
+    pub origin_conversation_id: Option<String>,
+    pub origin_chat_session_id: Option<String>,
+    pub origin_message_id: Option<String>,
+    pub creator_participant_id: Option<String>,
+    pub creator_participant_name: Option<String>,
+    pub executor_agent_id: Option<String>,
+    pub executor_agent_name: Option<String>,
+    pub report_actor_agent_id: Option<String>,
+    pub report_actor_agent_name: Option<String>,
+    pub max_runs: Option<i64>,
+    pub final_summary_prompt: Option<String>,
+    pub notify_on_final: Option<bool>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateTaskDeliveryRequest {
+    pub id: Option<String>,
+    pub task_id: String,
+    pub owner_agent_id: String,
+    pub runtime_key: Option<String>,
+    pub delivery_kind: Option<String>,
+    pub dedupe_key: String,
+    pub status: Option<String>,
+    pub origin_conversation_type: Option<String>,
+    pub origin_conversation_id: Option<String>,
+    pub origin_chat_session_id: Option<String>,
+    pub origin_message_id: Option<String>,
+    pub creator_participant_id: Option<String>,
+    pub creator_participant_name: Option<String>,
+    pub executor_agent_id: Option<String>,
+    pub executor_agent_name: Option<String>,
+    pub report_actor_agent_id: Option<String>,
+    pub report_actor_agent_name: Option<String>,
+    pub task_name: Option<String>,
+    pub run_count: Option<i64>,
+    pub summary_text: Option<String>,
+    pub error_text: Option<String>,
+    pub payload: Option<Value>,
+}
+
+#[derive(Deserialize)]
+pub struct PendingTaskDeliveriesQuery {
+    pub runtime_key: Option<String>,
+    pub chat_session_id: Option<String>,
+    pub conversation_type: Option<String>,
+    pub conversation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTaskDeliveryStatusRequest {
+    pub status: String,
+}
+
+fn normalize_optional_string(input: Option<String>) -> Option<String> {
+    input
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_task_delivery_id(task_id: &str, dedupe_key: &str) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    task_id.hash(&mut hasher);
+    dedupe_key.hash(&mut hasher);
+    format!("td_{now_ms:x}_{:x}", hasher.finish())
+}
+
+pub async fn upsert_task_runtime_meta(
+    State(_state): State<Arc<AppState>>,
+    Json(payload): Json<UpsertTaskRuntimeMetaRequest>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::ensure_db().map_err(storage_error)?;
+    let task_id = payload.task_id.trim();
+    if task_id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "task_id 不能为空"));
+    }
+    let owner_agent_id = payload.owner_agent_id.trim();
+    if owner_agent_id.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "owner_agent_id 不能为空",
+        ));
+    }
+    let record = assignment_store::TaskRuntimeBindingRecord {
+        task_id: task_id.to_string(),
+        owner_agent_id: owner_agent_id.to_string(),
+        runtime_key: normalize_optional_string(payload.runtime_key),
+        source_type: payload
+            .source_type
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "custom".to_string()),
+        display_name: normalize_optional_string(payload.display_name),
+        origin_conversation_type: normalize_optional_string(payload.origin_conversation_type),
+        origin_conversation_id: normalize_optional_string(payload.origin_conversation_id),
+        origin_chat_session_id: normalize_optional_string(payload.origin_chat_session_id),
+        origin_message_id: normalize_optional_string(payload.origin_message_id),
+        creator_participant_id: normalize_optional_string(payload.creator_participant_id),
+        creator_participant_name: normalize_optional_string(payload.creator_participant_name),
+        executor_agent_id: normalize_optional_string(payload.executor_agent_id),
+        executor_agent_name: normalize_optional_string(payload.executor_agent_name),
+        report_actor_agent_id: normalize_optional_string(payload.report_actor_agent_id),
+        report_actor_agent_name: normalize_optional_string(payload.report_actor_agent_name),
+        max_runs: payload.max_runs,
+        final_summary_prompt: normalize_optional_string(payload.final_summary_prompt),
+        notify_on_final: payload.notify_on_final.unwrap_or(true),
+        metadata: payload
+            .metadata
+            .unwrap_or_else(|| Value::Object(Default::default())),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    assignment_store::upsert_task_runtime_binding(&record).map_err(storage_error)?;
+    let stored = assignment_store::get_task_runtime_binding(task_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_error("写入任务元数据后读取失败"))?;
+    Ok(Json(json!({ "meta": stored })))
+}
+
+pub async fn get_task_runtime_meta(
+    State(_state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::ensure_db().map_err(storage_error)?;
+    let meta = assignment_store::get_task_runtime_binding(&id).map_err(storage_error)?;
+    match meta {
+        Some(meta) => Ok(Json(json!({ "meta": meta }))),
+        None => Err(ApiError::new(StatusCode::NOT_FOUND, "任务元数据不存在")),
+    }
+}
+
+pub async fn create_task_delivery(
+    State(_state): State<Arc<AppState>>,
+    Json(payload): Json<CreateTaskDeliveryRequest>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::ensure_db().map_err(storage_error)?;
+    let task_id = payload.task_id.trim();
+    if task_id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "task_id 不能为空"));
+    }
+    let owner_agent_id = payload.owner_agent_id.trim();
+    if owner_agent_id.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "owner_agent_id 不能为空",
+        ));
+    }
+    let dedupe_key = payload.dedupe_key.trim();
+    if dedupe_key.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "dedupe_key 不能为空",
+        ));
+    }
+    let delivery_id = payload
+        .id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| build_task_delivery_id(task_id, dedupe_key));
+    let record = assignment_store::TaskDeliveryRecord {
+        id: delivery_id.clone(),
+        task_id: task_id.to_string(),
+        owner_agent_id: owner_agent_id.to_string(),
+        runtime_key: normalize_optional_string(payload.runtime_key),
+        delivery_kind: payload
+            .delivery_kind
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "final".to_string()),
+        dedupe_key: dedupe_key.to_string(),
+        status: payload
+            .status
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "pending".to_string()),
+        origin_conversation_type: normalize_optional_string(payload.origin_conversation_type),
+        origin_conversation_id: normalize_optional_string(payload.origin_conversation_id),
+        origin_chat_session_id: normalize_optional_string(payload.origin_chat_session_id),
+        origin_message_id: normalize_optional_string(payload.origin_message_id),
+        creator_participant_id: normalize_optional_string(payload.creator_participant_id),
+        creator_participant_name: normalize_optional_string(payload.creator_participant_name),
+        executor_agent_id: normalize_optional_string(payload.executor_agent_id),
+        executor_agent_name: normalize_optional_string(payload.executor_agent_name),
+        report_actor_agent_id: normalize_optional_string(payload.report_actor_agent_id),
+        report_actor_agent_name: normalize_optional_string(payload.report_actor_agent_name),
+        task_name: normalize_optional_string(payload.task_name),
+        run_count: payload.run_count,
+        summary_text: normalize_optional_string(payload.summary_text),
+        error_text: normalize_optional_string(payload.error_text),
+        payload: payload
+            .payload
+            .unwrap_or_else(|| Value::Object(Default::default())),
+        created_at: String::new(),
+        updated_at: String::new(),
+        reported_at: None,
+        acknowledged_at: None,
+    };
+    assignment_store::create_or_update_task_delivery(&record).map_err(storage_error)?;
+    let stored = assignment_store::list_pending_task_deliveries(
+        record.runtime_key.as_deref(),
+        record.origin_chat_session_id.as_deref(),
+        record.origin_conversation_type.as_deref(),
+        record.origin_conversation_id.as_deref(),
+    )
+    .map_err(storage_error)?
+    .into_iter()
+    .find(|item| item.dedupe_key == record.dedupe_key)
+    .unwrap_or(record);
+    Ok(Json(json!({ "delivery": stored })))
+}
+
+pub async fn list_pending_task_deliveries_route(
+    State(_state): State<Arc<AppState>>,
+    Query(query): Query<PendingTaskDeliveriesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::ensure_db().map_err(storage_error)?;
+    let rows = assignment_store::list_pending_task_deliveries(
+        query.runtime_key.as_deref(),
+        query.chat_session_id.as_deref(),
+        query.conversation_type.as_deref(),
+        query.conversation_id.as_deref(),
+    )
+    .map_err(storage_error)?;
+    Ok(Json(json!({ "deliveries": rows })))
+}
+
+pub async fn get_task_delivery_route(
+    State(_state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::ensure_db().map_err(storage_error)?;
+    let delivery = assignment_store::get_task_delivery(&id).map_err(storage_error)?;
+    match delivery {
+        Some(delivery) => Ok(Json(json!({ "delivery": delivery }))),
+        None => Err(ApiError::new(StatusCode::NOT_FOUND, "任务投递不存在")),
+    }
+}
+
+pub async fn update_task_delivery_status(
+    State(_state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateTaskDeliveryStatusRequest>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::ensure_db().map_err(storage_error)?;
+    let status = payload.status.trim();
+    if !matches!(status, "pending" | "reported" | "acknowledged") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "status 仅支持 pending/reported/acknowledged",
+        ));
+    }
+    assignment_store::mark_task_delivery_status(&id, status).map_err(storage_error)?;
+    let delivery = assignment_store::get_task_delivery(&id)
+        .map_err(storage_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "任务投递不存在"))?;
+    Ok(Json(json!({ "delivery": delivery })))
+}
+
 #[derive(Deserialize)]
 pub struct ChatSessionQuery {
+    pub session_label: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ChatSessionCompactRequest {
     pub session_label: Option<String>,
     pub session_id: Option<String>,
 }
@@ -529,7 +1243,8 @@ pub async fn chat_sessions(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let path = format!("/api/agents/{id}/sessions");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let path = format!("/api/agents/{}/sessions", resolved.resolved);
     let data = state.openfang.get_json(&path).await?;
     Ok(Json(data))
 }
@@ -540,30 +1255,104 @@ pub async fn chat_session(
     Query(query): Query<ChatSessionQuery>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let (original_session_id, _target_session_id, switched) = ensure_switched_to_session_target(
-        &state,
-        &id,
-        query.session_id.as_deref(),
-        query.session_label.as_deref(),
-    )
-    .await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let session_id = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let session_label = query
+        .session_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-    let path = format!("/api/agents/{id}/session");
+    let session_ctx = if let Some(sid) = session_id {
+        ensure_switched_to_session_id(&state, &resolved.resolved, sid).await?
+    } else if let Some(label) = session_label {
+        let safe_label = normalize_session_label(label);
+        if safe_label.is_empty() {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "session_label 无效"));
+        }
+
+        let Some(existing_session_id) =
+            find_openfang_session_by_label(&state, &resolved.resolved, &safe_label).await?
+        else {
+            return Ok(Json(json!({
+                "label": safe_label,
+                "messages": []
+            })));
+        };
+
+        ensure_switched_to_session_id(&state, &resolved.resolved, &existing_session_id).await?
+    } else {
+        SessionSwitchContext::default()
+    };
+
+    let path = format!("/api/agents/{}/session", resolved.resolved);
     let data = match state.openfang.get_json(&path).await {
         Ok(value) => value,
         Err(err) => {
-            if switched {
-                let _ = switch_openfang_session(&state, &id, &original_session_id).await;
+            if session_ctx.switched {
+                let _ = switch_openfang_session(
+                    &state,
+                    &resolved.resolved,
+                    &session_ctx.original_session_id,
+                )
+                .await;
             }
             return Err(err);
         }
     };
 
-    if switched {
-        let _ = switch_openfang_session(&state, &id, &original_session_id).await;
+    if session_ctx.switched {
+        let _ =
+            switch_openfang_session(&state, &resolved.resolved, &session_ctx.original_session_id)
+                .await;
     }
 
     Ok(Json(data))
+}
+
+pub async fn chat_session_compact(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<ChatSessionCompactRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+
+    let session_ctx = ensure_switched_to_session_target(
+        &state,
+        &agent_id,
+        payload.session_id.as_deref(),
+        payload.session_label.as_deref(),
+    )
+    .await?;
+
+    let path = format!("/api/agents/{agent_id}/session/compact");
+    let data = match state.openfang.post_json(&path, json!({})).await {
+        Ok(value) => value,
+        Err(err) => {
+            if session_ctx.switched {
+                let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id)
+                    .await;
+            }
+            return Err(err);
+        }
+    };
+
+    if session_ctx.switched {
+        let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id).await;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "agent_id": agent_id,
+        "session_id": if session_ctx.target_session_id.trim().is_empty() { Value::Null } else { Value::String(session_ctx.target_session_id.clone()) },
+        "result": data,
+    })))
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -826,8 +1615,9 @@ fn merge_group_collaboration(
     obj.insert("discoverable".to_string(), Value::Bool(true));
     obj.insert("dispatchEnabled".to_string(), Value::Bool(true));
 
-    let existing = obj
-        .get("selectedWorkers")
+    let previous_group_workers = obj
+        .get("groupSelectedWorkers")
+        .or_else(|| obj.get("group_selected_workers"))
         .and_then(Value::as_array)
         .map(|items| {
             items
@@ -836,18 +1626,43 @@ fn merge_group_collaboration(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let existing = obj
+        .get("selectedWorkers")
+        .or_else(|| obj.get("selected_workers"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let previous_group_worker_keys = previous_group_workers
+        .iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .collect::<HashSet<String>>();
+    let preserved_manual_workers = existing
+        .into_iter()
+        .filter(|item| !previous_group_worker_keys.contains(&item.trim().to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let next_group_workers = build_group_selected_workers(group_member_ids, self_agent_id);
 
     let merged = normalize_collaboration_worker_keys(
-        &[
-            existing,
-            build_group_selected_workers(group_member_ids, self_agent_id),
-        ]
-        .concat(),
+        &[preserved_manual_workers, next_group_workers.clone()].concat(),
     );
 
     obj.insert(
         "selectedWorkers".to_string(),
         Value::Array(merged.iter().map(|s| Value::String(s.clone())).collect()),
+    );
+    obj.insert(
+        "groupSelectedWorkers".to_string(),
+        Value::Array(
+            next_group_workers
+                .iter()
+                .map(|s| Value::String(s.clone()))
+                .collect(),
+        ),
     );
 
     let callee_ids = callee_ids_from_selected_workers(&merged);
@@ -913,7 +1728,7 @@ pub async fn delete_chat_group(
 }
 
 pub async fn create_chat_group(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateChatGroupRequest>,
 ) -> Result<Json<Value>, ApiError> {
     assignment_store::ensure_db().map_err(storage_error)?;
@@ -1006,7 +1821,8 @@ pub async fn create_chat_group(
 
     let apply_acl = payload.apply_collaboration_acl.unwrap_or(true);
     if apply_acl {
-        apply_group_collaboration_acl(&member_agent_ids).map_err(storage_error)?;
+        let acl_member_ids = resolve_nuwa_alias_in_list(&state, &member_agent_ids).await?;
+        apply_group_collaboration_acl(&acl_member_ids).map_err(storage_error)?;
     }
 
     let group = assignment_store::get_chat_group(&group_id).map_err(storage_error)?;
@@ -1014,7 +1830,7 @@ pub async fn create_chat_group(
 }
 
 pub async fn update_chat_group(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(payload): Json<UpdateChatGroupRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1114,9 +1930,12 @@ pub async fn update_chat_group(
 
     assignment_store::update_chat_group(&record).map_err(storage_error)?;
 
-    let apply_acl = payload.apply_collaboration_acl.unwrap_or(false);
-    if apply_acl {
-        apply_group_collaboration_acl(&member_agent_ids).map_err(storage_error)?;
+    let membership_changed = existing.member_agent_ids != member_agent_ids
+        || existing.leader_agent_id != leader_agent_id;
+    let apply_acl = payload.apply_collaboration_acl.unwrap_or(true);
+    if apply_acl || membership_changed {
+        let acl_member_ids = resolve_nuwa_alias_in_list(&state, &member_agent_ids).await?;
+        apply_group_collaboration_acl(&acl_member_ids).map_err(storage_error)?;
     }
 
     let group = assignment_store::get_chat_group(&group_id).map_err(storage_error)?;
@@ -1465,9 +2284,6 @@ fn merge_agent_profile_override(
             "english_name".to_string(),
             Value::String(english_name.clone()),
         );
-        if !english_name.trim().is_empty() {
-            display_name_override = Some(english_name.clone());
-        }
     }
     if let Some(nickname) = &profile.nickname {
         object.insert("nickname".to_string(), Value::String(nickname.clone()));
@@ -1494,58 +2310,6 @@ fn merge_agent_profile_override(
                 );
             }
         }
-    }
-}
-
-const BUILTIN_NUWA_NAME: &str = "女娲";
-const BUILTIN_NUWA_AVATAR_URL: &str = "/agent_profile/avatar.png";
-const BUILTIN_NUWA_PORTRAIT_URL: &str = "/agent_profile/portrait.png";
-
-fn is_builtin_nuwa_agent_payload(payload: &Value) -> bool {
-    payload
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .map(|value| value == BUILTIN_NUWA_NAME)
-        .unwrap_or(false)
-}
-
-fn merge_builtin_nuwa_defaults(row: &mut Value) {
-    if !is_builtin_nuwa_agent_payload(row) {
-        return;
-    }
-    let Some(object) = row.as_object_mut() else {
-        return;
-    };
-    let identity = object
-        .entry("identity".to_string())
-        .or_insert_with(|| json!({}));
-    let Some(identity_obj) = identity.as_object_mut() else {
-        return;
-    };
-    let needs_avatar = identity_obj
-        .get("avatar_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .map(|value| value.is_empty())
-        .unwrap_or(true);
-    if needs_avatar {
-        identity_obj.insert(
-            "avatar_url".to_string(),
-            Value::String(BUILTIN_NUWA_AVATAR_URL.to_string()),
-        );
-    }
-    let needs_portrait = identity_obj
-        .get("portrait_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .map(|value| value.is_empty())
-        .unwrap_or(true);
-    if needs_portrait {
-        identity_obj.insert(
-            "portrait_url".to_string(),
-            Value::String(BUILTIN_NUWA_PORTRAIT_URL.to_string()),
-        );
     }
 }
 
@@ -1641,6 +2405,154 @@ fn normalize_context_file_name(file_name: &str) -> Option<&'static str> {
         .find(|item| item.eq_ignore_ascii_case(trimmed))
 }
 
+fn normalize_generated_heading(raw: &str) -> String {
+    let mut output = String::new();
+    let mut skip_ascii_paren = 0usize;
+    let mut skip_cn_paren = 0usize;
+    for ch in raw.chars() {
+        match ch {
+            '(' => {
+                skip_ascii_paren += 1;
+                continue;
+            }
+            ')' => {
+                skip_ascii_paren = skip_ascii_paren.saturating_sub(1);
+                continue;
+            }
+            '（' => {
+                skip_cn_paren += 1;
+                continue;
+            }
+            '）' => {
+                skip_cn_paren = skip_cn_paren.saturating_sub(1);
+                continue;
+            }
+            _ => {}
+        }
+        if skip_ascii_paren > 0 || skip_cn_paren > 0 {
+            continue;
+        }
+        if ch.is_whitespace()
+            || matches!(ch, '`' | '*' | '_' | ':' | '：' | '-' | '|' | '【' | '】')
+        {
+            continue;
+        }
+        output.extend(ch.to_lowercase());
+    }
+    output
+}
+
+fn split_generated_markdown_sections(text: &str) -> HashMap<String, String> {
+    let normalized = text.replace("\r\n", "\n");
+    let mut sections = HashMap::new();
+    let mut current_heading = String::new();
+    let mut buffer: Vec<String> = Vec::new();
+
+    let flush = |sections: &mut HashMap<String, String>,
+                 current_heading: &String,
+                 buffer: &mut Vec<String>| {
+        if !current_heading.is_empty() {
+            sections.insert(
+                current_heading.clone(),
+                buffer.join("\n").trim().to_string(),
+            );
+        }
+    };
+
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        if let Some(stripped) = trimmed.strip_prefix("# ") {
+            let heading = stripped.trim();
+            if !heading.is_empty() {
+                flush(&mut sections, &current_heading, &mut buffer);
+                current_heading = normalize_generated_heading(heading);
+                buffer.clear();
+                continue;
+            }
+        }
+        if !current_heading.is_empty() {
+            buffer.push(line.to_string());
+        }
+    }
+    flush(&mut sections, &current_heading, &mut buffer);
+    sections
+}
+
+fn read_generated_section(sections: &HashMap<String, String>, aliases: &[&str]) -> Option<String> {
+    aliases
+        .iter()
+        .find_map(|alias| sections.get(&normalize_generated_heading(alias)).cloned())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Default)]
+struct ParsedGeneratedIdentityBundle {
+    context_files: HashMap<&'static str, String>,
+    system_prompt: Option<String>,
+}
+
+fn parse_generated_identity_bundle_markdown(text: &str) -> ParsedGeneratedIdentityBundle {
+    let normalized = text.trim();
+    if normalized.is_empty() {
+        return ParsedGeneratedIdentityBundle::default();
+    }
+    let sections = split_generated_markdown_sections(normalized);
+    let mut parsed = ParsedGeneratedIdentityBundle::default();
+
+    let mappings: [(&'static str, [&str; 3]); 8] = [
+        ("IDENTITY.md", ["IDENTITY.md", "身份设定", "identity"]),
+        ("SOUL.md", ["SOUL.md", "灵魂规则", "soul"]),
+        ("USER.md", ["USER.md", "用户关系", "user"]),
+        ("MEMORY.md", ["MEMORY.md", "记忆规则", "长期记忆"]),
+        ("TOOLS.md", ["TOOLS.md", "工具规范", "tools"]),
+        ("AGENTS.md", ["AGENTS.md", "多智能体协作", "agents"]),
+        (
+            "BOOTSTRAP.md",
+            ["BOOTSTRAP.md", "首次会话流程", "首次运行流程"],
+        ),
+        (
+            "HEARTBEAT.md",
+            ["HEARTBEAT.md", "周期性任务提示词", "heartbeatchecklist"],
+        ),
+    ];
+
+    for (file_name, aliases) in mappings {
+        if let Some(content) = read_generated_section(&sections, &aliases) {
+            parsed.context_files.insert(file_name, content);
+        }
+    }
+    parsed.system_prompt = read_generated_section(&sections, &["系统提示词", "SYSTEM"]);
+
+    if parsed.context_files.is_empty() {
+        parsed
+            .context_files
+            .insert("IDENTITY.md", normalized.to_string());
+    }
+    parsed
+}
+
+fn complete_generated_identity_bundle(
+    raw_input: &str,
+    text: &str,
+) -> ParsedGeneratedIdentityBundle {
+    let mut parsed = parse_generated_identity_bundle_markdown(text);
+    let fallback_markdown = build_optimize_fallback_content(raw_input, "identity_bundle");
+    let fallback = parse_generated_identity_bundle_markdown(&fallback_markdown);
+
+    for file_name in KNOWN_CONTEXT_FILES {
+        if !parsed.context_files.contains_key(file_name) {
+            if let Some(content) = fallback.context_files.get(file_name) {
+                parsed.context_files.insert(file_name, content.to_string());
+            }
+        }
+    }
+    if parsed.system_prompt.is_none() {
+        parsed.system_prompt = fallback.system_prompt;
+    }
+    parsed
+}
+
 async fn read_context_file_from_openfang(
     state: &Arc<AppState>,
     agent_id: &str,
@@ -1668,6 +2580,14 @@ async fn write_context_file_to_openfang(
         .openfang
         .put_json(&path, json!({ "content": content }))
         .await?;
+    let binding = resolve_agent_workspace_binding(state, agent_id, None).await?;
+    let file_path = binding.private_workspace.join(file_name);
+    fs::write(&file_path, content).map_err(|e| {
+        storage_error(format!(
+            "写入工作区身份文件失败({}): {e}",
+            file_path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -1919,6 +2839,9 @@ fn normalize_workspace_segment(raw: &str) -> Option<String> {
     {
         return None;
     }
+    if value.chars().any(|ch| !ch.is_ascii()) {
+        return None;
+    }
     Some(value.to_string())
 }
 
@@ -1941,6 +2864,61 @@ fn is_valid_english_name(raw: &str) -> bool {
         return false;
     }
     true
+}
+
+fn looks_like_uuid(raw: &str) -> bool {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return false;
+    }
+    let parts = value.split('-').collect::<Vec<_>>();
+    if parts.len() != 5 {
+        return false;
+    }
+    let expected = [8usize, 4, 4, 4, 12];
+    for (idx, part) in parts.iter().enumerate() {
+        if part.len() != expected[idx] {
+            return false;
+        }
+        if !part.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_safe_workspace_segment_for_migration(raw: &str) -> bool {
+    let value = raw.trim();
+    !(value.is_empty()
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains("..")
+        || value.contains(':'))
+}
+
+fn maybe_migrate_workspace_dir(from_segment: &str, to_segment: &str) -> Result<bool, ApiError> {
+    let from = from_segment.trim();
+    let to = to_segment.trim();
+    if from.is_empty() || to.is_empty() || from == to {
+        return Ok(false);
+    }
+    if !is_safe_workspace_segment_for_migration(from)
+        || !is_safe_workspace_segment_for_migration(to)
+    {
+        return Ok(false);
+    }
+    let root = path_resolver::workspaces_root().map_err(storage_error)?;
+    let from_dir = root.join(from);
+    if !from_dir.is_dir() {
+        return Ok(false);
+    }
+    let to_dir = root.join(to);
+    if to_dir.exists() {
+        return Ok(false);
+    }
+    fs::rename(&from_dir, &to_dir)
+        .map_err(|e| storage_error(format!("迁移工作区目录失败({from} -> {to}): {e}")))?;
+    Ok(true)
 }
 
 fn workspace_mcp_server_name(agent_id: &str) -> String {
@@ -1978,13 +2956,38 @@ fn is_supported_openfang_provider(provider: &str) -> bool {
         || provider.trim().eq_ignore_ascii_case("claude-code")
 }
 
+fn normalize_runtime_provider_id(value: &str) -> String {
+    let normalized = assignment_store::normalize_provider_id(value);
+    match normalized.as_str() {
+        // OpenFang runtime/model catalog currently uses `nvidia` as provider id,
+        // while webot historical configs may still carry `nvidia-nim`.
+        "nvidia-nim" => "nvidia".to_string(),
+        _ => normalized,
+    }
+}
+
+fn runtime_provider_aliases(provider: &str) -> Vec<String> {
+    let normalized = normalize_runtime_provider_id(provider);
+    match normalized.as_str() {
+        "nvidia" => vec!["nvidia".to_string(), "nvidia-nim".to_string()],
+        _ if !normalized.is_empty() => vec![normalized],
+        _ => Vec::new(),
+    }
+}
+
+fn runtime_provider_ids_match(left: &str, right: &str) -> bool {
+    let left = normalize_runtime_provider_id(left);
+    let right = normalize_runtime_provider_id(right);
+    !left.is_empty() && left == right
+}
+
 fn strip_provider_prefixes(model: &str, provider: &str) -> String {
     let mut current = model.trim().to_string();
     if current.is_empty() {
         return current;
     }
-    let provider = provider.trim();
-    if provider.is_empty() {
+    let aliases = runtime_provider_aliases(provider);
+    if aliases.is_empty() {
         return current;
     }
     loop {
@@ -1994,13 +2997,97 @@ fn strip_provider_prefixes(model: &str, provider: &str) -> String {
         if suffix.is_empty() {
             break;
         }
-        if prefix.trim().eq_ignore_ascii_case(provider) {
+        if aliases
+            .iter()
+            .any(|candidate| prefix.trim().eq_ignore_ascii_case(candidate))
+        {
             current = suffix.to_string();
             continue;
         }
         break;
     }
     current
+}
+
+fn find_namespaced_local_provider_alias(
+    model: &str,
+    provider_configs: &HashMap<String, assignment_store::ProviderConfigRecord>,
+) -> Option<(String, String)> {
+    let trimmed = model.trim();
+    let (prefix, suffix) = trimmed.split_once('/')?;
+    let provider_id = assignment_store::normalize_provider_id(prefix);
+    let model_name = suffix.trim();
+    if provider_id.is_empty() || model_name.is_empty() {
+        return None;
+    }
+    let cfg = provider_configs.get(&provider_id)?;
+    let matched = cfg.models.iter().any(|item| {
+        let normalized = strip_provider_prefixes(item, &provider_id);
+        normalized.eq_ignore_ascii_case(model_name)
+    });
+    if matched {
+        return Some((provider_id, model_name.to_string()));
+    }
+    None
+}
+
+fn normalize_display_model_ref(
+    provider: &str,
+    raw_model: &str,
+    provider_configs: &HashMap<String, assignment_store::ProviderConfigRecord>,
+) -> (String, String) {
+    let normalized_provider = normalize_runtime_provider_id(provider);
+    let normalized_model = strip_provider_prefixes(raw_model, &normalized_provider);
+    if normalized_model.is_empty() {
+        return (normalized_provider, normalized_model);
+    }
+    if let Some((provider_id, model_name)) =
+        find_namespaced_local_provider_alias(&normalized_model, provider_configs)
+    {
+        return (provider_id, model_name);
+    }
+    (normalized_provider, normalized_model)
+}
+
+fn normalize_runtime_applied_model(
+    target_provider: &str,
+    applied_provider: &str,
+    applied_model_raw: &str,
+) -> (String, String) {
+    let target_provider = normalize_runtime_provider_id(target_provider);
+    let applied_provider_trimmed = normalize_runtime_provider_id(applied_provider);
+
+    let compare_provider = if applied_provider_trimmed.is_empty() {
+        target_provider.as_str()
+    } else {
+        applied_provider_trimmed.as_str()
+    };
+
+    // Some backends (e.g. NIM) may report provider as a wrapper (nvidia-nim),
+    // but keep the user-facing namespace in the model id (xianyu/glm-4.7).
+    // We accept the target provider/model if it can be derived from the applied model selector.
+    let stripped_once = strip_provider_prefixes(applied_model_raw, compare_provider);
+    let mut normalized_provider = if applied_provider_trimmed.is_empty() {
+        target_provider.clone()
+    } else {
+        applied_provider_trimmed.clone()
+    };
+    let mut normalized_model = stripped_once.clone();
+
+    let candidate = stripped_once;
+    if let Some((prefix, _)) = candidate.split_once('/') {
+        if runtime_provider_ids_match(prefix.trim(), target_provider.as_str()) {
+            normalized_provider = target_provider.clone();
+            normalized_model = strip_provider_prefixes(&candidate, target_provider.as_str());
+        }
+    } else if let Some((prefix, _)) = applied_model_raw.split_once('/') {
+        if runtime_provider_ids_match(prefix.trim(), target_provider.as_str()) {
+            normalized_provider = target_provider.clone();
+            normalized_model = strip_provider_prefixes(applied_model_raw, target_provider.as_str());
+        }
+    }
+
+    (normalized_provider, normalized_model)
 }
 
 fn is_probably_chat_model(provider: &str, model: &str) -> bool {
@@ -2042,9 +3129,9 @@ fn is_probably_chat_model(provider: &str, model: &str) -> bool {
 
 fn build_upstream_model_selector(provider: Option<&str>, raw_model: &str) -> Option<String> {
     let requested_provider = provider
-        .map(str::trim)
+        .map(normalize_runtime_provider_id)
         .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase);
+        .map(|value| value.to_ascii_lowercase());
     let mut model = raw_model.trim().to_string();
     if model.is_empty() {
         return None;
@@ -2101,7 +3188,7 @@ fn resolve_provider_model_pair(
 ) -> Option<(String, String)> {
     let selector = build_upstream_model_selector(preferred_provider, raw_model)?;
     if let Some((prefix, suffix)) = selector.split_once('/') {
-        let normalized_prefix = prefix.trim().to_ascii_lowercase();
+        let normalized_prefix = normalize_runtime_provider_id(prefix);
         let normalized_suffix = suffix.trim();
         if !normalized_suffix.is_empty() {
             if is_supported_openfang_provider(&normalized_prefix) {
@@ -2109,9 +3196,9 @@ fn resolve_provider_model_pair(
             }
             // 允许自定义 provider：当用户明确选择了 provider 时，也允许按前缀拆分
             if preferred_provider
-                .map(str::trim)
+                .map(normalize_runtime_provider_id)
                 .filter(|value| !value.is_empty())
-                .map(|value| value.eq_ignore_ascii_case(&normalized_prefix))
+                .map(|value| runtime_provider_ids_match(&value, &normalized_prefix))
                 .unwrap_or(false)
             {
                 return Some((normalized_prefix, normalized_suffix.to_string()));
@@ -2119,11 +3206,140 @@ fn resolve_provider_model_pair(
         }
     }
     let fallback_provider = preferred_provider
-        .map(str::trim)
+        .map(normalize_runtime_provider_id)
         .filter(|value| !value.is_empty())
-        .unwrap_or("openai")
+        .unwrap_or_else(|| "openai".to_string())
         .to_ascii_lowercase();
     Some((fallback_provider, selector))
+}
+
+fn payload_models_array<'a>(payload: &'a Value) -> Vec<&'a Value> {
+    if let Some(items) = payload.as_array() {
+        return items.iter().collect();
+    }
+    payload
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
+async fn ensure_runtime_model_available(
+    state: &Arc<AppState>,
+    provider: &str,
+    model: &str,
+) -> Result<(), ApiError> {
+    let normalized_model = strip_provider_prefixes(model, provider);
+    let payload = state.openfang.get_json("/api/models").await?;
+    let exists = payload_models_array(&payload).into_iter().any(|item| {
+        let item_provider = item
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let item_model = strip_provider_prefixes(
+            item.get("model")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            provider,
+        );
+        item_provider.eq_ignore_ascii_case(provider)
+            && item_model.eq_ignore_ascii_case(&normalized_model)
+    });
+
+    if exists {
+        return Ok(());
+    }
+
+    let display_name = format!("{provider}/{normalized_model}");
+    let _ = state
+        .openfang
+        .post_json(
+            "/api/models/custom",
+            json!({
+                "id": normalized_model,
+                "provider": provider,
+                "display_name": display_name
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn apply_runtime_agent_model(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Value, ApiError> {
+    ensure_runtime_model_available(state, provider, model).await?;
+
+    let selector = build_upstream_model_selector(Some(provider), model)
+        .unwrap_or_else(|| format!("{provider}/{model}"));
+    let path = format!("/api/agents/{agent_id}/model");
+    state
+        .openfang
+        .put_json(&path, json!({ "model": selector }))
+        .await?;
+
+    let detail_path = format!("/api/agents/{agent_id}");
+    let mut detail = state.openfang.get_json(&detail_path).await?;
+    let applied_provider = detail
+        .pointer("/model/provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let applied_model_raw = detail
+        .pointer("/model/model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (normalized_provider, normalized_model) =
+        normalize_runtime_applied_model(provider, &applied_provider, &applied_model_raw);
+    let normalized_target_model = strip_provider_prefixes(model, provider);
+
+    if let Some(model_obj) = detail.get_mut("model").and_then(Value::as_object_mut) {
+        if !normalized_provider.eq_ignore_ascii_case(&applied_provider) {
+            model_obj.insert(
+                "provider".to_string(),
+                Value::String(normalized_provider.clone()),
+            );
+        }
+        if !normalized_model.eq_ignore_ascii_case(&applied_model_raw) {
+            model_obj.insert("model".to_string(), Value::String(normalized_model.clone()));
+        }
+        let provider_config_map: HashMap<String, assignment_store::ProviderConfigRecord> =
+            assignment_store::list_provider_configs()
+                .map_err(storage_error)?
+                .into_iter()
+                .map(|item| (item.provider_id.clone(), item))
+                .collect();
+        let (display_provider, display_model) = normalize_display_model_ref(
+            &normalized_provider,
+            &normalized_model,
+            &provider_config_map,
+        );
+        if !display_provider.is_empty() && display_provider != normalized_provider {
+            model_obj.insert("provider".to_string(), Value::String(display_provider));
+        }
+        if !display_model.is_empty() && display_model != normalized_model {
+            model_obj.insert("model".to_string(), Value::String(display_model));
+        }
+    }
+
+    if !normalized_provider.eq_ignore_ascii_case(provider)
+        || !normalized_model.eq_ignore_ascii_case(&normalized_target_model)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "OpenFang 未应用目标模型，当前为 {}/{}，期望为 {}/{}",
+                applied_provider, applied_model_raw, provider, model
+            ),
+        ));
+    }
+
+    Ok(detail)
 }
 
 fn is_local_provider_configured(provider_id: &str) -> Result<bool, ApiError> {
@@ -2245,6 +3461,36 @@ async fn resolve_agent_workspace_binding(
 ) -> Result<AgentWorkspaceBinding, ApiError> {
     validate_agent_path_segment(agent_id)?;
     let workspace_segment = resolve_agent_workspace_segment(state, agent_id, upstream_hint).await?;
+    if workspace_segment != agent_id {
+        let mut migration_candidates = Vec::new();
+        migration_candidates.push(agent_id.to_string());
+        if let Some(hint) = upstream_hint {
+            migration_candidates.extend(collect_segment_candidates_from_payload(hint));
+        } else {
+            let detail_path = format!("/api/agents/{agent_id}");
+            if let Ok(detail) = state.openfang.get_json(&detail_path).await {
+                migration_candidates.extend(collect_segment_candidates_from_payload(&detail));
+            }
+        }
+        migration_candidates.retain(|item| item.trim() != workspace_segment);
+        migration_candidates.dedup();
+        for from in migration_candidates {
+            match maybe_migrate_workspace_dir(&from, &workspace_segment) {
+                Ok(true) => break,
+                Ok(false) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        from = %from,
+                        to = %workspace_segment,
+                        error = %err.message,
+                        "workspace binding migrate failed"
+                    );
+                    break;
+                }
+            }
+        }
+    }
     let private_workspace = path_resolver::workspaces_root()
         .map_err(storage_error)?
         .join(&workspace_segment);
@@ -2265,26 +3511,6 @@ async fn resolve_agent_workspace_binding(
             if seen.insert(key) {
                 extra_workspaces.push(path);
             }
-        }
-    }
-
-    let is_builtin_nuwa = if let Some(hint) = upstream_hint {
-        is_builtin_nuwa_agent_payload(hint)
-    } else {
-        let detail_path = format!("/api/agents/{agent_id}");
-        state
-            .openfang
-            .get_json(&detail_path)
-            .await
-            .ok()
-            .map(|detail| is_builtin_nuwa_agent_payload(&detail))
-            .unwrap_or(false)
-    };
-    if is_builtin_nuwa {
-        let webot_home = path_resolver::webot_home_dir().map_err(storage_error)?;
-        let key = path_identity_key(&webot_home);
-        if seen.insert(key) {
-            extra_workspaces.push(webot_home);
         }
     }
 
@@ -2726,7 +3952,19 @@ async fn save_agent_chat_asset_bytes(
     filename_hint: Option<&str>,
     bytes: &[u8],
     upstream_hint: Option<&Value>,
-) -> Result<(String, String, String, String, String, String, usize, Option<String>), ApiError> {
+) -> Result<
+    (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        usize,
+        Option<String>,
+    ),
+    ApiError,
+> {
     if bytes.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -2763,14 +4001,8 @@ async fn save_agent_chat_asset_bytes(
     let kind = chat_asset_kind_from_name(&file_name).to_string();
     let mime_type = chat_asset_content_type(&file_name).to_string();
     let asset_url = build_agent_chat_asset_url(agent_id, &relative_path);
-    let upstream_file_id = mirror_agent_chat_asset_to_openfang(
-        state,
-        agent_id,
-        &file_name,
-        &mime_type,
-        bytes,
-    )
-    .await;
+    let upstream_file_id =
+        mirror_agent_chat_asset_to_openfang(state, agent_id, &file_name, &mime_type, bytes).await;
     Ok((
         asset_url,
         file_name,
@@ -2919,7 +4151,14 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
                 .unwrap_or_default();
             !agent_id.is_empty() && !hidden.contains(&agent_id)
         });
+        let provider_configs = assignment_store::list_provider_configs().map_err(storage_error)?;
+        let provider_config_map: HashMap<String, assignment_store::ProviderConfigRecord> =
+            provider_configs
+                .into_iter()
+                .map(|item| (item.provider_id.clone(), item))
+                .collect();
         for row in rows {
+            let is_nuwa = is_nuwa_agent_row(row);
             let agent_id = row
                 .get("id")
                 .and_then(Value::as_str)
@@ -2937,7 +4176,37 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             if let Some(profile) = profiles.get(&agent_id) {
                 merge_agent_profile_override(row, profile);
             }
-            merge_builtin_nuwa_defaults(row);
+            if let Some(model_obj) = row.get_mut("model").and_then(Value::as_object_mut) {
+                let provider = model_obj
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let model = model_obj
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let (display_provider, display_model) =
+                    normalize_display_model_ref(&provider, &model, &provider_config_map);
+                if !display_provider.is_empty() && display_provider != provider {
+                    model_obj.insert(
+                        "provider".to_string(),
+                        Value::String(display_provider.clone()),
+                    );
+                }
+                if !display_model.is_empty() && display_model != model {
+                    model_obj.insert("model".to_string(), Value::String(display_model));
+                }
+            }
+            if is_nuwa {
+                if let Some(object) = row.as_object_mut() {
+                    object.insert(
+                        "id".to_string(),
+                        Value::String(DEFAULT_NUWA_AGENT_ID.to_string()),
+                    );
+                }
+            }
         }
     }
     Ok(Json(data))
@@ -2985,11 +4254,13 @@ pub async fn list_agent_assignments(
         let openfang = openfang.clone();
         async move {
             let mut row_errors = serde_json::Map::new();
+            let mut agent = agent;
             let agent_id = agent
                 .get("id")
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
                 .unwrap_or_default();
+            let is_nuwa = is_nuwa_agent_row(&agent);
 
             if agent_id.is_empty() {
                 row_errors.insert("agent".to_string(), json!("agent id 缺失"));
@@ -3029,6 +4300,15 @@ pub async fn list_agent_assignments(
                         Vec::new()
                     }
                 };
+
+            if is_nuwa {
+                if let Some(object) = agent.as_object_mut() {
+                    object.insert(
+                        "id".to_string(),
+                        Value::String(DEFAULT_NUWA_AGENT_ID.to_string()),
+                    );
+                }
+            }
 
             json!({
                 "agent": agent,
@@ -3086,7 +4366,14 @@ pub async fn create_agent(
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
     let mut manifest_toml = payload.manifest_toml.clone();
+    let mut preferred_workspace_segment: Option<String> = None;
     if let Ok(mut parsed) = manifest_toml.parse::<toml::Value>() {
+        preferred_workspace_segment = parsed
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| is_valid_english_name(value))
+            .and_then(normalize_workspace_segment);
         if let Some(model_table) = parsed
             .as_table_mut()
             .and_then(|root| root.get_mut("model"))
@@ -3144,10 +4431,25 @@ pub async fn create_agent(
 
     if let Some(agent_id) = created_agent_id {
         let _ = assignment_store::set_agent_hidden(&agent_id, false);
+        if let Some(english_name) = preferred_workspace_segment.clone() {
+            let _ = assignment_store::upsert_agent_profile_override(
+                &agent_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(english_name),
+                None,
+            );
+        }
         let workspace_result =
             resolve_agent_workspace_binding(&state, &agent_id, Some(&data)).await;
         let model_result = normalize_agent_model_selector_if_needed(&state, &agent_id).await;
         let context_sync_result = sync_agent_context_files(&state, &agent_id, true).await;
+        let default_skill_result = enable_default_global_skills_for_agent(&agent_id);
         let _ = sync_provider_configs_to_runtime(&state).await;
         let sync_result = sync_active_mcp_servers_to_runtime(&state).await;
         let assignment_result = sync_agent_mcp_assignments(&state, &agent_id).await;
@@ -3160,6 +4462,9 @@ pub async fn create_agent(
         }
         if let Err(err) = context_sync_result {
             warnings.push(format!("初始化身份文件失败：{}", err.message));
+        }
+        if let Err(err) = default_skill_result {
+            warnings.push(format!("默认启用 ui-skill 失败：{err}"));
         }
         if let Err(err) = sync_result {
             warnings.push(format!("同步 MCP 配置失败：{}", err.message));
@@ -3185,27 +4490,55 @@ pub async fn get_agent(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let provider_config_map: HashMap<String, assignment_store::ProviderConfigRecord> =
+        assignment_store::list_provider_configs()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|item| (item.provider_id.clone(), item))
+            .collect();
+    let path = format!("/api/agents/{}", resolved.resolved);
     let mut data = state.openfang.get_json(&path).await?;
     if let Some(model_obj) = data.get_mut("model").and_then(Value::as_object_mut) {
-        let provider = model_obj
+        let raw_provider = model_obj
             .get("provider")
             .and_then(Value::as_str)
             .unwrap_or("")
+            .trim()
             .to_string();
-        if let Some(model) = model_obj.get("model").and_then(Value::as_str) {
-            let normalized = strip_provider_prefixes(model, &provider);
-            if !normalized.is_empty() && normalized != model {
-                model_obj.insert("model".to_string(), Value::String(normalized));
-            }
+        let raw_model = model_obj
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let (display_provider, display_model) =
+            normalize_display_model_ref(&raw_provider, &raw_model, &provider_config_map);
+        let provider_id = if display_provider.is_empty() {
+            raw_provider.clone()
+        } else {
+            display_provider.clone()
+        };
+        if !provider_id.is_empty() && provider_id != raw_provider {
+            model_obj.insert("provider".to_string(), Value::String(provider_id.clone()));
+        }
+        if !provider_id.is_empty() && !display_model.is_empty() && display_model != raw_model {
+            model_obj.insert("model".to_string(), Value::String(display_model));
         }
     }
     if let Some(profile) =
-        assignment_store::get_agent_profile_override(&id).map_err(storage_error)?
+        assignment_store::get_agent_profile_override(&resolved.resolved).map_err(storage_error)?
     {
         merge_agent_profile_override(&mut data, &profile);
     }
-    merge_builtin_nuwa_defaults(&mut data);
+    if resolved.alias_used {
+        if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "id".to_string(),
+                Value::String(DEFAULT_NUWA_AGENT_ID.to_string()),
+            );
+        }
+    }
     Ok(Json(data))
 }
 
@@ -3215,9 +4548,14 @@ pub async fn update_agent_config(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved.clone();
+    let public_id = resolved.requested.clone();
     let mut overrides = extract_profile_override_patch(&payload);
     let current_override =
-        assignment_store::get_agent_profile_override(&id).map_err(storage_error)?;
+        assignment_store::get_agent_profile_override(&agent_id).map_err(storage_error)?;
+    let mut workspace_migration_from: Option<String> = None;
+    let mut workspace_migration_to: Option<String> = None;
 
     if let Some(requested_english_name) = overrides.english_name.clone() {
         let requested = requested_english_name.trim().to_string();
@@ -3240,14 +4578,22 @@ pub async fn update_agent_config(
             .filter(|value| !value.is_empty());
         if let Some(current) = current_override_english_name {
             if requested != current {
-                return Err(ApiError::new(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "英文名称创建后不可修改（涉及工作区路径）",
-                ));
+                if looks_like_uuid(&current) {
+                    workspace_migration_from = Some(current.clone());
+                    workspace_migration_to = Some(requested.clone());
+                    overrides.english_name = Some(requested);
+                } else {
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "英文名称创建后不可修改（涉及工作区路径）",
+                    ));
+                }
+            } else {
+                overrides.english_name = None;
             }
-            overrides.english_name = None;
         } else {
             overrides.english_name = Some(requested);
+            workspace_migration_to = overrides.english_name.clone();
         }
     }
 
@@ -3268,7 +4614,9 @@ pub async fn update_agent_config(
                 .map(|items| sanitize_collaboration_worker_keys(items))
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|item| item != &format!("local:{id}"))
+                .filter(|item| {
+                    item != &format!("local:{public_id}") && item != &format!("local:{agent_id}")
+                })
                 .collect::<Vec<String>>();
             collaboration_object.insert("selectedWorkers".to_string(), json!(selected_worker_keys));
 
@@ -3298,6 +4646,19 @@ pub async fn update_agent_config(
             } else {
                 Some(Vec::new())
             };
+            if let Some(callee_ids) = acl_local_callee_ids.as_mut() {
+                let needs_alias = callee_ids
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID));
+                if needs_alias {
+                    let nuwa_id = resolve_nuwa_agent_id(&state).await?;
+                    for callee_id in callee_ids.iter_mut() {
+                        if callee_id.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID) {
+                            *callee_id = nuwa_id.clone();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3314,8 +4675,8 @@ pub async fn update_agent_config(
             object.insert("tags".to_string(), json!(tags));
         }
     }
-    let path = format!("/api/agents/{id}/config");
-    let data = state.openfang.patch_json(&path, forwarded_payload).await?;
+    let path = format!("/api/agents/{agent_id}/config");
+    let mut data = state.openfang.patch_json(&path, forwarded_payload).await?;
     let has_channel_binding = overrides.channel_binding.is_some();
     if overrides.tags.is_some()
         || overrides.description.is_some()
@@ -3328,7 +4689,7 @@ pub async fn update_agent_config(
         || overrides.nickname.is_some()
     {
         assignment_store::upsert_agent_profile_override(
-            &id,
+            &agent_id,
             overrides.tags,
             overrides.description,
             overrides.system_prompt,
@@ -3342,11 +4703,74 @@ pub async fn update_agent_config(
         .map_err(storage_error)?;
     }
     if let Some(callee_ids) = acl_local_callee_ids {
-        assignment_store::replace_agent_collaboration_acl(&id, "private", &callee_ids)
+        assignment_store::replace_agent_collaboration_acl(&agent_id, "private", &callee_ids)
             .map_err(storage_error)?;
     }
     if has_channel_binding {
         sync_channel_bindings_to_runtime(&state).await?;
+    }
+    if let Some(to_segment) = workspace_migration_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let mut migrated = false;
+        let mut used_from: Option<String> = None;
+        let mut candidates = Vec::new();
+        if let Some(from) = workspace_migration_from
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            candidates.push(from.to_string());
+        }
+        let detail_path = format!("/api/agents/{agent_id}");
+        if let Ok(detail) = state.openfang.get_json(&detail_path).await {
+            if let Some(value) = detail.get("name").and_then(Value::as_str) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    candidates.push(value.to_string());
+                }
+            }
+        }
+        candidates.push(agent_id.clone());
+        candidates.retain(|item| item.trim() != to_segment);
+        candidates.dedup();
+
+        for from in candidates {
+            match maybe_migrate_workspace_dir(&from, to_segment) {
+                Ok(true) => {
+                    migrated = true;
+                    used_from = Some(from);
+                    break;
+                }
+                Ok(false) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        error = %err.message,
+                        "workspace migrate failed"
+                    );
+                    break;
+                }
+            }
+        }
+        if migrated {
+            tracing::info!(
+                agent_id = %agent_id,
+                from = %used_from.clone().unwrap_or_default(),
+                to = %to_segment,
+                "workspace migrated"
+            );
+        }
+    }
+    if resolved.alias_used {
+        if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "id".to_string(),
+                Value::String(DEFAULT_NUWA_AGENT_ID.to_string()),
+            );
+        }
     }
     Ok(Json(data))
 }
@@ -3357,13 +4781,14 @@ pub async fn update_agent_model(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
     let object = payload
         .as_object()
         .ok_or_else(|| ApiError::new(axum::http::StatusCode::BAD_REQUEST, "请求体必须是对象"))?;
     let provider = object
         .get("provider")
         .and_then(Value::as_str)
-        .map(canonical_provider_id)
+        .map(normalize_runtime_provider_id)
         .filter(|value| !value.is_empty());
     let raw_model = object
         .get("model")
@@ -3397,12 +4822,12 @@ pub async fn update_agent_model(
         ));
     }
 
-    let path = format!("/api/agents/{id}/config");
-    let forwarded = json!({
-        "provider": target_provider,
-        "model": target_model,
-    });
-    let data = state.openfang.patch_json(&path, forwarded).await?;
+    let mut data =
+        apply_runtime_agent_model(&state, &resolved.resolved, &target_provider, &target_model)
+            .await?;
+    if resolved.alias_used {
+        rewrite_agent_id_fields(&mut data, DEFAULT_NUWA_AGENT_ID);
+    }
     Ok(Json(data))
 }
 
@@ -3468,14 +4893,7 @@ async fn normalize_agent_model_selector_if_needed(
         return Ok(false);
     }
 
-    let path = format!("/api/agents/{agent_id}/config");
-    state
-        .openfang
-        .patch_json(
-            &path,
-            json!({ "provider": target_provider, "model": target_model }),
-        )
-        .await?;
+    let _ = apply_runtime_agent_model(state, agent_id, &target_provider, &target_model).await?;
     Ok(true)
 }
 
@@ -3484,10 +4902,12 @@ pub async fn list_agent_context_files(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
-    let sync_stats = sync_agent_context_files(&state, &id, true).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
+    let sync_stats = sync_agent_context_files(&state, &resolved.resolved, true).await?;
 
-    let cached = assignment_store::list_agent_context_files(&id).map_err(storage_error)?;
+    let cached =
+        assignment_store::list_agent_context_files(&resolved.resolved).map_err(storage_error)?;
     let mut items = Vec::with_capacity(KNOWN_CONTEXT_FILES.len());
     for file_name in KNOWN_CONTEXT_FILES {
         if let Some(record) = cached.get(file_name) {
@@ -3525,9 +4945,14 @@ pub async fn reconcile_agent_context_files(
     payload: Option<Json<ReconcileContextFilesRequest>>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
     let request = payload.map(|body| body.0).unwrap_or_default();
-    let stats =
-        sync_agent_context_files(&state, &id, request.initialize_empty.unwrap_or(true)).await?;
+    let stats = sync_agent_context_files(
+        &state,
+        &resolved.resolved,
+        request.initialize_empty.unwrap_or(true),
+    )
+    .await?;
     Ok(Json(json!({
         "status": "ok",
         "agent_id": id,
@@ -3595,7 +5020,8 @@ pub async fn get_agent_context_file(
     Path((id, filename)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     let normalized_file_name = normalize_context_file_name(&filename).ok_or_else(|| {
         ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -3603,8 +5029,9 @@ pub async fn get_agent_context_file(
         )
     })?;
 
-    if let Some(record) = assignment_store::get_agent_context_file(&id, normalized_file_name)
-        .map_err(storage_error)?
+    if let Some(record) =
+        assignment_store::get_agent_context_file(&resolved.resolved, normalized_file_name)
+            .map_err(storage_error)?
     {
         return Ok(Json(json!({
             "name": normalized_file_name,
@@ -3615,10 +5042,15 @@ pub async fn get_agent_context_file(
         })));
     }
 
-    let upstream = read_context_file_from_openfang(&state, &id, normalized_file_name).await?;
+    let upstream =
+        read_context_file_from_openfang(&state, &resolved.resolved, normalized_file_name).await?;
     if let Some(content) = upstream {
-        assignment_store::upsert_agent_context_file(&id, normalized_file_name, &content)
-            .map_err(storage_error)?;
+        assignment_store::upsert_agent_context_file(
+            &resolved.resolved,
+            normalized_file_name,
+            &content,
+        )
+        .map_err(storage_error)?;
         return Ok(Json(json!({
             "name": normalized_file_name,
             "content": content,
@@ -3640,38 +5072,71 @@ pub struct SetAgentContextFileRequest {
     pub content: String,
 }
 
+async fn persist_agent_context_file(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    file_name: &'static str,
+    content: &str,
+) -> Result<Option<String>, ApiError> {
+    if content.len() > MAX_CONTEXT_FILE_SIZE {
+        return Err(ApiError::new(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            format!("文件过大，单文件最大 {} 字节", MAX_CONTEXT_FILE_SIZE),
+        ));
+    }
+    write_context_file_to_openfang(state, agent_id, file_name, content).await?;
+    assignment_store::upsert_agent_context_file(agent_id, file_name, content)
+        .map_err(storage_error)?;
+    let updated_at = assignment_store::get_agent_context_file(agent_id, file_name)
+        .map_err(storage_error)?
+        .map(|record| record.updated_at);
+    Ok(updated_at)
+}
+
+async fn persist_agent_system_prompt(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    system_prompt: &str,
+) -> Result<(), ApiError> {
+    let path = format!("/api/agents/{agent_id}/config");
+    state
+        .openfang
+        .patch_json(&path, json!({ "system_prompt": system_prompt }))
+        .await?;
+    assignment_store::upsert_agent_profile_override(
+        agent_id,
+        None,
+        None,
+        Some(system_prompt.to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(storage_error)?;
+    Ok(())
+}
+
 pub async fn set_agent_context_file(
     State(state): State<Arc<AppState>>,
     Path((id, filename)): Path<(String, String)>,
     Json(payload): Json<SetAgentContextFileRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     let normalized_file_name = normalize_context_file_name(&filename).ok_or_else(|| {
         ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "不支持的身份文件（仅允许 SOUL.md/USER.md/TOOLS.md/MEMORY.md/AGENTS.md/BOOTSTRAP.md/IDENTITY.md/HEARTBEAT.md）",
         )
     })?;
-    if payload.content.len() > MAX_CONTEXT_FILE_SIZE {
-        return Err(ApiError::new(
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-            format!("文件过大，单文件最大 {} 字节", MAX_CONTEXT_FILE_SIZE),
-        ));
-    }
-
-    let path = format!("/api/agents/{id}/files/{normalized_file_name}");
     let content = payload.content;
-    let upstream = state
-        .openfang
-        .put_json(&path, json!({ "content": content.clone() }))
-        .await?;
-
-    assignment_store::upsert_agent_context_file(&id, normalized_file_name, &content)
-        .map_err(storage_error)?;
-    let updated_at = assignment_store::get_agent_context_file(&id, normalized_file_name)
-        .map_err(storage_error)?
-        .map(|record| record.updated_at);
+    let updated_at =
+        persist_agent_context_file(&state, &resolved.resolved, normalized_file_name, &content)
+            .await?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -3680,7 +5145,72 @@ pub async fn set_agent_context_file(
         "exists": true,
         "source": "sqlite",
         "updated_at": updated_at,
-        "upstream": upstream
+        "upstream": { "status": "ok" }
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateAndApplyAgentContextBundleRequest {
+    pub input: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+pub async fn generate_and_apply_agent_context_bundle(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<GenerateAndApplyAgentContextBundleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
+
+    let optimize_result = execute_optimize_prompt_request(
+        &state,
+        &OptimizePromptRequest {
+            input: payload.input.clone(),
+            target: Some("identity_bundle".to_string()),
+            provider: payload.provider.clone(),
+            model: payload.model.clone(),
+            agent_id: Some(resolved.resolved.clone()),
+        },
+    )
+    .await?;
+    let parsed = complete_generated_identity_bundle(&payload.input, &optimize_result.content);
+
+    let mut files = Vec::with_capacity(KNOWN_CONTEXT_FILES.len());
+    for file_name in KNOWN_CONTEXT_FILES {
+        let content = parsed
+            .context_files
+            .get(file_name)
+            .cloned()
+            .unwrap_or_default();
+        let updated_at =
+            persist_agent_context_file(&state, &resolved.resolved, file_name, &content).await?;
+        files.push(json!({
+            "name": file_name,
+            "content": content,
+            "exists": true,
+            "source": "sqlite",
+            "updated_at": updated_at,
+        }));
+    }
+
+    let system_prompt = parsed.system_prompt.unwrap_or_default();
+    persist_agent_system_prompt(&state, &resolved.resolved, &system_prompt).await?;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "agent_id": id,
+        "provider": optimize_result.provider,
+        "model": optimize_result.model,
+        "target": optimize_result.target,
+        "fallback": optimize_result.fallback,
+        "error": optimize_result.error,
+        "content": optimize_result.content,
+        "system_prompt": system_prompt,
+        "files": files
     })))
 }
 
@@ -3700,8 +5230,9 @@ pub async fn list_agent_memory_files(
     Query(query): Query<ListAgentMemoryFilesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
-    let memory_root = resolve_agent_memory_dir_smart(&state, &id).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
+    let memory_root = resolve_agent_memory_dir_smart(&state, &resolved.resolved).await?;
 
     let now = now_millis();
     let mut end_ms = query.end_ms.unwrap_or(now);
@@ -3819,8 +5350,9 @@ pub async fn get_agent_memory_file(
     Query(query): Query<AgentMemoryFilePathQuery>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
-    let memory_root = resolve_agent_memory_dir_smart(&state, &id).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
+    let memory_root = resolve_agent_memory_dir_smart(&state, &resolved.resolved).await?;
     let normalized_path = normalize_memory_relative_path(&query.path)?;
     let file_path = resolve_memory_file_path(&memory_root, &normalized_path);
     if !file_path.exists() || !file_path.is_file() {
@@ -3863,7 +5395,8 @@ pub async fn set_agent_memory_file(
     Json(payload): Json<SetAgentMemoryFileRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     if payload.content.len() > MAX_MEMORY_FILE_SIZE {
         return Err(ApiError::new(
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -3871,7 +5404,7 @@ pub async fn set_agent_memory_file(
         ));
     }
 
-    let memory_root = resolve_agent_memory_dir_smart(&state, &id).await?;
+    let memory_root = resolve_agent_memory_dir_smart(&state, &resolved.resolved).await?;
     let normalized_path = normalize_memory_relative_path(&payload.path)?;
     let file_path = resolve_memory_file_path(&memory_root, &normalized_path);
     if let Some(parent) = file_path.parent() {
@@ -3954,7 +5487,8 @@ pub async fn search_agent_memory(
     Query(query): Query<AgentMemorySearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
 
     let mut params: Vec<(String, String)> = Vec::new();
     if let Some(q) = query
@@ -3991,7 +5525,7 @@ pub async fn search_agent_memory(
         ));
     }
 
-    let path = format!("/api/memory/agents/{id}/search");
+    let path = format!("/api/memory/agents/{}/search", resolved.resolved);
     match state.openfang.get_json_with_query(&path, &params).await {
         Ok(data) => Ok(Json(data)),
         Err(error) if is_semantic_memory_endpoint_unavailable(&error) => {
@@ -4018,9 +5552,10 @@ pub async fn get_agent_memory_item(
     Path((id, memory_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     validate_memory_id_segment(&memory_id)?;
-    let path = format!("/api/memory/agents/{id}/items/{memory_id}");
+    let path = format!("/api/memory/agents/{}/items/{memory_id}", resolved.resolved);
     let data = match state.openfang.get_json(&path).await {
         Ok(data) => data,
         Err(error) if is_semantic_memory_endpoint_unavailable(&error) => {
@@ -4046,7 +5581,8 @@ pub async fn feedback_agent_memory(
     Json(payload): Json<AgentMemoryFeedbackRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     validate_memory_id_segment(&payload.memory_id)?;
     let action = payload.action.trim();
     if action.is_empty() {
@@ -4056,7 +5592,7 @@ pub async fn feedback_agent_memory(
         ));
     }
 
-    let path = format!("/api/memory/agents/{id}/feedback");
+    let path = format!("/api/memory/agents/{}/feedback", resolved.resolved);
     let body = json!({
         "memory_id": payload.memory_id.trim(),
         "action": action,
@@ -4078,9 +5614,10 @@ pub async fn delete_agent_memory_item(
     Path((id, memory_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     validate_memory_id_segment(&memory_id)?;
-    let path = format!("/api/memory/agents/{id}/items/{memory_id}");
+    let path = format!("/api/memory/agents/{}/items/{memory_id}", resolved.resolved);
     let data = match state.openfang.delete_json(&path).await {
         Ok(data) => data,
         Err(error) if is_semantic_memory_endpoint_unavailable(&error) => {
@@ -4180,7 +5717,10 @@ async fn export_agent_bundle_inner(
     request: ExportAgentBundleRequest,
 ) -> Result<(AxumHeaderMap, Bytes), ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    validate_agent_path_segment(&agent_id)?;
     let options = ExportAgentBundleOptions::from_request(&request);
     if !options.any_enabled() {
         return Err(ApiError::new(
@@ -4189,24 +5729,30 @@ async fn export_agent_bundle_inner(
         ));
     }
 
-    let detail_path = format!("/api/agents/{id}");
+    let detail_path = format!("/api/agents/{agent_id}");
     let mut detail = state.openfang.get_json(&detail_path).await?;
     let profile_override =
-        assignment_store::get_agent_profile_override(&id).map_err(storage_error)?;
+        assignment_store::get_agent_profile_override(&agent_id).map_err(storage_error)?;
     if let Some(profile) = profile_override.as_ref() {
         merge_agent_profile_override(&mut detail, profile);
     }
 
-    let workspace_binding = resolve_agent_workspace_binding(&state, &id, Some(&detail)).await?;
+    let workspace_binding =
+        resolve_agent_workspace_binding(&state, &agent_id, Some(&detail)).await?;
     let workspace_name = workspace_binding
         .private_workspace
         .file_name()
         .and_then(OsStr::to_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(id.as_str());
+        .unwrap_or(public_id.as_str());
     let safe_segment = sanitize_export_filename_segment(workspace_name);
     let bundle_root = format!("agent_bundle_{safe_segment}");
+    let manifest_agent_id = if resolved.alias_used {
+        public_id.clone()
+    } else {
+        agent_id.clone()
+    };
 
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
     let exported_at_unix = SystemTime::now()
@@ -4220,7 +5766,7 @@ async fn export_agent_bundle_inner(
         &json!({
             "version": 1,
             "exported_at_unix": exported_at_unix,
-            "agent_id": id,
+            "agent_id": manifest_agent_id,
             "workspace_name": workspace_name,
             "options": {
                 "include_profile": options.include_profile,
@@ -4252,12 +5798,12 @@ async fn export_agent_bundle_inner(
         let hidden = assignment_store::list_hidden_agent_ids()
             .map_err(storage_error)?
             .into_iter()
-            .any(|agent_id| agent_id == id);
+            .any(|hidden_id| hidden_id == agent_id);
         let assignments = json!({
-            "skills": assignment_store::list_agent_enabled_skills(&id).map_err(storage_error)?,
-            "mcp_servers": assignment_store::list_agent_enabled_mcp_servers(&id).map_err(storage_error)?,
-            "extra_workspaces": assignment_store::list_agent_workspace_folders(&id).map_err(storage_error)?,
-            "collaboration_acl_private": assignment_store::list_agent_collaboration_acl(&id, "private").map_err(storage_error)?,
+            "skills": assignment_store::list_agent_enabled_skills(&agent_id).map_err(storage_error)?,
+            "mcp_servers": assignment_store::list_agent_enabled_mcp_servers(&agent_id).map_err(storage_error)?,
+            "extra_workspaces": assignment_store::list_agent_workspace_folders(&agent_id).map_err(storage_error)?,
+            "collaboration_acl_private": assignment_store::list_agent_collaboration_acl(&agent_id, "private").map_err(storage_error)?,
             "hidden": hidden
         });
         write_zip_json_entry(
@@ -4268,8 +5814,9 @@ async fn export_agent_bundle_inner(
     }
 
     if options.include_context_files {
-        let sync_stats = sync_agent_context_files(&state, &id, true).await?;
-        let cached = assignment_store::list_agent_context_files(&id).map_err(storage_error)?;
+        let sync_stats = sync_agent_context_files(&state, &agent_id, true).await?;
+        let cached =
+            assignment_store::list_agent_context_files(&agent_id).map_err(storage_error)?;
         let mut index_rows = Vec::with_capacity(KNOWN_CONTEXT_FILES.len());
         for file_name in KNOWN_CONTEXT_FILES {
             let (content, exists, updated_at) = if let Some(record) = cached.get(file_name) {
@@ -4303,7 +5850,7 @@ async fn export_agent_bundle_inner(
     }
 
     if options.include_memory_files {
-        let memory_root = resolve_agent_memory_dir_smart(&state, &id).await?;
+        let memory_root = resolve_agent_memory_dir_smart(&state, &agent_id).await?;
         let memory_file_count = append_directory_files_to_zip(
             &mut zip,
             &memory_root,
@@ -4321,7 +5868,7 @@ async fn export_agent_bundle_inner(
 
     if options.include_media_files {
         let (avatar_dir, portrait_dir) =
-            resolve_agent_media_dirs(&state, &id, Some(&detail)).await?;
+            resolve_agent_media_dirs(&state, &agent_id, Some(&detail)).await?;
         let avatar_count = append_directory_files_to_zip(
             &mut zip,
             &avatar_dir,
@@ -4345,7 +5892,7 @@ async fn export_agent_bundle_inner(
     }
 
     if options.include_chat_history {
-        let session_path = format!("/api/agents/{id}/session");
+        let session_path = format!("/api/agents/{agent_id}/session");
         if let Ok(session_payload) = state.openfang.get_json(&session_path).await {
             write_zip_json_entry(
                 &mut zip,
@@ -4855,6 +6402,10 @@ pub async fn import_agent_bundle_upload(
             }
         }
 
+        if let Err(err) = enable_default_global_skills_for_agent(&agent_id) {
+            warnings.push(format!("默认启用 ui-skill 失败: {err}"));
+        }
+
         if let Err(err) = sync_active_mcp_servers_to_runtime(&state).await {
             warnings.push(format!("同步 MCP 运行时失败: {}", err.message));
         }
@@ -4907,7 +6458,10 @@ pub async fn import_agent_avatar(
     Json(payload): Json<ImportAgentAvatarRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let source = PathBuf::from(payload.source_path.trim());
@@ -4923,8 +6477,11 @@ pub async fn import_agent_avatar(
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("avatar");
-    let (avatar_url, filename, saved_path) =
-        save_agent_avatar_bytes(&state, &id, Some(source_name), &bytes, None).await?;
+    let (mut avatar_url, filename, saved_path) =
+        save_agent_avatar_bytes(&state, &agent_id, Some(source_name), &bytes, None).await?;
+    if resolved.alias_used {
+        avatar_url = build_avatar_url(&public_id, &filename);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -4942,7 +6499,10 @@ pub async fn upload_agent_avatar(
     mut multipart: Multipart,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let mut picked_name: Option<String> = None;
@@ -4979,8 +6539,11 @@ pub async fn upload_agent_avatar(
         )
     })?;
 
-    let (avatar_url, filename, saved_path) =
-        save_agent_avatar_bytes(&state, &id, picked_name.as_deref(), &bytes, None).await?;
+    let (mut avatar_url, filename, saved_path) =
+        save_agent_avatar_bytes(&state, &agent_id, picked_name.as_deref(), &bytes, None).await?;
+    if resolved.alias_used {
+        avatar_url = build_avatar_url(&public_id, &filename);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -5009,8 +6572,10 @@ pub async fn get_agent_chat_asset_file(
     Query(query): Query<AgentChatAssetFileQuery>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     let relative = sanitize_upload_relative_path(&query.path)?;
-    let binding = resolve_agent_workspace_binding(&state, &id, None).await?;
+    let binding = resolve_agent_workspace_binding(&state, &resolved.resolved, None).await?;
     let file_path = binding.private_workspace.join("data").join(&relative);
     let root = binding
         .private_workspace
@@ -5058,7 +6623,10 @@ pub async fn upload_agent_chat_asset(
     mut multipart: Multipart,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let mut picked_name: Option<String> = None;
@@ -5095,8 +6663,20 @@ pub async fn upload_agent_chat_asset(
         )
     })?;
 
-    let (asset_url, filename, relative_path, saved_path, kind, mime_type, size, upstream_file_id) =
-        save_agent_chat_asset_bytes(&state, &id, picked_name.as_deref(), &bytes, None).await?;
+    let (
+        mut asset_url,
+        filename,
+        relative_path,
+        saved_path,
+        kind,
+        mime_type,
+        size,
+        upstream_file_id,
+    ) = save_agent_chat_asset_bytes(&state, &agent_id, picked_name.as_deref(), &bytes, None)
+        .await?;
+    if resolved.alias_used {
+        asset_url = build_agent_chat_asset_url(&public_id, &relative_path);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -5118,12 +6698,27 @@ pub async fn upload_agent_chat_asset_inline(
     Json(payload): Json<UploadInlineImageRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let bytes = decode_inline_upload_base64(&payload.content_base64)?;
-    let (asset_url, filename, relative_path, saved_path, kind, mime_type, size, upstream_file_id) =
-        save_agent_chat_asset_bytes(&state, &id, payload.filename.as_deref(), &bytes, None).await?;
+    let (
+        mut asset_url,
+        filename,
+        relative_path,
+        saved_path,
+        kind,
+        mime_type,
+        size,
+        upstream_file_id,
+    ) = save_agent_chat_asset_bytes(&state, &agent_id, payload.filename.as_deref(), &bytes, None)
+        .await?;
+    if resolved.alias_used {
+        asset_url = build_agent_chat_asset_url(&public_id, &relative_path);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -5175,12 +6770,19 @@ pub async fn upload_agent_avatar_inline(
     Json(payload): Json<UploadInlineImageRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let bytes = decode_inline_upload_base64(&payload.content_base64)?;
-    let (avatar_url, filename, saved_path) =
-        save_agent_avatar_bytes(&state, &id, payload.filename.as_deref(), &bytes, None).await?;
+    let (mut avatar_url, filename, saved_path) =
+        save_agent_avatar_bytes(&state, &agent_id, payload.filename.as_deref(), &bytes, None)
+            .await?;
+    if resolved.alias_used {
+        avatar_url = build_avatar_url(&public_id, &filename);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -5197,6 +6799,8 @@ pub async fn get_agent_avatar(
     Path((id, filename)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     let safe_filename = filename.trim();
     if safe_filename.is_empty()
         || safe_filename.contains('/')
@@ -5210,7 +6814,7 @@ pub async fn get_agent_avatar(
     }
     let ext = detect_avatar_ext_from_name(safe_filename)
         .ok_or_else(|| ApiError::new(axum::http::StatusCode::BAD_REQUEST, "不支持的头像格式"))?;
-    let avatar_dir = resolve_agent_avatar_dir(&state, &id, None).await?;
+    let avatar_dir = resolve_agent_avatar_dir(&state, &resolved.resolved, None).await?;
     let avatar_path = avatar_dir.join(safe_filename);
     if !avatar_path.exists() {
         return Err(ApiError::new(
@@ -5236,7 +6840,10 @@ pub async fn import_agent_portrait(
     Json(payload): Json<ImportAgentAvatarRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let source = PathBuf::from(payload.source_path.trim());
@@ -5252,8 +6859,11 @@ pub async fn import_agent_portrait(
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("portrait");
-    let (portrait_url, filename, saved_path) =
-        save_agent_portrait_bytes(&state, &id, Some(source_name), &bytes, None).await?;
+    let (mut portrait_url, filename, saved_path) =
+        save_agent_portrait_bytes(&state, &agent_id, Some(source_name), &bytes, None).await?;
+    if resolved.alias_used {
+        portrait_url = build_portrait_url(&public_id, &filename);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -5271,7 +6881,10 @@ pub async fn upload_agent_portrait(
     mut multipart: Multipart,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let mut picked_name: Option<String> = None;
@@ -5308,8 +6921,11 @@ pub async fn upload_agent_portrait(
         )
     })?;
 
-    let (portrait_url, filename, saved_path) =
-        save_agent_portrait_bytes(&state, &id, picked_name.as_deref(), &bytes, None).await?;
+    let (mut portrait_url, filename, saved_path) =
+        save_agent_portrait_bytes(&state, &agent_id, picked_name.as_deref(), &bytes, None).await?;
+    if resolved.alias_used {
+        portrait_url = build_portrait_url(&public_id, &filename);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -5327,12 +6943,19 @@ pub async fn upload_agent_portrait_inline(
     Json(payload): Json<UploadInlineImageRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let detail_path = format!("/api/agents/{id}");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let detail_path = format!("/api/agents/{agent_id}");
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let bytes = decode_inline_upload_base64(&payload.content_base64)?;
-    let (portrait_url, filename, saved_path) =
-        save_agent_portrait_bytes(&state, &id, payload.filename.as_deref(), &bytes, None).await?;
+    let (mut portrait_url, filename, saved_path) =
+        save_agent_portrait_bytes(&state, &agent_id, payload.filename.as_deref(), &bytes, None)
+            .await?;
+    if resolved.alias_used {
+        portrait_url = build_portrait_url(&public_id, &filename);
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -5349,6 +6972,8 @@ pub async fn get_agent_portrait(
     Path((id, filename)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
     let safe_filename = filename.trim();
     if safe_filename.is_empty()
         || safe_filename.contains('/')
@@ -5362,7 +6987,7 @@ pub async fn get_agent_portrait(
     }
     let ext = detect_avatar_ext_from_name(safe_filename)
         .ok_or_else(|| ApiError::new(axum::http::StatusCode::BAD_REQUEST, "不支持的立绘格式"))?;
-    let portrait_dir = resolve_agent_portrait_dir(&state, &id, None).await?;
+    let portrait_dir = resolve_agent_portrait_dir(&state, &resolved.resolved, None).await?;
     let portrait_path = portrait_dir.join(safe_filename);
     if !portrait_path.exists() {
         return Err(ApiError::new(
@@ -5388,13 +7013,18 @@ pub async fn delete_agent(
     Query(query): Query<DeleteAgentQuery>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    validate_agent_path_segment(&agent_id)?;
     let mode = query.mode.unwrap_or(DeleteAgentMode::Purge);
 
     match mode {
         DeleteAgentMode::LocalOnly => {
-            assignment_store::clear_agent_local_data(&id).map_err(storage_error)?;
-            assignment_store::set_agent_hidden(&id, true).map_err(storage_error)?;
+            assignment_store::clear_agent_local_data(&agent_id).map_err(storage_error)?;
+            assignment_store::set_agent_hidden(&agent_id, true).map_err(storage_error)?;
+            if resolved.alias_used {
+                clear_nuwa_agent_id_cache().await;
+            }
             let runtime = sync_active_mcp_servers_to_runtime(&state).await?;
             Ok(Json(json!({
                 "status": "ok",
@@ -5406,13 +7036,16 @@ pub async fn delete_agent(
             })))
         }
         DeleteAgentMode::Purge => {
-            let workspace_binding = resolve_agent_workspace_binding(&state, &id, None)
+            let workspace_binding = resolve_agent_workspace_binding(&state, &agent_id, None)
                 .await
                 .ok();
-            let path = format!("/api/agents/{id}");
+            let path = format!("/api/agents/{agent_id}");
             let openfang_data = state.openfang.delete_json(&path).await?;
-            assignment_store::clear_agent_local_data(&id).map_err(storage_error)?;
-            assignment_store::set_agent_hidden(&id, false).map_err(storage_error)?;
+            assignment_store::clear_agent_local_data(&agent_id).map_err(storage_error)?;
+            assignment_store::set_agent_hidden(&agent_id, false).map_err(storage_error)?;
+            if resolved.alias_used {
+                clear_nuwa_agent_id_cache().await;
+            }
 
             let removed_workspace_dirs = if let Some(binding) = workspace_binding.as_ref() {
                 remove_agent_workspace_dirs(binding)?
@@ -5451,7 +7084,8 @@ pub async fn stop_agent(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let path = format!("/api/agents/{id}/stop");
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let path = format!("/api/agents/{}/stop", resolved.resolved);
     let data = state.openfang.post_json(&path, json!({})).await?;
     Ok(Json(data))
 }
@@ -5468,7 +7102,12 @@ pub async fn list_cron_jobs(
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
     let path = if let Some(agent_id) = query.agent_id.filter(|id| !id.trim().is_empty()) {
-        format!("/api/cron/jobs?agent_id={agent_id}")
+        let resolved = if agent_id.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID) {
+            resolve_nuwa_agent_id(&state).await?
+        } else {
+            agent_id
+        };
+        format!("/api/cron/jobs?agent_id={resolved}")
     } else {
         "/api/cron/jobs".to_string()
     };
@@ -5564,7 +7203,9 @@ pub async fn get_agent_skills(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let runtime_available = openfang_known_skill_names(&state, &id).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let runtime_available = openfang_known_skill_names(&state, &agent_id).await?;
     let runtime_bundled_set: HashSet<String> = openfang_bundled_skill_names(&state)
         .await
         .unwrap_or_default()
@@ -5592,7 +7233,8 @@ pub async fn get_agent_skills(
     let mut available = custom_available.clone();
     available.extend(builtin_available.iter().cloned());
     available.extend(runtime_available.iter().cloned());
-    let mut assigned = assignment_store::list_agent_enabled_skills(&id).map_err(storage_error)?;
+    let mut assigned =
+        assignment_store::list_agent_enabled_skills(&agent_id).map_err(storage_error)?;
     available.extend(assigned.iter().cloned());
     available.sort();
     available.dedup();
@@ -5625,6 +7267,8 @@ pub async fn set_agent_skills(
     Json(payload): Json<SetAgentSkillsRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
     let mut desired = resolve_assignment(
         payload.mode.as_deref(),
         payload.skills,
@@ -5633,8 +7277,9 @@ pub async fn set_agent_skills(
     )?;
 
     let mut available = global_custom_skill_names()?;
-    available.extend(openfang_known_skill_names(&state, &id).await?);
-    let mut previous = assignment_store::list_agent_enabled_skills(&id).map_err(storage_error)?;
+    available.extend(openfang_known_skill_names(&state, &agent_id).await?);
+    let mut previous =
+        assignment_store::list_agent_enabled_skills(&agent_id).map_err(storage_error)?;
     available.extend(previous.iter().cloned());
     available.sort();
     available.dedup();
@@ -5663,20 +7308,26 @@ pub async fn set_agent_skills(
     previous.dedup();
 
     for skill in &previous {
-        assignment_store::set_agent_skill_enabled(&id, skill, false).map_err(storage_error)?;
+        assignment_store::set_agent_skill_enabled(&agent_id, skill, false)
+            .map_err(storage_error)?;
     }
     for skill in &desired {
-        assignment_store::set_agent_skill_enabled(&id, skill, true).map_err(storage_error)?;
+        assignment_store::set_agent_skill_enabled(&agent_id, skill, true).map_err(storage_error)?;
     }
 
-    match sync_agent_skill_assignments(&state, &id).await {
-        Ok(result) => Ok(Json(result)),
+    match sync_agent_skill_assignments(&state, &agent_id).await {
+        Ok(mut result) => {
+            if resolved.alias_used {
+                rewrite_agent_id_fields(&mut result, DEFAULT_NUWA_AGENT_ID);
+            }
+            Ok(Json(result))
+        }
         Err(err) => {
             for skill in &desired {
-                let _ = assignment_store::set_agent_skill_enabled(&id, skill, false);
+                let _ = assignment_store::set_agent_skill_enabled(&agent_id, skill, false);
             }
             for skill in &previous {
-                let _ = assignment_store::set_agent_skill_enabled(&id, skill, true);
+                let _ = assignment_store::set_agent_skill_enabled(&agent_id, skill, true);
             }
             Err(err)
         }
@@ -5688,7 +7339,8 @@ pub async fn get_agent_workspaces(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let binding = resolve_agent_workspace_binding(&state, &id, None).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let binding = resolve_agent_workspace_binding(&state, &resolved.resolved, None).await?;
     let private_workspace = path_to_string(&binding.private_workspace);
     let shared_workspace = path_to_string(&binding.shared_workspace);
     let extra_workspaces = binding
@@ -5727,7 +7379,8 @@ pub async fn set_agent_workspaces(
     Json(payload): Json<SetAgentWorkspacesRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    validate_agent_path_segment(&id)?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
 
     let candidate_list = payload
         .extra_workspaces
@@ -5752,10 +7405,11 @@ pub async fn set_agent_workspaces(
         }
     }
 
-    assignment_store::replace_agent_workspace_folders(&id, &normalized).map_err(storage_error)?;
+    assignment_store::replace_agent_workspace_folders(&resolved.resolved, &normalized)
+        .map_err(storage_error)?;
     let runtime = sync_active_mcp_servers_to_runtime(&state).await?;
-    let assignment = sync_agent_mcp_assignments(&state, &id).await?;
-    let binding = resolve_agent_workspace_binding(&state, &id, None).await?;
+    let assignment = sync_agent_mcp_assignments(&state, &resolved.resolved).await?;
+    let binding = resolve_agent_workspace_binding(&state, &resolved.resolved, None).await?;
 
     Ok(Json(json!({
         "agent_id": id,
@@ -5777,14 +7431,16 @@ pub async fn get_agent_mcp_servers(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let workspace_server = workspace_mcp_server_name(&id);
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let workspace_server = workspace_mcp_server_name(&agent_id);
     let mut runtime_available =
-        strip_workspace_mcp_names(openfang_known_mcp_server_names(&state, &id).await?);
+        strip_workspace_mcp_names(openfang_known_mcp_server_names(&state, &agent_id).await?);
     runtime_available.retain(|name| name != &workspace_server);
     let mut available = known_mcp_server_names(&state).await?;
     available.extend(runtime_available.iter().cloned());
     let mut assigned = strip_workspace_mcp_names(
-        assignment_store::list_agent_enabled_mcp_servers(&id).map_err(storage_error)?,
+        assignment_store::list_agent_enabled_mcp_servers(&agent_id).map_err(storage_error)?,
     );
     assigned.retain(|name| name != &workspace_server);
     available.extend(assigned.iter().cloned());
@@ -5820,7 +7476,9 @@ pub async fn set_agent_mcp_servers(
     Json(payload): Json<SetAgentMcpServersRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let workspace_server = workspace_mcp_server_name(&id);
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let workspace_server = workspace_mcp_server_name(&agent_id);
     let mut desired = resolve_assignment(
         payload.mode.as_deref(),
         payload.mcp_servers,
@@ -5830,7 +7488,7 @@ pub async fn set_agent_mcp_servers(
     desired.retain(|name| name != &workspace_server && !is_system_hidden_mcp_server(name));
 
     let mut known = known_mcp_server_names(&state).await?;
-    known.extend(openfang_known_mcp_server_names(&state, &id).await?);
+    known.extend(openfang_known_mcp_server_names(&state, &agent_id).await?);
     known.retain(|name| name != &workspace_server && !is_system_hidden_mcp_server(name));
     known.sort();
     known.dedup();
@@ -5857,37 +7515,42 @@ pub async fn set_agent_mcp_servers(
     desired.dedup();
 
     let mut previous = strip_workspace_mcp_names(
-        assignment_store::list_agent_enabled_mcp_servers(&id).map_err(storage_error)?,
+        assignment_store::list_agent_enabled_mcp_servers(&agent_id).map_err(storage_error)?,
     );
     previous.retain(|name| name != &workspace_server);
     previous.sort();
     previous.dedup();
 
     for server in &previous {
-        assignment_store::set_agent_mcp_enabled(&id, server, false).map_err(storage_error)?;
+        assignment_store::set_agent_mcp_enabled(&agent_id, server, false).map_err(storage_error)?;
     }
     for server in &desired {
-        assignment_store::set_agent_mcp_enabled(&id, server, true).map_err(storage_error)?;
+        assignment_store::set_agent_mcp_enabled(&agent_id, server, true).map_err(storage_error)?;
     }
 
     if let Err(err) = sync_active_mcp_servers_to_runtime(&state).await {
         for server in &desired {
-            let _ = assignment_store::set_agent_mcp_enabled(&id, server, false);
+            let _ = assignment_store::set_agent_mcp_enabled(&agent_id, server, false);
         }
         for server in &previous {
-            let _ = assignment_store::set_agent_mcp_enabled(&id, server, true);
+            let _ = assignment_store::set_agent_mcp_enabled(&agent_id, server, true);
         }
         return Err(err);
     }
 
-    match sync_agent_mcp_assignments(&state, &id).await {
-        Ok(result) => Ok(Json(result)),
+    match sync_agent_mcp_assignments(&state, &agent_id).await {
+        Ok(mut result) => {
+            if resolved.alias_used {
+                rewrite_agent_id_fields(&mut result, DEFAULT_NUWA_AGENT_ID);
+            }
+            Ok(Json(result))
+        }
         Err(err) => {
             for server in &desired {
-                let _ = assignment_store::set_agent_mcp_enabled(&id, server, false);
+                let _ = assignment_store::set_agent_mcp_enabled(&agent_id, server, false);
             }
             for server in &previous {
-                let _ = assignment_store::set_agent_mcp_enabled(&id, server, true);
+                let _ = assignment_store::set_agent_mcp_enabled(&agent_id, server, true);
             }
             let _ = sync_active_mcp_servers_to_runtime(&state).await;
             Err(err)
@@ -5908,6 +7571,8 @@ pub async fn set_agent_skill_toggle(
     Json(payload): Json<SetAgentSkillToggleRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
     let skill = payload.skill.trim();
     if skill.is_empty() {
         return Err(ApiError::new(
@@ -5918,7 +7583,7 @@ pub async fn set_agent_skill_toggle(
 
     if payload.enabled {
         let mut available = global_custom_skill_names()?;
-        available.extend(openfang_known_skill_names(&state, &id).await?);
+        available.extend(openfang_known_skill_names(&state, &agent_id).await?);
         available.sort();
         available.dedup();
         if !available.iter().any(|name| name == skill) {
@@ -5929,17 +7594,22 @@ pub async fn set_agent_skill_toggle(
         }
     }
 
-    let prev_enabled = assignment_store::list_agent_enabled_skills(&id)
+    let prev_enabled = assignment_store::list_agent_enabled_skills(&agent_id)
         .map_err(storage_error)?
         .iter()
         .any(|name| name == skill);
-    assignment_store::set_agent_skill_enabled(&id, skill, payload.enabled)
+    assignment_store::set_agent_skill_enabled(&agent_id, skill, payload.enabled)
         .map_err(storage_error)?;
 
-    match sync_agent_skill_assignments(&state, &id).await {
-        Ok(result) => Ok(Json(result)),
+    match sync_agent_skill_assignments(&state, &agent_id).await {
+        Ok(mut result) => {
+            if resolved.alias_used {
+                rewrite_agent_id_fields(&mut result, DEFAULT_NUWA_AGENT_ID);
+            }
+            Ok(Json(result))
+        }
         Err(err) => {
-            let _ = assignment_store::set_agent_skill_enabled(&id, skill, prev_enabled);
+            let _ = assignment_store::set_agent_skill_enabled(&agent_id, skill, prev_enabled);
             Err(err)
         }
     }
@@ -5958,6 +7628,8 @@ pub async fn set_agent_mcp_server_toggle(
     Json(payload): Json<SetAgentMcpServerToggleRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
     let server = payload.mcp_server.trim();
     if server.is_empty() {
         return Err(ApiError::new(
@@ -5965,7 +7637,7 @@ pub async fn set_agent_mcp_server_toggle(
             "mcp_server 不能为空",
         ));
     }
-    let workspace_server = workspace_mcp_server_name(&id);
+    let workspace_server = workspace_mcp_server_name(&agent_id);
     if server == workspace_server || is_system_hidden_mcp_server(server) {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -5975,7 +7647,7 @@ pub async fn set_agent_mcp_server_toggle(
 
     if payload.enabled {
         let mut known = known_mcp_server_names(&state).await?;
-        known.extend(openfang_known_mcp_server_names(&state, &id).await?);
+        known.extend(openfang_known_mcp_server_names(&state, &agent_id).await?);
         known.retain(|name| name != &workspace_server && !is_system_hidden_mcp_server(name));
         known.sort();
         known.dedup();
@@ -5987,21 +7659,27 @@ pub async fn set_agent_mcp_server_toggle(
         }
     }
 
-    let prev_enabled = assignment_store::list_agent_enabled_mcp_servers(&id)
+    let prev_enabled = assignment_store::list_agent_enabled_mcp_servers(&agent_id)
         .map_err(storage_error)?
         .iter()
         .any(|name| name == server && !is_system_hidden_mcp_server(name));
-    assignment_store::set_agent_mcp_enabled(&id, server, payload.enabled).map_err(storage_error)?;
+    assignment_store::set_agent_mcp_enabled(&agent_id, server, payload.enabled)
+        .map_err(storage_error)?;
 
     if let Err(err) = sync_active_mcp_servers_to_runtime(&state).await {
-        let _ = assignment_store::set_agent_mcp_enabled(&id, server, prev_enabled);
+        let _ = assignment_store::set_agent_mcp_enabled(&agent_id, server, prev_enabled);
         return Err(err);
     }
 
-    match sync_agent_mcp_assignments(&state, &id).await {
-        Ok(result) => Ok(Json(result)),
+    match sync_agent_mcp_assignments(&state, &agent_id).await {
+        Ok(mut result) => {
+            if resolved.alias_used {
+                rewrite_agent_id_fields(&mut result, DEFAULT_NUWA_AGENT_ID);
+            }
+            Ok(Json(result))
+        }
         Err(err) => {
-            let _ = assignment_store::set_agent_mcp_enabled(&id, server, prev_enabled);
+            let _ = assignment_store::set_agent_mcp_enabled(&agent_id, server, prev_enabled);
             let _ = sync_active_mcp_servers_to_runtime(&state).await;
             Err(err)
         }
@@ -6391,7 +8069,7 @@ pub async fn clear_global_mcp_config(
 
 fn default_memory_enhancement_config() -> Value {
     json!({
-        "enabled": false,
+        "enabled": true,
         "mode": "remote",
         "base_url": "",
         "api_key": "",
@@ -6461,6 +8139,212 @@ fn normalize_memory_enhancement_config(mut config: Value) -> Value {
         }
     }
     config
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryEnhancementRuntimeConfig {
+    enabled: bool,
+    auto_recall: bool,
+    recall_limit: usize,
+    recall_score_threshold: f32,
+}
+
+#[derive(Debug, Clone)]
+struct SemanticMemoryRecallContext {
+    prompt: String,
+    query: String,
+    hit_count: usize,
+    log_detail: String,
+}
+
+async fn fetch_semantic_memory_rows(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    query: &str,
+    limit: usize,
+    min_confidence: f32,
+) -> Result<Option<Vec<Value>>, ApiError> {
+    let params = vec![
+        ("q".to_string(), query.to_string()),
+        ("limit".to_string(), limit.to_string()),
+        ("min_confidence".to_string(), min_confidence.to_string()),
+    ];
+    let path = format!("/api/memory/agents/{agent_id}/unified-search");
+    let payload = match state.openfang.get_json_with_query(&path, &params).await {
+        Ok(data) => data,
+        Err(error) if is_semantic_memory_endpoint_unavailable(&error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "semantic memory auto recall skipped because upstream endpoint is unavailable"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut rows = payload
+        .get("memories")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    // upstream unified-search 当前不会使用 min_confidence，这里按 score 阈值做本地过滤。
+    // 注意：recent window (query="") 不应被阈值过滤，否则会导致完全无候选。
+    if !query.trim().is_empty() {
+        rows.retain(|row| {
+            row.get("score")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                >= min_confidence as f64
+        });
+    }
+    Ok(Some(rows))
+}
+
+async fn fetch_unified_memory_debug_plan_lines(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let params = vec![
+        ("q".to_string(), trimmed.to_string()),
+        ("limit".to_string(), limit.to_string()),
+    ];
+    let path = format!("/api/memory/agents/{agent_id}/unified-debug");
+    let payload = match state.openfang.get_json_with_query(&path, &params).await {
+        Ok(data) => data,
+        Err(error) if is_semantic_memory_endpoint_unavailable(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    let mut lines = Vec::new();
+    if let Some(plan) = payload.get("query_plan") {
+        let seed = plan
+            .get("projection_seed_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let subj_type = plan
+            .get("subject_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let subj_id = plan.get("subject_id").and_then(Value::as_str).unwrap_or("");
+        lines.push(format!(
+            "query_plan: subject={}:{} seed_events={} limit={}",
+            subj_type, subj_id, seed, limit
+        ));
+    }
+
+    let subject_plan = payload
+        .get("subject_plan")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !subject_plan.is_empty() {
+        lines.push(format!("subject_plan: {} subjects", subject_plan.len()));
+        for row in subject_plan.into_iter().take(10) {
+            let st = row.get("subject_type").and_then(Value::as_str).unwrap_or("");
+            let sid = row.get("subject_id").and_then(Value::as_str).unwrap_or("");
+            let depth = row.get("depth").and_then(Value::as_u64).unwrap_or(0);
+            let w = row.get("weight").and_then(Value::as_f64).unwrap_or(0.0);
+            let rel = row
+                .get("relation_strength")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            lines.push(format!("- {}:{} depth={} w={:.2} rel={:.2}", st, sid, depth, w, rel));
+        }
+    }
+
+    if lines.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(lines))
+    }
+}
+
+fn merge_semantic_memory_rows(
+    relevant_rows: Vec<Value>,
+    recent_rows: Vec<Value>,
+    limit: usize,
+) -> Vec<Value> {
+    let mut merged = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_contents = HashSet::new();
+
+    for row in relevant_rows.into_iter().chain(recent_rows.into_iter()) {
+        let row_id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let row_content = row
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        let duplicate = row_id
+            .as_ref()
+            .map(|value| seen_ids.contains(value))
+            .unwrap_or(false)
+            || row_content
+                .as_ref()
+                .map(|value| seen_contents.contains(value))
+                .unwrap_or(false);
+        if duplicate {
+            continue;
+        }
+
+        if let Some(row_id) = row_id {
+            seen_ids.insert(row_id);
+        }
+        if let Some(row_content) = row_content {
+            seen_contents.insert(row_content);
+        }
+        merged.push(row);
+        if merged.len() >= limit {
+            break;
+        }
+    }
+
+    merged
+}
+
+fn resolve_memory_enhancement_runtime_config() -> Result<MemoryEnhancementRuntimeConfig, ApiError> {
+    let stored = assignment_store::get_memory_enhancement_config().map_err(storage_error)?;
+    let config = normalize_memory_enhancement_config(
+        stored.unwrap_or_else(default_memory_enhancement_config),
+    );
+    let enabled = config
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let auto_recall = config
+        .get("auto_recall")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let recall_limit = config
+        .get("recall_limit")
+        .and_then(Value::as_u64)
+        .map(|value| value.clamp(1, 12) as usize)
+        .unwrap_or(8);
+    let recall_score_threshold = config
+        .get("recall_score_threshold")
+        .and_then(Value::as_f64)
+        .map(|value| value.clamp(0.0, 1.0) as f32)
+        .unwrap_or(0.45);
+
+    Ok(MemoryEnhancementRuntimeConfig {
+        enabled,
+        auto_recall,
+        recall_limit,
+        recall_score_threshold,
+    })
 }
 
 pub async fn get_memory_enhancement_config(
@@ -6682,33 +8566,161 @@ async fn switch_openfang_session(
     Ok(())
 }
 
+#[derive(Debug, Clone, Default)]
+struct SessionSwitchContext {
+    original_session_id: String,
+    target_session_id: String,
+    switched: bool,
+    created_session_id: Option<String>,
+}
+
+async fn restore_openfang_session_with_client(
+    openfang: &crate::openfang::OpenFangClient,
+    agent_id: &str,
+    session_id: &str,
+) {
+    let sid = session_id.trim();
+    if sid.is_empty() {
+        return;
+    }
+    let path = format!("/api/agents/{agent_id}/sessions/{sid}/switch");
+    if let Err(err) = openfang.post_json(&path, json!({})).await {
+        tracing::warn!(
+            agent_id = %agent_id,
+            session_id = %sid,
+            error = %err.message,
+            "failed to restore original session"
+        );
+    }
+}
+
+fn is_strictly_empty_session_payload(session: &Value, expected_session_id: &str) -> bool {
+    let expected = expected_session_id.trim();
+    if expected.is_empty() {
+        return false;
+    }
+    let Some(current_session_id) = session
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if current_session_id != expected {
+        return false;
+    }
+    matches!(
+        session.get("messages").and_then(Value::as_array),
+        Some(messages) if messages.is_empty()
+    )
+}
+
+async fn delete_openfang_session_if_current_empty(
+    openfang: &crate::openfang::OpenFangClient,
+    agent_id: &str,
+    session_id: &str,
+) {
+    let sid = session_id.trim();
+    if sid.is_empty() {
+        return;
+    }
+    let session_path = format!("/api/agents/{agent_id}/session");
+    let session_payload = match openfang.get_json(&session_path).await {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                session_id = %sid,
+                error = %err.message,
+                "failed to inspect current session before cleanup"
+            );
+            return;
+        }
+    };
+    if !is_strictly_empty_session_payload(&session_payload, sid) {
+        return;
+    }
+    let delete_path = format!("/api/sessions/{sid}");
+    match openfang.delete_json(&delete_path).await {
+        Ok(_) => {
+            tracing::info!(
+                agent_id = %agent_id,
+                session_id = %sid,
+                "deleted newly created empty session"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                session_id = %sid,
+                error = %err.message,
+                "failed to delete newly created empty session"
+            );
+        }
+    }
+}
+
+async fn restore_and_cleanup_switched_session(
+    openfang: &crate::openfang::OpenFangClient,
+    agent_id: &str,
+    session_ctx: &SessionSwitchContext,
+) {
+    if let Some(created_session_id) = session_ctx
+        .created_session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let cleanup_session_id =
+            if session_ctx.target_session_id.trim() == created_session_id.trim() {
+                session_ctx.target_session_id.as_str()
+            } else {
+                created_session_id
+            };
+        delete_openfang_session_if_current_empty(openfang, agent_id, cleanup_session_id).await;
+    }
+    if session_ctx.switched {
+        restore_openfang_session_with_client(openfang, agent_id, &session_ctx.original_session_id)
+            .await;
+    }
+}
+
 async fn ensure_switched_to_session_label(
     state: &Arc<AppState>,
     agent_id: &str,
     label: &str,
-) -> Result<(String, String, bool), ApiError> {
+) -> Result<SessionSwitchContext, ApiError> {
     let safe_label = normalize_session_label(label);
     if safe_label.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "session_label 无效"));
     }
     let original_session_id = get_openfang_agent_session_id(state, agent_id).await?;
-    let target_session_id =
+    let (target_session_id, created_session_id) =
         match find_openfang_session_by_label(state, agent_id, &safe_label).await? {
-            Some(existing) => existing,
-            None => create_openfang_session_with_label(state, agent_id, &safe_label).await?,
+            Some(existing) => (existing, None),
+            None => {
+                let created =
+                    create_openfang_session_with_label(state, agent_id, &safe_label).await?;
+                (created.clone(), Some(created))
+            }
         };
     let switched = original_session_id != target_session_id;
     if switched {
         switch_openfang_session(state, agent_id, &target_session_id).await?;
     }
-    Ok((original_session_id, target_session_id, switched))
+    Ok(SessionSwitchContext {
+        original_session_id,
+        target_session_id,
+        switched,
+        created_session_id,
+    })
 }
 
 async fn ensure_switched_to_session_id(
     state: &Arc<AppState>,
     agent_id: &str,
     session_id: &str,
-) -> Result<(String, String, bool), ApiError> {
+) -> Result<SessionSwitchContext, ApiError> {
     let target_session_id = session_id.trim();
     if target_session_id.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "session_id 无效"));
@@ -6718,7 +8730,12 @@ async fn ensure_switched_to_session_id(
     if switched {
         switch_openfang_session(state, agent_id, target_session_id).await?;
     }
-    Ok((original_session_id, target_session_id.to_string(), switched))
+    Ok(SessionSwitchContext {
+        original_session_id,
+        target_session_id: target_session_id.to_string(),
+        switched,
+        created_session_id: None,
+    })
 }
 
 async fn ensure_switched_to_session_target(
@@ -6726,14 +8743,14 @@ async fn ensure_switched_to_session_target(
     agent_id: &str,
     session_id: Option<&str>,
     session_label: Option<&str>,
-) -> Result<(String, String, bool), ApiError> {
+) -> Result<SessionSwitchContext, ApiError> {
     if let Some(sid) = session_id.map(str::trim).filter(|v| !v.is_empty()) {
         return ensure_switched_to_session_id(state, agent_id, sid).await;
     }
     if let Some(label) = session_label.map(str::trim).filter(|v| !v.is_empty()) {
         return ensure_switched_to_session_label(state, agent_id, label).await;
     }
-    Ok((String::new(), String::new(), false))
+    Ok(SessionSwitchContext::default())
 }
 
 fn resolve_agent_system_prompt(
@@ -6971,6 +8988,38 @@ fn has_meaningful_history(session: &Value) -> bool {
             .trim()
             .to_ascii_lowercase();
         if role != "user" && role != "assistant" && role != "agent" {
+            continue;
+        }
+        if let Some(content) = row.get("content") {
+            if let Some(text) = extract_text_from_json(content) {
+                if !looks_like_protocol_only_text(&text) {
+                    return true;
+                }
+            }
+        }
+        if let Some(message) = row.get("message") {
+            if let Some(text) = extract_text_from_json(message) {
+                if !looks_like_protocol_only_text(&text) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn has_meaningful_user_history(session: &Value) -> bool {
+    let Some(rows) = session.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    for row in rows {
+        let role = row
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if role != "user" {
             continue;
         }
         if let Some(content) = row.get("content") {
@@ -7700,8 +9749,13 @@ fn apply_system_prompt_guard(
     message: &str,
     system_prompt: Option<&str>,
     collaboration_prompt: Option<&str>,
+    semantic_memory_prompt: Option<&str>,
+    include_prompt_blocks: bool,
 ) -> String {
     if message.contains("[system:profile]") {
+        return message.to_string();
+    }
+    if !include_prompt_blocks {
         return message.to_string();
     }
 
@@ -7718,10 +9772,199 @@ fn apply_system_prompt_guard(
             blocks.push(trimmed.to_string());
         }
     }
+    if let Some(semantic_memory_prompt) = semantic_memory_prompt {
+        let trimmed = semantic_memory_prompt.trim();
+        if !trimmed.is_empty() {
+            blocks.push(trimmed.to_string());
+        }
+    }
     if blocks.is_empty() {
         return message.to_string();
     }
     format!("{}\n\n{}", blocks.join("\n\n"), message)
+}
+
+async fn resolve_semantic_memory_prompt(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    message: &str,
+) -> Result<Option<SemanticMemoryRecallContext>, ApiError> {
+    let config = resolve_memory_enhancement_runtime_config()?;
+    if !config.enabled || !config.auto_recall {
+        return Ok(None);
+    }
+
+    let query = extract_user_message_segment(message);
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let relevant_rows = fetch_semantic_memory_rows(
+        state,
+        agent_id,
+        &query,
+        config.recall_limit,
+        config.recall_score_threshold,
+    )
+    .await?;
+    let Some(relevant_rows) = relevant_rows else {
+        return Ok(None);
+    };
+    let recent_rows = fetch_semantic_memory_rows(
+        state,
+        agent_id,
+        "",
+        config.recall_limit,
+        config.recall_score_threshold,
+    )
+    .await?
+    .unwrap_or_default();
+    let rows = merge_semantic_memory_rows(relevant_rows, recent_rows, config.recall_limit);
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let debug_plan_lines = match fetch_unified_memory_debug_plan_lines(
+        state,
+        agent_id,
+        &query,
+        config.recall_limit,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %error.message,
+                "semantic memory debug plan skipped due to error"
+            );
+            None
+        }
+    };
+
+    let mut lines = Vec::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        let Some(content) = row.get("content").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let confidence = row
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let scope = row
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let source = row
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("semantic");
+        let kind = row
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("semantic_memory");
+        let score = row
+            .get("score")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let event_type = row
+            .get("event_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let explain = row.get("explain");
+        let query_subject_type = explain
+            .and_then(|value| value.get("query_subject_type"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let query_subject_id = explain
+            .and_then(|value| value.get("query_subject_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let query_subject_depth = explain
+            .and_then(|value| value.get("query_subject_depth"))
+            .and_then(Value::as_u64);
+        let query_subject_weight = explain
+            .and_then(|value| value.get("query_subject_weight"))
+            .and_then(Value::as_f64);
+        let related_from_subject_type = explain
+            .and_then(|value| value.get("related_from_subject_type"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let related_from_subject_id = explain
+            .and_then(|value| value.get("related_from_subject_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let reason = row
+            .get("explain")
+            .and_then(|value| value.get("reason"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("统一记忆召回");
+        let summary = truncate_for_prompt(content, 180);
+        let mut prefix = format!(
+            "- #{idx} [kind={kind}] [score={score:.2}] [confidence={confidence:.2}] [scope={scope}] [source={source}]",
+            idx = index + 1
+        );
+        if let Some(event_type) = event_type {
+            prefix.push_str(&format!(" [event_type={event_type}]"));
+        }
+        if let (Some(st), Some(sid)) = (query_subject_type, query_subject_id) {
+            prefix.push_str(&format!(" [subject={st}:{sid}]"));
+        }
+        if let Some(depth) = query_subject_depth {
+            prefix.push_str(&format!(" [depth={depth}]"));
+        }
+        if let Some(w) = query_subject_weight {
+            prefix.push_str(&format!(" [w={w:.2}]"));
+        }
+        if let (Some(from_type), Some(from_id)) = (related_from_subject_type, related_from_subject_id) {
+            prefix.push_str(&format!(" [from={from_type}:{from_id}]"));
+        }
+        lines.push(format!("{prefix} {summary} ({reason})"));
+    }
+
+    if lines.is_empty() {
+        return Ok(None);
+    }
+
+    let prompt = [
+        "[system:semantic-memory]",
+        "以下是与当前用户输入相关的跨会话长期记忆，仅在相关时参考。",
+        "若与用户本轮明确表述冲突，必须以本轮表述为准；不要把旧记忆当作绝对事实。",
+        &lines.join("\n"),
+    ]
+    .join("\n");
+    let mut log_sections = Vec::new();
+    log_sections.push(format!("query: {}", query));
+    if let Some(plan_lines) = debug_plan_lines {
+        log_sections.push("debug_plan:".to_string());
+        log_sections.extend(plan_lines);
+    }
+    log_sections.push(format!("hits: {}", lines.len()));
+    log_sections.push(lines.join("\n"));
+    let log_detail = log_sections.join("\n");
+
+    Ok(Some(SemanticMemoryRecallContext {
+        prompt,
+        query,
+        hit_count: lines.len(),
+        log_detail,
+    }))
 }
 
 fn find_sse_frame_boundary(buffer: &str) -> Option<(usize, usize)> {
@@ -7879,8 +10122,11 @@ fn extract_assistant_texts(session: &Value) -> Vec<String> {
     results
 }
 
-fn extract_latest_assistant_text(session: &Value) -> Option<String> {
-    extract_assistant_texts(session).into_iter().last()
+fn should_inject_prompt_blocks_for_session(session: Option<&Value>) -> bool {
+    match session {
+        Some(payload) => !has_meaningful_user_history(payload),
+        None => true,
+    }
 }
 
 fn extract_new_assistant_text(session: &Value, baseline_count: usize) -> Option<String> {
@@ -7891,9 +10137,7 @@ fn extract_new_assistant_text(session: &Value, baseline_count: usize) -> Option<
     texts.into_iter().skip(baseline_count).last()
 }
 
-fn build_openfang_attachment_payload(
-    attachments: &[ChatMessageAttachmentRequest],
-) -> Vec<Value> {
+fn build_openfang_attachment_payload(attachments: &[ChatMessageAttachmentRequest]) -> Vec<Value> {
     attachments
         .iter()
         .filter_map(|item| {
@@ -7917,66 +10161,97 @@ pub async fn chat_message(
     Json(payload): Json<ChatMessageRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    if let Err(err) = normalize_agent_model_selector_if_needed(&state, &id).await {
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    if let Err(err) = normalize_agent_model_selector_if_needed(&state, &agent_id).await {
         tracing::warn!(
-            agent_id = %id,
+            agent_id = %agent_id,
             error = %err.message,
             "chat_message: model normalize skipped due to error"
         );
     }
-    if let Err(err) = sync_agent_context_files(&state, &id, false).await {
-        tracing::warn!(agent_id = %id, error = %err.message, "chat_message: context sync skipped due to error");
+    if let Err(err) = sync_agent_context_files(&state, &agent_id, false).await {
+        tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message: context sync skipped due to error");
     }
-    if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &id).await {
-        tracing::warn!(agent_id = %id, error = %err.message, "chat_message: auto-init skipped due to error");
+    if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &agent_id).await {
+        tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message: auto-init skipped due to error");
     }
-    if let Err(err) = maybe_persist_user_profile_patch(&state, &id, &payload.message).await {
-        tracing::warn!(agent_id = %id, error = %err.message, "chat_message: auto-profile skipped due to error");
+    if let Err(err) = maybe_persist_user_profile_patch(&state, &agent_id, &payload.message).await {
+        tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message: auto-profile skipped due to error");
     }
-    let include_bootstrap = should_include_bootstrap_for_turn(&state, &id).await;
-    let system_prompt = resolve_agent_system_prompt(&id, include_bootstrap)?;
-    let collaboration_prompt = match resolve_collaboration_prompt(&state, &id).await {
+    let include_bootstrap = should_include_bootstrap_for_turn(&state, &agent_id).await;
+    let system_prompt = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
+    let collaboration_prompt = match resolve_collaboration_prompt(&state, &agent_id).await {
         Ok(value) => value,
         Err(error) => {
-            tracing::warn!(agent_id = %id, error = %error.message, "chat_message: collaboration prompt skipped due to error");
+            tracing::warn!(agent_id = %agent_id, error = %error.message, "chat_message: collaboration prompt skipped due to error");
             None
         }
     };
-
-    let (original_session_id, _target_session_id, switched) = ensure_switched_to_session_target(
+    let semantic_memory_context = match resolve_semantic_memory_prompt(
         &state,
-        &id,
+        &agent_id,
+        &payload.message,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(agent_id = %agent_id, error = %error.message, "chat_message: semantic memory recall skipped due to error");
+            None
+        }
+    };
+    if let Some(context) = semantic_memory_context.as_ref() {
+        tracing::info!(
+            agent_id = %agent_id,
+            query = %context.query,
+            hit_count = context.hit_count,
+            "chat_message: semantic memory recalled"
+        );
+    }
+
+    let session_ctx = ensure_switched_to_session_target(
+        &state,
+        &agent_id,
         payload.session_id.as_deref(),
         payload.session_label.as_deref(),
     )
     .await?;
+    let session_path = format!("/api/agents/{agent_id}/session");
+    let current_session = state.openfang.get_json(&session_path).await.ok();
+    let include_prompt_blocks = should_inject_prompt_blocks_for_session(current_session.as_ref());
 
     let outgoing_message = apply_system_prompt_guard(
         &payload.message,
         system_prompt.as_deref(),
         collaboration_prompt.as_deref(),
+        semantic_memory_context
+            .as_ref()
+            .map(|item| item.prompt.as_str()),
+        include_prompt_blocks,
     );
     let attachments = build_openfang_attachment_payload(&payload.attachments);
-    let path = format!("/api/agents/{id}/message");
+    let path = format!("/api/agents/{agent_id}/message");
     let data = match state
         .openfang
-        .post_json(&path, json!({
-            "message": outgoing_message,
-            "attachments": attachments
-        }))
+        .post_json(
+            &path,
+            json!({
+                "message": outgoing_message,
+                "attachments": attachments
+            }),
+        )
         .await
     {
         Ok(value) => value,
         Err(err) => {
-            if switched {
-                let _ = switch_openfang_session(&state, &id, &original_session_id).await;
-            }
+            restore_and_cleanup_switched_session(&state.openfang, &agent_id, &session_ctx).await;
             return Err(err);
         }
     };
 
-    if switched {
-        let _ = switch_openfang_session(&state, &id, &original_session_id).await;
+    if session_ctx.switched {
+        let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id).await;
     }
 
     Ok(Json(data))
@@ -7988,92 +10263,141 @@ pub async fn chat_message_stream(
     Json(payload): Json<ChatMessageRequest>,
 ) -> Result<axum::response::Response, ApiError> {
     ensure_online(&state).await?;
-    if let Err(err) = normalize_agent_model_selector_if_needed(&state, &id).await {
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    if let Err(err) = normalize_agent_model_selector_if_needed(&state, &agent_id).await {
         tracing::warn!(
-            agent_id = %id,
+            agent_id = %agent_id,
             error = %err.message,
             "chat_message_stream: model normalize skipped due to error"
         );
     }
-    if let Err(err) = sync_agent_context_files(&state, &id, false).await {
-        tracing::warn!(agent_id = %id, error = %err.message, "chat_message_stream: context sync skipped due to error");
+    if let Err(err) = sync_agent_context_files(&state, &agent_id, false).await {
+        tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message_stream: context sync skipped due to error");
     }
-    if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &id).await {
-        tracing::warn!(agent_id = %id, error = %err.message, "chat_message_stream: auto-init skipped due to error");
+    if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &agent_id).await {
+        tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message_stream: auto-init skipped due to error");
     }
-    if let Err(err) = maybe_persist_user_profile_patch(&state, &id, &payload.message).await {
-        tracing::warn!(agent_id = %id, error = %err.message, "chat_message_stream: auto-profile skipped due to error");
+    if let Err(err) = maybe_persist_user_profile_patch(&state, &agent_id, &payload.message).await {
+        tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message_stream: auto-profile skipped due to error");
     }
-    let include_bootstrap = should_include_bootstrap_for_turn(&state, &id).await;
-    let system_prompt = resolve_agent_system_prompt(&id, include_bootstrap)?;
-    let collaboration_prompt = match resolve_collaboration_prompt(&state, &id).await {
+    let include_bootstrap = should_include_bootstrap_for_turn(&state, &agent_id).await;
+    let system_prompt = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
+    let collaboration_prompt = match resolve_collaboration_prompt(&state, &agent_id).await {
         Ok(value) => value,
         Err(error) => {
-            tracing::warn!(agent_id = %id, error = %error.message, "chat_message_stream: collaboration prompt skipped due to error");
+            tracing::warn!(agent_id = %agent_id, error = %error.message, "chat_message_stream: collaboration prompt skipped due to error");
             None
         }
     };
-
-    let (original_session_id, _target_session_id, switched) = ensure_switched_to_session_target(
+    let semantic_memory_context = match resolve_semantic_memory_prompt(
         &state,
-        &id,
+        &agent_id,
+        &payload.message,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(agent_id = %agent_id, error = %error.message, "chat_message_stream: semantic memory recall skipped due to error");
+            None
+        }
+    };
+    if let Some(context) = semantic_memory_context.as_ref() {
+        tracing::info!(
+            agent_id = %agent_id,
+            query = %context.query,
+            hit_count = context.hit_count,
+            "chat_message_stream: semantic memory recalled"
+        );
+    }
+
+    let session_ctx = ensure_switched_to_session_target(
+        &state,
+        &agent_id,
         payload.session_id.as_deref(),
         payload.session_label.as_deref(),
     )
     .await?;
+    let session_path = format!("/api/agents/{agent_id}/session");
+    let current_session = state.openfang.get_json(&session_path).await.ok();
+    let include_prompt_blocks = should_inject_prompt_blocks_for_session(current_session.as_ref());
 
     let outgoing_message = apply_system_prompt_guard(
         &payload.message,
         system_prompt.as_deref(),
         collaboration_prompt.as_deref(),
+        semantic_memory_context
+            .as_ref()
+            .map(|item| item.prompt.as_str()),
+        include_prompt_blocks,
     );
     let attachments = build_openfang_attachment_payload(&payload.attachments);
-    let session_path = format!("/api/agents/{id}/session");
-    let baseline_assistant_count = match state.openfang.get_json(&session_path).await {
-        Ok(session) => extract_assistant_texts(&session).len(),
-        Err(_) => 0,
-    };
+    let baseline_assistant_count = current_session
+        .as_ref()
+        .map(|session| extract_assistant_texts(session).len())
+        .unwrap_or(0);
 
-    let path = format!("/api/agents/{id}/message/stream");
+    let path = format!("/api/agents/{agent_id}/message/stream");
     let upstream = match state
         .openfang
-        .post_stream(&path, json!({
-            "message": outgoing_message,
-            "attachments": attachments
-        }))
+        .post_stream(
+            &path,
+            json!({
+                "message": outgoing_message,
+                "attachments": attachments
+            }),
+        )
         .await
     {
         Ok(stream) => stream,
         Err(err) => {
-            if switched {
-                let _ = switch_openfang_session(&state, &id, &original_session_id).await;
-            }
+            restore_and_cleanup_switched_session(&state.openfang, &agent_id, &session_ctx).await;
             return Err(err);
         }
     };
     let openfang = state.openfang.clone();
-    let agent_id = id;
+    let agent_id = agent_id;
     let message = outgoing_message;
-    let original_session_id = original_session_id;
-    let switched = switched;
+    let session_ctx = session_ctx;
+    let semantic_memory_context = semantic_memory_context;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(128);
     tokio::spawn(async move {
         let restore_original_session = || async {
-            if !switched {
+            if !session_ctx.switched {
                 return;
             }
-            let sid = original_session_id.trim();
-            if sid.is_empty() {
-                return;
-            }
-            let path = format!("/api/agents/{agent_id}/sessions/{sid}/switch");
-            let _ = openfang.post_json(&path, json!({})).await;
+            restore_openfang_session_with_client(
+                &openfang,
+                &agent_id,
+                &session_ctx.original_session_id,
+            )
+            .await;
         };
+        let restore_and_cleanup = || async {
+            restore_and_cleanup_switched_session(&openfang, &agent_id, &session_ctx).await;
+        };
+
+        if let Some(context) = semantic_memory_context.as_ref() {
+            let payload = json!({
+                "phase": "unified_memory_recall",
+                "detail": context.log_detail,
+                "query": context.query,
+                "hits": context.hit_count,
+            })
+            .to_string();
+            let event_bytes = Bytes::from(format!("event: phase\ndata: {payload}\n\n"));
+            if tx.send(Ok(event_bytes)).await.is_err() {
+                restore_and_cleanup().await;
+                return;
+            }
+        }
 
         let mut upstream_stream = upstream.bytes_stream();
         let mut frame_buffer = String::new();
         let mut streamed_text = String::new();
+        let mut saw_tool_result = false;
         let mut saw_upstream_done = false;
         let baseline_assistant_count = baseline_assistant_count;
 
@@ -8081,7 +10405,7 @@ pub async fn chat_message_stream(
             match chunk {
                 Ok(bytes) => {
                     if tx.send(Ok(bytes.clone())).await.is_err() {
-                        restore_original_session().await;
+                        restore_and_cleanup().await;
                         return;
                     }
 
@@ -8103,6 +10427,9 @@ pub async fn chat_message_stream(
                                     streamed_text.push_str(&data);
                                 }
                             }
+                            if event_name == "tool_result" {
+                                saw_tool_result = true;
+                            }
                             if event_name == "done" {
                                 saw_upstream_done = true;
                                 if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
@@ -8120,7 +10447,7 @@ pub async fn chat_message_stream(
                     let error = json!({ "error": err.to_string() }).to_string();
                     let event_bytes = Bytes::from(format!("event: error\ndata: {error}\n\n"));
                     let _ = tx.send(Ok(event_bytes)).await;
-                    restore_original_session().await;
+                    restore_and_cleanup().await;
                     return;
                 }
             }
@@ -8139,8 +10466,7 @@ pub async fn chat_message_stream(
 
         let session_path = format!("/api/agents/{agent_id}/session");
         let recovered = match openfang.get_json(&session_path).await {
-            Ok(session) => extract_new_assistant_text(&session, baseline_assistant_count)
-                .or_else(|| extract_latest_assistant_text(&session)),
+            Ok(session) => extract_new_assistant_text(&session, baseline_assistant_count),
             Err(_) => None,
         };
 
@@ -8175,6 +10501,15 @@ pub async fn chat_message_stream(
                 restore_original_session().await;
                 return;
             }
+        }
+
+        if saw_tool_result {
+            tracing::info!(
+                agent_id = %agent_id,
+                "chat stream finished with tool_result only; skipping empty-stream error"
+            );
+            restore_original_session().await;
+            return;
         }
 
         tracing::warn!(agent_id = %agent_id, streamed_text = %streamed_text, "chat stream ended without renderable final text");
@@ -8262,39 +10597,73 @@ fn profile_has_tag(profile: &assignment_store::AgentProfileOverrideRecord, tag: 
 
 pub async fn send_a2a_task(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<Value>,
+    Json(mut payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let caller_agent_id = pick_agent_id_from_payload(
-        &payload,
-        &[
-            &["caller_agent_id"],
-            &["callerAgentId"],
-            &["params", "caller_agent_id"],
-            &["params", "callerAgentId"],
-            &["params", "metadata", "caller_agent_id"],
-            &["params", "metadata", "callerAgentId"],
-            &["metadata", "caller_agent_id"],
-            &["metadata", "callerAgentId"],
-        ],
-    );
-    let callee_agent_id = pick_agent_id_from_payload(
-        &payload,
-        &[
-            &["callee_agent_id"],
-            &["calleeAgentId"],
-            &["agent_id"],
-            &["agentId"],
-            &["params", "callee_agent_id"],
-            &["params", "calleeAgentId"],
-            &["params", "agent_id"],
-            &["params", "agentId"],
-            &["params", "metadata", "callee_agent_id"],
-            &["params", "metadata", "calleeAgentId"],
-            &["params", "metadata", "agent_id"],
-            &["params", "metadata", "agentId"],
-        ],
-    );
+    let caller_paths: &[&[&str]] = &[
+        &["caller_agent_id"],
+        &["callerAgentId"],
+        &["params", "caller_agent_id"],
+        &["params", "callerAgentId"],
+        &["params", "metadata", "caller_agent_id"],
+        &["params", "metadata", "callerAgentId"],
+        &["metadata", "caller_agent_id"],
+        &["metadata", "callerAgentId"],
+    ];
+    let callee_paths: &[&[&str]] = &[
+        &["callee_agent_id"],
+        &["calleeAgentId"],
+        &["agent_id"],
+        &["agentId"],
+        &["params", "callee_agent_id"],
+        &["params", "calleeAgentId"],
+        &["params", "agent_id"],
+        &["params", "agentId"],
+        &["params", "metadata", "callee_agent_id"],
+        &["params", "metadata", "calleeAgentId"],
+        &["params", "metadata", "agent_id"],
+        &["params", "metadata", "agentId"],
+    ];
+    let mut caller_agent_id = pick_agent_id_from_payload(&payload, caller_paths);
+    let mut callee_agent_id = pick_agent_id_from_payload(&payload, callee_paths);
+
+    let needs_alias = caller_agent_id
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID))
+        .unwrap_or(false)
+        || callee_agent_id
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID))
+            .unwrap_or(false);
+    if needs_alias {
+        let resolved_nuwa = resolve_nuwa_agent_id(&state).await?;
+        if caller_agent_id
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID))
+            .unwrap_or(false)
+        {
+            caller_agent_id = Some(resolved_nuwa.clone());
+        }
+        if callee_agent_id
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(DEFAULT_NUWA_AGENT_ID))
+            .unwrap_or(false)
+        {
+            callee_agent_id = Some(resolved_nuwa.clone());
+        }
+        replace_payload_agent_id(
+            &mut payload,
+            caller_paths,
+            DEFAULT_NUWA_AGENT_ID,
+            &resolved_nuwa,
+        );
+        replace_payload_agent_id(
+            &mut payload,
+            callee_paths,
+            DEFAULT_NUWA_AGENT_ID,
+            &resolved_nuwa,
+        );
+    }
 
     if let (Some(caller), Some(callee)) = (caller_agent_id.clone(), callee_agent_id.clone()) {
         if caller == callee {
@@ -8525,9 +10894,8 @@ fn extract_provider_ids_from_payload(payload: &Value) -> HashSet<String> {
         .map(|rows| {
             rows.iter()
                 .filter_map(|row| row.get("id").and_then(Value::as_str))
-                .map(str::trim)
+                .map(normalize_runtime_provider_id)
                 .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
                 .collect::<HashSet<String>>()
         })
         .unwrap_or_default()
@@ -8566,13 +10934,17 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> Result<Json<V
         let Some(obj) = row.as_object_mut() else {
             continue;
         };
-        let provider_id = obj
+        let raw_provider_id = obj
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let provider_id = normalize_runtime_provider_id(&raw_provider_id);
         if provider_id.is_empty() {
             continue;
+        }
+        if provider_id != raw_provider_id {
+            obj.insert("id".to_string(), json!(provider_id.clone()));
         }
         seen.insert(provider_id.clone());
         if let Some(cfg) = config_map.get(&provider_id) {
@@ -8609,8 +10981,9 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> Result<Json<V
             .and_then(|cfg| cfg.base_url.as_ref())
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false);
-        let configured =
-            has_key || has_base_url || (!auth_status.contains("missing") && !auth_status.contains("none"));
+        let configured = has_key
+            || has_base_url
+            || (!auth_status.contains("missing") && !auth_status.contains("none"));
         let runtime_loaded = upstream_provider_ids.contains(&provider_id);
         let model_discovered = obj
             .get("model_count")
@@ -8808,33 +11181,36 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Result<Json<Valu
     }
 
     let mut filtered_models = Vec::new();
+    let mut seen_model_ids = HashSet::new();
     for mut row in models {
         let Some(obj) = row.as_object_mut() else {
             continue;
         };
-        let model_id = obj
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let provider_id = obj
+        let raw_provider_id = obj
             .get("provider")
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if !provider_linked(&provider_id) {
-            continue;
-        }
+            .unwrap_or_default();
         let raw_model = obj
             .get("model")
             .and_then(Value::as_str)
-            .unwrap_or(&model_id)
+            .or_else(|| obj.get("id").and_then(Value::as_str))
+            .unwrap_or_default()
             .to_string();
-        let normalized_model = strip_provider_prefixes(&raw_model, &provider_id);
-        if normalized_model.is_empty() {
+        let (provider_id, normalized_model) =
+            normalize_display_model_ref(raw_provider_id, &raw_model, &config_map);
+        if provider_id.is_empty() || normalized_model.is_empty() {
             continue;
         }
-        obj.insert("model".to_string(), json!(normalized_model));
+        obj.insert("provider".to_string(), json!(provider_id.clone()));
+        if !provider_linked(&provider_id) {
+            continue;
+        }
+        let model_id = assignment_store::make_model_id(&provider_id, &normalized_model);
+        if !seen_model_ids.insert(model_id.clone()) {
+            continue;
+        }
+        obj.insert("id".to_string(), json!(model_id.clone()));
+        obj.insert("model".to_string(), json!(normalized_model.clone()));
         let display_name = obj
             .get("display_name")
             .and_then(Value::as_str)
@@ -8907,7 +11283,7 @@ pub async fn test_model_connection(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ModelTestRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let provider_id = payload.provider.trim().to_string();
+    let provider_id = canonical_provider_id(&payload.provider);
     if provider_id.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9046,6 +11422,130 @@ pub async fn test_model_connection(
             "model_id": payload.model_id
         })))
     }
+}
+
+#[derive(Deserialize)]
+pub struct ProviderConnectionTestRequest {
+    pub provider_id: String,
+}
+
+pub async fn test_provider_connection(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ProviderConnectionTestRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let provider_id = canonical_provider_id(&payload.provider_id);
+    if provider_id.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "provider id 不能为空",
+        ));
+    }
+
+    let local_provider_config =
+        assignment_store::get_provider_config(&provider_id).map_err(storage_error)?;
+    if let Some(cfg) = local_provider_config {
+        let protocol = normalize_protocol(&cfg.protocol).unwrap_or("openai");
+        let has_base_url = cfg
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let has_api_key = cfg
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let (Some(base_url), Some(api_key)) = (has_base_url, has_api_key) {
+            return match discover_models_from_provider(&provider_id, protocol, base_url, api_key)
+                .await
+            {
+                Ok(models) => Ok(Json(json!({
+                    "ok": true,
+                    "status": "ok",
+                    "message": if models.is_empty() {
+                        "API 已连通".to_string()
+                    } else {
+                        format!("API 已连通，探测到 {} 个模型", models.len())
+                    },
+                    "model_count": models.len()
+                }))),
+                Err(error) => Ok(Json(json!({
+                    "ok": false,
+                    "status": "connection_error",
+                    "message": error
+                }))),
+            };
+        }
+    }
+
+    let upstream = get_upstream_json_quick(&state, "/api/providers").await;
+    let matched = upstream
+        .as_ref()
+        .and_then(|value| value.get("providers"))
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter().find(|row| {
+                row.get("id")
+                    .and_then(Value::as_str)
+                    .map(normalize_runtime_provider_id)
+                    .map(|value| value == provider_id)
+                    .unwrap_or(false)
+            })
+        });
+
+    if let Some(row) = matched {
+        let auth_status = row
+            .get("auth_status")
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_ascii_lowercase();
+        let configured = !auth_status.contains("missing") && !auth_status.contains("none");
+        if configured {
+            let model_count = row
+                .get("model_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            return Ok(Json(json!({
+                "ok": true,
+                "status": "ok",
+                "message": if model_count > 0 {
+                    format!("运行时已加载，当前可见 {} 个模型", model_count)
+                } else {
+                    "运行时已加载，API 鉴权正常".to_string()
+                },
+                "model_count": model_count
+            })));
+        }
+    }
+
+    let record = assignment_store::get_provider_config(&provider_id).map_err(storage_error)?;
+    let has_api_key = record
+        .as_ref()
+        .and_then(|cfg| cfg.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let has_base_url = record
+        .as_ref()
+        .and_then(|cfg| cfg.base_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+
+    Ok(Json(json!({
+        "ok": false,
+        "status": if has_api_key || has_base_url {
+            "unverified"
+        } else {
+            "not_configured"
+        },
+        "message": if has_api_key || has_base_url {
+            "已保存配置，但暂时无法确认 API 连通性"
+        } else {
+            "尚未配置可用的 API Key / Base URL"
+        }
+    })))
 }
 
 #[derive(Deserialize)]
@@ -9348,12 +11848,15 @@ pub async fn update_default_model(
     }
 
     let model_assignments = assignment_store::list_model_assignments().map_err(storage_error)?;
-    let hit = model_assignments.iter().find(|item| item.model_id == model_id).ok_or_else(|| {
-        ApiError::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            "默认模型不存在，请先配置并启用对应供应商/模型",
-        )
-    })?;
+    let hit = model_assignments
+        .iter()
+        .find(|item| item.model_id == model_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "默认模型不存在，请先配置并启用对应供应商/模型",
+            )
+        })?;
     if !hit.enabled {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -9361,7 +11864,11 @@ pub async fn update_default_model(
         ));
     }
     let provider_enabled = assignment_store::list_provider_enabled_map().map_err(storage_error)?;
-    if !provider_enabled.get(&hit.provider_id).copied().unwrap_or(true) {
+    if !provider_enabled
+        .get(&hit.provider_id)
+        .copied()
+        .unwrap_or(true)
+    {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "默认模型所属供应商已被禁用，请先启用供应商",
@@ -9572,6 +12079,26 @@ fn extract_openfang_skill_names(payload: &Value) -> Vec<String> {
     names
 }
 
+fn enable_default_global_skills_for_agent(agent_id: &str) -> Result<Vec<String>, String> {
+    let skills_root = assignment_store::skills_root()?;
+    let mut enabled = Vec::new();
+
+    for skill in DEFAULT_GLOBAL_SKILLS {
+        let skill_name = skill.trim();
+        if skill_name.is_empty() {
+            continue;
+        }
+        if !skills_root.join(skill_name).is_dir() {
+            continue;
+        }
+
+        assignment_store::set_agent_skill_enabled(agent_id, skill_name, true)?;
+        enabled.push(skill_name.to_string());
+    }
+
+    Ok(enabled)
+}
+
 async fn openfang_known_skill_names(
     state: &Arc<AppState>,
     agent_id: &str,
@@ -9771,6 +12298,12 @@ fn global_custom_skill_names() -> Result<Vec<String>, ApiError> {
 
 async fn sync_active_mcp_servers_to_runtime(state: &Arc<AppState>) -> Result<Value, ApiError> {
     ensure_online(state).await?;
+    sync_active_mcp_servers_to_runtime_inner(state).await
+}
+
+async fn sync_active_mcp_servers_to_runtime_inner(
+    state: &Arc<AppState>,
+) -> Result<Value, ApiError> {
     let stored = assignment_store::get_global_mcp_config().map_err(storage_error)?;
     let mut all_map = stored
         .as_ref()
@@ -10377,6 +12910,17 @@ pub struct ChannelTestRequest {
     channel: String,
 }
 
+#[derive(Deserialize)]
+pub struct ChannelNotifyRequest {
+    agent_id: Option<String>,
+    preferred_channel: Option<String>,
+    target: Option<String>,
+    title: String,
+    message: String,
+    tag: Option<String>,
+    level: Option<String>,
+}
+
 pub async fn get_channel_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, ApiError> {
@@ -10535,6 +13079,426 @@ pub async fn test_channel_connection(
     })))
 }
 
+fn normalize_channel_name(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("system"))
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn split_notification_targets(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(|ch| matches!(ch, ',' | ';' | '\n' | '\r' | '|' | '，' | '；'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("system"))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn resolve_channel_binding_for_notification(
+    agent_id: Option<&str>,
+    preferred_channel: Option<&str>,
+) -> Result<Option<ChannelBindingCandidate>, ApiError> {
+    let preferred = normalize_channel_name(preferred_channel);
+    if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+        let profile =
+            assignment_store::get_agent_profile_override(agent_id).map_err(storage_error)?;
+        if let Some(profile) = profile {
+            if let Some(candidate) = parse_channel_binding_candidate(&profile) {
+                if preferred
+                    .as_deref()
+                    .map(|channel| channel == candidate.channel_type)
+                    .unwrap_or(true)
+                {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+    }
+
+    let Some(channel) = preferred else {
+        return Ok(None);
+    };
+    let profiles = assignment_store::list_agent_profile_overrides().map_err(storage_error)?;
+    Ok(select_latest_channel_bindings(&profiles)
+        .get(channel.as_str())
+        .cloned())
+}
+
+fn resolve_notification_targets(
+    binding: &ChannelBindingCandidate,
+    explicit_target: Option<&str>,
+) -> Vec<String> {
+    let explicit = split_notification_targets(explicit_target);
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    let config = binding.config.as_object();
+    match binding.channel_type.as_str() {
+        "telegram" => read_string_list(config.and_then(|value| value.get("allowed_users"))),
+        _ => Vec::new(),
+    }
+}
+
+fn notification_text(title: &str, message: &str, level: Option<&str>) -> String {
+    let level_label = match level
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "error" => "失败",
+        "success" => "完成",
+        "warning" => "告警",
+        _ => "通知",
+    };
+    format!("【{}】{}\n\n{}", level_label, title.trim(), message.trim())
+}
+
+async fn send_telegram_notification(
+    binding: &ChannelBindingCandidate,
+    targets: &[String],
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let config = binding
+        .config
+        .as_object()
+        .ok_or_else(|| "Telegram 渠道配置格式异常".to_string())?;
+    let token_env = read_string(config.get("bot_token_env"))
+        .ok_or_else(|| "Telegram 渠道缺少 bot_token_env".to_string())?;
+    let token = env::var(&token_env)
+        .map_err(|_| format!("缺少环境变量: {token_env}"))?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(format!("环境变量 {token_env} 为空"));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("初始化 Telegram 客户端失败: {e}"))?;
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let mut delivered = Vec::new();
+    let mut failures = Vec::new();
+    for target in targets {
+        match client
+            .post(&url)
+            .json(&json!({
+                "chat_id": target,
+                "text": text,
+                "disable_web_page_preview": true,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                delivered.push(target.clone());
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                failures.push(format!("{target}: HTTP {status} {}", body.trim()));
+            }
+            Err(error) => {
+                failures.push(format!("{target}: {error}"));
+            }
+        }
+    }
+
+    if delivered.is_empty() {
+        return Err(failures.join("；"));
+    }
+    if !failures.is_empty() {
+        tracing::warn!(
+            channel = "telegram",
+            agent_id = %binding.agent_id,
+            failed_targets = %failures.join("；"),
+            "channel notify partially failed"
+        );
+    }
+    Ok(delivered)
+}
+
+async fn send_discord_notification(
+    binding: &ChannelBindingCandidate,
+    targets: &[String],
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let config = binding
+        .config
+        .as_object()
+        .ok_or_else(|| "Discord 渠道配置格式异常".to_string())?;
+    let token_env = read_string(config.get("bot_token_env"))
+        .ok_or_else(|| "Discord 渠道缺少 bot_token_env".to_string())?;
+    let token = env::var(&token_env)
+        .map_err(|_| format!("缺少环境变量: {token_env}"))?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(format!("环境变量 {token_env} 为空"));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("初始化 Discord 客户端失败: {e}"))?;
+    let mut delivered = Vec::new();
+    let mut failures = Vec::new();
+    for target in targets {
+        let url = format!("https://discord.com/api/v10/channels/{target}/messages");
+        match client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bot {token}"))
+            .json(&json!({
+                "content": text.chars().take(1_900).collect::<String>(),
+            }))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                delivered.push(target.clone());
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                failures.push(format!("{target}: HTTP {status} {}", body.trim()));
+            }
+            Err(error) => {
+                failures.push(format!("{target}: {error}"));
+            }
+        }
+    }
+
+    if delivered.is_empty() {
+        return Err(failures.join("；"));
+    }
+    if !failures.is_empty() {
+        tracing::warn!(
+            channel = "discord",
+            agent_id = %binding.agent_id,
+            failed_targets = %failures.join("；"),
+            "channel notify partially failed"
+        );
+    }
+    Ok(delivered)
+}
+
+async fn fetch_feishu_tenant_access_token(
+    app_id: &str,
+    app_secret: &str,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("初始化飞书客户端失败: {e}"))?;
+    let response = client
+        .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+        .json(&json!({
+            "app_id": app_id,
+            "app_secret": app_secret,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("获取飞书 tenant_access_token 失败: {e}"))?;
+
+    let status = response.status();
+    let payload = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("飞书鉴权失败: HTTP {status} {payload}"));
+    }
+    let data = serde_json::from_str::<Value>(&payload)
+        .map_err(|e| format!("飞书鉴权返回解析失败: {e}; body={payload}"))?;
+    data.get("tenant_access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "飞书鉴权未返回 tenant_access_token".to_string())
+}
+
+fn parse_feishu_target(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if let Some((target_type, target_id)) = trimmed.split_once(':') {
+        let normalized_type = match target_type.trim().to_ascii_lowercase().as_str() {
+            "open_id" | "user_id" | "union_id" | "email" | "chat_id" => {
+                target_type.trim().to_ascii_lowercase()
+            }
+            _ => "chat_id".to_string(),
+        };
+        return (normalized_type, target_id.trim().to_string());
+    }
+    ("chat_id".to_string(), trimmed.to_string())
+}
+
+async fn send_feishu_notification(
+    binding: &ChannelBindingCandidate,
+    targets: &[String],
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let config = binding
+        .config
+        .as_object()
+        .ok_or_else(|| "飞书渠道配置格式异常".to_string())?;
+    let app_id =
+        read_string(config.get("app_id")).ok_or_else(|| "飞书渠道缺少 app_id".to_string())?;
+    let app_secret_env = read_string(config.get("app_secret_env"))
+        .ok_or_else(|| "飞书渠道缺少 app_secret_env".to_string())?;
+    let app_secret = env::var(&app_secret_env)
+        .map_err(|_| format!("缺少环境变量: {app_secret_env}"))?
+        .trim()
+        .to_string();
+    if app_secret.is_empty() {
+        return Err(format!("环境变量 {app_secret_env} 为空"));
+    }
+    let access_token = fetch_feishu_tenant_access_token(&app_id, &app_secret).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("初始化飞书消息客户端失败: {e}"))?;
+
+    let mut delivered = Vec::new();
+    let mut failures = Vec::new();
+    for target in targets {
+        let (receive_id_type, receive_id) = parse_feishu_target(target);
+        if receive_id.is_empty() {
+            failures.push("empty_target".to_string());
+            continue;
+        }
+        let url = format!(
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+        );
+        let body = json!({
+            "receive_id": receive_id,
+            "msg_type": "text",
+            "content": json!({ "text": text }).to_string(),
+        });
+        match client
+            .post(&url)
+            .bearer_auth(&access_token)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                delivered.push(target.clone());
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                failures.push(format!("{target}: HTTP {status} {}", body.trim()));
+            }
+            Err(error) => {
+                failures.push(format!("{target}: {error}"));
+            }
+        }
+    }
+
+    if delivered.is_empty() {
+        return Err(failures.join("；"));
+    }
+    if !failures.is_empty() {
+        tracing::warn!(
+            channel = "feishu",
+            agent_id = %binding.agent_id,
+            failed_targets = %failures.join("；"),
+            "channel notify partially failed"
+        );
+    }
+    Ok(delivered)
+}
+
+async fn dispatch_channel_notification(
+    binding: &ChannelBindingCandidate,
+    targets: &[String],
+    text: &str,
+) -> Result<Vec<String>, String> {
+    match binding.channel_type.as_str() {
+        "telegram" => send_telegram_notification(binding, targets, text).await,
+        "discord" => send_discord_notification(binding, targets, text).await,
+        "feishu" => send_feishu_notification(binding, targets, text).await,
+        "email" => Err("Email 渠道暂未接入主动任务通知发送".to_string()),
+        "qqbot" => Err("QQBot 渠道暂未接入主动任务通知发送".to_string()),
+        _ => Err(format!("暂不支持的渠道类型: {}", binding.channel_type)),
+    }
+}
+
+pub async fn send_channel_notification(
+    Json(payload): Json<ChannelNotifyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let title = payload.title.trim();
+    let message = payload.message.trim();
+    if title.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "title 不能为空"));
+    }
+    if message.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "message 不能为空"));
+    }
+
+    let binding = resolve_channel_binding_for_notification(
+        payload.agent_id.as_deref(),
+        payload.preferred_channel.as_deref(),
+    )?;
+    let Some(binding) = binding else {
+        return Ok(Json(json!({
+            "ok": false,
+            "delivered": false,
+            "fallback_recommended": true,
+            "reason": "当前智能体未配置可用通知渠道"
+        })));
+    };
+
+    let (missing, missing_env) = validate_channel_binding_requirements(&binding);
+    if !missing.is_empty() || !missing_env.is_empty() {
+        return Ok(Json(json!({
+            "ok": false,
+            "delivered": false,
+            "resolved_channel": binding.channel_type,
+            "fallback_recommended": true,
+            "reason": if !missing.is_empty() {
+                format!("渠道配置缺少字段: {}", missing.join(", "))
+            } else {
+                format!("渠道缺少环境变量: {}", missing_env.join(", "))
+            }
+        })));
+    }
+
+    let targets = resolve_notification_targets(&binding, payload.target.as_deref());
+    if targets.is_empty() {
+        return Ok(Json(json!({
+            "ok": false,
+            "delivered": false,
+            "resolved_channel": binding.channel_type,
+            "fallback_recommended": true,
+            "reason": "渠道已配置，但没有可用通知目标"
+        })));
+    }
+
+    let rendered = notification_text(title, message, payload.level.as_deref());
+    match dispatch_channel_notification(&binding, &targets, &rendered).await {
+        Ok(delivered_targets) => Ok(Json(json!({
+            "ok": true,
+            "delivered": true,
+            "resolved_channel": binding.channel_type,
+            "resolved_target": delivered_targets.join(","),
+            "delivered_targets": delivered_targets,
+            "tag": payload.tag,
+            "fallback_recommended": false
+        }))),
+        Err(reason) => Ok(Json(json!({
+            "ok": false,
+            "delivered": false,
+            "resolved_channel": binding.channel_type,
+            "resolved_target": targets.join(","),
+            "fallback_recommended": true,
+            "reason": reason,
+            "tag": payload.tag
+        }))),
+    }
+}
+
 fn apply_mcp_config_to_openfang_file(payload: &Value) -> Result<Value, ApiError> {
     let config_path = resolve_openfang_config_path()?;
     if let Some(parent) = config_path.parent() {
@@ -10602,8 +13566,15 @@ async fn trigger_openfang_reload(state: &Arc<AppState>) -> Result<Value, ApiErro
 }
 
 pub async fn sync_provider_configs_to_runtime(state: &Arc<AppState>) -> Result<Value, ApiError> {
-    crate::reconcile_runtime_config_from_storage().map_err(storage_error)?;
     let online = ensure_online(state).await.is_ok();
+    sync_provider_configs_to_runtime_with_online(state, online).await
+}
+
+async fn sync_provider_configs_to_runtime_with_online(
+    state: &Arc<AppState>,
+    online: bool,
+) -> Result<Value, ApiError> {
+    crate::reconcile_runtime_config_from_storage().map_err(storage_error)?;
     let reload = if online {
         Some(trigger_openfang_reload(state).await?)
     } else {
@@ -11108,5 +14079,95 @@ fn resolve_assignment(
             format!("不支持的 mode: {other}（仅支持 all / allowlist）"),
         )),
         None => Ok(primary.or(fallback).unwrap_or_default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_upstream_model_selector, normalize_display_model_ref,
+        normalize_runtime_applied_model, normalize_runtime_provider_id,
+        resolve_provider_model_pair, strip_provider_prefixes,
+    };
+    use crate::assignment_store::ProviderConfigRecord;
+    use std::collections::HashMap;
+
+    fn provider_record(provider_id: &str, models: &[&str]) -> ProviderConfigRecord {
+        ProviderConfigRecord {
+            provider_id: provider_id.to_string(),
+            display_name: Some(provider_id.to_string()),
+            protocol: "openai".to_string(),
+            base_url: Some("https://example.com/v1".to_string()),
+            api_key: Some("test-key".to_string()),
+            models: models.iter().map(|item| item.to_string()).collect(),
+            is_custom: false,
+            updated_at: "2026-03-16 00:00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn nvidia_runtime_provider_alias_is_normalized() {
+        assert_eq!(normalize_runtime_provider_id("nvidia-nim"), "nvidia");
+        assert_eq!(normalize_runtime_provider_id("NVIDIA"), "nvidia");
+    }
+
+    #[test]
+    fn strip_provider_prefixes_accepts_nvidia_aliases() {
+        assert_eq!(
+            strip_provider_prefixes("nvidia-nim/xianyu/glm-4.7", "nvidia"),
+            "xianyu/glm-4.7"
+        );
+        assert_eq!(
+            strip_provider_prefixes("nvidia/xianyu/glm-4.7", "nvidia-nim"),
+            "xianyu/glm-4.7"
+        );
+    }
+
+    #[test]
+    fn build_upstream_selector_uses_runtime_provider_id_for_nim() {
+        assert_eq!(
+            build_upstream_model_selector(Some("nvidia-nim"), "xianyu/glm-4.7"),
+            Some("nvidia/xianyu/glm-4.7".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_provider_model_pair_preserves_namespaced_model_for_nim() {
+        assert_eq!(
+            resolve_provider_model_pair(Some("nvidia-nim"), "xianyu/glm-4.7"),
+            Some(("nvidia".to_string(), "xianyu/glm-4.7".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalize_runtime_applied_model_strips_mismatched_nvidia_prefix() {
+        assert_eq!(
+            normalize_runtime_applied_model("nvidia", "nvidia", "nvidia-nim/xianyu/glm-4.7"),
+            ("nvidia".to_string(), "xianyu/glm-4.7".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_display_model_prefers_local_namespaced_provider() {
+        let mut provider_configs = HashMap::new();
+        provider_configs.insert(
+            "xianyu".to_string(),
+            provider_record("xianyu", &["glm-4.7", "minimax-m2.5"]),
+        );
+
+        assert_eq!(
+            normalize_display_model_ref("nvidia", "xianyu/minimax-m2.5", &provider_configs),
+            ("xianyu".to_string(), "minimax-m2.5".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_display_model_keeps_wrapper_provider_without_local_match() {
+        let provider_configs = HashMap::new();
+
+        assert_eq!(
+            normalize_display_model_ref("nvidia", "qwen/qwen3.5-397b-a17b", &provider_configs),
+            ("nvidia".to_string(), "qwen/qwen3.5-397b-a17b".to_string())
+        );
     }
 }

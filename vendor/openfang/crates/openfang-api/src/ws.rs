@@ -694,77 +694,79 @@ async fn handle_text_message(
                             )
                             .await;
                         }
-        Err(e) => {
-            stream_task.abort();
-            let err_msg = e.to_string();
-            let is_panic = e.is_panic();
-            let is_cancelled = e.is_cancelled();
-            let panic_detail = if is_panic {
-                let payload = e.into_panic();
-                if let Some(msg) = payload.downcast_ref::<&str>() {
-                    Some(msg.to_string())
-                } else if let Some(msg) = payload.downcast_ref::<String>() {
-                    Some(msg.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let user_msg = if is_panic {
-                match panic_detail.as_deref() {
-                    Some(detail) => format!(
-                        "Internal error occurred (panic: {})",
-                        truncate_message(detail, 600),
-                    ),
-                    None => "Internal error occurred (panic)".to_string(),
-                }
-            } else if is_cancelled {
-                "Internal error occurred (task cancelled)".to_string()
-            } else if err_msg.trim().is_empty() {
-                "Internal error occurred".to_string()
-            } else {
-                format!(
-                    "Internal error occurred ({})",
-                    truncate_message(&err_msg, 600),
-                )
-            };
-            let audit_outcome = if is_panic {
-                panic_detail
-                    .as_deref()
-                    .map(|detail| format!("panic: {}", truncate_message(detail, 800)))
-                    .unwrap_or_else(|| "panic".to_string())
-            } else if is_cancelled {
-                "cancelled".to_string()
-            } else if err_msg.trim().is_empty() {
-                "internal error".to_string()
-            } else {
-                truncate_message(&err_msg, 800)
-            };
-            warn!("Agent task panicked: {err_msg}");
-            state.kernel.audit_log.record(
-                agent_id.to_string(),
-                openfang_runtime::audit::AuditAction::AgentMessage,
-                "agent loop panicked",
-                audit_outcome,
-            );
-            let _ = send_json(
-                sender,
-                &serde_json::json!({
-                    "type": "typing", "state": "stop",
-                }),
+                        Err(e) => {
+                            stream_task.abort();
+                            let err_msg = e.to_string();
+                            let is_panic = e.is_panic();
+                            let is_cancelled = e.is_cancelled();
+                            let panic_detail = if is_panic {
+                                let payload = e.into_panic();
+                                if let Some(msg) = payload.downcast_ref::<&str>() {
+                                    Some(msg.to_string())
+                                } else if let Some(msg) = payload.downcast_ref::<String>() {
+                                    Some(msg.clone())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            let user_msg = if is_panic {
+                                match panic_detail.as_deref() {
+                                    Some(detail) => format!(
+                                        "Internal error occurred (panic: {})",
+                                        truncate_message(detail, 600),
+                                    ),
+                                    None => "Internal error occurred (panic)".to_string(),
+                                }
+                            } else if is_cancelled {
+                                "Internal error occurred (task cancelled)".to_string()
+                            } else if err_msg.trim().is_empty() {
+                                "Internal error occurred".to_string()
+                            } else {
+                                format!(
+                                    "Internal error occurred ({})",
+                                    truncate_message(&err_msg, 600),
+                                )
+                            };
+                            let audit_outcome = if is_panic {
+                                panic_detail
+                                    .as_deref()
+                                    .map(|detail| {
+                                        format!("panic: {}", truncate_message(detail, 800))
+                                    })
+                                    .unwrap_or_else(|| "panic".to_string())
+                            } else if is_cancelled {
+                                "cancelled".to_string()
+                            } else if err_msg.trim().is_empty() {
+                                "internal error".to_string()
+                            } else {
+                                truncate_message(&err_msg, 800)
+                            };
+                            warn!("Agent task panicked: {err_msg}");
+                            state.kernel.audit_log.record(
+                                agent_id.to_string(),
+                                openfang_runtime::audit::AuditAction::AgentMessage,
+                                "agent loop panicked",
+                                audit_outcome,
+                            );
+                            let _ = send_json(
+                                sender,
+                                &serde_json::json!({
+                                    "type": "typing", "state": "stop",
+                                }),
                             )
                             .await;
-            let _ = send_json(
-                sender,
-                &serde_json::json!({
-                    "type": "error",
-                    "content": user_msg,
-                }),
-            )
-            .await;
-        }
-    }
+                            let _ = send_json(
+                                sender,
+                                &serde_json::json!({
+                                    "type": "error",
+                                    "content": user_msg,
+                                }),
+                            )
+                            .await;
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Streaming setup failed: {e}");
@@ -864,7 +866,10 @@ async fn handle_command(
                 match state.kernel.set_agent_model(agent_id, args) {
                     Ok(()) => {
                         let msg = if let Some(entry) = state.kernel.registry.get(agent_id) {
-                            format!("Model switched to: {} (provider: {})", entry.manifest.model.model, entry.manifest.model.provider)
+                            format!(
+                                "Model switched to: {} (provider: {})",
+                                entry.manifest.model.model, entry.manifest.model.provider
+                            )
                         } else {
                             format!("Model switched to: {args}")
                         };
@@ -1052,11 +1057,13 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             name,
             result_preview,
             is_error,
+            input,
         } => match verbose {
             VerboseLevel::Off => Some(serde_json::json!({
                 "type": "tool_result",
                 "tool": name,
                 "is_error": is_error,
+                "input": input,
             })),
             VerboseLevel::On => {
                 let truncated: String = result_preview.chars().take(200).collect();
@@ -1065,6 +1072,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                     "tool": name,
                     "result": truncated,
                     "is_error": is_error,
+                    "input": input,
                 }))
             }
             VerboseLevel::Full => Some(serde_json::json!({
@@ -1072,6 +1080,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 "tool": name,
                 "result": result_preview,
                 "is_error": is_error,
+                "input": input,
             })),
         },
         StreamEvent::PhaseChange { phase, detail } => Some(serde_json::json!({
@@ -1193,11 +1202,13 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
             if inner.contains("localhost:11434") || inner.contains("ollama") {
                 "Model not found on Ollama. Run `ollama pull <model>` to download it, then try again. Use /model to see options.".to_string()
             } else {
-                "Model unavailable. Use /model to see options or check your provider configuration.".to_string()
+                "Model unavailable. Use /model to see options or check your provider configuration."
+                    .to_string()
             }
         }
         llm_errors::LlmErrorCategory::Format => {
-            "LLM request failed. Check your API key and model configuration in Settings.".to_string()
+            "LLM request failed. Check your API key and model configuration in Settings."
+                .to_string()
         }
         _ => classified.sanitized_message,
     }

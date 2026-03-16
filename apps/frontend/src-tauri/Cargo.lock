@@ -5147,6 +5147,7 @@ name = "webot-frontend"
 version = "1.8.0-1"
 dependencies = [
  "base64 0.22.1",
+ "reqwest 0.12.28",
  "rfd",
  "serde",
  "serde_json",

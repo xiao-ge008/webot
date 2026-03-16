@@ -18,9 +18,14 @@ import type { StoredChatSession } from '@/services/chat-session-store';
 import { buildInitialMessages, generateId, mapManagementAgentToUi } from '@/components/chat/chat-page-helpers';
 import type { Message } from '@/data/mock-chats';
 import { cn } from '@/lib/utils';
-import { DEFAULT_GROUP_LIMITS, type ChatGroup, type ChatGroupLimits, type ChatGroupMode } from '@/types/group';
+import { DEFAULT_GROUP_LIMITS, type ChatGroup, type ChatGroupLimits, type ChatGroupMode, type GroupMemoryDigest, type GroupSessionRuntime } from '@/types/group';
 import type { Agent } from '@/types';
-import { AtSign, Plus, Search, Settings, Users, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, MessageCircle, Plus, Search, Settings, ListChecks, Users, X } from 'lucide-react';
+
+const MEMBER_DIRECTORY_CACHE_TTL_MS = 60_000;
+let memberDirectoryCache: Map<string, Agent> | null = null;
+let memberDirectoryCacheAt = 0;
+let memberDirectoryPendingPromise: Promise<Map<string, Agent>> | null = null;
 
 function normalizeLabelComponent(raw: string, maxLen: number): string {
     const trimmed = raw.trim();
@@ -41,6 +46,55 @@ function normalizeLabelComponent(raw: string, maxLen: number): string {
 function buildGroupSessionLabel(groupId: string): string {
     const conversation = normalizeLabelComponent(groupId, 56);
     return `groupmem_web_${conversation}`;
+}
+
+function buildScopedGroupSessionLabel(groupId: string, sessionId: string): string {
+    const conversation = normalizeLabelComponent(groupId, 40);
+    const session = normalizeLabelComponent(sessionId, 40);
+    return `groupmem_web_${conversation}_${session || 'default'}`;
+}
+
+function normalizeGroupSessionIdentity(
+    session: StoredChatSession,
+    groupId: string,
+    leaderAgentId: string,
+    fallbackIndex: number,
+): StoredChatSession {
+    const safeId = session.id?.trim() || `group_session_${fallbackIndex + 1}`;
+    const legacyLabel = buildGroupSessionLabel(groupId);
+    const currentLabel = (session.sessionLabel || '').trim();
+    const normalizedLabel = !currentLabel || currentLabel === legacyLabel
+        ? buildScopedGroupSessionLabel(groupId, safeId)
+        : currentLabel;
+
+    return ensureGroupSessionRuntime({
+        ...session,
+        id: safeId,
+        sessionLabel: normalizedLabel,
+        sessionSource: session.sessionSource ?? 'app',
+        remoteSessionOwnerAgentId: session.remoteSessionOwnerAgentId || leaderAgentId,
+    }, leaderAgentId);
+}
+
+function normalizeGroupSessions(
+    sessions: StoredChatSession[],
+    groupId: string,
+    leaderAgentId: string,
+): StoredChatSession[] {
+    const seenIds = new Set<string>();
+    return sessions.map((session, index) => {
+        let next = normalizeGroupSessionIdentity(session, groupId, leaderAgentId, index);
+        if (seenIds.has(next.id)) {
+            const dedupedId = `${next.id}_${index + 1}`;
+            next = {
+                ...next,
+                id: dedupedId,
+                sessionLabel: buildScopedGroupSessionLabel(groupId, dedupedId),
+            };
+        }
+        seenIds.add(next.id);
+        return next;
+    });
 }
 
 function buildFallbackMember(agentId: string): Agent {
@@ -89,6 +143,81 @@ function buildGroupSharedContext(messages: Message[], limit: number): string {
     ].join('\n');
 }
 
+function compactDigestLine(raw: string, maxLen: number): string {
+    const normalized = raw.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLen ? `${normalized.slice(0, maxLen)}...` : normalized;
+}
+
+function createInitialGroupRuntime(leaderAgentId: string): GroupSessionRuntime {
+    return {
+        version: '1.0',
+        status: 'idle',
+        leaderAgentId: leaderAgentId.trim() || undefined,
+        currentSpeakerId: undefined,
+        lastCompletedSpeakerId: undefined,
+        queueVersion: 0,
+        queue: [],
+        stopRequested: false,
+    };
+}
+
+function normalizeGroupRuntimeValue(runtime: GroupSessionRuntime | undefined, leaderAgentId: string): GroupSessionRuntime {
+    const base = createInitialGroupRuntime(leaderAgentId);
+    return {
+        ...base,
+        ...(runtime ?? {}),
+        leaderAgentId: (runtime?.leaderAgentId || leaderAgentId || '').trim() || undefined,
+        queue: Array.isArray(runtime?.queue) ? runtime!.queue.slice(-18) : [],
+        stopRequested: runtime?.stopRequested === true,
+    };
+}
+
+function buildGroupMemoryDigest(messages: Message[], runtime: GroupSessionRuntime): GroupMemoryDigest | undefined {
+    const recentRows = messages
+        .filter((item) => item.role === 'user' || item.role === 'agent')
+        .filter((item) => Boolean((item.text || '').trim()))
+        .slice(-8);
+    if (recentRows.length === 0) {
+        return undefined;
+    }
+    const lastUser = [...recentRows].reverse().find((item) => item.role === 'user');
+    const recentAgents = recentRows
+        .filter((item) => item.role === 'agent')
+        .slice(-3)
+        .map((item) => `${item.agentName || item.agentId || '成员'}: ${compactDigestLine(item.text || '', 72)}`)
+        .filter(Boolean);
+    const activeQueue = runtime.queue
+        .filter((item) => item.status === 'queued' || item.status === 'running')
+        .slice(0, 4);
+    const pendingLine = activeQueue.length > 0
+        ? activeQueue.map((item) => `${item.status === 'running' ? '进行中' : '待发言'} ${item.agentName || item.agentId}`).join('；')
+        : '';
+    const speakerLine = recentAgents.length > 0 ? recentAgents.join(' | ') : '';
+    const summaryParts = [
+        lastUser ? `用户诉求：${compactDigestLine(lastUser.text || '', 96)}` : '',
+        speakerLine ? `近期结论：${compactDigestLine(speakerLine, 180)}` : '',
+        pendingLine ? `当前队列：${pendingLine}` : '',
+    ].filter(Boolean);
+    if (summaryParts.length === 0) {
+        return undefined;
+    }
+    return {
+        summary: summaryParts.join('\n'),
+        speakerLine: speakerLine || undefined,
+        pendingLine: pendingLine || undefined,
+        lastUserIntent: lastUser ? compactDigestLine(lastUser.text || '', 96) : undefined,
+        updatedAt: new Date().toISOString(),
+    };
+}
+
+function ensureGroupSessionRuntime(session: StoredChatSession, leaderAgentId: string): StoredChatSession {
+    return {
+        ...session,
+        groupRuntime: normalizeGroupRuntimeValue(session.groupRuntime, leaderAgentId),
+    };
+}
+
 function extractMentions(text: string): string[] {
     const raw = text || '';
     if (!raw.includes('@')) return [];
@@ -103,7 +232,6 @@ function extractMentions(text: string): string[] {
         if (seen.has(key)) continue;
         seen.add(key);
         out.push(token);
-        if (out.length >= 12) break;
     }
     return out;
 }
@@ -144,6 +272,24 @@ function scoreAgentForMessage(message: string, agent: Agent): number {
     return score;
 }
 
+function scoreDirectNameAgentMatch(message: string, agent: Agent): number {
+    const normalized = message.toLowerCase();
+    const aliases = [
+        { value: (agent.name || '').trim(), weight: 120 },
+        { value: (agent.title || '').trim(), weight: 100 },
+        { value: (agent.id || '').trim(), weight: 80 },
+    ];
+    let score = 0;
+    for (const alias of aliases) {
+        const token = alias.value.toLowerCase();
+        if (!token || token.length < 2) continue;
+        if (normalized.includes(token)) {
+            score = Math.max(score, alias.weight + Math.min(token.length, 24));
+        }
+    }
+    return score;
+}
+
 function hashMessageSeed(message: string): number {
     const text = message.trim();
     if (!text) return 0;
@@ -168,6 +314,34 @@ function pickFallbackAgents(message: string, agents: Agent[], maxCount: number):
     return picked;
 }
 
+async function loadMemberDirectoryCached(force = false): Promise<Map<string, Agent>> {
+    const now = Date.now();
+    if (!force && memberDirectoryCache && (now - memberDirectoryCacheAt) < MEMBER_DIRECTORY_CACHE_TTL_MS) {
+        return memberDirectoryCache;
+    }
+    if (!force && memberDirectoryPendingPromise) {
+        return memberDirectoryPendingPromise;
+    }
+
+    memberDirectoryPendingPromise = (async () => {
+        const rows = await listManagementAgents();
+        const mapped = rows.map(mapManagementAgentToUi);
+        const next = new Map<string, Agent>();
+        for (const agent of mapped) {
+            next.set(agent.id, agent);
+        }
+        memberDirectoryCache = next;
+        memberDirectoryCacheAt = Date.now();
+        return next;
+    })();
+
+    try {
+        return await memberDirectoryPendingPromise;
+    } finally {
+        memberDirectoryPendingPromise = null;
+    }
+}
+
 export function GroupChatPage() {
     const { id } = useParams();
     const { t } = useTranslation();
@@ -183,12 +357,14 @@ export function GroupChatPage() {
 
     const [selectedSpeakerId, setSelectedSpeakerId] = useState<string>('');
     const [selectedTargetIds, setSelectedTargetIds] = useState<string[]>([]);
+    const [autoConversationEnabled, setAutoConversationEnabled] = useState(false);
     const [targetSelectError, setTargetSelectError] = useState('');
     const [sessionKeyword, setSessionKeyword] = useState('');
     const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null);
+    const [canScrollTargetsLeft, setCanScrollTargetsLeft] = useState(false);
+    const [canScrollTargetsRight, setCanScrollTargetsRight] = useState(false);
 
     const runtimeKey = useMemo(() => (group ? `group:${group.groupId}` : ''), [group]);
-    const sessionLabel = useMemo(() => (group ? buildGroupSessionLabel(group.groupId) : ''), [group]);
 
     const sessions = useChatRuntimeSelector(runtimeKey, (state) => state.sessions);
     const activeSessionId = useChatRuntimeSelector(runtimeKey, (state) => state.activeSessionId);
@@ -207,6 +383,10 @@ export function GroupChatPage() {
         if (!activeSessionId) return null;
         return sessions.find((session) => session.id === activeSessionId) ?? null;
     }, [activeSessionId, sessions]);
+    const activeGroupRuntime = useMemo(
+        () => normalizeGroupRuntimeValue(activeSession?.groupRuntime, group?.leaderAgentId || ''),
+        [activeSession?.groupRuntime, group?.leaderAgentId],
+    );
 
     const groupMembers = useMemo(() => {
         if (!group) return [] as Agent[];
@@ -215,6 +395,21 @@ export function GroupChatPage() {
 
     const onlineMemberCount = useMemo(() => groupMembers.filter((m) => m.status === 'online' || m.status === 'busy').length, [groupMembers]);
     const mentionDirectory = useMemo(() => buildMentionDirectory(groupMembers), [groupMembers]);
+    const runningQueueItems = useMemo(
+        () => activeGroupRuntime.queue.filter((item) => item.status === 'running' || item.status === 'queued'),
+        [activeGroupRuntime.queue],
+    );
+    const activeAsyncTaskCount = useMemo(() => {
+        if (!activeSession) return 0;
+        const taskCount = activeSession.messages.filter((msg) => {
+            const stage = msg.taskCard?.stage;
+            return stage === 'running' || stage === 'scheduled';
+        }).length;
+        const a2aCount = activeSession.messages.reduce((sum, msg) => (
+            sum + ((msg.a2aCards ?? []).filter((card) => card.status === 'working').length)
+        ), 0);
+        return taskCount + a2aCount;
+    }, [activeSession]);
 
     const speaker = useMemo(() => {
         if (!group) return null;
@@ -227,6 +422,10 @@ export function GroupChatPage() {
         return memberDirectory.get(group.leaderAgentId) ?? buildFallbackMember(group.leaderAgentId);
     }, [group, memberDirectory]);
 
+    useEffect(() => {
+        setAutoConversationEnabled(false);
+    }, [groupId]);
+
     const idleAutoConfig = useMemo(() => {
         if (!group) {
             return { enabled: false } as const;
@@ -235,10 +434,10 @@ export function GroupChatPage() {
             enabled: true,
             scope: 'group' as const,
             scopeId: group.groupId,
-            idleMs: 60_000,
-            maxPerPage: 2,
+            idleMs: 120_000,
+            maxPerPage: 1,
             maxPerDay: 1,
-            cooldownMs: 600_000,
+            cooldownMs: 86_400_000,
             agentOverride: idleAutoLeader,
         };
     }, [group, idleAutoLeader]);
@@ -247,12 +446,57 @@ export function GroupChatPage() {
     const speakerRef = useRef(speakerId);
     speakerRef.current = speakerId;
     const lastSpeakerIdRef = useRef<string>('');
+    const targetScrollRef = useRef<HTMLDivElement | null>(null);
     const groupMode = group?.groupMode ?? 'leader_dispatch';
     const groupLimits = useMemo(
         () => ({ ...DEFAULT_GROUP_LIMITS, ...(group?.limits ?? {}) }),
         [group],
     );
-    const maxTalkTargets = Math.max(1, groupLimits.maxMentions);
+    const responderQueueLimit = Math.min(3, Math.max(1, groupLimits.maxSpeakers));
+    const maxTalkTargets = Math.max(groupMembers.length, Math.max(1, groupLimits.maxMentions));
+    const activeSessionLabel = useMemo(() => {
+        if (!group || !activeSession) return '';
+        return normalizeGroupSessionIdentity(activeSession, group.groupId, group.leaderAgentId, 0).sessionLabel || '';
+    }, [activeSession, group]);
+
+    const syncTargetScrollControls = () => {
+        const node = targetScrollRef.current;
+        if (!node) {
+            setCanScrollTargetsLeft(false);
+            setCanScrollTargetsRight(false);
+            return;
+        }
+        const maxScrollLeft = Math.max(0, node.scrollWidth - node.clientWidth);
+        setCanScrollTargetsLeft(node.scrollLeft > 8);
+        setCanScrollTargetsRight(node.scrollLeft < maxScrollLeft - 8);
+    };
+
+    const scrollTargetsBy = (offset: number) => {
+        const node = targetScrollRef.current;
+        if (!node) return;
+        node.scrollBy({
+            left: offset,
+            behavior: 'smooth',
+        });
+        window.requestAnimationFrame(syncTargetScrollControls);
+    };
+
+    useEffect(() => {
+        syncTargetScrollControls();
+    }, [groupMembers, selectedTargetIds.length, group]);
+
+    useEffect(() => {
+        const node = targetScrollRef.current;
+        if (!node) return;
+        const handleScroll = () => syncTargetScrollControls();
+        node.addEventListener('scroll', handleScroll, { passive: true });
+        window.addEventListener('resize', handleScroll);
+        handleScroll();
+        return () => {
+            node.removeEventListener('scroll', handleScroll);
+            window.removeEventListener('resize', handleScroll);
+        };
+    }, [groupMembers.length, group]);
 
     useEffect(() => {
         if (!runtimeKey || !speakerId) {
@@ -279,6 +523,61 @@ export function GroupChatPage() {
         }
         lastSpeakerIdRef.current = speakerId;
     }, [memberDirectory, runtimeKey, speakerId]);
+
+    useEffect(() => {
+        if (!runtimeKey || memberDirectory.size === 0) {
+            return;
+        }
+        chatRuntimeStore.updateSessions(runtimeKey, (prev) => {
+            let changed = false;
+            const nextSessions = prev.map((session) => {
+                let sessionChanged = false;
+                const nextMessages = session.messages.map((msg) => {
+                    if (msg.role !== 'agent') return msg;
+                    const agentId = (msg.agentId || '').trim();
+                    const agentName = (msg.agentName || '').trim();
+                    const matched = (
+                        (agentId ? memberDirectory.get(agentId) : undefined)
+                        || (agentName ? mentionDirectory.get(agentName.toLowerCase()) : undefined)
+                    );
+                    if (!matched) return msg;
+
+                    const nextAgentId = agentId || matched.id;
+                    const nextAgentName = agentName || matched.name;
+                    const nextAvatarUrl = msg.agentAvatarUrl || matched.avatarUrl;
+                    const nextColor = msg.agentColor || matched.color;
+                    const nextPortraitUrl = msg.agentPortraitUrl || matched.portraitUrl;
+                    if (
+                        nextAgentId === msg.agentId
+                        && nextAgentName === msg.agentName
+                        && nextAvatarUrl === msg.agentAvatarUrl
+                        && nextColor === msg.agentColor
+                        && nextPortraitUrl === msg.agentPortraitUrl
+                    ) {
+                        return msg;
+                    }
+
+                    changed = true;
+                    sessionChanged = true;
+                    return {
+                        ...msg,
+                        agentId: nextAgentId,
+                        agentName: nextAgentName,
+                        agentAvatarUrl: nextAvatarUrl,
+                        agentColor: nextColor,
+                        agentPortraitUrl: nextPortraitUrl,
+                    };
+                });
+
+                if (!sessionChanged) return session;
+                return {
+                    ...session,
+                    messages: nextMessages,
+                };
+            });
+            return changed ? nextSessions : prev;
+        });
+    }, [memberDirectory, mentionDirectory, runtimeKey]);
 
     const [settingsName, setSettingsName] = useState('');
     const [settingsDescription, setSettingsDescription] = useState('');
@@ -315,11 +614,16 @@ export function GroupChatPage() {
         };
 
         const nowMs = Date.now();
+        const sessionId = generateId();
         const session: StoredChatSession = {
-            id: generateId(),
+            id: sessionId,
             title: t('groupChat.defaultSessionTitle', { defaultValue: '群聊' }),
             updatedAt: nowMs,
             messages: [introMessage, ...buildInitialMessages(speakerRef.current || '')],
+            sessionLabel: buildScopedGroupSessionLabel(group.groupId, sessionId),
+            sessionSource: 'app',
+            remoteSessionOwnerAgentId: group.leaderAgentId,
+            groupRuntime: createInitialGroupRuntime(group.leaderAgentId),
             streamState: 'idle',
         };
         return { sessions: [session], activeSessionId: session.id };
@@ -372,6 +676,7 @@ export function GroupChatPage() {
         chatRuntimeStore.ensureAgentState(runtimeKey, () => {
             const loaded = chatRuntimeStore.loadAgentFromStorage(runtimeKey);
             if (loaded?.sessions?.length) {
+                const normalizedLoaded = normalizeGroupSessions(loaded.sessions, group.groupId, group.leaderAgentId);
                 const isLegacySeed = (session: StoredChatSession): boolean => {
                     if (session.messages.length !== 1) return false;
                     const only = session.messages[0];
@@ -380,13 +685,18 @@ export function GroupChatPage() {
                     return text.includes('欢迎来到') && (text.includes('群组') || text.includes('群聊'));
                 };
 
-                const shouldDropLegacySeeds = loaded.sessions.length === 2 && loaded.sessions.every(isLegacySeed);
+                const shouldDropLegacySeeds = normalizedLoaded.length === 2 && normalizedLoaded.every(isLegacySeed);
                 if (!shouldDropLegacySeeds) {
-                    return loaded;
+                    return {
+                        sessions: normalizedLoaded,
+                        activeSessionId: normalizedLoaded.some((session) => session.id === loaded.activeSessionId)
+                            ? loaded.activeSessionId
+                            : normalizedLoaded[0]?.id || '',
+                    };
                 }
             }
             return {
-                sessions: initialState.sessions,
+                sessions: normalizeGroupSessions(initialState.sessions, group.groupId, group.leaderAgentId),
                 activeSessionId: initialState.activeSessionId,
             };
         });
@@ -400,13 +710,8 @@ export function GroupChatPage() {
         setDirectoryLoading(true);
         void (async () => {
             try {
-                const rows = await listManagementAgents();
+                const next = await loadMemberDirectoryCached();
                 if (cancelled) return;
-                const mapped = rows.map(mapManagementAgentToUi);
-                const next = new Map<string, Agent>();
-                for (const agent of mapped) {
-                    next.set(agent.id, agent);
-                }
                 setMemberDirectory(next);
             } catch {
                 // ignore directory failures; fallback members still work
@@ -417,8 +722,43 @@ export function GroupChatPage() {
         return () => { cancelled = true; };
     }, [group]);
 
+    useEffect(() => {
+        if (!runtimeKey || !group || !activeSessionId || !activeSession) {
+            return;
+        }
+        const nextDigest = buildGroupMemoryDigest(activeSession.messages, activeGroupRuntime);
+        const currentDigest = activeSession.groupRuntime?.memoryDigest;
+        const nextSummary = nextDigest?.summary || '';
+        const currentSummary = currentDigest?.summary || '';
+        const nextPending = nextDigest?.pendingLine || '';
+        const currentPending = currentDigest?.pendingLine || '';
+        const nextSpeaker = nextDigest?.speakerLine || '';
+        const currentSpeaker = currentDigest?.speakerLine || '';
+        const nextIntent = nextDigest?.lastUserIntent || '';
+        const currentIntent = currentDigest?.lastUserIntent || '';
+        if (
+            nextSummary === currentSummary
+            && nextPending === currentPending
+            && nextSpeaker === currentSpeaker
+            && nextIntent === currentIntent
+        ) {
+            return;
+        }
+        chatRuntimeStore.updateSessions(runtimeKey, (prev) => prev.map((session) => {
+            if (session.id !== activeSessionId) return session;
+            return {
+                ...session,
+                groupRuntime: {
+                    ...normalizeGroupRuntimeValue(session.groupRuntime, group.leaderAgentId),
+                    memoryDigest: nextDigest,
+                },
+            };
+        }));
+    }, [activeGroupRuntime, activeSession, activeSessionId, group, runtimeKey]);
+
     const handleCreateSession = () => {
-        if (!runtimeKey) return;
+        if (!runtimeKey || !group) return;
+        setAutoConversationEnabled(false);
         const nextId = generateId();
         chatRuntimeStore.updateSessions(runtimeKey, (prev) => {
             const index = prev.length + 1;
@@ -427,6 +767,10 @@ export function GroupChatPage() {
                 title: t('chat.newSessionAutoTitle', { index, defaultValue: `新对话 ${index}` }),
                 updatedAt: Date.now(),
                 messages: buildInitialMessages(speakerRef.current || ''),
+                sessionLabel: buildScopedGroupSessionLabel(group.groupId, nextId),
+                sessionSource: 'app',
+                remoteSessionOwnerAgentId: group.leaderAgentId,
+                groupRuntime: createInitialGroupRuntime(group.leaderAgentId),
                 autoTitle: true,
                 streamState: 'idle',
             };
@@ -437,6 +781,7 @@ export function GroupChatPage() {
 
     const handleSelectSession = (sessionId: string) => {
         if (!runtimeKey) return;
+        setAutoConversationEnabled(false);
         chatRuntimeStore.setActiveSessionId(runtimeKey, sessionId);
     };
 
@@ -455,6 +800,10 @@ export function GroupChatPage() {
                 title: t('groupChat.defaultSessionTitle', { defaultValue: '群聊' }),
                 updatedAt: Date.now(),
                 messages: buildInitialMessages(speakerRef.current || ''),
+                sessionLabel: buildScopedGroupSessionLabel(group?.groupId || runtimeKey, `${Date.now()}`),
+                sessionSource: 'app' as const,
+                remoteSessionOwnerAgentId: group?.leaderAgentId,
+                groupRuntime: createInitialGroupRuntime(group?.leaderAgentId || ''),
                 streamState: 'idle' as const,
             };
             chatRuntimeStore.updateSessions(runtimeKey, [fallbackSession]);
@@ -491,10 +840,6 @@ export function GroupChatPage() {
             const exists = base.includes(id);
             if (exists) {
                 return base.filter((x) => x !== id);
-            }
-            if (base.length >= maxTalkTargets) {
-                setTargetSelectError(`每轮最多选择 ${maxTalkTargets} 位成员`);
-                return base;
             }
             setSelectedSpeakerId(id);
             return [...base, id];
@@ -535,9 +880,6 @@ export function GroupChatPage() {
             if (groupMode !== 'free_talk') {
                 return [];
             }
-            const maxExtra = Math.max(0, groupLimits.maxSpeakers - 1);
-            if (maxExtra <= 0) return [];
-
             const mentionTokens = extractMentions(message);
             if (mentionTokens.length > 0) {
                 const seen = new Set<string>();
@@ -550,12 +892,14 @@ export function GroupChatPage() {
                     if (seen.has(targetId)) continue;
                     seen.add(targetId);
                     targets.push(hit);
-                    if (targets.length >= maxExtra) break;
                 }
                 if (targets.length > 0) {
                     return targets;
                 }
             }
+
+            const maxExtra = Math.min(3, Math.max(0, responderQueueLimit - 1));
+            if (maxExtra <= 0) return [];
 
             const ranked = groupMembers
                 .filter((agent) => agent.id !== speakerId)
@@ -574,7 +918,52 @@ export function GroupChatPage() {
             const fallbackCandidates = groupMembers.filter((agent) => agent.id !== speakerId);
             return pickFallbackAgents(message, fallbackCandidates, maxExtra);
         };
-    }, [extraReplyAgents, group, groupLimits.maxSpeakers, groupMembers, groupMode, mentionDirectory, selectedTargetIds, speakerId]);
+    }, [extraReplyAgents, group, groupMembers, groupMode, mentionDirectory, responderQueueLimit, selectedTargetIds, speakerId]);
+
+    const resolvePrimaryReplyAgent = useMemo(() => {
+        if (!group) return undefined;
+        return (message: string) => {
+            const trimmed = message.trim();
+            if (!trimmed) return null;
+
+            let resolved: Agent | null = null;
+            if (selectedTargetIds.length) {
+                const preferredId = (selectedSpeakerId || selectedTargetIds[0] || group.leaderAgentId).trim();
+                if (preferredId) {
+                    resolved = memberDirectory.get(preferredId) ?? buildFallbackMember(preferredId);
+                }
+            } else {
+                const mentionTokens = extractMentions(trimmed);
+                for (const token of mentionTokens) {
+                    const hit = mentionDirectory.get(token.toLowerCase());
+                    if (hit?.id) {
+                        resolved = hit;
+                        break;
+                    }
+                }
+
+                if (!resolved && groupMode === 'free_talk') {
+                    const directHit = groupMembers
+                        .map((agent) => ({
+                            agent,
+                            score: scoreDirectNameAgentMatch(trimmed, agent),
+                            fallback: scoreAgentForMessage(trimmed, agent),
+                        }))
+                        .filter((item) => item.score > 0)
+                        .sort((a, b) => (b.score - a.score) || (b.fallback - a.fallback))
+                        .map((item) => item.agent)[0];
+                    if (directHit) {
+                        resolved = directHit;
+                    }
+                }
+            }
+
+            if (resolved?.id) {
+                setSelectedSpeakerId((prev) => (prev === resolved!.id ? prev : resolved!.id));
+            }
+            return resolved;
+        };
+    }, [group, groupMembers, groupMode, memberDirectory, mentionDirectory, selectedSpeakerId, selectedTargetIds]);
 
     const dynamicSystemPreamble = useMemo(() => {
         if (!group) return '';
@@ -587,84 +976,135 @@ export function GroupChatPage() {
         const dispatchHint = [
             '[system:group-mention-dispatch]',
             '本群已开启“@自动转发”：任何成员回复里出现 @某成员，系统会把该句静默转发给被@成员继续讨论。',
-            '规则：需要对方接棒时才@；@时把要做的事写清楚；若你@别人来答，请闭麦不要继续输出正文。',
+            '规则：需要对方接棒时才@；显式 @ 按出现顺序串行入队，前一位完成后下一位继续；@时把要做的事写清楚；若你@别人来答，请闭麦不要继续输出正文。',
+            '自由抢答也要排队，按关联权重依次补位，单轮最多补位 3 人。',
+            '当一轮发言结束且没有明确停止时，由主持人继续承接总结、点名下一位，或直接安排下一步工作。',
+            '若群内连续 2 分钟无人推进，主持人只允许追问 1 次，不能重复催促。',
             '终止：当用户说“停止/终止/暂停讨论/闭麦”或点击「终止输出」时，停止继续@与扩展讨论。',
-            `限制：一次最多@${maxTalkTargets}人；自动讨论链最大深度${groupLimits.mentionMaxDepth}。`,
+            `规则补充：显式@人数不再单独限额（最多覆盖当前群成员）；自动讨论链最大深度${groupLimits.mentionMaxDepth}。`,
         ].join('\n');
         const runtimeHint = [
             '[system:group-chat-runtime]',
             `当前主回复者: ${speaker?.name ?? speakerId} (id=${speakerId || 'unknown'})`,
             selectedTargetNames.length > 0 ? `本次@对象: ${selectedTargetNames.map((name) => `@${name}`).join(' ')}` : '本次未指定@对象：由主持人按秩序决定是否点名接棒。',
-            `当前群聊模式: ${groupMode === 'free_talk' ? '自由发言（相关者可主动回应）' : '主持人调度（未@仅主持人回应）'}`,
-            `阈值：每轮最多 ${groupLimits.maxSpeakers} 人发言，冷却 ${Math.round(groupLimits.cooldownMs / 1000)} 秒，重复抑制阈值 ${groupLimits.duplicateThreshold}`,
+            `当前群聊模式: ${groupMode === 'free_talk' ? '自由发言（相关成员可主动回应）' : '主持人调度（未@仅主持人回应）'}`,
+            `阈值：自由抢答每轮最多 ${responderQueueLimit} 人顺序发言，冷却 ${Math.round(groupLimits.cooldownMs / 1000)} 秒，重复抑制阈值 ${groupLimits.duplicateThreshold}`,
             '注意：这是群聊公开消息，你的回复应让群内所有成员都能理解与跟进。',
+            '异步任务汇报规则：进度只更新任务卡片与时间线，不要用聊天正文频繁刷进度；仅异常/失败/最终总结时再汇报一次。',
+            'A2A 委派规则：只能使用稳定的 agent_id（即本群列表里的 id=...），禁止用昵称/中文名/口头称呼进行调用。',
             selectedLines.length > 0 ? '群成员（可互相委派 A2A，仅限群内白名单）:' : '',
             selectedLines.length > 0 ? selectedLines.join('\n') : '',
         ].filter(Boolean).join('\n');
-        const sharedContext = activeSession ? buildGroupSharedContext(activeSession.messages, 14) : '';
-        return [group.systemPrompt, dispatchHint, runtimeHint, sharedContext].filter(Boolean).join('\n\n');
-    }, [activeSession, group, groupLimits, groupMode, maxTalkTargets, memberDirectory, selectedTargetNames, speaker, speakerId]);
+        const digestContext = activeGroupRuntime.memoryDigest?.summary
+            ? [
+                '[system:group-memory-digest]',
+                '以下是当前群聊的阶段摘要，请优先沿用此摘要理解上下文，避免重复展开旧消息：',
+                activeGroupRuntime.memoryDigest.summary,
+            ].join('\n')
+            : '';
+        const sharedContext = activeSession && !digestContext ? buildGroupSharedContext(activeSession.messages, 8) : '';
+        const queueContext = runningQueueItems.length > 0
+            ? [
+                '[system:group-runtime-queue]',
+                `当前发言队列：${runningQueueItems.map((item) => `${item.status === 'running' ? '进行中' : '待发言'} ${item.agentName || item.agentId}`).join('；')}`,
+            ].join('\n')
+            : '';
+        return [group.systemPrompt, dispatchHint, runtimeHint, queueContext, digestContext, sharedContext].filter(Boolean).join('\n\n');
+    }, [activeGroupRuntime.memoryDigest, activeSession, group, groupLimits, groupMode, memberDirectory, responderQueueLimit, runningQueueItems, selectedTargetNames, speaker, speakerId]);
 
     const inputToolbar = useMemo(() => {
         if (!group) return null;
         return (
-            <div className="flex items-start gap-2">
-                <div className="inline-flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-muted-foreground">
-                    <AtSign className="w-3.5 h-3.5" />
-                    {t('groupChat.talkTo', { defaultValue: '对话对象' })}
-                </div>
+            <div className="flex items-center gap-2 min-w-0">
                 <div className="flex-1 min-w-0">
-                    <div className="flex flex-wrap gap-1.5 max-h-16 overflow-y-auto pr-1">
+                    <div className="chat-target-strip group/target-strip relative min-w-0">
                         <button
                             type="button"
-                            onClick={() => {
-                                setTargetSelectError('');
-                                setSelectedTargetIds([]);
-                                setSelectedSpeakerId(group.leaderAgentId);
-                            }}
+                            onClick={() => scrollTargetsBy(-220)}
+                            disabled={!canScrollTargetsLeft}
                             className={cn(
-                                'inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-bold transition-all border',
-                                selectedTargetIds.length === 0
-                                    ? 'bg-primary/10 text-primary border-primary/30 hover:bg-primary/15'
-                                    : 'bg-background/60 text-muted-foreground border-border/60 hover:bg-muted/50 hover:text-foreground',
+                                'chat-target-scroll-arrow chat-target-scroll-arrow-left',
+                                !canScrollTargetsLeft && 'pointer-events-none opacity-0',
                             )}
-                            title="不指定@对象（主持人调度）"
+                            aria-label="向左查看对象"
                         >
-                            <span className="max-w-[120px] truncate">自动分工</span>
+                            <ChevronLeft className="h-3.5 w-3.5" />
                         </button>
-                        {groupMembers.map((m) => {
-                            const selected = selectedTargetIds.includes(m.id);
-                            return (
-                                <button
-                                    key={m.id}
-                                    type="button"
-                                    onClick={() => toggleTarget(m.id)}
-                                    className={cn(
-                                        'inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-bold transition-all border',
-                                        selected
-                                            ? 'bg-primary/10 text-primary border-primary/30 hover:bg-primary/15'
-                                            : 'bg-background/60 text-muted-foreground border-border/60 hover:bg-muted/50 hover:text-foreground',
-                                    )}
-                                    title={selected ? t('groupChat.unselect', { defaultValue: '取消选择' }) : t('groupChat.select', { defaultValue: '选择' })}
-                                >
-                                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full overflow-hidden">
-                                        <AgentAvatar name={m.name} avatarUrl={m.avatarUrl} color={m.color} size="sm" className="w-5 h-5" />
-                                    </span>
-                                    <span className="max-w-[120px] truncate">@{m.name}</span>
-                                </button>
-                            );
-                        })}
+                        <div
+                            ref={targetScrollRef}
+                            className="chat-target-scroll flex items-center gap-1.5 overflow-x-auto overflow-y-hidden whitespace-nowrap px-8 pb-1"
+                            onWheel={(event) => {
+                                const node = targetScrollRef.current;
+                                if (!node) return;
+                                if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
+                                    return;
+                                }
+                                event.preventDefault();
+                                node.scrollBy({
+                                    left: event.deltaY,
+                                });
+                            }}
+                        >
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setTargetSelectError('');
+                                    setSelectedTargetIds([]);
+                                    setSelectedSpeakerId(group.leaderAgentId);
+                                }}
+                                className={cn(
+                                    'inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-bold transition-all border whitespace-nowrap',
+                                    selectedTargetIds.length === 0
+                                        ? 'bg-primary/10 text-primary border-primary/30 hover:bg-primary/15'
+                                        : 'bg-background/60 text-muted-foreground border-border/60 hover:bg-muted/50 hover:text-foreground',
+                                )}
+                                title="不指定@对象（主持人调度）"
+                            >
+                                <span className="max-w-[84px] truncate">智能</span>
+                            </button>
+                            {groupMembers.map((m) => {
+                                const selected = selectedTargetIds.includes(m.id);
+                                return (
+                                    <button
+                                        key={m.id}
+                                        type="button"
+                                        onClick={() => toggleTarget(m.id)}
+                                        className={cn(
+                                            'inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-bold transition-all border whitespace-nowrap',
+                                            selected
+                                                ? 'bg-primary/10 text-primary border-primary/30 hover:bg-primary/15'
+                                                : 'bg-background/60 text-muted-foreground border-border/60 hover:bg-muted/50 hover:text-foreground',
+                                        )}
+                                        title={selected ? t('groupChat.unselect', { defaultValue: '取消选择' }) : t('groupChat.select', { defaultValue: '选择' })}
+                                    >
+                                        <span className="inline-flex h-5 w-5 items-center justify-center rounded-full overflow-hidden">
+                                            <AgentAvatar name={m.name} avatarUrl={m.avatarUrl} color={m.color} size="sm" className="w-5 h-5" />
+                                        </span>
+                                        <span className="max-w-[120px] truncate">@{m.name}</span>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => scrollTargetsBy(220)}
+                            disabled={!canScrollTargetsRight}
+                            className={cn(
+                                'chat-target-scroll-arrow chat-target-scroll-arrow-right',
+                                !canScrollTargetsRight && 'pointer-events-none opacity-0',
+                            )}
+                            aria-label="向右查看对象"
+                        >
+                            <ChevronRight className="h-3.5 w-3.5" />
+                        </button>
                     </div>
                     {targetSelectError ? (
                         <div className="mt-1 text-[10px] font-bold text-destructive/90">{targetSelectError}</div>
                     ) : null}
                 </div>
-                <div className="text-[10px] text-muted-foreground/70 font-medium shrink-0">
-                    {t('groupChat.talkToHint', { defaultValue: `可多选（最多${maxTalkTargets}位），在群里@TA们发起对话` })}
-                </div>
             </div>
         );
-    }, [group, groupMembers, selectedTargetIds, t, targetSelectError, maxTalkTargets]);
+    }, [group, groupMembers, selectedTargetIds, t, targetSelectError]);
 
     const transformUserMessage = useMemo(() => {
         if (!selectedTargetNames.length) return undefined;
@@ -763,13 +1203,21 @@ export function GroupChatPage() {
                 limits: settingsLimits,
                 applyCollaborationAcl: settingsApplyAcl,
             });
-            setGroup(updated);
-            setSettingsMemberIds(updated.memberAgentIds);
-            setSettingsAdminIds((updated.adminAgentIds?.length ? updated.adminAgentIds : [updated.leaderAgentId]).filter(Boolean));
-            setSettingsMode(updated.groupMode ?? 'leader_dispatch');
-            setSettingsLimits(updated.limits ?? DEFAULT_GROUP_LIMITS);
-            setSelectedTargetIds((prev) => prev.filter((id) => updated.memberAgentIds.includes(id)));
-            setSelectedSpeakerId((prev) => (updated.memberAgentIds.includes(prev) ? prev : updated.leaderAgentId));
+            const [refreshedDirectory, refreshedGroup] = await Promise.all([
+                loadMemberDirectoryCached(true).catch(() => null),
+                getChatGroup(group.groupId).catch(() => updated),
+            ]);
+            if (refreshedDirectory) {
+                setMemberDirectory(refreshedDirectory);
+            }
+            const nextGroup = refreshedGroup ?? updated;
+            setGroup(nextGroup);
+            setSettingsMemberIds(nextGroup.memberAgentIds);
+            setSettingsAdminIds((nextGroup.adminAgentIds?.length ? nextGroup.adminAgentIds : [nextGroup.leaderAgentId]).filter(Boolean));
+            setSettingsMode(nextGroup.groupMode ?? 'leader_dispatch');
+            setSettingsLimits(nextGroup.limits ?? DEFAULT_GROUP_LIMITS);
+            setSelectedTargetIds((prev) => prev.filter((id) => nextGroup.memberAgentIds.includes(id)));
+            setSelectedSpeakerId((prev) => (nextGroup.memberAgentIds.includes(prev) ? prev : nextGroup.leaderAgentId));
             setSettingsSaveOkAt(Date.now());
         } catch (err) {
             setSettingsSaveError(err instanceof Error ? err.message : String(err));
@@ -948,6 +1396,61 @@ export function GroupChatPage() {
                     </div>
                 </div>
 
+                <div className="px-4 pb-3">
+                    <Card className="border-border/70 bg-background/70 shadow-sm">
+                        <CardContent className="px-4 py-3">
+                            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                                <Badge variant="secondary" className="rounded-full px-2.5 py-1">
+                                    队列状态：{activeGroupRuntime.status === 'running' ? '执行中' : activeGroupRuntime.status === 'stopped' ? '已终止' : '空闲'}
+                                </Badge>
+                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
+                                    当前发言：{speaker?.name ?? speakerId}
+                                </Badge>
+                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
+                                    待处理：{runningQueueItems.length}
+                                </Badge>
+                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
+                                    异步任务：{activeAsyncTaskCount}
+                                </Badge>
+                                {activeGroupRuntime.lastCompactedAt ? (
+                                    <Badge variant="secondary" className="rounded-full px-2.5 py-1 bg-amber-500/10 text-amber-700">
+                                        已压缩：{new Date(activeGroupRuntime.lastCompactedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                    </Badge>
+                                ) : null}
+                                {activeGroupRuntime.stopRequested ? (
+                                    <Badge variant="destructive" className="rounded-full px-2.5 py-1">
+                                        已终止：{activeGroupRuntime.stopReason || '用户终止'}
+                                    </Badge>
+                                ) : null}
+                            </div>
+                            {activeGroupRuntime.memoryDigest?.summary ? (
+                                <div className="mt-2 rounded-xl border border-border/60 bg-muted/25 px-3 py-2 text-[12px] leading-5 text-muted-foreground whitespace-pre-wrap">
+                                    {activeGroupRuntime.memoryDigest.summary}
+                                </div>
+                            ) : null}
+                            {runningQueueItems.length > 0 ? (
+                                <div className="mt-2 flex flex-wrap gap-2">
+                                    {runningQueueItems.map((item) => (
+                                        <div
+                                            key={item.id}
+                                            className={cn(
+                                                'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold',
+                                                item.status === 'running'
+                                                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700'
+                                                    : 'border-border/70 bg-background text-foreground/80',
+                                            )}
+                                        >
+                                            <span>{item.status === 'running' ? '执行中' : '排队中'}</span>
+                                            <span>{item.agentName || item.agentId}</span>
+                                            {item.note ? <span className="text-muted-foreground">· {item.note}</span> : null}
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : null}
+                        </CardContent>
+                    </Card>
+                </div>
+
                 {/* 聊天区域 */}
                 <div className="flex-1 min-h-0 flex">
                         <ChatPage
@@ -955,21 +1458,27 @@ export function GroupChatPage() {
                             runtimeKey={runtimeKey}
                             sessionOwnerAgentId={group.leaderAgentId}
                             fixedSessionTitle={group.name}
-                            sessionLabel={sessionLabel}
+                            sessionLabel={activeSessionLabel}
                             systemPreamble={dynamicSystemPreamble}
                             groupUpgradeEnabled={false}
                             uiVariant="embedded"
                         inputToolbar={inputToolbar}
                         idleAuto={idleAutoConfig}
+                        autoConversationEnabled={autoConversationEnabled}
+                        autoConversationLeader={idleAutoLeader}
+                        onAutoConversationEnabledChange={setAutoConversationEnabled}
                         extraReplyAgents={extraReplyAgents}
                         selectExtraReplyAgents={selectExtraReplyAgents}
                         mentionDispatchAgents={groupMembers}
                         mentionDispatchMaxTargets={maxTalkTargets}
                         mentionDispatchMaxDepth={groupLimits.mentionMaxDepth}
-                        maxRespondersPerUserTurn={groupLimits.maxSpeakers}
+                        maxRespondersPerUserTurn={responderQueueLimit}
                         agentCooldownMs={groupLimits.cooldownMs}
                         duplicateSuppressionThreshold={groupLimits.duplicateThreshold}
                         stopAuthorityAgentIds={[group.leaderAgentId, ...(group.adminAgentIds ?? [])].filter(Boolean)}
+                        groupRuntimeEnabled
+                        groupLeaderAgentId={group.leaderAgentId}
+                        resolvePrimaryReplyAgent={resolvePrimaryReplyAgent}
                         transformUserMessage={transformUserMessage}
                     />
                 </div>
@@ -979,15 +1488,53 @@ export function GroupChatPage() {
             <div className="chat-info-sidebar">
                 <div className="chat-info-panel">
                     {speaker?.portraitUrl ? (
-                        <div className="chat-info-portrait-card">
+                        <div className="chat-info-portrait-card group relative overflow-hidden">
                             <img
                                 src={speaker.portraitUrl}
                                 alt={`${speaker.name} portrait`}
                                 className="chat-info-portrait-img"
+                                loading="lazy"
+                                decoding="async"
                             />
+                            {speaker?.id ? (
+                                <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-end bg-gradient-to-t from-black/55 via-black/15 to-transparent px-3 pb-3 pt-10 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                                    <div className="pointer-events-auto flex items-center gap-2">
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="私聊该智能体"
+                                            onClick={() => navigate(`/chat/${speaker.id}`)}
+                                        >
+                                            <MessageCircle className="h-4 w-4" />
+                                        </Button>
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="设置该智能体"
+                                            onClick={() => navigate(`/edit/${speaker.id}`)}
+                                        >
+                                            <Settings className="h-4 w-4" />
+                                        </Button>
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="任务管理"
+                                            onClick={() => navigate(`/agent/${encodeURIComponent(speaker.id)}/tasks`)}
+                                        >
+                                            <ListChecks className="h-4 w-4" />
+                                        </Button>
+                                    </div>
+                                </div>
+                            ) : null}
                         </div>
                     ) : (
-                        <div className="chat-info-portrait-placeholder">
+                        <div className="chat-info-portrait-placeholder group relative overflow-hidden">
                             <AgentAvatar
                                 name={speaker?.name ?? speakerId}
                                 avatarUrl={speaker?.avatarUrl}
@@ -995,6 +1542,42 @@ export function GroupChatPage() {
                                 size="xl"
                                 className="chat-info-portrait-fallback-avatar"
                             />
+                            {speaker?.id ? (
+                                <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-end bg-gradient-to-t from-black/55 via-black/15 to-transparent px-3 pb-3 pt-10 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                                    <div className="pointer-events-auto flex items-center gap-2">
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="私聊该智能体"
+                                            onClick={() => navigate(`/chat/${speaker.id}`)}
+                                        >
+                                            <MessageCircle className="h-4 w-4" />
+                                        </Button>
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="设置该智能体"
+                                            onClick={() => navigate(`/edit/${speaker.id}`)}
+                                        >
+                                            <Settings className="h-4 w-4" />
+                                        </Button>
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="任务管理"
+                                            onClick={() => navigate(`/agent/${encodeURIComponent(speaker.id)}/tasks`)}
+                                        >
+                                            <ListChecks className="h-4 w-4" />
+                                        </Button>
+                                    </div>
+                                </div>
+                            ) : null}
                         </div>
                     )}
 
@@ -1030,9 +1613,6 @@ export function GroupChatPage() {
                                             setSelectedTargetIds((prev) => {
                                                 const base = normalizeIdList(prev);
                                                 if (base.includes(m.id)) return base;
-                                                if (base.length >= maxTalkTargets) {
-                                                    return [m.id];
-                                                }
                                                 return [...base, m.id];
                                             });
                                         }}
@@ -1268,7 +1848,7 @@ export function GroupChatPage() {
                                 <div className="space-y-2">
                                     <Label className="text-[11px] font-black uppercase tracking-widest ml-1 opacity-70">发言阈值</Label>
                                     <div className="text-[11px] text-muted-foreground">
-                                        每轮最多 {settingsLimits.maxSpeakers} 人，单人冷却 {Math.round(settingsLimits.cooldownMs / 1000)} 秒，重复抑制 {settingsLimits.duplicateThreshold}，@上限 {settingsLimits.maxMentions}，链深度 {settingsLimits.mentionMaxDepth}
+                                        自由发言每轮最多 {settingsLimits.maxSpeakers} 人，单人冷却 {Math.round(settingsLimits.cooldownMs / 1000)} 秒，重复抑制 {settingsLimits.duplicateThreshold}，显式@不再限人数，链深度 {settingsLimits.mentionMaxDepth}
                                     </div>
                                 </div>
 

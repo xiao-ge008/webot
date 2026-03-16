@@ -91,3 +91,20 @@
   - `E:\weBot2\_local_backups\openfang-memory-orchestrator-p2-final-20260310-023030.patch`（包含 404 边界修复）
 - 官方升级后重放建议：
   - 优先使用：`git -C E:\weBot2\openfang-fresh apply E:\weBot2\_local_backups\openfang-memory-orchestrator-p2-final-20260310-023030.patch`
+
+## 2026-03-14
+
+### Patch 004 - 上游精华吸收计划（v0.4.0 selective sync）
+- 背景：
+  - 不再尝试整仓升级到 `v0.4.0`
+  - 改为只吸收 provider/runtime 方向的高收益修复
+- 计划文档：
+  - `E:\weBot2\webot-app\docs\openfang-selective-sync-plan-2026-03-14.md`
+- 本批目标：
+  - `crates/openfang-runtime/src/drivers/openai.rs`
+  - `crates/openfang-runtime/src/think_filter.rs`
+  - `crates/openfang-runtime/src/lib.rs`
+- 迁移理由：
+  - reasoning 模型 `temperature` 兼容
+  - `<think>...</think>` 流式过滤
+  - Kimi / Qwen / DeepSeek / 本地 OpenAI-compatible 服务的稳定性增强

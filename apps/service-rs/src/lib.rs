@@ -20,9 +20,9 @@ use openfang::OpenFangClient;
 use serde_json::Value;
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex, RwLock};
+use toml::value::Table as TomlTable;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use toml::value::Table as TomlTable;
 use tracing::{error, info, warn};
 
 #[cfg(target_os = "windows")]
@@ -107,8 +107,8 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
     }
 
     let mut root: TomlTable = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .map_err(|e| format!("读取 OpenFang 配置失败: {e}"))?;
+        let content =
+            fs::read_to_string(&config_path).map_err(|e| format!("读取 OpenFang 配置失败: {e}"))?;
         toml::from_str::<TomlTable>(&content).unwrap_or_default()
     } else {
         TomlTable::new()
@@ -152,14 +152,27 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
             "protocol".to_string(),
             toml::Value::String(cfg.protocol.trim().to_ascii_lowercase()),
         );
-        if let Some(base_url) = cfg.base_url.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(base_url) = cfg
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             provider_table.insert(
                 "base_url".to_string(),
                 toml::Value::String(base_url.trim_end_matches('/').to_string()),
             );
         }
-        if let Some(api_key) = cfg.api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-            provider_table.insert("api_key".to_string(), toml::Value::String(api_key.to_string()));
+        if let Some(api_key) = cfg
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            provider_table.insert(
+                "api_key".to_string(),
+                toml::Value::String(api_key.to_string()),
+            );
         }
         toml_providers.push(toml::Value::Table(provider_table));
 
@@ -196,7 +209,10 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
                 "model".to_string(),
                 toml::Value::String(assignment_store::normalize_model_name(model_name)),
             );
-            root.insert("default_model".to_string(), toml::Value::Table(default_table));
+            root.insert(
+                "default_model".to_string(),
+                toml::Value::Table(default_table),
+            );
         } else {
             root.remove("default_model");
         }
@@ -204,8 +220,8 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
         root.remove("default_model");
     }
 
-    let output = toml::to_string_pretty(&root)
-        .map_err(|e| format!("序列化 OpenFang 配置失败: {e}"))?;
+    let output =
+        toml::to_string_pretty(&root).map_err(|e| format!("序列化 OpenFang 配置失败: {e}"))?;
     fs::write(&config_path, output).map_err(|e| format!("写入 OpenFang 配置失败: {e}"))?;
     Ok(())
 }
@@ -653,6 +669,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         .nest("/api/chat", routes::chat_router())
         .nest("/api/groups", routes::groups_router())
+        .nest("/api/tasks", routes::tasks_router())
         .route("/api/compose/dashboard", get(routes::compose_dashboard))
         .with_state(state)
         .layer(CorsLayer::permissive())

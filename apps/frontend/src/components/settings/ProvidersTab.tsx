@@ -13,9 +13,11 @@ import {
   deleteManagementProviderConfig,
   listManagementProviderConfigs,
   listManagementProviders,
+  testManagementProviderConnection,
   toggleManagementProviderEnabled,
   updateManagementProviderConfig,
   type ManagementProviderOption,
+  type ManagementProviderTestResult,
   type ProviderConfigItem,
 } from '@/services/management-client';
 
@@ -43,7 +45,7 @@ interface ProviderConfigFormState {
 
 const PROVIDER_CATALOG: ProviderCatalogItem[] = [
   { id: 'google-ai', name: 'Google', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
-  { id: 'nvidia-nim', name: 'NVIDIA', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
+  { id: 'nvidia', name: 'NVIDIA', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
   { id: 'openrouter', name: 'OpenRouter', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
   { id: 'vercel-ai', name: 'Vercel', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
   { id: 'openai', name: 'OpenAI', tags: ['主流'], popular: true, defaultProtocol: 'openai' },
@@ -83,19 +85,58 @@ function authStatusLabel(configured: boolean, t: (key: string) => string): strin
   return configured ? t('settings.providers.apiKeySet') : t('settings.providers.apiKeyMissing');
 }
 
-function providerHealthLabel(provider: ManagementProviderOption): { text: string; tone: string } {
-  switch (provider.healthStatus) {
+function providerHealthLabel(
+  provider: ManagementProviderOption,
+  check?: { status: string; message: string },
+): { text: string; tone: string } {
+  const status = (check?.status || provider.connectionStatus || provider.healthStatus || '').toLowerCase();
+  switch (status) {
+    case 'ok':
+    case 'connected':
     case 'healthy':
-      return { text: '已就绪', tone: 'text-success' };
-    case 'no_models':
-      return { text: '无模型', tone: 'text-amber-600' };
-    case 'configured':
-      return { text: '待加载', tone: 'text-amber-600' };
+      return { text: '已连通', tone: 'text-success' };
+    case 'checking':
+      return { text: '检测中', tone: 'text-amber-600' };
+    case 'connection_error':
+    case 'error':
+      return { text: '连接异常', tone: 'text-destructive' };
     case 'disabled':
       return { text: '已禁用', tone: 'text-foreground-tertiary' };
+    case 'configured':
+    case 'unverified':
+      return { text: '已配置', tone: 'text-amber-600' };
     default:
       return { text: '待配置', tone: 'text-amber-600' };
   }
+}
+
+function isManagedProvider(
+  _provider: ManagementProviderOption,
+  options: { hasSavedConfig: boolean },
+): boolean {
+  return options.hasSavedConfig;
+}
+
+function providerSummaryText(
+  provider: ManagementProviderOption,
+  check?: { status: string; message: string },
+): string {
+  if (check?.message) {
+    return check.message;
+  }
+  if (!provider.enabled) {
+    return '已断开连接，本地配置仍保留，重新启用即可恢复。';
+  }
+  if (provider.healthy) {
+    return '运行时已加载，可用于模型与智能体。';
+  }
+  if (provider.runtimeLoaded && provider.configured) {
+    return '运行时已识别，建议执行一次模型测试确认可用性。';
+  }
+  if (provider.configured || provider.hasApiKey || provider.hasBaseUrl) {
+    return '已保存本地配置，完成模型列表后即可在模型页启用。';
+  }
+  return '尚未完成连接，请补充 URL、密钥和模型列表。';
 }
 
 function createFormFromProvider(
@@ -136,6 +177,9 @@ export function ProvidersTab() {
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
+  const [providerCheckMap, setProviderCheckMap] = useState<
+    Record<string, { status: string; message: string }>
+  >({});
 
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [search, setSearch] = useState('');
@@ -145,6 +189,75 @@ export function ProvidersTab() {
   const configMap = useMemo(() => {
     return new Map(configs.map((item) => [item.provider_id, item]));
   }, [configs]);
+
+  const buildInitialProviderCheck = (
+    provider: ManagementProviderOption,
+    cfg?: ProviderConfigItem,
+  ): { status: string; message: string } => {
+    if (!provider.enabled) {
+      return {
+        status: 'disabled',
+        message: '已断开连接，本地配置仍保留，重新启用即可恢复。',
+      };
+    }
+    if (!authConfigured(provider, cfg)) {
+      return {
+        status: 'incomplete',
+        message: '尚未完成连接，请补充 URL、密钥和模型列表。',
+      };
+    }
+    return {
+      status: 'checking',
+      message: '正在检测 API 连通性...',
+    };
+  };
+
+  const normalizeProviderCheckResult = (
+    result: ManagementProviderTestResult,
+  ): { status: string; message: string } => ({
+    status: result.ok ? 'ok' : result.status || 'connection_error',
+    message: result.message || (result.ok ? 'API 已连通' : '供应商检测失败'),
+  });
+
+  const runProviderChecks = async (
+    providerRows: ManagementProviderOption[],
+    configRows: ProviderConfigItem[],
+  ) => {
+    const nextConfigMap = new Map(configRows.map((item) => [item.provider_id, item]));
+    setProviderCheckMap(
+      Object.fromEntries(
+        providerRows.map((provider) => [
+          provider.providerId,
+          buildInitialProviderCheck(provider, nextConfigMap.get(provider.providerId)),
+        ]),
+      ),
+    );
+
+    const checkResults = await Promise.all(
+      providerRows.map(async (provider) => {
+        const cfg = nextConfigMap.get(provider.providerId);
+        const initial = buildInitialProviderCheck(provider, cfg);
+        if (initial.status !== 'checking') {
+          return [provider.providerId, initial] as const;
+        }
+        try {
+          const result = await testManagementProviderConnection(provider.providerId);
+          return [provider.providerId, normalizeProviderCheckResult(result)] as const;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : '供应商检测失败';
+          return [
+            provider.providerId,
+            {
+              status: 'connection_error',
+              message,
+            },
+          ] as const;
+        }
+      }),
+    );
+
+    setProviderCheckMap(Object.fromEntries(checkResults));
+  };
 
   const loadProviders = async () => {
     setLoading(true);
@@ -156,6 +269,7 @@ export function ProvidersTab() {
       ]);
       setProviders(providerRows);
       setConfigs(configRows);
+      void runProviderChecks(providerRows, configRows);
     } catch (error) {
       console.error('[Settings][Providers] 加载失败:', error);
       setErrorMessage('加载提供商失败，请确认后端服务已开机。');
@@ -168,13 +282,32 @@ export function ProvidersTab() {
     void loadProviders();
   }, []);
 
-  const connectedProviders = providers.filter((item) => item.enabled || item.configured || item.linked);
+  const managedProviders = useMemo(() => {
+    return providers.filter((item) =>
+      isManagedProvider(item, { hasSavedConfig: configMap.has(item.providerId) }),
+    );
+  }, [providers, configMap]);
 
-  const filteredCatalog = PROVIDER_CATALOG.filter((item) => {
+  const managedProviderIds = useMemo(() => {
+    return new Set(
+      managedProviders
+        .map((item) => item.providerId)
+        .filter((item) => !item.startsWith('custom-')),
+    );
+  }, [managedProviders]);
+
+  const filteredCatalog = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-    if (!keyword) return true;
-    return item.name.toLowerCase().includes(keyword) || item.id.toLowerCase().includes(keyword);
-  });
+    return PROVIDER_CATALOG.filter((item) => {
+      if (managedProviderIds.has(item.id)) {
+        return false;
+      }
+      if (!keyword) {
+        return true;
+      }
+      return item.name.toLowerCase().includes(keyword) || item.id.toLowerCase().includes(keyword);
+    });
+  }, [search, managedProviderIds]);
   const popularCatalog = filteredCatalog.filter((item) => item.popular);
   const otherCatalog = filteredCatalog.filter((item) => !item.popular);
 
@@ -334,14 +467,16 @@ export function ProvidersTab() {
       <div className="bg-background-secondary/30 rounded-2xl overflow-hidden border border-border-light/50">
         {loading ? (
           <div className="p-8 text-center text-foreground-secondary">{t('settings.providers.loading')}</div>
-        ) : connectedProviders.length === 0 ? (
+        ) : managedProviders.length === 0 ? (
           <div className="p-10 text-center text-foreground-secondary space-y-4">
             <div className="w-16 h-16 mx-auto rounded-2xl border border-dashed border-border-light flex items-center justify-center">
               <Bot className="w-7 h-7 opacity-60" />
             </div>
             <div>
               <p className="text-sm font-medium text-foreground">还没有已连接的供应商</p>
-              <p className="text-xs text-foreground-tertiary mt-1">点击下方按钮连接你的第一个模型供应商</p>
+              <p className="text-xs text-foreground-tertiary mt-1">
+                全新安装默认不会展示内置候选供应商，点击下方按钮手动添加你的第一个供应商
+              </p>
             </div>
             <Button variant="outline" className="gap-2" onClick={() => setSelectorOpen(true)}>
               <Plus className="w-4 h-4" />
@@ -349,12 +484,12 @@ export function ProvidersTab() {
             </Button>
           </div>
         ) : (
-          connectedProviders.map((provider, index) => (
+          managedProviders.map((provider, index) => (
             <div
               key={provider.providerId}
               className={cn(
                 'flex items-center justify-between p-5',
-                index !== connectedProviders.length - 1 && 'border-b border-border-light',
+                index !== managedProviders.length - 1 && 'border-b border-border-light',
               )}
             >
               <div className="flex items-start gap-3 min-w-0">
@@ -364,9 +499,14 @@ export function ProvidersTab() {
                 <div className="space-y-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-[15px] font-medium text-foreground">{provider.displayName}</span>
-                    <span className={cn('inline-flex items-center gap-1 text-xs', providerHealthLabel(provider).tone)}>
+                    <span
+                      className={cn(
+                        'inline-flex items-center gap-1 text-xs',
+                        providerHealthLabel(provider, providerCheckMap[provider.providerId]).tone,
+                      )}
+                    >
                       <Circle className="w-2.5 h-2.5 fill-current" />
-                      {providerHealthLabel(provider).text}
+                      {providerHealthLabel(provider, providerCheckMap[provider.providerId]).text}
                     </span>
                     <Badge variant="outline" className="text-[10px]">
                       {toProtocol(provider.protocol)}
@@ -376,11 +516,7 @@ export function ProvidersTab() {
                     {authStatusLabel(authConfigured(provider, configMap.get(provider.providerId)), t)} · {provider.providerId}
                   </p>
                   <p className="text-xs text-foreground-tertiary truncate">
-                    {provider.healthy
-                      ? '运行时已加载，可用于模型与智能体。'
-                      : provider.modelDiscovered
-                        ? '已保存配置，但建议执行一次模型测试。'
-                        : '请补充模型列表或自动发现模型后再使用。'}
+                    {providerSummaryText(provider, providerCheckMap[provider.providerId])}
                   </p>
                 </div>
               </div>
@@ -410,7 +546,7 @@ export function ProvidersTab() {
         )}
       </div>
 
-      {connectedProviders.length > 0 && (
+      {managedProviders.length > 0 && (
         <button
           type="button"
           className="mt-4 w-full rounded-2xl border-2 border-dashed border-border-light py-6 text-sm font-medium text-foreground-secondary hover:text-foreground hover:border-accent/50 hover:bg-background-secondary/20 transition-colors flex items-center justify-center gap-2"

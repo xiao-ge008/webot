@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Link, useLocation } from 'react-router-dom';
 import {
   Dialog,
   DialogContent,
@@ -23,11 +24,13 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useTheme, type ThemeMode } from '@/providers/ThemeProvider';
+import { useUpdateManager } from '@/providers/UpdateProvider';
 import { changeLanguage } from '@/i18n';
 import { cn } from '@/lib/utils';
 import {
   Settings2,
   Settings,
+  ChevronLeft,
   Keyboard,
   Cpu,
   Sparkles,
@@ -55,10 +58,22 @@ import {
   type McpServerSummary,
 } from '@/services/management-client';
 
-/** 设置弹窗 - 左右分栏布局 */
+/** 顶部设置入口：从“弹窗”改为“全屏设置页（modal route）” */
 export function SettingsDialog() {
+  const location = useLocation();
+
+  return (
+    <Button variant="ghost" size="icon" className="h-9 w-9" asChild>
+      <Link to="/settings" state={{ backgroundLocation: location }}>
+        <Settings2 className="h-4 w-4" />
+      </Link>
+    </Button>
+  );
+}
+
+/** 全屏设置内容（左右分栏），用于 /settings 页面 */
+export function SettingsContent({ onBack }: { onBack: () => void }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
   const [activeTab, setActiveTab] = useState('general');
   const menuGroups = useMemo(
     () => [
@@ -86,10 +101,8 @@ export function SettingsDialog() {
       },
       {
         title: 'Assets',
-        items: [
-          { id: 'live2d', label: 'Live2D', icon: UploadCloud },
-        ],
-      }
+        items: [{ id: 'live2d', label: 'Live2D', icon: UploadCloud }],
+      },
     ],
     [t],
   );
@@ -97,85 +110,98 @@ export function SettingsDialog() {
   const activeLabel = useMemo(() => {
     for (const group of menuGroups) {
       const match = group.items.find((item) => item.id === activeTab);
-      if (match) {
-        return match.label;
-      }
+      if (match) return match.label;
     }
     return activeTab;
   }, [activeTab, menuGroups]);
 
   return (
-    <>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="h-9 w-9"
-        onClick={() => setOpen(true)}
-      >
-        <Settings2 className="h-4 w-4" />
-      </Button>
+    <div className="h-full w-full flex overflow-hidden bg-background">
+      {/* 左侧边栏 */}
+      <div className="w-[260px] bg-background-secondary/40 border-r border-border-light flex flex-col">
+        {/* 顶部返回（贴近参考图：轻量、无强按钮感） */}
+        <div className="h-12 flex items-center px-4">
+          <button
+            type="button"
+            onClick={onBack}
+            className={cn(
+              // 胶囊返回按钮：淡色背景 + 图标标识，统一全局风格
+              'inline-flex items-center gap-1.5 h-7 px-2.5 rounded-full',
+              'bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15',
+              'text-[12px] font-medium text-foreground-secondary hover:text-foreground',
+              'transition-apple select-none',
+            )}
+            aria-label="返回应用"
+          >
+            <ChevronLeft className="w-3.5 h-3.5" />
+            返回
+          </button>
+        </div>
 
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-5xl h-[80vh] p-0 overflow-hidden flex gap-0 bg-background sm:rounded-2xl">
-          {/* 左侧边栏 */}
-          <div className="w-[210px] bg-background-secondary/40 border-r border-border-light flex flex-col pt-5 pb-3">
-            <div className="flex-1 px-3 space-y-4 overflow-y-auto">
-              {menuGroups.map((group) => (
-                <div key={group.title} className="space-y-1">
-                  <h4 className="px-2 text-[11px] font-medium text-foreground-tertiary mb-1">
-                    {group.title}
-                  </h4>
-                  {group.items.map((item) => {
-                    const Icon = item.icon;
-                    const isActive = activeTab === item.id;
-                    return (
-                      <Button
-                        key={item.id}
-                        variant="ghost"
-                        onClick={() => setActiveTab(item.id)}
-                        className={cn(
-                          'w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[13px] font-medium transition-apple text-left',
-                          isActive
-                            ? 'bg-black/5 dark:bg-white/10 text-foreground'
-                            : 'text-foreground-secondary hover:bg-black/5 dark:hover:bg-white/5 hover:text-foreground'
-                        )}
-                      >
-                        <Icon className="w-3.5 h-3.5" />
-                        {item.label}
-                      </Button>
-                    );
-                  })}
-                </div>
-              ))}
+        <div className="flex-1 px-3 space-y-4 overflow-y-auto pt-4 pb-3">
+          {menuGroups.map((group) => (
+            <div key={group.title} className="space-y-1">
+              <h4 className="px-2 text-[11px] font-medium text-foreground-tertiary mb-1">{group.title}</h4>
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                const isActive = activeTab === item.id;
+                return (
+                  <Button
+                    key={item.id}
+                    variant="ghost"
+                    onClick={() => setActiveTab(item.id)}
+                    className={cn(
+                      // 二级菜单：显式左对齐（Button 基础样式可能包含 justify-center）
+                      'w-full flex items-center justify-start gap-2 px-2.5 py-1.5 rounded-lg text-[13px] font-medium transition-apple text-left',
+                      isActive
+                        ? 'bg-black/5 dark:bg-white/10 text-foreground'
+                        : 'text-foreground-secondary hover:bg-black/5 dark:hover:bg-white/5 hover:text-foreground',
+                    )}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    {item.label}
+                  </Button>
+                );
+              })}
             </div>
+          ))}
+        </div>
+      </div>
 
-            {/* 底部版本号已移除 */}
-          </div>
+      {/* 右侧内容区 */}
+      <div className="flex-1 overflow-y-auto bg-background relative">
+        {/*
+          这里是“全屏页面”，不在 Radix Dialog 的上下文中。
+          不要使用 DialogTitle/DialogDescription，否则会触发：
+          `DialogTitle` must be used within `Dialog` 的运行时错误。
+        */}
+        <div className="sr-only" aria-hidden="true">
+          <h1>{t('settings.general')}</h1>
+          <p>{t('settings.pagePending', { name: activeLabel })}</p>
+        </div>
 
-          {/* 右侧内容区 */}
-          <div className="flex-1 overflow-y-auto p-10 bg-background relative">
-            {activeTab === 'general' && <GeneralTab />}
-            {activeTab === 'providers' && <ProvidersTab />}
-            {activeTab === 'models' && <ModelsTab />}
-            {activeTab === 'memoryEnhancement' && <MemoryEnhancementTab />}
-            {activeTab === 'skills' && <SkillsTab />}
-            {activeTab === 'mcp' && <McpTab />}
-            {activeTab === 'live2d' && <Live2DTab />}
-            {activeTab !== 'general' &&
-              activeTab !== 'providers' &&
-              activeTab !== 'models' &&
-              activeTab !== 'memoryEnhancement' &&
-              activeTab !== 'skills' &&
-              activeTab !== 'mcp' &&
-              activeTab !== 'live2d' && (
-                <div className="flex items-center justify-center h-full text-foreground-secondary">
-                  {t('settings.pagePending', { name: activeLabel })}
-                </div>
-              )}
-          </div>
-        </DialogContent>
-      </Dialog>
-    </>
+        <div className="p-10">
+          {activeTab === 'general' && <GeneralTab />}
+          {activeTab === 'providers' && <ProvidersTab />}
+          {activeTab === 'models' && <ModelsTab />}
+          {activeTab === 'memoryEnhancement' && <MemoryEnhancementTab />}
+          {activeTab === 'skills' && <SkillsTab />}
+          {activeTab === 'mcp' && <McpTab />}
+          {activeTab === 'live2d' && <Live2DTab />}
+          {activeTab !== 'general' &&
+            activeTab !== 'providers' &&
+            activeTab !== 'models' &&
+            activeTab !== 'memoryEnhancement' &&
+            activeTab !== 'skills' &&
+            activeTab !== 'mcp' &&
+            activeTab !== 'live2d' && (
+              <div className="flex items-center justify-center min-h-[60vh] text-foreground-secondary">
+                {t('settings.pagePending', { name: activeLabel })}
+              </div>
+            )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -526,6 +552,15 @@ function parseImportMcpMap(rawJson: string): Record<string, JsonRecord> {
 function GeneralTab() {
   const { t, i18n } = useTranslation();
   const { mode, setMode, fontFamily, setFontFamily, fontSize, setFontSize } = useTheme();
+  const {
+    supported,
+    preferences,
+    currentVersion,
+    checking,
+    setAutoCheckOnStartup,
+    setShowReleaseNotes,
+    checkNow,
+  } = useUpdateManager();
 
   const [autoLaunch, setAutoLaunchState] = useState(false);
   const [autoLaunchSaving, setAutoLaunchSaving] = useState(false);
@@ -654,9 +689,17 @@ function GeneralTab() {
           <div className="flex items-center justify-between p-5">
             <div>
               <p className="text-[15px] font-medium text-foreground">{t('settings.checkUpdateAtStart')}</p>
-              <p className="text-sm text-foreground-secondary mt-0.5">{t('settings.checkUpdateAtStartDesc')}</p>
+              <p className="text-sm text-foreground-secondary mt-0.5">
+                {t('settings.checkUpdateAtStartDesc')}
+                {supported && currentVersion ? ` · ${t('settings.currentVersionLabel', { version: currentVersion })}` : ''}
+                {!supported ? ` · ${t('settings.updateUnsupportedRuntimeShort')}` : ''}
+              </p>
             </div>
-            <Switch defaultChecked />
+            <Switch
+              checked={preferences.autoCheckOnStartup}
+              onCheckedChange={setAutoCheckOnStartup}
+              disabled={!supported}
+            />
           </div>
 
           {/* 发行说明 */}
@@ -665,7 +708,11 @@ function GeneralTab() {
               <p className="text-[15px] font-medium text-foreground">{t('settings.releaseNotes')}</p>
               <p className="text-sm text-foreground-secondary mt-0.5">{t('settings.releaseNotesDesc')}</p>
             </div>
-            <Switch defaultChecked />
+            <Switch
+              checked={preferences.showReleaseNotes}
+              onCheckedChange={setShowReleaseNotes}
+              disabled={!supported}
+            />
           </div>
 
           {/* 检查更新 */}
@@ -674,7 +721,16 @@ function GeneralTab() {
               <p className="text-[15px] font-medium text-foreground">{t('settings.checkNow')}</p>
               <p className="text-sm text-foreground-secondary mt-0.5">{t('settings.checkNowDesc')}</p>
             </div>
-            <Button variant="outline" size="sm" className="h-8 rounded-lg bg-background">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-lg bg-background gap-2"
+              onClick={() => {
+                void checkNow();
+              }}
+              disabled={checking || !supported}
+            >
+              <RefreshCw className={cn('w-3.5 h-3.5', checking && 'animate-spin')} />
               {t('settings.checkNow')}
             </Button>
           </div>

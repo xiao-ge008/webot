@@ -1,6 +1,8 @@
 import type { ChatAttachment, Message, MessageToolCall, MessageTrace } from '@/data/mock-chats';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
+import type { ChatTaskLifecycleItem } from '@/types/chat-task';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
+import type { GroupMemoryDigest, GroupQueueItem, GroupSessionRuntime } from '@/types/group';
 
 const STORAGE_KEY = 'webot-chat-sessions-v1';
 const A2A_PLACEHOLDER_AGENT_ID = 'unknown-agent';
@@ -14,6 +16,14 @@ export interface StoredChatSession {
   messages: Message[];
   remoteSessionId?: string;
   remoteSessionOwnerAgentId?: string;
+  remoteContextOffset?: number;
+  contextDigest?: {
+    summary: string;
+    lastUserIntent?: string;
+    updatedAt: string;
+  };
+  lastCompactedAt?: string;
+  groupRuntime?: GroupSessionRuntime;
   sessionLabel?: string;
   sessionSource?: 'app' | 'web' | 'unknown';
   autoTitle?: boolean;
@@ -76,7 +86,10 @@ function cloneMessage(message: Message): Message {
     tools: message.tools?.map((tool) => ({ ...tool, running: false })),
     thinkingTrace: message.thinkingTrace?.map((trace) => ({ ...trace })),
     toolTrace: message.toolTrace?.map((trace) => ({ ...trace })),
-    taskCard: message.taskCard ? { ...message.taskCard } : undefined,
+    taskCard: message.taskCard ? {
+      ...message.taskCard,
+      timeline: message.taskCard.timeline?.map((entry) => ({ ...entry })),
+    } : undefined,
     a2aCards: message.a2aCards?.map((card) => ({
       ...card,
       logs: card.logs.map((log) => ({ ...log })),
@@ -99,6 +112,116 @@ function cloneMessage(message: Message): Message {
     debugWatchdogTriggered: undefined,
     debugLastChunkKind: undefined,
     debugLastEvent: undefined,
+  };
+}
+
+function normalizeGroupQueueItem(raw: unknown): GroupQueueItem | null {
+  const item = isRecord(raw) ? raw : null;
+  if (!item) return null;
+  const id = typeof item.id === 'string' ? item.id.trim() : '';
+  const agentId = typeof item.agentId === 'string' ? item.agentId.trim() : '';
+  const createdAt = typeof item.createdAt === 'string' ? item.createdAt.trim() : '';
+  if (!id || !agentId || !createdAt) {
+    return null;
+  }
+  const statusRaw = typeof item.status === 'string' ? item.status.trim() : '';
+  const status = statusRaw === 'queued'
+    || statusRaw === 'running'
+    || statusRaw === 'done'
+    || statusRaw === 'skipped'
+    || statusRaw === 'cancelled'
+    ? statusRaw
+    : 'queued';
+  const reasonRaw = typeof item.reason === 'string' ? item.reason.trim() : '';
+  const reason = reasonRaw === 'user_primary'
+    || reasonRaw === 'user_followup'
+    || reasonRaw === 'user_mention'
+    || reasonRaw === 'mention_handoff'
+    || reasonRaw === 'leader_wrapup'
+    || reasonRaw === 'idle_prompt'
+    || reasonRaw === 'task_report'
+    ? reasonRaw
+    : 'user_followup';
+  return {
+    id,
+    agentId,
+    agentName: typeof item.agentName === 'string' && item.agentName.trim() ? item.agentName.trim() : undefined,
+    status,
+    reason,
+    depth: typeof item.depth === 'number' && Number.isFinite(item.depth) ? Math.max(0, Math.floor(item.depth)) : undefined,
+    sourceMessageId: typeof item.sourceMessageId === 'string' && item.sourceMessageId.trim() ? item.sourceMessageId.trim() : undefined,
+    note: typeof item.note === 'string' && item.note.trim() ? item.note.trim() : undefined,
+    createdAt,
+    startedAt: typeof item.startedAt === 'string' && item.startedAt.trim() ? item.startedAt.trim() : undefined,
+    finishedAt: typeof item.finishedAt === 'string' && item.finishedAt.trim() ? item.finishedAt.trim() : undefined,
+  };
+}
+
+function normalizeGroupMemoryDigest(raw: unknown): GroupMemoryDigest | undefined {
+  const item = isRecord(raw) ? raw : null;
+  if (!item) return undefined;
+  const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
+  const updatedAt = typeof item.updatedAt === 'string' ? item.updatedAt.trim() : '';
+  if (!summary || !updatedAt) {
+    return undefined;
+  }
+  return {
+    summary,
+    speakerLine: typeof item.speakerLine === 'string' && item.speakerLine.trim() ? item.speakerLine.trim() : undefined,
+    pendingLine: typeof item.pendingLine === 'string' && item.pendingLine.trim() ? item.pendingLine.trim() : undefined,
+    lastUserIntent: typeof item.lastUserIntent === 'string' && item.lastUserIntent.trim() ? item.lastUserIntent.trim() : undefined,
+    updatedAt,
+  };
+}
+
+function normalizeGroupRuntime(raw: unknown): GroupSessionRuntime | undefined {
+  const item = isRecord(raw) ? raw : null;
+  if (!item) return undefined;
+  const version = item.version === '1.0' ? '1.0' : '1.0';
+  const statusRaw = typeof item.status === 'string' ? item.status.trim() : '';
+  const status = statusRaw === 'running' || statusRaw === 'stopped' || statusRaw === 'idle'
+    ? statusRaw
+    : 'idle';
+  const queue = Array.isArray(item.queue)
+    ? item.queue.map(normalizeGroupQueueItem).filter((row): row is GroupQueueItem => row != null).slice(-24)
+    : [];
+  return {
+    version,
+    status,
+    leaderAgentId: typeof item.leaderAgentId === 'string' && item.leaderAgentId.trim() ? item.leaderAgentId.trim() : undefined,
+    currentSpeakerId: typeof item.currentSpeakerId === 'string' && item.currentSpeakerId.trim() ? item.currentSpeakerId.trim() : undefined,
+    lastCompletedSpeakerId: typeof item.lastCompletedSpeakerId === 'string' && item.lastCompletedSpeakerId.trim() ? item.lastCompletedSpeakerId.trim() : undefined,
+    queueVersion: typeof item.queueVersion === 'number' && Number.isFinite(item.queueVersion) ? Math.max(0, Math.floor(item.queueVersion)) : 0,
+    queue,
+    stopRequested: item.stopRequested === true,
+    stopReason: typeof item.stopReason === 'string' && item.stopReason.trim() ? item.stopReason.trim() : undefined,
+    lastCompactedAt: typeof item.lastCompactedAt === 'string' && item.lastCompactedAt.trim() ? item.lastCompactedAt.trim() : undefined,
+    lastEventAt: typeof item.lastEventAt === 'string' && item.lastEventAt.trim() ? item.lastEventAt.trim() : undefined,
+    memoryDigest: normalizeGroupMemoryDigest(item.memoryDigest),
+  };
+}
+
+function cloneGroupRuntime(runtime?: GroupSessionRuntime): GroupSessionRuntime | undefined {
+  if (!runtime) return undefined;
+  return {
+    ...runtime,
+    queue: runtime.queue.map((item) => ({ ...item })),
+    memoryDigest: runtime.memoryDigest ? { ...runtime.memoryDigest } : undefined,
+  };
+}
+
+function normalizeContextDigest(raw: unknown): StoredChatSession['contextDigest'] {
+  const item = isRecord(raw) ? raw : null;
+  if (!item) return undefined;
+  const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
+  const updatedAt = typeof item.updatedAt === 'string' ? item.updatedAt.trim() : '';
+  if (!summary || !updatedAt) {
+    return undefined;
+  }
+  return {
+    summary,
+    lastUserIntent: typeof item.lastUserIntent === 'string' && item.lastUserIntent.trim() ? item.lastUserIntent.trim() : undefined,
+    updatedAt,
   };
 }
 
@@ -167,8 +290,22 @@ function normalizeA2aCard(raw: unknown, index: number): A2AWorkCardData | null {
     agentColor: typeof item.agentColor === 'string' ? item.agentColor : undefined,
     status,
     summary: typeof item.summary === 'string' ? item.summary : undefined,
+    objective: typeof item.objective === 'string' ? item.objective : undefined,
+    requestPayloadText: typeof item.requestPayloadText === 'string' ? item.requestPayloadText : undefined,
     startedAt,
     finishedAt: typeof item.finishedAt === 'string' ? item.finishedAt : undefined,
+    finalReportText: typeof item.finalReportText === 'string' ? item.finalReportText : undefined,
+    latestEventAt: typeof item.latestEventAt === 'string' ? item.latestEventAt : undefined,
+    latestEventTitle: typeof item.latestEventTitle === 'string' ? item.latestEventTitle : undefined,
+    latestEventKind:
+      item.latestEventKind === 'started'
+      || item.latestEventKind === 'progress'
+      || item.latestEventKind === 'final'
+      || item.latestEventKind === 'failed'
+        ? item.latestEventKind
+        : undefined,
+    bindingSessionId: typeof item.bindingSessionId === 'string' ? item.bindingSessionId : undefined,
+    bindingSourceMessageId: typeof item.bindingSourceMessageId === 'string' ? item.bindingSourceMessageId : undefined,
     logs,
   };
 }
@@ -332,6 +469,105 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
         typeof item.taskCard.completedNotified === 'boolean'
           ? item.taskCard.completedNotified
           : undefined,
+      taskKind:
+        item.taskCard.taskKind === 'chat_async'
+        || item.taskCard.taskKind === 'chat_schedule'
+        || item.taskCard.taskKind === 'manual_schedule'
+        || item.taskCard.taskKind === 'a2a_delegate'
+          ? item.taskCard.taskKind
+          : undefined,
+      creatorParticipantName:
+        typeof item.taskCard.creatorParticipantName === 'string'
+          ? item.taskCard.creatorParticipantName
+          : undefined,
+      executorAgentName:
+        typeof item.taskCard.executorAgentName === 'string'
+          ? item.taskCard.executorAgentName
+          : undefined,
+      reportActorName:
+        typeof item.taskCard.reportActorName === 'string'
+          ? item.taskCard.reportActorName
+          : undefined,
+      reportStatus:
+        item.taskCard.reportStatus === 'pending'
+        || item.taskCard.reportStatus === 'reported'
+        || item.taskCard.reportStatus === 'acknowledged'
+          ? item.taskCard.reportStatus
+          : undefined,
+      progressPercent:
+        typeof item.taskCard.progressPercent === 'number' && Number.isFinite(item.taskCard.progressPercent)
+          ? item.taskCard.progressPercent
+          : undefined,
+      errorSummary:
+        typeof item.taskCard.errorSummary === 'string'
+          ? item.taskCard.errorSummary
+          : undefined,
+      finalSummaryText:
+        typeof item.taskCard.finalSummaryText === 'string'
+          ? item.taskCard.finalSummaryText
+          : undefined,
+      latestReportAt:
+        typeof item.taskCard.latestReportAt === 'string'
+          ? item.taskCard.latestReportAt
+          : undefined,
+      latestReportKind:
+        item.taskCard.latestReportKind === 'progress'
+        || item.taskCard.latestReportKind === 'anomaly'
+        || item.taskCard.latestReportKind === 'final'
+        || item.taskCard.latestReportKind === 'failed'
+        || item.taskCard.latestReportKind === 'started'
+          ? item.taskCard.latestReportKind
+          : undefined,
+      bindingSessionId:
+        typeof item.taskCard.bindingSessionId === 'string'
+          ? item.taskCard.bindingSessionId
+          : undefined,
+      bindingSourceMessageId:
+        typeof item.taskCard.bindingSourceMessageId === 'string'
+          ? item.taskCard.bindingSourceMessageId
+          : undefined,
+      timeline: Array.isArray(item.taskCard.timeline)
+        ? item.taskCard.timeline
+          .map((entry, entryIndex) => {
+            const row = isRecord(entry) ? entry : null;
+            if (!row) return null;
+            const title = typeof row.title === 'string' ? row.title.trim() : '';
+            const at = typeof row.at === 'string' && row.at.trim() ? row.at : '';
+            if (!title || !at) return null;
+            const kind =
+              row.kind === 'created'
+              || row.kind === 'started'
+              || row.kind === 'progress'
+              || row.kind === 'anomaly'
+              || row.kind === 'final'
+              || row.kind === 'failed'
+              || row.kind === 'cancelled'
+                ? row.kind
+                : 'progress';
+            const level =
+              row.level === 'info'
+              || row.level === 'success'
+              || row.level === 'error'
+                ? row.level
+                : undefined;
+            const normalizedEntry: ChatTaskLifecycleItem = {
+              id:
+                typeof row.id === 'string' && row.id.trim()
+                  ? row.id
+                  : `task_timeline_${Date.now()}_${entryIndex}`,
+              kind,
+              title,
+              at,
+              ...(typeof row.detail === 'string' ? { detail: row.detail } : {}),
+              ...(typeof row.runCount === 'number' && Number.isFinite(row.runCount)
+                ? { runCount: row.runCount }
+                : {}),
+              ...(level ? { level } : {}),
+            };
+            return normalizedEntry;
+          })
+          .filter((entry): entry is ChatTaskLifecycleItem => entry != null)
+        : undefined,
     };
   }
   if (Array.isArray(item.a2aCards)) {
@@ -369,6 +605,14 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
   const remoteSessionOwnerAgentId = typeof item.remoteSessionOwnerAgentId === 'string' && item.remoteSessionOwnerAgentId.trim()
     ? item.remoteSessionOwnerAgentId.trim()
     : undefined;
+  const remoteContextOffset = typeof item.remoteContextOffset === 'number' && Number.isFinite(item.remoteContextOffset)
+    ? Math.max(0, Math.floor(item.remoteContextOffset))
+    : undefined;
+  const contextDigest = normalizeContextDigest(item.contextDigest);
+  const lastCompactedAt = typeof item.lastCompactedAt === 'string' && item.lastCompactedAt.trim()
+    ? item.lastCompactedAt.trim()
+    : undefined;
+  const groupRuntime = normalizeGroupRuntime(item.groupRuntime);
   const sessionLabel = typeof item.sessionLabel === 'string' && item.sessionLabel.trim()
     ? item.sessionLabel.trim()
     : undefined;
@@ -395,6 +639,10 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
     messages,
     remoteSessionId,
     remoteSessionOwnerAgentId,
+    remoteContextOffset,
+    contextDigest,
+    lastCompactedAt,
+    groupRuntime,
     sessionLabel,
     sessionSource,
     autoTitle: autoTitle || undefined,
@@ -501,6 +749,9 @@ function cloneState(state: StoredAgentChatState): StoredAgentChatState {
     sessions: state.sessions.map((session) => ({
       ...session,
       messages: session.messages.map((message) => cloneMessage(message)),
+      contextDigest: session.contextDigest ? { ...session.contextDigest } : undefined,
+      lastCompactedAt: session.lastCompactedAt,
+      groupRuntime: cloneGroupRuntime(session.groupRuntime),
     })),
   };
 }

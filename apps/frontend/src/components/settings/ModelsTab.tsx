@@ -17,12 +17,14 @@ import { Circle, RefreshCw, Search } from 'lucide-react';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import {
   listManagementModels,
+  listManagementProviderConfigs,
   listManagementProviders,
   setManagementDefaultModel,
   testManagementModelConnection,
   toggleManagementModelEnabled,
   type ManagementModelsPayload,
   type ManagementModelOption,
+  type ProviderConfigItem,
 } from '@/services/management-client';
 
 function groupModelsByProvider(models: ManagementModelOption[]) {
@@ -37,7 +39,15 @@ function groupModelsByProvider(models: ManagementModelOption[]) {
 
 export function ModelsTab() {
   const { t } = useTranslation();
-  const [providers, setProviders] = useState<{ providerId: string; displayName: string; enabled: boolean; linked: boolean; configured: boolean; healthy: boolean }[]>([]);
+  const [providers, setProviders] = useState<{
+    providerId: string;
+    displayName: string;
+    enabled: boolean;
+    linked: boolean;
+    configured: boolean;
+    healthy: boolean;
+    hasSavedConfig: boolean;
+  }[]>([]);
   const [models, setModels] = useState<ManagementModelOption[]>([]);
   const [modelsMeta, setModelsMeta] = useState<Pick<ManagementModelsPayload, 'defaultModelId' | 'defaultModelValid' | 'defaultModelReason'>>({
     defaultModelId: undefined,
@@ -55,18 +65,23 @@ export function ModelsTab() {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [providerRows, modelRows] = await Promise.all([
+      const [providerRows, providerConfigRows, modelRows] = await Promise.all([
         listManagementProviders(),
+        listManagementProviderConfigs(),
         listManagementModels(),
       ]);
+      const configMap = new Map<string, ProviderConfigItem>(
+        providerConfigRows.map((item) => [item.provider_id, item]),
+      );
       setProviders(
         providerRows.map((item) => ({
           providerId: item.providerId,
-          displayName: item.displayName,
+          displayName: configMap.get(item.providerId)?.display_name || item.displayName,
           enabled: item.enabled,
           linked: item.linked,
           configured: item.configured,
           healthy: item.healthy,
+          hasSavedConfig: configMap.has(item.providerId),
         })),
       );
       setModels(modelRows.models);
@@ -82,16 +97,22 @@ export function ModelsTab() {
         );
       });
       setSelectedProviderId((prev) => {
-        const linkedProviders = providerRows
-          .filter((item) => item.enabled && item.configured)
+        const selectableProviderIds = providerRows
+          .filter((item) => item.enabled && configMap.has(item.providerId))
           .map((item) => item.providerId);
-        if (linkedProviders.includes(prev)) {
+        if (selectableProviderIds.includes(prev)) {
           return prev;
         }
-        if (linkedProviders.length > 0) {
-          return linkedProviders[0];
+        if (selectableProviderIds.length > 0) {
+          return selectableProviderIds[0];
         }
-        const providersFromModels = Array.from(new Set(modelRows.models.map((item) => item.providerId)));
+        const providersFromModels = Array.from(
+          new Set(
+            modelRows.models
+              .map((item) => item.providerId)
+              .filter((providerId) => configMap.has(providerId)),
+          ),
+        );
         if (providersFromModels.includes(prev)) {
           return prev;
         }
@@ -151,7 +172,7 @@ export function ModelsTab() {
   }, [filteredModels]);
 
   const selectableProviders = useMemo(() => {
-    return providers.filter((item) => item.enabled && item.configured);
+    return providers.filter((item) => item.enabled && item.hasSavedConfig);
   }, [providers]);
 
   const providerIds = useMemo(() => {

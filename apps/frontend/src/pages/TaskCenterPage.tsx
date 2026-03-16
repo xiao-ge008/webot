@@ -106,7 +106,7 @@ export function TaskCenterPage() {
     const [selectedTask, setSelectedTask] = useState<Task | null>(null);
     const [taskRuns, setTaskRuns] = useState<TaskRunRecord[]>([]);
     const [taskFinalSummary, setTaskFinalSummary] = useState<{ runCount: number; content: string; createdAt: string } | null>(null);
-    const [activeSourceTab, setActiveSourceTab] = useState<'chat' | 'custom' | 'templates'>('custom');
+    const [activeSourceTab, setActiveSourceTab] = useState<'custom' | 'templates'>('custom');
 
     const refreshTasks = useCallback(async (agentId: string, options?: { silent?: boolean }) => {
         if (!agentId) {
@@ -273,7 +273,8 @@ export function TaskCenterPage() {
     }, [t]);
 
     const handleClearAllTasks = async () => {
-        if (!selectedAgentId || tasks.length === 0) {
+        const manualTasks = tasks.filter((task) => task.sourceType !== 'chat');
+        if (!selectedAgentId || manualTasks.length === 0) {
             return;
         }
 
@@ -290,14 +291,14 @@ export function TaskCenterPage() {
         try {
             let success = 0;
             let failed = 0;
-            const deletable = tasks.filter((task) => canDeleteTask(task));
+            const deletable = manualTasks.filter((task) => canDeleteTask(task));
             for (const task of deletable) {
                 const result = await deleteTask(task.id);
                 if (result.success) success += 1;
                 else failed += 1;
             }
-            if (tasks.length > deletable.length) {
-                failed += tasks.length - deletable.length;
+            if (manualTasks.length > deletable.length) {
+                failed += manualTasks.length - deletable.length;
             }
             alert(t('tasks.list.clearAllResult', { success, failed }));
             await refreshTasks(selectedAgentId);
@@ -306,15 +307,15 @@ export function TaskCenterPage() {
         }
     };
 
-    const filteredTasks = tasks.filter(task => {
-        const source = task.sourceType as string;
+    const manualTasks = tasks.filter((task) => task.sourceType !== 'chat');
+
+    const filteredTasks = manualTasks.filter(task => {
         const tab = activeSourceTab as string;
 
         // 分类过滤
         if (tab === 'templates') return !!task.isTemplate;
         if (task.isTemplate && tab !== 'templates') return false; // 模板仅在模板页展示
-        if (tab === 'chat' && source !== 'chat') return false;
-        if (tab === 'custom' && source !== 'custom') return false;
+        if (tab === 'custom' && task.sourceType !== 'custom') return false;
 
         // 搜索过滤
         if (searchQuery && !task.name.toLowerCase().includes(searchQuery.toLowerCase())) return false;
@@ -322,7 +323,7 @@ export function TaskCenterPage() {
         return true;
     });
 
-    const lifecycleStats = tasks.reduce(
+    const lifecycleStats = manualTasks.reduce(
         (acc, task) => {
             const state = resolveTaskLifecycle(task);
             acc[state] += 1;
@@ -331,7 +332,7 @@ export function TaskCenterPage() {
         { pending: 0, running: 0, success: 0, failed: 0 } as Record<TaskLifecycleState, number>,
     );
     const stats = {
-        total: tasks.length,
+        total: manualTasks.length,
         pending: lifecycleStats.pending,
         running: lifecycleStats.running,
         success: lifecycleStats.success,
@@ -384,7 +385,7 @@ export function TaskCenterPage() {
                         size="sm"
                         className="rounded-full gap-2 font-bold px-5 h-10 bg-card text-foreground hover:bg-muted/70 border-border/30"
                         onClick={() => { void handleClearAllTasks(); }}
-                        disabled={tasks.length === 0 || clearingAll}
+                        disabled={manualTasks.length === 0 || clearingAll}
                     >
                         <Trash2 className="w-4 h-4" />
                         {t('tasks.list.clearAll')}
@@ -432,14 +433,6 @@ export function TaskCenterPage() {
 
             {/* 分类选项卡 */}
             <div className="flex items-center gap-1 bg-muted/30 p-1 rounded-2xl w-fit self-center md:self-start">
-                <Button
-                    variant={activeSourceTab === 'chat' ? 'default' : 'ghost'}
-                    size="sm"
-                    className="rounded-xl px-6 font-bold"
-                    onClick={() => setActiveSourceTab('chat')}
-                >
-                    {t('tasks.tabs.chat')}
-                </Button>
                 <Button
                     variant={activeSourceTab === 'custom' ? 'default' : 'ghost'}
                     size="sm"
@@ -1147,6 +1140,9 @@ function TaskFormDialog({
         }
     };
 
+    // 任务中心列表里会混入 chat 触发的任务；表单里只允许基于“手动/自定义”任务做模板选择
+    const manualTasks = tasks.filter((taskItem) => taskItem.sourceType !== 'chat');
+
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent className="z-[70] w-[min(960px,calc(100vw-24px))] max-w-2xl max-h-[92vh] overflow-hidden flex flex-col min-h-0 p-0 rounded-3xl border-none shadow-2xl">
@@ -1179,7 +1175,7 @@ function TaskFormDialog({
                                 </SelectTrigger>
                                 <SelectContent className="rounded-xl border-none shadow-xl">
                                     <SelectItem value="none">{t('common.none')}</SelectItem>
-                                    {tasks.filter(t => t.isTemplate).map(t => (
+                                    {manualTasks.filter(t => t.isTemplate).map(t => (
                                         <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>
                                     ))}
                                 </SelectContent>

@@ -400,6 +400,7 @@ export const CHAT_RENDER_MODES = {
 
 export interface AgentChatInput {
   agentId: string;
+  agentName?: string;
   message: string;
   history?: readonly AgentChatMessage[];
   attachments?: readonly AgentChatAttachmentInput[];
@@ -421,6 +422,9 @@ export interface AgentChatResult {
   spec?: unknown;
   error?: string;
   usedFallback?: boolean;
+  recoveredSessionLabel?: string;
+  recoveredRemoteSessionId?: string;
+  recoveryReason?: 'session_conflict' | 'context_overflow';
 }
 
 export interface AgentChatStreamChunk {

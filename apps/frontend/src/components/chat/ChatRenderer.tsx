@@ -2,7 +2,7 @@ import { memo } from 'react';
 import type { ReactNode } from 'react';
 import type { Agent } from '@/types';
 import type { Message } from '@/data/mock-chats';
-import type { ChatSendPayload, GroupUpgradeActionPayload } from '@/components/chat/ChatConversationPane';
+import type { ChatContextUsageMeter, ChatSendPayload, GroupUpgradeActionPayload } from '@/components/chat/ChatConversationPane';
 import { ChatConversationPane } from '@/components/chat/ChatConversationPane';
 
 export interface ChatRendererProps {
@@ -11,10 +11,12 @@ export interface ChatRendererProps {
   messages: Message[];
   isSending: boolean;
   inputLocked: boolean;
+  autoConversationEnabled?: boolean;
   streamState: 'idle' | 'streaming' | 'waiting';
   streamingMessage?: Message | null;
   hideHeader?: boolean;
   inputToolbar?: ReactNode;
+  contextUsage?: ChatContextUsageMeter;
   onUserActivity?: (source: 'input' | 'send' | 'focus' | 'keydown' | 'ui_action') => void;
   onSendMessage: (payload: ChatSendPayload) => void;
   onSendSilentMessage: (text: string) => void;
@@ -24,7 +26,8 @@ export interface ChatRendererProps {
   onConfirmCreateTaskCard?: (messageId: string) => void;
   onCancelTaskCard: (messageId: string) => void;
   onDeleteTaskCard: (messageId: string) => void;
-  onOpenTaskCardDetails: (taskId: string) => void;
+  onToggleAutoConversation?: () => void;
+  onOpenTaskCardDetails: (input: { taskId?: string; messageId: string }) => void;
   onOpenA2aCardDetails: (messageId: string, cardId: string) => void;
   onConfirmGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
   onCancelGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
@@ -42,10 +45,12 @@ export const ChatRenderer = memo(function ChatRenderer({
   messages,
   isSending,
   inputLocked,
+  autoConversationEnabled,
   streamState,
   streamingMessage,
   hideHeader,
   inputToolbar,
+  contextUsage,
   onUserActivity,
   onSendMessage,
   onSendSilentMessage,
@@ -55,6 +60,7 @@ export const ChatRenderer = memo(function ChatRenderer({
   onConfirmCreateTaskCard,
   onCancelTaskCard,
   onDeleteTaskCard,
+  onToggleAutoConversation,
   onOpenTaskCardDetails,
   onOpenA2aCardDetails,
   onConfirmGroupUpgrade,
@@ -73,10 +79,12 @@ export const ChatRenderer = memo(function ChatRenderer({
       messages={messages}
       isSending={isSending}
       inputLocked={inputLocked}
+      autoConversationEnabled={autoConversationEnabled}
       streamState={streamState}
       streamingMessage={streamingMessage}
       hideHeader={hideHeader}
       inputToolbar={inputToolbar}
+      contextUsage={contextUsage}
       onUserActivity={onUserActivity}
       onSendMessage={onSendMessage}
       onSendSilentMessage={onSendSilentMessage}
@@ -86,6 +94,7 @@ export const ChatRenderer = memo(function ChatRenderer({
       onConfirmCreateTaskCard={onConfirmCreateTaskCard}
       onCancelTaskCard={onCancelTaskCard}
       onDeleteTaskCard={onDeleteTaskCard}
+      onToggleAutoConversation={onToggleAutoConversation}
       onOpenTaskCardDetails={onOpenTaskCardDetails}
       onOpenA2aCardDetails={onOpenA2aCardDetails}
       onConfirmGroupUpgrade={onConfirmGroupUpgrade}
@@ -104,11 +113,14 @@ export const ChatRenderer = memo(function ChatRenderer({
   && prev.messages === next.messages
   && prev.isSending === next.isSending
   && prev.inputLocked === next.inputLocked
+  && prev.autoConversationEnabled === next.autoConversationEnabled
   && prev.streamState === next.streamState
   && prev.streamingMessage === next.streamingMessage
   && prev.hideHeader === next.hideHeader
   && prev.inputToolbar === next.inputToolbar
+  && prev.contextUsage === next.contextUsage
   && prev.onUserActivity === next.onUserActivity
+  && prev.onToggleAutoConversation === next.onToggleAutoConversation
   && prev.onConfirmGroupUpgrade === next.onConfirmGroupUpgrade
   && prev.onCancelGroupUpgrade === next.onCancelGroupUpgrade
   && prev.onConfirmAgentManagement === next.onConfirmAgentManagement

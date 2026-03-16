@@ -630,6 +630,12 @@ export function parseTraceFromLog(chunk: AgentChatStreamChunk): ParsedTrace | nu
     if (!detail && /^(streaming|done|typing)$/i.test(normalizedPhase)) {
       return null;
     }
+    if (normalizedPhase === 'semantic_memory_recall' || normalizedPhase === 'unified_memory_recall') {
+      return { target: 'tool', title: '记忆召回', detail };
+    }
+    if (normalizedPhase === 'unified_memory_debug') {
+      return { target: 'tool', title: '记忆调试', detail };
+    }
     if (normalizedPhase === 'thinking' && detail) {
       return { target: 'thinking', title: '深度思考', detail };
     }
@@ -1246,6 +1252,12 @@ function parseToolLogPayload(raw: string): Record<string, unknown> | undefined {
   return payload;
 }
 
+function getToolNameFromLogPayload(payload: Record<string, unknown> | undefined): string {
+  if (!payload) return '';
+  const candidate = payload.tool || payload.name || payload.tool_name;
+  return typeof candidate === 'string' ? candidate.trim() : '';
+}
+
 function hasMeaningfulToolLogContent(payload: Record<string, unknown>): boolean {
   const ignoredKeys = new Set(['tool', 'input', 'args', 'arguments', 'name', 'id', 'type']);
   return Object.keys(payload).some((key) => {
@@ -1296,13 +1308,17 @@ ${row.detail || ''}`));
   const detail = (latestTool.detail || '').trim();
   const title = latestTool.title.trim() || '工具结果';
   const payload = parseToolLogPayload(detail);
+  const payloadToolName = getToolNameFromLogPayload(payload);
   const readable = extractReadableTextFromLog(detail);
 
   const queryMatch = detail.match(/(?:^|\n)\s*query\s*:\s*(.+)$/im);
   const toolMatch = detail.match(/<tool_call>\s*=?\s*([^\n\r]+)/i);
 
   const query = queryMatch?.[1]?.trim();
-  const toolName = toolMatch?.[1]?.trim() || (typeof payload?.tool === 'string' ? payload.tool.trim() : '');
+  const toolName = toolMatch?.[1]?.trim() || payloadToolName;
+  if (toolName.toLowerCase() === 'memory_recall') {
+    return undefined;
+  }
   const fallbackDetail = hasMeaningfulToolLogContent(payload || {})
     ? detail.replace(/<tool_call>\s*=?\s*/gi, '').trim()
     : '';

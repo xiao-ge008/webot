@@ -3,6 +3,7 @@
 //! Works with OpenAI, Ollama, vLLM, and any other OpenAI-compatible endpoint.
 
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
+use crate::think_filter::{FilterAction, StreamingThinkFilter};
 use async_trait::async_trait;
 use futures::StreamExt;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
@@ -25,9 +26,17 @@ impl OpenAIDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .user_agent(crate::USER_AGENT)
+                .build()
+                .unwrap_or_default(),
             extra_headers: Vec::new(),
         }
+    }
+
+    /// Moonshot/Kimi 一类模型在多轮 tool_call 场景下要求显式处理 reasoning 内容。
+    fn kimi_needs_reasoning_content(&self, model: &str) -> bool {
+        self.base_url.contains("moonshot") || model.to_lowercase().contains("kimi")
     }
 
     /// Create a driver with additional HTTP headers (e.g. for Copilot IDE auth).
@@ -55,6 +64,10 @@ struct OaiRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
 }
 
 /// Returns true if a model uses `max_completion_tokens` instead of `max_tokens`.
@@ -67,6 +80,23 @@ fn uses_completion_tokens(model: &str) -> bool {
         || m.starts_with("o4")
 }
 
+/// OpenAI o 系列、部分 reasoning 模型会拒绝 temperature 参数。
+fn rejects_temperature(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("gpt-5-mini")
+        || m.starts_with("gpt5-mini")
+        || m.contains("-reasoning")
+}
+
+/// Kimi K2/K2.5 等模型只接受 temperature = 1。
+fn temperature_must_be_one(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.starts_with("kimi-k2") || m == "kimi-k2.5" || m == "kimi-k2.5-0711"
+}
+
 #[derive(Debug, Serialize)]
 struct OaiMessage {
     role: String,
@@ -76,6 +106,8 @@ struct OaiMessage {
     tool_calls: Option<Vec<OaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 /// Content can be a plain string or an array of content parts (for images).
@@ -145,6 +177,7 @@ struct OaiChoice {
 struct OaiResponseMessage {
     content: Option<String>,
     tool_calls: Option<Vec<OaiToolCall>>,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +198,7 @@ impl LlmDriver for OpenAIDriver {
                 content: Some(OaiMessageContent::Text(system.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
 
@@ -178,6 +212,7 @@ impl LlmDriver for OpenAIDriver {
                             content: Some(OaiMessageContent::Text(text.clone())),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         });
                     }
                 }
@@ -187,6 +222,7 @@ impl LlmDriver for OpenAIDriver {
                         content: Some(OaiMessageContent::Text(text.clone())),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
                 (Role::Assistant, MessageContent::Text(text)) => {
@@ -195,6 +231,7 @@ impl LlmDriver for OpenAIDriver {
                         content: Some(OaiMessageContent::Text(text.clone())),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
@@ -211,9 +248,14 @@ impl LlmDriver for OpenAIDriver {
                                 has_tool_results = true;
                                 oai_messages.push(OaiMessage {
                                     role: "tool".to_string(),
-                                    content: Some(OaiMessageContent::Text(content.clone())),
+                                    content: Some(OaiMessageContent::Text(if content.is_empty() {
+                                        "(empty)".to_string()
+                                    } else {
+                                        content.clone()
+                                    })),
                                     tool_calls: None,
                                     tool_call_id: Some(tool_use_id.clone()),
+                                    reasoning_content: None,
                                 });
                             }
                             ContentBlock::Text { text } => {
@@ -236,6 +278,7 @@ impl LlmDriver for OpenAIDriver {
                             content: Some(OaiMessageContent::Parts(parts)),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         });
                     }
                 }
@@ -259,10 +302,15 @@ impl LlmDriver for OpenAIDriver {
                             _ => {}
                         }
                     }
+                    let has_tool_calls = !tool_calls.is_empty();
                     oai_messages.push(OaiMessage {
                         role: "assistant".to_string(),
                         content: if text_parts.is_empty() {
-                            None
+                            if has_tool_calls {
+                                Some(OaiMessageContent::Text(String::new()))
+                            } else {
+                                None
+                            }
                         } else {
                             Some(OaiMessageContent::Text(text_parts.join("")))
                         },
@@ -272,6 +320,13 @@ impl LlmDriver for OpenAIDriver {
                             Some(tool_calls)
                         },
                         tool_call_id: None,
+                        reasoning_content: if has_tool_calls
+                            && self.kimi_needs_reasoning_content(&request.model)
+                        {
+                            Some(String::new())
+                        } else {
+                            None
+                        },
                     });
                 }
                 _ => {}
@@ -310,10 +365,24 @@ impl LlmDriver for OpenAIDriver {
             messages: oai_messages,
             max_tokens: mt,
             max_completion_tokens: mct,
-            temperature: Some(request.temperature),
+            temperature: if self.kimi_needs_reasoning_content(&request.model) {
+                Some(0.6)
+            } else if temperature_must_be_one(&request.model) {
+                Some(1.0)
+            } else if rejects_temperature(&request.model) {
+                None
+            } else {
+                Some(request.temperature)
+            },
             tools: oai_tools,
             tool_choice,
             stream: false,
+            stream_options: None,
+            thinking: if self.kimi_needs_reasoning_content(&request.model) {
+                Some(serde_json::json!({"type": "disabled"}))
+            } else {
+                None
+            },
         };
 
         let max_retries = 3;
@@ -370,6 +439,17 @@ impl LlmDriver for OpenAIDriver {
                         tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
                         continue;
                     }
+                }
+
+                if status == 400
+                    && body.contains("temperature")
+                    && body.contains("unsupported_parameter")
+                    && oai_request.temperature.is_some()
+                    && attempt < max_retries
+                {
+                    warn!(model = %oai_request.model, "Stripping temperature for this model");
+                    oai_request.temperature = None;
+                    continue;
                 }
 
                 // GPT-5 / o-series: switch from max_tokens to max_completion_tokens
@@ -444,10 +524,46 @@ impl LlmDriver for OpenAIDriver {
             let mut content = Vec::new();
             let mut tool_calls = Vec::new();
 
+            if let Some(ref reasoning) = choice.message.reasoning_content {
+                if !reasoning.is_empty() {
+                    debug!(len = reasoning.len(), "Captured reasoning_content from response");
+                    content.push(ContentBlock::Thinking {
+                        thinking: reasoning.clone(),
+                    });
+                }
+            }
+
             if let Some(text) = choice.message.content {
                 if !text.is_empty() {
-                    content.push(ContentBlock::Text { text });
+                    let (cleaned, thinking) = extract_think_tags(&text);
+                    if let Some(think_text) = thinking {
+                        if choice.message.reasoning_content.is_none() {
+                            content.push(ContentBlock::Thinking {
+                                thinking: think_text,
+                            });
+                        }
+                    }
+                    if !cleaned.is_empty() {
+                        content.push(ContentBlock::Text { text: cleaned });
+                    }
                 }
+            }
+
+            let has_text = content.iter().any(|block| matches!(block, ContentBlock::Text { .. }));
+            let has_thinking = content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Thinking { .. }));
+            if has_thinking && !has_text && choice.message.tool_calls.is_none() {
+                let thinking_text = content
+                    .iter()
+                    .find_map(|block| match block {
+                        ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                content.push(ContentBlock::Text {
+                    text: extract_thinking_summary(thinking_text),
+                });
             }
 
             if let Some(calls) = choice.message.tool_calls {
@@ -488,6 +604,15 @@ impl LlmDriver for OpenAIDriver {
                 })
                 .unwrap_or_default();
 
+            let usage = if !content.is_empty() && usage.input_tokens == 0 && usage.output_tokens == 0
+            {
+                let mut synthetic = usage;
+                synthetic.output_tokens = 1;
+                synthetic
+            } else {
+                usage
+            };
+
             return Ok(CompletionResponse {
                 content,
                 stop_reason,
@@ -516,6 +641,7 @@ impl LlmDriver for OpenAIDriver {
                 content: Some(OaiMessageContent::Text(system.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
 
@@ -528,6 +654,7 @@ impl LlmDriver for OpenAIDriver {
                             content: Some(OaiMessageContent::Text(text.clone())),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         });
                     }
                 }
@@ -537,6 +664,7 @@ impl LlmDriver for OpenAIDriver {
                         content: Some(OaiMessageContent::Text(text.clone())),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
                 (Role::Assistant, MessageContent::Text(text)) => {
@@ -545,6 +673,7 @@ impl LlmDriver for OpenAIDriver {
                         content: Some(OaiMessageContent::Text(text.clone())),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
                 (Role::User, MessageContent::Blocks(blocks)) => {
@@ -557,9 +686,14 @@ impl LlmDriver for OpenAIDriver {
                         {
                             oai_messages.push(OaiMessage {
                                 role: "tool".to_string(),
-                                content: Some(OaiMessageContent::Text(content.clone())),
+                                content: Some(OaiMessageContent::Text(if content.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    content.clone()
+                                })),
                                 tool_calls: None,
                                 tool_call_id: Some(tool_use_id.clone()),
+                                reasoning_content: None,
                             });
                         }
                     }
@@ -584,10 +718,15 @@ impl LlmDriver for OpenAIDriver {
                             _ => {}
                         }
                     }
+                    let has_tool_calls = !tool_calls_out.is_empty();
                     oai_messages.push(OaiMessage {
                         role: "assistant".to_string(),
                         content: if text_parts.is_empty() {
-                            None
+                            if has_tool_calls {
+                                Some(OaiMessageContent::Text(String::new()))
+                            } else {
+                                None
+                            }
                         } else {
                             Some(OaiMessageContent::Text(text_parts.join("")))
                         },
@@ -597,6 +736,13 @@ impl LlmDriver for OpenAIDriver {
                             Some(tool_calls_out)
                         },
                         tool_call_id: None,
+                        reasoning_content: if has_tool_calls
+                            && self.kimi_needs_reasoning_content(&request.model)
+                        {
+                            Some(String::new())
+                        } else {
+                            None
+                        },
                     });
                 }
                 _ => {}
@@ -635,10 +781,24 @@ impl LlmDriver for OpenAIDriver {
             messages: oai_messages,
             max_tokens: mt,
             max_completion_tokens: mct,
-            temperature: Some(request.temperature),
+            temperature: if self.kimi_needs_reasoning_content(&request.model) {
+                Some(0.6)
+            } else if temperature_must_be_one(&request.model) {
+                Some(1.0)
+            } else if rejects_temperature(&request.model) {
+                None
+            } else {
+                Some(request.temperature)
+            },
             tools: oai_tools,
             tool_choice,
             stream: true,
+            stream_options: Some(serde_json::json!({"include_usage": true})),
+            thinking: if self.kimi_needs_reasoning_content(&request.model) {
+                Some(serde_json::json!({"type": "disabled"}))
+            } else {
+                None
+            },
         };
 
         // Retry loop for the initial HTTP request
@@ -699,6 +859,20 @@ impl LlmDriver for OpenAIDriver {
                     }
                 }
 
+                if status == 400
+                    && body.contains("temperature")
+                    && body.contains("unsupported_parameter")
+                    && oai_request.temperature.is_some()
+                    && attempt < max_retries
+                {
+                    warn!(
+                        model = %oai_request.model,
+                        "Stripping temperature for this model (stream)"
+                    );
+                    oai_request.temperature = None;
+                    continue;
+                }
+
                 // GPT-5 / o-series: switch from max_tokens to max_completion_tokens
                 if status == 400
                     && body.contains("max_tokens")
@@ -757,6 +931,8 @@ impl LlmDriver for OpenAIDriver {
             // Parse the SSE stream
             let mut buffer = String::new();
             let mut text_content = String::new();
+            let mut reasoning_content = String::new();
+            let mut think_filter = StreamingThinkFilter::new();
             // Track tool calls: index -> (id, name, arguments)
             let mut tool_accum: Vec<(String, String, String)> = Vec::new();
             let mut finish_reason: Option<String> = None;
@@ -811,10 +987,35 @@ impl LlmDriver for OpenAIDriver {
                         // Text content delta
                         if let Some(text) = delta["content"].as_str() {
                             if !text.is_empty() {
-                                text_content.push_str(text);
+                                for action in think_filter.process(text) {
+                                    match action {
+                                        FilterAction::EmitText(visible) => {
+                                            if !visible.is_empty() {
+                                                text_content.push_str(&visible);
+                                                let _ = tx
+                                                    .send(StreamEvent::TextDelta { text: visible })
+                                                    .await;
+                                            }
+                                        }
+                                        FilterAction::EmitThinking(thinking) => {
+                                            if !thinking.is_empty() {
+                                                reasoning_content.push_str(&thinking);
+                                                let _ = tx
+                                                    .send(StreamEvent::ThinkingDelta { text: thinking })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(reasoning) = delta["reasoning_content"].as_str() {
+                            if !reasoning.is_empty() {
+                                reasoning_content.push_str(reasoning);
                                 let _ = tx
-                                    .send(StreamEvent::TextDelta {
-                                        text: text.to_string(),
+                                    .send(StreamEvent::ThinkingDelta {
+                                        text: reasoning.to_string(),
                                     })
                                     .await;
                             }
@@ -874,8 +1075,29 @@ impl LlmDriver for OpenAIDriver {
             let mut content = Vec::new();
             let mut tool_calls = Vec::new();
 
+            for action in think_filter.flush() {
+                match action {
+                    FilterAction::EmitText(visible) => {
+                        if !visible.is_empty() {
+                            text_content.push_str(&visible);
+                        }
+                    }
+                    FilterAction::EmitThinking(thinking) => {
+                        if !thinking.is_empty() {
+                            reasoning_content.push_str(&thinking);
+                        }
+                    }
+                }
+            }
+
             if !text_content.is_empty() {
                 content.push(ContentBlock::Text { text: text_content });
+            }
+
+            if !reasoning_content.is_empty() {
+                content.push(ContentBlock::Thinking {
+                    thinking: reasoning_content.clone(),
+                });
             }
 
             for (id, name, arguments) in &tool_accum {
@@ -912,6 +1134,20 @@ impl LlmDriver for OpenAIDriver {
                     }
                 }
             };
+
+            let has_text = content.iter().any(|block| matches!(block, ContentBlock::Text { .. }));
+            let has_thinking = content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Thinking { .. }));
+            if has_thinking && !has_text && tool_calls.is_empty() {
+                content.push(ContentBlock::Text {
+                    text: extract_thinking_summary(&reasoning_content),
+                });
+            }
+
+            if !content.is_empty() && usage.input_tokens == 0 && usage.output_tokens == 0 {
+                usage.output_tokens = 1;
+            }
 
             let _ = tx
                 .send(StreamEvent::ContentComplete { stop_reason, usage })
@@ -955,6 +1191,67 @@ fn extract_max_tokens_limit(body: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// 提取内容中的 `<think>...</think>` 块，返回清理后的正文和可选 thinking 文本。
+fn extract_think_tags(text: &str) -> (String, Option<String>) {
+    let mut cleaned = String::new();
+    let mut collected = Vec::new();
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find("<think>") {
+        cleaned.push_str(&remaining[..start]);
+        let after_start = &remaining[start + "<think>".len()..];
+        if let Some(end) = after_start.find("</think>") {
+            let thinking = after_start[..end].trim();
+            if !thinking.is_empty() {
+                collected.push(thinking.to_string());
+            }
+            remaining = &after_start[end + "</think>".len()..];
+        } else {
+            collected.push(after_start.trim().to_string());
+            remaining = "";
+            break;
+        }
+    }
+
+    cleaned.push_str(remaining);
+    let cleaned = cleaned.trim().to_string();
+    let thinking = if collected.is_empty() {
+        None
+    } else {
+        Some(collected.join("\n\n"))
+    };
+
+    (cleaned, thinking)
+}
+
+/// 当模型只返回思维链没有最终正文时，抽取一个可展示的简短结果，避免空响应。
+fn extract_thinking_summary(thinking: &str) -> String {
+    let trimmed = thinking.trim();
+    if trimmed.is_empty() {
+        return "[模型只返回了思考内容，没有最终答案。请尝试重新提问。]".to_string();
+    }
+
+    let lines: Vec<&str> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if let Some(last) = lines.last() {
+        if !last.is_empty() {
+            return (*last).to_string();
+        }
+    }
+
+    trimmed
+        .split_terminator(['.', '!', '?', '。', '！', '？'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .last()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "[模型只返回了思考内容，没有最终答案。请尝试重新提问。]".to_string())
 }
 
 ///
@@ -1065,5 +1362,19 @@ mod tests {
         assert!(result.is_some());
         let resp = result.unwrap();
         assert_eq!(resp.tool_calls[0].name, "shell_exec");
+    }
+
+    #[test]
+    fn test_extract_think_tags() {
+        let (cleaned, thinking) = extract_think_tags("abc<think>reason</think>xyz");
+        assert_eq!(cleaned, "abcxyz");
+        assert_eq!(thinking.as_deref(), Some("reason"));
+    }
+
+    #[test]
+    fn test_rejects_temperature_reasoning_models() {
+        assert!(rejects_temperature("o3-mini"));
+        assert!(rejects_temperature("gpt-5-mini"));
+        assert!(!rejects_temperature("gpt-4o"));
     }
 }

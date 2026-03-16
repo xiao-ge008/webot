@@ -1073,25 +1073,64 @@ pub async fn send_message_stream(
                         .event("tool_use")
                         .json_data(serde_json::json!({"tool": name}))
                         .unwrap_or_else(|_| Event::default().data("error")),
-                    StreamEvent::ToolUseEnd { name, input, .. } => Event::default()
-                        .event("tool_result")
-                        .json_data(serde_json::json!({"tool": name, "input": input}))
-                        .unwrap_or_else(|_| Event::default().data("error")),
-                    StreamEvent::ContentComplete { usage, .. } => Event::default()
-                        .event("done")
-                        .json_data(serde_json::json!({
-                            "done": true,
-                            "usage": {
-                                "input_tokens": usage.input_tokens,
-                                "output_tokens": usage.output_tokens,
-                            }
-                        }))
-                        .unwrap_or_else(|_| Event::default().data("error")),
+                    // ToolUseEnd means the LLM finished emitting a tool call with parsed JSON input.
+                    // It is *not* the tool execution result. We intentionally skip it in SSE to avoid
+                    // misleading the client into thinking the tool has completed.
+                    StreamEvent::ToolUseEnd { .. } => Event::default().comment("skip"),
+                    StreamEvent::ContentComplete {
+                        stop_reason, usage, ..
+                    } => {
+                        // IMPORTANT: When stop_reason == ToolUse, the agent loop will continue:
+                        // - execute tools
+                        // - then start another LLM completion
+                        //
+                        // The webot frontend treats `event: done` as "end of turn" and will stop
+                        // consuming the stream, so emitting `done` here would prematurely cut off
+                        // tool results and the final answer.
+                        if stop_reason == openfang_types::message::StopReason::ToolUse {
+                            Event::default()
+                                .event("phase")
+                                .json_data(serde_json::json!({
+                                    "phase": "tool_use",
+                                    "detail": format!(
+                                        "LLM 完成一轮输出并请求调用工具（usage: in={}, out={}）。",
+                                        usage.input_tokens,
+                                        usage.output_tokens
+                                    ),
+                                }))
+                                .unwrap_or_else(|_| Event::default().data("error"))
+                        } else {
+                            Event::default()
+                                .event("done")
+                                .json_data(serde_json::json!({
+                                    "done": true,
+                                    "usage": {
+                                        "input_tokens": usage.input_tokens,
+                                        "output_tokens": usage.output_tokens,
+                                    }
+                                }))
+                                .unwrap_or_else(|_| Event::default().data("error"))
+                        }
+                    }
                     StreamEvent::PhaseChange { phase, detail } => Event::default()
                         .event("phase")
                         .json_data(serde_json::json!({
                             "phase": phase,
                             "detail": detail,
+                        }))
+                        .unwrap_or_else(|_| Event::default().data("error")),
+                    StreamEvent::ToolExecutionResult {
+                        name,
+                        result_preview,
+                        is_error,
+                        input,
+                    } => Event::default()
+                        .event("tool_result")
+                        .json_data(serde_json::json!({
+                            "tool": name,
+                            "result": result_preview,
+                            "is_error": is_error,
+                            "input": input,
                         }))
                         .unwrap_or_else(|_| Event::default().data("error")),
                     _ => Event::default().comment("skip"),
@@ -2758,6 +2797,10 @@ pub struct MemorySearchQuery {
     pub memory_type: Option<String>,
     #[serde(default)]
     pub min_confidence: Option<f32>,
+    #[serde(default)]
+    pub subject_type: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2941,6 +2984,83 @@ pub async fn search_agent_memories(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Memory search failed"})),
+            )
+        }
+    }
+}
+
+/// GET /api/memory/agents/:id/unified-search — Query unified memory across semantic + projections.
+pub async fn search_agent_memories_unified(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<MemorySearchQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(12).clamp(1, 50);
+    let q = params.q.unwrap_or_default();
+    match state
+        .kernel
+        .unified_memory_query(
+            &id,
+            &q,
+            limit,
+            params.subject_type.as_deref(),
+            params.subject_id.as_deref(),
+        )
+        .await
+    {
+        Ok(results) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "query": q,
+                "limit": limit,
+                "subject_type": params.subject_type,
+                "subject_id": params.subject_id,
+                "memories": results,
+            })),
+        ),
+        Err(error) if error.contains("Agent not found:") => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid agent ID"})),
+        ),
+        Err(error) => {
+            tracing::warn!("Unified memory search failed for agent {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Unified memory search failed"})),
+            )
+        }
+    }
+}
+
+/// GET /api/memory/agents/:id/unified-debug — Debug unified memory query plan and ranking.
+pub async fn debug_agent_memories_unified(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<MemorySearchQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(12).clamp(1, 50);
+    let q = params.q.unwrap_or_default();
+    match state
+        .kernel
+        .unified_memory_debug_query(
+            &id,
+            &q,
+            limit,
+            params.subject_type.as_deref(),
+            params.subject_id.as_deref(),
+        )
+        .await
+    {
+        Ok(debug) => (StatusCode::OK, Json(debug)),
+        Err(error) if error.contains("Agent not found:") => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid agent ID"})),
+        ),
+        Err(error) => {
+            tracing::warn!("Unified memory debug failed for agent {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Unified memory debug failed"})),
             )
         }
     }
@@ -9492,14 +9612,20 @@ pub async fn list_cron_jobs(
             let mut value = serde_json::to_value(&job).unwrap_or_default();
             if let Some(obj) = value.as_object_mut() {
                 if let Some(meta) = meta {
-                    obj.insert("last_status".to_string(), serde_json::json!(meta.last_status));
+                    obj.insert(
+                        "last_status".to_string(),
+                        serde_json::json!(meta.last_status),
+                    );
                     obj.insert(
                         "consecutive_errors".to_string(),
                         serde_json::json!(meta.consecutive_errors),
                     );
                     obj.insert("one_shot".to_string(), serde_json::json!(meta.one_shot));
                     obj.insert("run_count".to_string(), serde_json::json!(meta.run_count));
-                    obj.insert("last_output".to_string(), serde_json::json!(meta.last_output));
+                    obj.insert(
+                        "last_output".to_string(),
+                        serde_json::json!(meta.last_output),
+                    );
                     obj.insert("runs".to_string(), serde_json::json!(meta.runs));
                 }
             }

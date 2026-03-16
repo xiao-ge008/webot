@@ -17,6 +17,8 @@ interface AgentManagementConfirmCardProps {
   workspaces?: string[];
   deleteMode?: 'purge' | 'local_only';
   summaryItems?: string[];
+  items?: Array<Record<string, unknown>>;
+  agents?: Array<Record<string, unknown>>;
   payload?: unknown;
   confirmAction?: string;
   cancelAction?: string;
@@ -33,6 +35,11 @@ function normalizeText(value: unknown): string {
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => normalizeText(item)).filter(Boolean);
+}
+
+function normalizeObjectArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object');
 }
 
 function resolveModeLabel(mode: string): string {
@@ -70,6 +77,20 @@ export function GenUIAgentManagementConfirmCard(ctx: unknown) {
     const explicit = normalizeStringArray(props.summaryItems);
     if (explicit.length > 0) {
       return explicit;
+    }
+    const groupedItems = normalizeObjectArray(props.items).concat(normalizeObjectArray(props.agents));
+    if (groupedItems.length > 0) {
+      return groupedItems.map((item, index) => {
+        const nickname = normalizeText(item.nickname) || normalizeText(item.name) || normalizeText(item.targetName) || `角色 ${index + 1}`;
+        const englishName = normalizeText(item.englishName) || normalizeText(item.english_name) || normalizeText(item.englishNickname);
+        const model = normalizeText(item.model);
+        const tags = normalizeStringArray(item.tags);
+        const parts = [`${index + 1}. ${nickname}`];
+        if (englishName) parts.push(`英文名：${englishName}`);
+        if (model) parts.push(`模型：${model}`);
+        if (tags.length > 0) parts.push(`标签：${tags.join(' / ')}`);
+        return parts.join('，');
+      });
     }
     const next: string[] = [];
     const displayName = normalizeText(props.nickname) || normalizeText(props.targetName);
@@ -136,7 +157,7 @@ export function GenUIAgentManagementConfirmCard(ctx: unknown) {
         {normalizeStringArray(props.workspaces).length > 0 ? (
           <div className="flex items-start gap-2 rounded-xl border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
             <FolderLock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>确认后将同步写入工作区权限，并生成基础人格文件。</span>
+            <span>确认后将同步写入工作区权限，并调用本地模型生成完整身份文件。</span>
           </div>
         ) : null}
       </CardContent>

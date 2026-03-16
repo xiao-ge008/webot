@@ -247,14 +247,14 @@ pub async fn execute_tool(
         }
 
         // Inter-agent tools (require kernel handle)
-        "agent_send" => tool_agent_send(input, kernel).await,
+        "agent_send" => tool_agent_send(input, kernel, caller_agent_id).await,
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
 
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
-        "memory_recall" => tool_memory_recall(input, kernel),
+        "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id).await,
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -634,11 +634,14 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_recall".to_string(),
-            description: "Recall a value from shared memory by key.".to_string(),
+            description: "Recall a known shared memory key, or query the current agent's unified memory with a natural-language request when the key is unknown.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall" }
+                    "key": { "type": "string", "description": "A known shared memory key, or a natural-language memory query" },
+                    "subject_type": { "type": "string", "description": "Optional projection subject type for unified memory query, such as agent, group, user, or a2a_edge" },
+                    "subject_id": { "type": "string", "description": "Optional projection subject identifier paired with subject_type" },
+                    "limit": { "type": "integer", "description": "Optional max results for unified memory query (default 6, max 12)" }
                 },
                 "required": ["key"]
             }),
@@ -1509,6 +1512,7 @@ fn require_kernel(
 async fn tool_agent_send(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let agent_id = input["agent_id"]
@@ -1528,11 +1532,26 @@ async fn tool_agent_send(
         ));
     }
 
-    AGENT_CALL_DEPTH
+    let response = AGENT_CALL_DEPTH
         .scope(std::cell::Cell::new(current_depth + 1), async {
             kh.send_to_agent(agent_id, message).await
         })
-        .await
+        .await?;
+
+    if let Some(caller_agent_id) = caller_agent_id {
+        if let Err(error) = kh
+            .record_agent_collaboration(caller_agent_id, agent_id, message, &response)
+            .await
+        {
+            warn!(
+                caller_agent_id = %caller_agent_id,
+                target_agent_id = %agent_id,
+                "Failed to persist agent collaboration memory: {error}"
+            );
+        }
+    }
+
+    Ok(response)
 }
 
 async fn tool_agent_spawn(
@@ -1593,15 +1612,42 @@ fn tool_memory_store(
     Ok(format!("Stored value under key '{key}'."))
 }
 
-fn tool_memory_recall(
+async fn tool_memory_recall(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
+    let subject_type = input["subject_type"].as_str();
+    let subject_id = input["subject_id"].as_str();
+    let limit = input["limit"]
+        .as_u64()
+        .map(|value| value.clamp(1, 12) as usize)
+        .unwrap_or(6);
     match kh.memory_recall(key)? {
         Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
-        None => Ok(format!("No value found for key '{key}'.")),
+        None => {
+            if let Some(caller_agent_id) = caller_agent_id {
+                let results = kh
+                    .query_agent_memory(caller_agent_id, key, limit, subject_type, subject_id)
+                    .await?;
+                if !results.is_empty() {
+                    let payload = serde_json::json!({
+                        "mode": "unified_memory",
+                        "query": key,
+                        "subject_type": subject_type,
+                        "subject_id": subject_id,
+                        "results": results,
+                    });
+                    return Ok(
+                        serde_json::to_string_pretty(&payload)
+                            .unwrap_or_else(|_| payload.to_string()),
+                    );
+                }
+            }
+            Ok(format!("No value found for key '{key}'."))        
+        }
     }
 }
 

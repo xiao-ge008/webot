@@ -4,6 +4,9 @@ export type JobType = 'agent' | 'shell';
 export type SessionTarget = 'isolated' | 'main';
 export type DeliveryMode = 'none' | 'announce';
 export type RunStatus = 'ok' | 'error' | 'running' | 'idle';
+export type TaskConversationType = 'dm' | 'group';
+export type TaskDeliveryKind = 'progress' | 'final' | 'anomaly';
+export type TaskDeliveryStatus = 'pending' | 'reported' | 'acknowledged';
 
 export interface TaskSchedule {
     kind: ScheduleKind;
@@ -58,4 +61,32 @@ export interface TaskRunRecord {
     endTime?: string;
     status: RunStatus;
     output: string;
+}
+
+export interface TaskReportDelivery {
+    id: string;
+    taskId: string;
+    ownerAgentId: string;
+    runtimeKey?: string;
+    deliveryKind: TaskDeliveryKind;
+    status: TaskDeliveryStatus;
+    originConversationType?: TaskConversationType;
+    originConversationId?: string;
+    originChatSessionId?: string;
+    originMessageId?: string;
+    creatorParticipantId?: string;
+    creatorParticipantName?: string;
+    executorAgentId?: string;
+    executorAgentName?: string;
+    reportActorAgentId?: string;
+    reportActorAgentName?: string;
+    taskName?: string;
+    runCount?: number;
+    summaryText?: string;
+    errorText?: string;
+    payload?: Record<string, unknown>;
+    createdAt: string;
+    updatedAt: string;
+    reportedAt?: string;
+    acknowledgedAt?: string;
 }

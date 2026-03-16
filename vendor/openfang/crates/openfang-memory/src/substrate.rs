@@ -680,6 +680,235 @@ impl MemorySubstrate {
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Persist a structured memory event for unified multi-subject memory orchestration.
+    pub async fn append_memory_event_async(
+        &self,
+        event_type: &str,
+        content: &str,
+        conversation_id: &str,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> OpenFangResult<String> {
+        let conn = Arc::clone(&self.conn);
+        let event_type = event_type.to_string();
+        let content = content.to_string();
+        let conversation_id = conversation_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let metadata_str = serde_json::to_string(&metadata)
+                .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+            let group_id = metadata
+                .get("group_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let task_id = metadata
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let source_agent_id = metadata
+                .get("source_agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let target_agent_id = metadata
+                .get("target_agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let speaker_agent_id = metadata
+                .get("speaker_agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let speaker_user_id = metadata
+                .get("speaker_user_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let participant_ids = metadata
+                .get("participant_ids")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()))
+                .to_string();
+            let reply_to_event_id = metadata
+                .get("reply_to_event_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let tool_use_id = metadata
+                .get("tool_use_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let delegation_depth = metadata
+                .get("delegation_depth")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+
+            db.execute(
+                "INSERT INTO memory_events (
+                    event_id, event_type, content, conversation_id, group_id, task_id,
+                    source_agent_id, target_agent_id, speaker_agent_id, speaker_user_id,
+                    participant_ids, reply_to_event_id, tool_use_id, delegation_depth, metadata, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                rusqlite::params![
+                    event_id,
+                    event_type,
+                    content,
+                    conversation_id,
+                    group_id,
+                    task_id,
+                    source_agent_id,
+                    target_agent_id,
+                    speaker_agent_id,
+                    speaker_user_id,
+                    participant_ids,
+                    reply_to_event_id,
+                    tool_use_id,
+                    delegation_depth,
+                    metadata_str,
+                    now,
+                ],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            Ok(event_id)
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Persist a subject projection for a memory event.
+    pub async fn append_memory_projection_async(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+        event_id: &str,
+        projection_role: &str,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> OpenFangResult<String> {
+        let conn = Arc::clone(&self.conn);
+        let subject_type = subject_type.to_string();
+        let subject_id = subject_id.to_string();
+        let event_id = event_id.to_string();
+        let projection_role = projection_role.to_string();
+        tokio::task::spawn_blocking(move || {
+            let projection_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let metadata_str = serde_json::to_string(&metadata)
+                .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+            db.execute(
+                "INSERT INTO memory_projections (
+                    projection_id, subject_type, subject_id, event_id, projection_role, metadata, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    projection_id,
+                    subject_type,
+                    subject_id,
+                    event_id,
+                    projection_role,
+                    metadata_str,
+                    now,
+                ],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            Ok(projection_id)
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// List recent projected events for a subject.
+    pub async fn list_projected_events_async(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> OpenFangResult<Vec<serde_json::Value>> {
+        let conn = Arc::clone(&self.conn);
+        let subject_type = subject_type.to_string();
+        let subject_id = subject_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let mut stmt = db.prepare(
+                "SELECT
+                    p.projection_id,
+                    p.subject_type,
+                    p.subject_id,
+                    p.projection_role,
+                    p.metadata,
+                    e.event_id,
+                    e.event_type,
+                    e.content,
+                    e.conversation_id,
+                    e.group_id,
+                    e.task_id,
+                    e.source_agent_id,
+                    e.target_agent_id,
+                    e.speaker_agent_id,
+                    e.speaker_user_id,
+                    e.participant_ids,
+                    e.metadata,
+                    e.created_at
+                 FROM memory_projections p
+                 JOIN memory_events e ON e.event_id = p.event_id
+                 WHERE p.subject_type = ?1 AND p.subject_id = ?2
+                 ORDER BY e.created_at DESC
+                 LIMIT ?3"
+            ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            let rows = stmt.query_map(
+                rusqlite::params![subject_type, subject_id, limit as i64],
+                |row| {
+                    let projection_metadata_raw = row.get::<_, String>(4)?;
+                    let event_metadata_raw = row.get::<_, String>(16)?;
+                    let participant_ids_raw = row.get::<_, String>(15)?;
+                    let projection_metadata: serde_json::Value =
+                        serde_json::from_str(&projection_metadata_raw)
+                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                    let event_metadata: serde_json::Value =
+                        serde_json::from_str(&event_metadata_raw)
+                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                    let participant_ids: serde_json::Value =
+                        serde_json::from_str(&participant_ids_raw)
+                            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+                    Ok(serde_json::json!({
+                        "kind": "projected_event",
+                        "projection_id": row.get::<_, String>(0)?,
+                        "subject_type": row.get::<_, String>(1)?,
+                        "subject_id": row.get::<_, String>(2)?,
+                        "projection_role": row.get::<_, String>(3)?,
+                        "projection_metadata": projection_metadata,
+                        "event_id": row.get::<_, String>(5)?,
+                        "event_type": row.get::<_, String>(6)?,
+                        "content": row.get::<_, String>(7)?,
+                        "conversation_id": row.get::<_, String>(8)?,
+                        "group_id": row.get::<_, String>(9)?,
+                        "task_id": row.get::<_, String>(10)?,
+                        "source_agent_id": row.get::<_, String>(11)?,
+                        "target_agent_id": row.get::<_, String>(12)?,
+                        "speaker_agent_id": row.get::<_, String>(13)?,
+                        "speaker_user_id": row.get::<_, String>(14)?,
+                        "participant_ids": participant_ids,
+                        "event_metadata": event_metadata,
+                        "created_at": row.get::<_, String>(17)?,
+                    }))
+                },
+            ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     // -----------------------------------------------------------------
     // Task queue operations
     // -----------------------------------------------------------------

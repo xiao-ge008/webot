@@ -1,5 +1,52 @@
 export type ChatGroupMode = 'leader_dispatch' | 'free_talk';
 
+export type GroupQueueStatus = 'queued' | 'running' | 'done' | 'skipped' | 'cancelled';
+export type GroupQueueReason =
+  | 'user_primary'
+  | 'user_followup'
+  | 'user_mention'
+  | 'mention_handoff'
+  | 'leader_wrapup'
+  | 'idle_prompt'
+  | 'task_report';
+
+export interface GroupQueueItem {
+  id: string;
+  agentId: string;
+  agentName?: string;
+  status: GroupQueueStatus;
+  reason: GroupQueueReason;
+  depth?: number;
+  sourceMessageId?: string;
+  note?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export interface GroupMemoryDigest {
+  summary: string;
+  speakerLine?: string;
+  pendingLine?: string;
+  lastUserIntent?: string;
+  updatedAt: string;
+}
+
+export interface GroupSessionRuntime {
+  version: '1.0';
+  status: 'idle' | 'running' | 'stopped';
+  leaderAgentId?: string;
+  currentSpeakerId?: string;
+  lastCompletedSpeakerId?: string;
+  queueVersion: number;
+  queue: GroupQueueItem[];
+  stopRequested: boolean;
+  stopReason?: string;
+  lastCompactedAt?: string;
+  lastEventAt?: string;
+  memoryDigest?: GroupMemoryDigest;
+}
+
 export interface ChatGroupLimits {
   maxSpeakers: number;
   maxMentions: number;

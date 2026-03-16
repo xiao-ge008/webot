@@ -264,6 +264,14 @@ pub async fn build_router(
             axum::routing::get(routes::search_agent_memories),
         )
         .route(
+            "/api/memory/agents/{id}/unified-search",
+            axum::routing::get(routes::search_agent_memories_unified),
+        )
+        .route(
+            "/api/memory/agents/{id}/unified-debug",
+            axum::routing::get(routes::debug_agent_memories_unified),
+        )
+        .route(
             "/api/memory/agents/{id}/feedback",
             axum::routing::post(routes::feedback_agent_memory),
         )

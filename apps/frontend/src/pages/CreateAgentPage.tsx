@@ -27,6 +27,7 @@ import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+import { formatModelLabel } from '@/lib/model-label';
 import {
   type AgentConfigPatchInput,
   patchManagementAgentConfig,
@@ -395,6 +396,7 @@ export function CreateAgentPage() {
   const [tags, setTags] = useState<string[]>([]);
   const [bio, setBio] = useState('');
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+  const [selectedProviderId, setSelectedProviderId] = useState('');
   const [selectedModelId, setSelectedModelId] = useState('');
   const [saving, setSaving] = useState(false);
   const [optimizing, setOptimizing] = useState(false);
@@ -430,6 +432,7 @@ export function CreateAgentPage() {
         setModelOptions(options);
         if (options.length > 0) {
           const preferred = options.find((item) => item.isDefault) ?? options[0];
+          setSelectedProviderId(preferred.providerId);
           setSelectedModelId(preferred.modelId);
         }
       } catch (error) {
@@ -486,6 +489,37 @@ export function CreateAgentPage() {
     () => modelOptions.find((item) => item.modelId === selectedModelId) ?? null,
     [modelOptions, selectedModelId],
   );
+
+  const providerOptions = useMemo(() => {
+    const providers = uniqueSorted(modelOptions.map((item) => item.providerId).filter(Boolean));
+    if (selectedProviderId && !providers.includes(selectedProviderId)) {
+      return uniqueSorted([selectedProviderId, ...providers]);
+    }
+    return providers;
+  }, [modelOptions, selectedProviderId]);
+
+  const filteredModelOptions = useMemo(() => {
+    if (!selectedProviderId) {
+      return modelOptions;
+    }
+    return modelOptions.filter((item) => item.providerId === selectedProviderId);
+  }, [modelOptions, selectedProviderId]);
+
+  useEffect(() => {
+    if (!selectedProviderId) {
+      return;
+    }
+    if (filteredModelOptions.length === 0) {
+      return;
+    }
+    if (filteredModelOptions.some((item) => item.modelId === selectedModelId)) {
+      return;
+    }
+    const preferred = filteredModelOptions.find((item) => item.isDefault) ?? filteredModelOptions[0];
+    if (preferred) {
+      setSelectedModelId(preferred.modelId);
+    }
+  }, [filteredModelOptions, selectedModelId, selectedProviderId]);
 
   const pickPreferredModel = (options: ModelOption[]): ModelOption | null => {
     if (options.length === 0) {
@@ -632,6 +666,7 @@ export function CreateAgentPage() {
         setModelOptions(options);
         effectiveModel = pickPreferredModel(options);
         if (effectiveModel) {
+          setSelectedProviderId(effectiveModel.providerId);
           setSelectedModelId(effectiveModel.modelId);
         }
       }
@@ -1038,15 +1073,30 @@ export function CreateAgentPage() {
                 </CardHeader>
                 <CardContent className="p-8 pt-4 space-y-6">
                   <div className="space-y-3">
+                    <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">供应商</Label>
+                    <Select value={selectedProviderId} onValueChange={setSelectedProviderId}>
+                      <SelectTrigger className="h-12 rounded-xl bg-muted/20 border-border shadow-inner">
+                        <SelectValue placeholder="请选择供应商" />
+                      </SelectTrigger>
+                      <SelectContent className="rounded-xl">
+                        {providerOptions.map((providerId) => (
+                          <SelectItem key={providerId} value={providerId}>
+                            {providerId}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-3">
                     <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">对话模型</Label>
                     <Select value={selectedModelId} onValueChange={setSelectedModelId}>
                       <SelectTrigger className="h-12 rounded-xl bg-muted/20 border-border shadow-inner">
                         <SelectValue placeholder={t('edit.modelRequired')} />
                       </SelectTrigger>
                       <SelectContent className="rounded-xl">
-                        {modelOptions.map((option) => (
+                        {filteredModelOptions.map((option) => (
                           <SelectItem key={option.modelId} value={option.modelId}>
-                            {option.displayName}
+                            {formatModelLabel(option.providerId, option.modelName, option.displayName)}
                           </SelectItem>
                         ))}
                       </SelectContent>

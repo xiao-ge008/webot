@@ -1,10 +1,12 @@
 use base64::engine::general_purpose;
 use base64::Engine;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use tauri::AppHandle;
 use tauri::Manager;
 use tauri::State;
@@ -17,6 +19,19 @@ pub struct DesktopStatus {
     pub port: u16,
     pub api_base_url: String,
     pub uptime_secs: u64,
+}
+
+#[derive(Serialize)]
+pub struct AppMetadata {
+    pub version: String,
+    pub platform: String,
+    pub arch: String,
+}
+
+#[derive(Serialize)]
+pub struct UpdateInstallResult {
+    pub installer_path: String,
+    pub launched: bool,
 }
 
 #[tauri::command]
@@ -41,6 +56,15 @@ pub fn get_status(state: State<'_, DesktopState>) -> DesktopStatus {
         port: state.port,
         api_base_url: state.api_base_url.clone(),
         uptime_secs: state.started_at.elapsed().as_secs(),
+    }
+}
+
+#[tauri::command]
+pub fn get_app_metadata(app: AppHandle) -> AppMetadata {
+    AppMetadata {
+        version: app.package_info().version.to_string(),
+        platform: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
     }
 }
 
@@ -586,4 +610,135 @@ pub fn launch_mpv(app: AppHandle, url: String) -> Result<(), String> {
     let fallback = "mpv";
 
     spawn_mpv(fallback, target)
+}
+
+fn sanitize_download_name(raw_name: &str) -> String {
+    let trimmed = raw_name.trim();
+    if trimmed.is_empty() {
+        return "webot-update-installer".to_string();
+    }
+
+    let mut output = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        let invalid = matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            || ch.is_control();
+        output.push(if invalid { '_' } else { ch });
+    }
+
+    let normalized = output.trim_matches('.').trim();
+    if normalized.is_empty() {
+        "webot-update-installer".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn launch_installer(path: &Path) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if extension == "msi" {
+            Command::new("msiexec")
+                .arg("/i")
+                .arg(path)
+                .spawn()
+                .map_err(|err| format!("启动 MSI 安装程序失败: {err}"))?;
+            return Ok(true);
+        }
+
+        Command::new(path)
+            .spawn()
+            .map_err(|err| format!("启动安装程序失败: {err}"))?;
+        return Ok(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("打开更新包失败: {err}"))?;
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("打开更新包失败: {err}"))?;
+        return Ok(false);
+    }
+
+    #[allow(unreachable_code)]
+    Err("当前平台暂不支持自动安装更新".to_string())
+}
+
+#[tauri::command]
+pub async fn download_and_install_update(
+    app: AppHandle,
+    download_url: String,
+    file_name: String,
+) -> Result<UpdateInstallResult, String> {
+    let url = download_url.trim();
+    if url.is_empty() {
+        return Err("更新下载地址为空".to_string());
+    }
+
+    let sanitized_name = sanitize_download_name(&file_name);
+    let temp_root = app
+        .path()
+        .temp_dir()
+        .map_err(|err| format!("读取临时目录失败: {err}"))?
+        .join("webot-updates");
+    fs::create_dir_all(&temp_root).map_err(|err| format!("创建更新目录失败: {err}"))?;
+
+    let installer_path = temp_root.join(sanitized_name);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("WeBot-Updater"));
+    headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .map_err(|err| format!("创建下载客户端失败: {err}"))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| format!("下载更新包失败: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载更新包失败: HTTP {}", response.status()));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("读取更新包失败: {err}"))?;
+    if bytes.is_empty() {
+        return Err("更新包为空".to_string());
+    }
+
+    fs::write(&installer_path, &bytes).map_err(|err| format!("写入更新包失败: {err}"))?;
+
+    let launched = launch_installer(&installer_path)?;
+    if launched {
+        let app_handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            app_handle.exit(0);
+        });
+    }
+
+    Ok(UpdateInstallResult {
+        installer_path: installer_path.to_string_lossy().to_string(),
+        launched,
+    })
 }

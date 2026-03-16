@@ -33,10 +33,11 @@ use openfang_types::capability::Capability;
 use openfang_types::config::KernelConfig;
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
-use openfang_types::memory::Memory;
+use openfang_types::memory::{Memory, MemoryFragment, MemorySource};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
@@ -321,7 +322,7 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          - Batch tool calls when possible \u{2014} don't output reasoning between each call.\n\
          - When a task is ambiguous, ask ONE clarifying question, not five.\n\
          - Store important context in memory (memory_store) proactively.\n\
-         - Search memory (memory_recall) before asking the user for context they may have given before.\n\n\
+        - Use memory_recall before asking the user for repeated context: known shared keys read shared memory, natural-language requests query your unified long-term memory.\n\n\
          ## Tool Usage Protocols\n\
          - file_read BEFORE file_write \u{2014} always understand what exists.\n\
          - web_search for current info, web_fetch for specific URLs.\n\
@@ -4877,6 +4878,1109 @@ pub fn shared_memory_agent_id() -> AgentId {
     ]))
 }
 
+fn truncate_collaboration_excerpt(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out = normalized.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn resolve_agent_entry_for_collaboration(
+    registry: &AgentRegistry,
+    agent_ref: &str,
+) -> Result<AgentEntry, String> {
+    match agent_ref.parse::<AgentId>() {
+        Ok(id) => registry
+            .get(id)
+            .ok_or_else(|| format!("Agent not found: {agent_ref}")),
+        Err(_) => registry
+            .find_by_name(agent_ref)
+            .ok_or_else(|| format!("Agent not found: {agent_ref}")),
+    }
+}
+
+fn memory_fragment_to_json(fragment: &MemoryFragment) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "semantic_memory",
+        "id": fragment.id.to_string(),
+        "content": fragment.content,
+        "source": fragment.source,
+        "scope": fragment.scope,
+        "confidence": fragment.confidence,
+        "created_at": fragment.created_at.to_rfc3339(),
+        "metadata": fragment.metadata,
+    })
+}
+
+fn lexical_match_score(text: &str, query: &str) -> f64 {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return 0.35;
+    }
+    let haystack = text.to_lowercase();
+    let terms: Vec<String> = trimmed
+        .split_whitespace()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return 0.2;
+    }
+    let matched = terms.iter().filter(|term| haystack.contains(term.as_str())).count();
+    matched as f64 / terms.len() as f64
+}
+
+fn recency_score_from_timestamp(timestamp: &str) -> f64 {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return 0.2;
+    };
+    let age_hours = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
+        .num_hours()
+        .max(0) as f64;
+    (1.0 / (1.0 + age_hours / 24.0)).clamp(0.0, 1.0)
+}
+
+fn rank_semantic_memory_item(mut item: serde_json::Value, query: &str) -> serde_json::Value {
+    let content = item
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let confidence = item
+        .get("confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.5);
+    let created_at = item
+        .get("created_at")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let lexical = lexical_match_score(content, query);
+    let recency = recency_score_from_timestamp(created_at);
+    let query_subject_weight = item
+        .get("query_subject_weight")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let query_subject_type = item
+        .get("query_subject_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let query_subject_id = item
+        .get("query_subject_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let query_subject_depth = item
+        .get("query_subject_depth")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let related_from_subject_type = item
+        .get("related_from_subject_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let related_from_subject_id = item
+        .get("related_from_subject_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let base_score = (0.5 * lexical + 0.2 * recency + 0.3 * confidence).clamp(0.0, 1.0);
+    let score = (base_score * query_subject_weight).clamp(0.0, 1.0);
+    item["score"] = serde_json::Value::from(score);
+    item["explain"] = serde_json::json!({
+        "channel": "semantic_memory",
+        "lexical_match": lexical,
+        "recency": recency,
+        "confidence": confidence,
+        "query_subject_type": query_subject_type,
+        "query_subject_id": query_subject_id,
+        "query_subject_depth": query_subject_depth,
+        "query_subject_weight": query_subject_weight,
+        "related_from_subject_type": related_from_subject_type,
+        "related_from_subject_id": related_from_subject_id,
+        "reason": "语义记忆候选（多主体联合排序）"
+    });
+    item
+}
+
+fn rank_projected_event_item(mut item: serde_json::Value, query: &str) -> serde_json::Value {
+    let content = item
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let created_at = item
+        .get("created_at")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let projection_role = item
+        .get("projection_role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let lexical = lexical_match_score(content, query);
+    let recency = recency_score_from_timestamp(created_at);
+    let role_weight = match projection_role {
+        "owner" | "caller" | "callee" => 1.0,
+        "participant" => 0.85,
+        _ => 0.7,
+    };
+    let query_subject_weight = item
+        .get("query_subject_weight")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let query_subject_type = item
+        .get("query_subject_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let query_subject_id = item
+        .get("query_subject_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let query_subject_depth = item
+        .get("query_subject_depth")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let related_from_subject_type = item
+        .get("related_from_subject_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let related_from_subject_id = item
+        .get("related_from_subject_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let base_score = (0.45 * lexical + 0.3 * recency + 0.25 * role_weight).clamp(0.0, 1.0);
+    let score = (base_score * query_subject_weight).clamp(0.0, 1.0);
+    item["score"] = serde_json::Value::from(score);
+    item["explain"] = serde_json::json!({
+        "channel": "projected_event",
+        "lexical_match": lexical,
+        "recency": recency,
+        "projection_role_weight": role_weight,
+        "query_subject_type": query_subject_type,
+        "query_subject_id": query_subject_id,
+        "query_subject_depth": query_subject_depth,
+        "query_subject_weight": query_subject_weight,
+        "related_from_subject_type": related_from_subject_type,
+        "related_from_subject_id": related_from_subject_id,
+        "reason": "事件层/投影视图候选（多主体联合排序）"
+    });
+    item
+}
+
+fn subject_weight(subject_type: &str, depth: u64) -> f64 {
+    let type_weight: f64 = match subject_type {
+        "agent" => 1.0_f64,
+        "task" => 0.95_f64,
+        "group" => 0.9_f64,
+        "user" => 0.85_f64,
+        "a2a_edge" => 0.88_f64,
+        "conversation" => 0.8_f64,
+        _ => 0.75_f64,
+    };
+    let depth_penalty: f64 = match depth {
+        0 => 1.0_f64,
+        1 => 0.82_f64,
+        _ => 0.72_f64,
+    };
+    (type_weight * depth_penalty).clamp(0.0_f64, 1.0_f64)
+}
+
+fn extract_related_subjects_from_event(
+    event: &serde_json::Value,
+    primary_subject_type: &str,
+    primary_subject_id: &str,
+) -> Vec<(String, String)> {
+    let mut subjects = Vec::new();
+
+    if let Some(group_id) = event
+        .get("group_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let key = ("group".to_string(), group_id.to_string());
+        if key.0 != primary_subject_type || key.1 != primary_subject_id {
+            subjects.push(key);
+        }
+    }
+
+    if let Some(task_id) = event
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let key = ("task".to_string(), task_id.to_string());
+        if key.0 != primary_subject_type || key.1 != primary_subject_id {
+            subjects.push(key);
+        }
+    }
+
+    if let Some(participant_scope) = event
+        .get("event_metadata")
+        .and_then(|value| value.get("participant_scope"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let key = ("user".to_string(), participant_scope.to_string());
+        if key.0 != primary_subject_type || key.1 != primary_subject_id {
+            subjects.push(key);
+        }
+    }
+
+    let source_agent_id = event
+        .get("source_agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target_agent_id = event
+        .get("target_agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(source_agent_id), Some(target_agent_id)) = (source_agent_id, target_agent_id) {
+        let edge_id = format!("{source_agent_id}->{target_agent_id}");
+        let key = ("a2a_edge".to_string(), edge_id);
+        if key.0 != primary_subject_type || key.1 != primary_subject_id {
+            subjects.push(key);
+        }
+        let peer_agent = if primary_subject_type == "agent" && primary_subject_id == source_agent_id {
+            Some(target_agent_id)
+        } else if primary_subject_type == "agent" && primary_subject_id == target_agent_id {
+            Some(source_agent_id)
+        } else {
+            None
+        };
+        if let Some(peer_agent) = peer_agent {
+            let peer_key = ("agent".to_string(), peer_agent.to_string());
+            if peer_key.0 != primary_subject_type || peer_key.1 != primary_subject_id {
+                subjects.push(peer_key);
+            }
+        }
+    }
+
+    subjects
+}
+
+#[allow(dead_code)]
+fn collect_related_projection_subjects(
+    events: &[serde_json::Value],
+    primary_subject_type: &str,
+    primary_subject_id: &str,
+) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut subjects = Vec::new();
+
+    for event in events {
+        for key in extract_related_subjects_from_event(event, primary_subject_type, primary_subject_id)
+        {
+            if seen.insert(key.clone()) {
+                subjects.push(key);
+            }
+        }
+    }
+
+    subjects
+}
+
+fn infer_subject_keys_from_semantic_item(
+    item: &serde_json::Value,
+    agent_id: &str,
+) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    let metadata = item.get("metadata").unwrap_or(&serde_json::Value::Null);
+
+    let group_label = metadata
+        .get("group_label")
+        .or_else(|| metadata.get("conversation_scope"))
+        .or_else(|| metadata.get("group_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(group_label) = group_label {
+        keys.push(("group".to_string(), group_label.to_string()));
+    }
+
+    let participant_scope = metadata
+        .get("participant_scope")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(participant_scope) = participant_scope {
+        keys.push(("user".to_string(), participant_scope.to_string()));
+    }
+
+    let task_id = metadata
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(task_id) = task_id {
+        keys.push(("task".to_string(), task_id.to_string()));
+    }
+
+    let source_agent_id = metadata
+        .get("source_agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target_agent_id = metadata
+        .get("target_agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(source_agent_id), Some(target_agent_id)) = (source_agent_id, target_agent_id) {
+        keys.push((
+            "a2a_edge".to_string(),
+            format!("{source_agent_id}->{target_agent_id}"),
+        ));
+    }
+
+    let peer_agent_id = metadata
+        .get("peer_agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(peer_agent_id) = peer_agent_id {
+        keys.push(("agent".to_string(), peer_agent_id.to_string()));
+    }
+
+    // Semantic fragments are always owned by the agent query context, so "agent" is a stable fallback.
+    keys.push(("agent".to_string(), agent_id.to_string()));
+    keys
+}
+
+fn merge_memory_fragments(
+    relevant: Vec<MemoryFragment>,
+    recent: Vec<MemoryFragment>,
+    limit: usize,
+) -> Vec<MemoryFragment> {
+    let mut merged = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_contents = HashSet::new();
+
+    for fragment in relevant.into_iter().chain(recent.into_iter()) {
+        let id = fragment.id.to_string();
+        let content = fragment.content.trim().to_string();
+        if seen_ids.contains(&id) || (!content.is_empty() && seen_contents.contains(&content)) {
+            continue;
+        }
+        seen_ids.insert(id);
+        if !content.is_empty() {
+            seen_contents.insert(content);
+        }
+        merged.push(fragment);
+        if merged.len() >= limit {
+            break;
+        }
+    }
+
+    merged
+}
+
+async fn append_memory_projection(
+    kernel: &OpenFangKernel,
+    subject_type: &str,
+    subject_id: &str,
+    event_id: &str,
+    projection_role: &str,
+    metadata: HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    kernel
+        .memory
+        .append_memory_projection_async(
+            subject_type,
+            subject_id,
+            event_id,
+            projection_role,
+            metadata,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to append memory projection: {e}"))
+}
+
+async fn persist_agent_collaboration_memory(
+    kernel: &OpenFangKernel,
+    owner_id: AgentId,
+    peer_id: AgentId,
+    peer_name: &str,
+    direction: &str,
+    request: &str,
+    response: &str,
+    collaboration_id: &str,
+    source_event_id: &str,
+) -> Result<(), String> {
+    let request_excerpt = truncate_collaboration_excerpt(request, 320);
+    let response_excerpt = truncate_collaboration_excerpt(response, 420);
+    let content = match direction {
+        "outbound" => format!(
+            "我与智能体 {peer_name} 发生了一次协作。我的请求: {request_excerpt} 对方回复: {response_excerpt}"
+        ),
+        "inbound" => format!(
+            "智能体 {peer_name} 向我发起了一次协作请求。对方请求: {request_excerpt} 我的回复: {response_excerpt}"
+        ),
+        _ => format!(
+            "我与智能体 {peer_name} 发生了一次协作。请求: {request_excerpt} 回复: {response_excerpt}"
+        ),
+    };
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "memory_type".to_string(),
+        serde_json::Value::String("agent_collaboration".to_string()),
+    );
+    metadata.insert(
+        "channel".to_string(),
+        serde_json::Value::String("agent_send".to_string()),
+    );
+    metadata.insert(
+        "direction".to_string(),
+        serde_json::Value::String(direction.to_string()),
+    );
+    metadata.insert(
+        "peer_agent_id".to_string(),
+        serde_json::Value::String(peer_id.to_string()),
+    );
+    metadata.insert(
+        "peer_agent_name".to_string(),
+        serde_json::Value::String(peer_name.to_string()),
+    );
+    metadata.insert(
+        "collaboration_id".to_string(),
+        serde_json::Value::String(collaboration_id.to_string()),
+    );
+    metadata.insert(
+        "source_event_id".to_string(),
+        serde_json::Value::String(source_event_id.to_string()),
+    );
+    metadata.insert(
+        "request_excerpt".to_string(),
+        serde_json::Value::String(request_excerpt),
+    );
+    metadata.insert(
+        "response_excerpt".to_string(),
+        serde_json::Value::String(response_excerpt),
+    );
+    metadata.insert("importance".to_string(), serde_json::Value::from(0.78_f64));
+    metadata.insert("confidence".to_string(), serde_json::Value::from(0.92_f64));
+
+    kernel
+        .memory
+        .remember(
+            owner_id,
+            &content,
+            MemorySource::System,
+            "collaboration",
+            metadata,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to persist collaboration memory: {e}"))
+}
+
+async fn persist_group_memory_fragment(
+    kernel: &OpenFangKernel,
+    owner_id: AgentId,
+    group_label: &str,
+    participant_scope: Option<&str>,
+    channel_type: &str,
+    conversation_id: Option<&str>,
+    thread_id: Option<&str>,
+    sender_platform_id: &str,
+    memory_type: &str,
+    content: &str,
+    importance: f64,
+    confidence: f64,
+    source_event_id: &str,
+) -> Result<(), String> {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "memory_type".to_string(),
+        serde_json::Value::String(memory_type.to_string()),
+    );
+    metadata.insert(
+        "conversation_scope".to_string(),
+        serde_json::Value::String(group_label.to_string()),
+    );
+    metadata.insert(
+        "group_label".to_string(),
+        serde_json::Value::String(group_label.to_string()),
+    );
+    metadata.insert(
+        "channel_type".to_string(),
+        serde_json::Value::String(channel_type.to_string()),
+    );
+    metadata.insert(
+        "sender_platform_id".to_string(),
+        serde_json::Value::String(sender_platform_id.to_string()),
+    );
+    metadata.insert(
+        "source_event_id".to_string(),
+        serde_json::Value::String(source_event_id.to_string()),
+    );
+    if let Some(scope) = participant_scope.filter(|value| !value.trim().is_empty()) {
+        metadata.insert(
+            "participant_scope".to_string(),
+            serde_json::Value::String(scope.to_string()),
+        );
+    }
+    if let Some(conversation_id) = conversation_id.filter(|value| !value.trim().is_empty()) {
+        metadata.insert(
+            "conversation_id".to_string(),
+            serde_json::Value::String(conversation_id.to_string()),
+        );
+    }
+    if let Some(thread_id) = thread_id.filter(|value| !value.trim().is_empty()) {
+        metadata.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+    }
+    metadata.insert("importance".to_string(), serde_json::Value::from(importance));
+    metadata.insert("confidence".to_string(), serde_json::Value::from(confidence));
+
+    kernel
+        .memory
+        .remember(
+            owner_id,
+            content,
+            MemorySource::Conversation,
+            "group",
+            metadata,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to persist group memory: {e}"))
+}
+
+impl OpenFangKernel {
+    pub async fn record_group_interaction_memory(
+        &self,
+        agent_id: AgentId,
+        group_label: &str,
+        participant_scope: Option<&str>,
+        channel_type: &str,
+        conversation_id: Option<&str>,
+        thread_id: Option<&str>,
+        sender_platform_id: &str,
+        user_message: &str,
+        response: &str,
+    ) -> Result<(), String> {
+        let user_excerpt = truncate_collaboration_excerpt(user_message, 320);
+        let response_excerpt = truncate_collaboration_excerpt(response, 420);
+        let group_message = format!(
+            "群聊 {group_label} 中，成员 {sender_platform_id} 说: {user_excerpt}"
+        );
+        let group_summary = format!(
+            "群聊 {group_label} 中一次对话：成员 {sender_platform_id} 说: {user_excerpt} 我回复: {response_excerpt}"
+        );
+        let mut errors = Vec::new();
+        let mut event_metadata = HashMap::new();
+        event_metadata.insert(
+            "group_id".to_string(),
+            serde_json::Value::String(group_label.to_string()),
+        );
+        event_metadata.insert(
+            "speaker_user_id".to_string(),
+            serde_json::Value::String(sender_platform_id.to_string()),
+        );
+        event_metadata.insert(
+            "source_agent_id".to_string(),
+            serde_json::Value::String(agent_id.to_string()),
+        );
+        event_metadata.insert(
+            "participant_ids".to_string(),
+            serde_json::json!([sender_platform_id, agent_id.to_string()]),
+        );
+        event_metadata.insert(
+            "channel_type".to_string(),
+            serde_json::Value::String(channel_type.to_string()),
+        );
+        if let Some(scope) = participant_scope.filter(|value| !value.trim().is_empty()) {
+            event_metadata.insert(
+                "participant_scope".to_string(),
+                serde_json::Value::String(scope.to_string()),
+            );
+        }
+        if let Some(conversation_id) = conversation_id.filter(|value| !value.trim().is_empty()) {
+            event_metadata.insert(
+                "platform_conversation_id".to_string(),
+                serde_json::Value::String(conversation_id.to_string()),
+            );
+        }
+        if let Some(thread_id) = thread_id.filter(|value| !value.trim().is_empty()) {
+            event_metadata.insert(
+                "thread_id".to_string(),
+                serde_json::Value::String(thread_id.to_string()),
+            );
+        }
+        let event_id = match self
+            .memory
+            .append_memory_event_async(
+                "group_message_turn",
+                &group_summary,
+                group_label,
+                event_metadata,
+            )
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(error) => {
+                errors.push(format!("group_event:{error}"));
+                None
+            }
+        };
+
+        if let Some(event_id) = event_id.as_deref() {
+            let mut projection_meta = HashMap::new();
+            projection_meta.insert(
+                "group_label".to_string(),
+                serde_json::Value::String(group_label.to_string()),
+            );
+            if let Err(error) = append_memory_projection(
+                self,
+                "agent",
+                &agent_id.to_string(),
+                event_id,
+                "owner",
+                projection_meta.clone(),
+            )
+            .await
+            {
+                errors.push(format!("group_projection_agent:{error}"));
+            }
+            if let Err(error) = append_memory_projection(
+                self,
+                "group",
+                group_label,
+                event_id,
+                "participant",
+                projection_meta.clone(),
+            )
+            .await
+            {
+                errors.push(format!("group_projection_group:{error}"));
+            }
+            if let Some(scope) = participant_scope.filter(|value| !value.trim().is_empty()) {
+                let mut participant_meta = projection_meta.clone();
+                participant_meta.insert(
+                    "sender_platform_id".to_string(),
+                    serde_json::Value::String(sender_platform_id.to_string()),
+                );
+                if let Err(error) = append_memory_projection(
+                    self,
+                    "user",
+                    scope,
+                    event_id,
+                    "participant",
+                    participant_meta,
+                )
+                .await
+                {
+                    errors.push(format!("group_projection_user:{error}"));
+                }
+            }
+        }
+
+        if let Err(error) = persist_group_memory_fragment(
+            self,
+            agent_id,
+            group_label,
+            participant_scope,
+            channel_type,
+            conversation_id,
+            thread_id,
+            sender_platform_id,
+            "group_message",
+            &group_message,
+            0.74,
+            0.88,
+            event_id.as_deref().unwrap_or(""),
+        )
+        .await
+        {
+            errors.push(format!("group_message:{error}"));
+        }
+
+        if let Err(error) = persist_group_memory_fragment(
+            self,
+            agent_id,
+            group_label,
+            participant_scope,
+            channel_type,
+            conversation_id,
+            thread_id,
+            sender_platform_id,
+            "group_summary",
+            &group_summary,
+            0.8,
+            0.9,
+            event_id.as_deref().unwrap_or(""),
+        )
+        .await
+        {
+            errors.push(format!("group_summary:{error}"));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    pub async fn unified_memory_query(
+        &self,
+        agent_ref: &str,
+        query: &str,
+        limit: usize,
+        subject_type: Option<&str>,
+        subject_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let debug = self
+            .unified_memory_debug_query(agent_ref, query, limit, subject_type, subject_id)
+            .await?;
+        Ok(debug
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn unified_memory_debug_query(
+        &self,
+        agent_ref: &str,
+        query: &str,
+        limit: usize,
+        subject_type: Option<&str>,
+        subject_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let agent = resolve_agent_entry_for_collaboration(&self.registry, agent_ref)?;
+        let trimmed_query = query.trim();
+        let requested_subject_type = subject_type
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("agent")
+            .to_string();
+        let requested_subject_id = subject_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if requested_subject_type == "agent" {
+                    agent.id.to_string()
+                } else {
+                    String::new()
+                }
+            });
+        #[derive(Debug, Clone)]
+        struct SubjectPlanItem {
+            subject_type: String,
+            subject_id: String,
+            depth: u64,
+            relation_strength: f64,
+            weight: f64,
+            related_from: Option<(String, String)>,
+            reason: String,
+        }
+
+        let relevant = self
+            .memory
+            .search_memories_async(agent.id, trimmed_query, limit, None, None, Some(0.0))
+            .await
+            .map_err(|e| format!("Unified memory search failed: {e}"))?;
+        let recent = self
+            .memory
+            .search_memories_async(agent.id, "", limit, None, None, Some(0.0))
+            .await
+            .map_err(|e| format!("Recent memory window search failed: {e}"))?;
+        let merged_semantic = merge_memory_fragments(relevant.clone(), recent.clone(), limit);
+
+        let per_subject_limit = limit.clamp(1, 8);
+        let seed_limit = (limit.clamp(1, 12) * 4).clamp(12, 48);
+        let seed_projected_events = if requested_subject_id.is_empty() {
+            Vec::new()
+        } else {
+            self.memory
+                .list_projected_events_async(&requested_subject_type, &requested_subject_id, seed_limit)
+                .await
+                .map_err(|e| format!("Projected event query failed: {e}"))?
+        };
+
+        // 以“最近投影事件的共现”估计多主体联合排序的 query plan（task/group/user/a2a_edge/peer_agent 等）。
+        let mut related_strengths: HashMap<(String, String), f64> = HashMap::new();
+        for event in &seed_projected_events {
+            let created_at = event
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let recency = recency_score_from_timestamp(created_at);
+            for (subject_type, subject_id) in extract_related_subjects_from_event(
+                event,
+                &requested_subject_type,
+                &requested_subject_id,
+            ) {
+                let key = (subject_type, subject_id);
+                *related_strengths.entry(key).or_insert(0.0) += recency.max(0.05);
+            }
+        }
+
+        let denom = seed_projected_events.len().max(1) as f64;
+        let mut related_ranked: Vec<(String, String, f64, f64)> = related_strengths
+            .into_iter()
+            .map(|((subject_type, subject_id), sum)| {
+                let strength = (sum / denom).clamp(0.0, 1.0);
+                let base = subject_weight(&subject_type, 1);
+                let weight = (base * strength.clamp(0.2, 1.0)).clamp(0.0, 1.0);
+                (subject_type, subject_id, strength, weight)
+            })
+            .collect();
+        related_ranked.sort_by(|a, b| {
+            b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut subject_plan: Vec<SubjectPlanItem> = Vec::new();
+        if !requested_subject_id.is_empty() {
+            subject_plan.push(SubjectPlanItem {
+                subject_type: requested_subject_type.clone(),
+                subject_id: requested_subject_id.clone(),
+                depth: 0,
+                relation_strength: 1.0,
+                weight: subject_weight(&requested_subject_type, 0),
+                related_from: None,
+                reason: "primary_subject".to_string(),
+            });
+        }
+
+        let related_from = if requested_subject_id.is_empty() {
+            None
+        } else {
+            Some((requested_subject_type.clone(), requested_subject_id.clone()))
+        };
+        let mut related_subject_rows = Vec::new();
+        for (subject_type, subject_id, strength, weight) in related_ranked.into_iter().take(8) {
+            related_subject_rows.push(serde_json::json!({
+                "subject_type": subject_type,
+                "subject_id": subject_id,
+                "relation_strength": strength,
+                "weight": weight,
+            }));
+            subject_plan.push(SubjectPlanItem {
+                subject_type,
+                subject_id,
+                depth: 1,
+                relation_strength: strength,
+                weight,
+                related_from: related_from.clone(),
+                reason: "co_occurrence_from_seed".to_string(),
+            });
+        }
+
+        // 拉取投影候选：不是“先加再 break”，而是多主体统一拉取、去重、统一排序。
+        let mut projection_candidates_raw: Vec<serde_json::Value> = Vec::new();
+        for plan in &subject_plan {
+            let mut events = if plan.depth == 0
+                && plan.subject_type == requested_subject_type
+                && plan.subject_id == requested_subject_id
+            {
+                seed_projected_events
+                    .iter()
+                    .take(per_subject_limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                self.memory
+                    .list_projected_events_async(&plan.subject_type, &plan.subject_id, per_subject_limit)
+                    .await
+                    .map_err(|e| format!("Related projected event query failed: {e}"))?
+            };
+            for event in &mut events {
+                event["query_subject_type"] = serde_json::Value::String(plan.subject_type.clone());
+                event["query_subject_id"] = serde_json::Value::String(plan.subject_id.clone());
+                event["query_subject_depth"] = serde_json::Value::from(plan.depth);
+                event["query_subject_weight"] = serde_json::Value::from(plan.weight);
+                if let Some((from_type, from_id)) = &plan.related_from {
+                    event["related_from_subject_type"] = serde_json::Value::String(from_type.clone());
+                    event["related_from_subject_id"] = serde_json::Value::String(from_id.clone());
+                }
+            }
+            projection_candidates_raw.extend(events);
+        }
+
+        // 语义候选：基于 metadata 推断其关联主体后，纳入同一套多主体权重模型。
+        let agent_id_str = agent.id.to_string();
+        let mut plan_map: HashMap<(String, String), (f64, u64, Option<(String, String)>)> =
+            HashMap::new();
+        for plan in &subject_plan {
+            plan_map.insert(
+                (plan.subject_type.clone(), plan.subject_id.clone()),
+                (plan.weight, plan.depth, plan.related_from.clone()),
+            );
+        }
+        let default_semantic_weight = if requested_subject_id.is_empty() {
+            1.0
+        } else {
+            subject_weight(&requested_subject_type, 0)
+        };
+        let semantic_candidates: Vec<serde_json::Value> = merged_semantic
+            .iter()
+            .map(memory_fragment_to_json)
+            .map(|mut item| {
+                // 语义记忆通常同时“属于 agent”以及更具体的 group/user/task 等主体。
+                // 为了让多主体联合排序真正生效，这里优先选择更具体的主体；仅在没有命中时才回退到 (agent, agent_id)。
+                let mut best_specific: Option<(String, String, f64, u64, Option<(String, String)>)> =
+                    None;
+                let mut best_any: Option<(String, String, f64, u64, Option<(String, String)>)> =
+                    None;
+                for (subject_type, subject_id) in
+                    infer_subject_keys_from_semantic_item(&item, &agent_id_str)
+                {
+                    if let Some((weight, depth, related_from)) =
+                        plan_map.get(&(subject_type.clone(), subject_id.clone()))
+                    {
+                        if best_any
+                            .as_ref()
+                            .map(|(_, _, best_weight, _, _)| weight > best_weight)
+                            .unwrap_or(true)
+                        {
+                            best_any = Some((
+                                subject_type.clone(),
+                                subject_id.clone(),
+                                *weight,
+                                *depth,
+                                related_from.clone(),
+                            ));
+                        }
+                        let is_agent_fallback =
+                            subject_type == "agent" && subject_id == agent_id_str;
+                        if !is_agent_fallback
+                            && best_specific
+                                .as_ref()
+                                .map(|(_, _, best_weight, _, _)| weight > best_weight)
+                                .unwrap_or(true)
+                        {
+                            best_specific = Some((
+                                subject_type.clone(),
+                                subject_id.clone(),
+                                *weight,
+                                *depth,
+                                related_from.clone(),
+                            ));
+                        }
+                    }
+                }
+                let best = best_specific.or(best_any);
+                if let Some((subject_type, subject_id, weight, depth, related_from)) = best {
+                    item["query_subject_type"] = serde_json::Value::String(subject_type);
+                    item["query_subject_id"] = serde_json::Value::String(subject_id);
+                    item["query_subject_depth"] = serde_json::Value::from(depth);
+                    item["query_subject_weight"] = serde_json::Value::from(weight);
+                    if let Some((from_type, from_id)) = related_from {
+                        item["related_from_subject_type"] = serde_json::Value::String(from_type);
+                        item["related_from_subject_id"] = serde_json::Value::String(from_id);
+                    }
+                } else {
+                    item["query_subject_type"] = serde_json::Value::String(requested_subject_type.clone());
+                    item["query_subject_id"] = serde_json::Value::String(requested_subject_id.clone());
+                    item["query_subject_depth"] = serde_json::Value::from(0_u64);
+                    item["query_subject_weight"] = serde_json::Value::from(default_semantic_weight);
+                }
+                rank_semantic_memory_item(item, trimmed_query)
+            })
+            .collect();
+
+        let projection_candidates: Vec<serde_json::Value> = projection_candidates_raw
+            .into_iter()
+            .map(|item| rank_projected_event_item(item, trimmed_query))
+            .collect();
+
+        fn candidate_score(item: &serde_json::Value) -> f64 {
+            item.get("score")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+        }
+
+        // 去重策略：同一个 source_event_id / event_id 只保留更高分的候选（语义与投影同台竞争）。
+        let mut by_event_id: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut non_event_candidates: Vec<serde_json::Value> = Vec::new();
+        for candidate in semantic_candidates
+            .iter()
+            .cloned()
+            .chain(projection_candidates.iter().cloned())
+        {
+            let event_id = candidate
+                .get("metadata")
+                .and_then(|metadata| metadata.get("source_event_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| {
+                    candidate
+                        .get("event_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                });
+
+            if let Some(event_id) = event_id {
+                match by_event_id.get(&event_id) {
+                    Some(existing) if candidate_score(existing) >= candidate_score(&candidate) => {}
+                    _ => {
+                        by_event_id.insert(event_id, candidate);
+                    }
+                }
+            } else {
+                non_event_candidates.push(candidate);
+            }
+        }
+
+        let mut unified_candidates = non_event_candidates;
+        unified_candidates.extend(by_event_id.into_values());
+        unified_candidates.sort_by(|a, b| {
+            candidate_score(b)
+                .partial_cmp(&candidate_score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        unified_candidates.truncate(limit);
+
+        let mut subject_plan_rows = Vec::new();
+        for plan in &subject_plan {
+            subject_plan_rows.push(serde_json::json!({
+                "subject_type": plan.subject_type,
+                "subject_id": plan.subject_id,
+                "depth": plan.depth,
+                "relation_strength": plan.relation_strength,
+                "weight": plan.weight,
+                "related_from": plan.related_from.as_ref().map(|(t, id)| serde_json::json!({"subject_type": t, "subject_id": id})),
+                "reason": plan.reason,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "query_plan": {
+                "agent_id": agent.id.to_string(),
+                "agent_name": agent.name,
+                "query": trimmed_query,
+                "limit": limit,
+                "subject_type": requested_subject_type,
+                "subject_id": requested_subject_id,
+                "semantic_relevant_count": relevant.len(),
+                "semantic_recent_count": recent.len(),
+                "projection_seed_count": seed_projected_events.len(),
+                "projection_per_subject_limit": per_subject_limit,
+            },
+            "subject_plan": subject_plan_rows,
+            "related_subjects": related_subject_rows,
+            "semantic_candidates": semantic_candidates,
+            "projection_candidates": projection_candidates,
+            "results": unified_candidates,
+        }))
+    }
+}
+
 /// Deliver a cron job's agent response to the configured delivery target.
 async fn cron_deliver_response(
     kernel: &OpenFangKernel,
@@ -4983,6 +6087,172 @@ impl KernelHandle for OpenFangKernel {
         Ok(result.response)
     }
 
+    async fn record_agent_collaboration(
+        &self,
+        caller_agent_id: &str,
+        target_agent_id: &str,
+        request: &str,
+        response: &str,
+    ) -> Result<(), String> {
+        let caller = resolve_agent_entry_for_collaboration(&self.registry, caller_agent_id)?;
+        let target = resolve_agent_entry_for_collaboration(&self.registry, target_agent_id)?;
+        let collaboration_id = uuid::Uuid::new_v4().to_string();
+        let mut errors = Vec::new();
+        let request_excerpt = truncate_collaboration_excerpt(request, 320);
+        let response_excerpt = truncate_collaboration_excerpt(response, 420);
+        let edge_id = format!("{}->{}", caller.id, target.id);
+        let conversation_id = format!("a2a::{edge_id}");
+        let mut event_metadata = HashMap::new();
+        event_metadata.insert(
+            "source_agent_id".to_string(),
+            serde_json::Value::String(caller.id.to_string()),
+        );
+        event_metadata.insert(
+            "target_agent_id".to_string(),
+            serde_json::Value::String(target.id.to_string()),
+        );
+        event_metadata.insert(
+            "participant_ids".to_string(),
+            serde_json::json!([caller.id.to_string(), target.id.to_string()]),
+        );
+        event_metadata.insert(
+            "channel".to_string(),
+            serde_json::Value::String("agent_send".to_string()),
+        );
+        event_metadata.insert(
+            "collaboration_id".to_string(),
+            serde_json::Value::String(collaboration_id.clone()),
+        );
+        event_metadata.insert(
+            "request_excerpt".to_string(),
+            serde_json::Value::String(request_excerpt.clone()),
+        );
+        event_metadata.insert(
+            "response_excerpt".to_string(),
+            serde_json::Value::String(response_excerpt.clone()),
+        );
+        let event_content = format!(
+            "智能体协作事件：{} 向 {} 发起请求：{}；收到回复：{}",
+            caller.name, target.name, request_excerpt, response_excerpt
+        );
+        let event_id = match self
+            .memory
+            .append_memory_event_async(
+                "a2a_result",
+                &event_content,
+                &conversation_id,
+                event_metadata,
+            )
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(error) => {
+                errors.push(format!("collaboration_event:{error}"));
+                None
+            }
+        };
+
+        if let Some(event_id) = event_id.as_deref() {
+            let mut caller_projection = HashMap::new();
+            caller_projection.insert(
+                "peer_agent_id".to_string(),
+                serde_json::Value::String(target.id.to_string()),
+            );
+            if let Err(error) = append_memory_projection(
+                self,
+                "agent",
+                &caller.id.to_string(),
+                event_id,
+                "caller",
+                caller_projection,
+            )
+            .await
+            {
+                errors.push(format!("caller_projection:{error}"));
+            }
+
+            let mut target_projection = HashMap::new();
+            target_projection.insert(
+                "peer_agent_id".to_string(),
+                serde_json::Value::String(caller.id.to_string()),
+            );
+            if let Err(error) = append_memory_projection(
+                self,
+                "agent",
+                &target.id.to_string(),
+                event_id,
+                "callee",
+                target_projection,
+            )
+            .await
+            {
+                errors.push(format!("callee_projection:{error}"));
+            }
+
+            let mut edge_projection = HashMap::new();
+            edge_projection.insert(
+                "caller_agent_id".to_string(),
+                serde_json::Value::String(caller.id.to_string()),
+            );
+            edge_projection.insert(
+                "callee_agent_id".to_string(),
+                serde_json::Value::String(target.id.to_string()),
+            );
+            if let Err(error) = append_memory_projection(
+                self,
+                "a2a_edge",
+                &edge_id,
+                event_id,
+                "owner",
+                edge_projection,
+            )
+            .await
+            {
+                errors.push(format!("edge_projection:{error}"));
+            }
+        }
+
+        if let Err(error) = persist_agent_collaboration_memory(
+            self,
+            caller.id,
+            target.id,
+            &target.name,
+            "outbound",
+            request,
+            response,
+            &collaboration_id,
+            event_id.as_deref().unwrap_or(""),
+        )
+        .await
+        {
+            errors.push(format!("caller:{}:{error}", caller.id));
+        }
+
+        if caller.id != target.id {
+            if let Err(error) = persist_agent_collaboration_memory(
+                self,
+                target.id,
+                caller.id,
+                &caller.name,
+                "inbound",
+                request,
+                response,
+                &collaboration_id,
+                event_id.as_deref().unwrap_or(""),
+            )
+            .await
+            {
+                errors.push(format!("target:{}:{error}", target.id));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     fn list_agents(&self) -> Vec<kernel_handle::AgentInfo> {
         self.registry
             .list()
@@ -5019,6 +6289,18 @@ impl KernelHandle for OpenFangKernel {
         self.memory
             .structured_get(agent_id, key)
             .map_err(|e| format!("Memory recall failed: {e}"))
+    }
+
+    async fn query_agent_memory(
+        &self,
+        agent_id: &str,
+        query: &str,
+        limit: usize,
+        subject_type: Option<&str>,
+        subject_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.unified_memory_query(agent_id, query, limit, subject_type, subject_id)
+            .await
     }
 
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {
@@ -5058,24 +6340,234 @@ impl KernelHandle for OpenFangKernel {
         assigned_to: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<String, String> {
-        self.memory
+        let task_id = self
+            .memory
             .task_post(title, description, assigned_to, created_by)
             .await
-            .map_err(|e| format!("Task post failed: {e}"))
+            .map_err(|e| format!("Task post failed: {e}"))?;
+
+        let conversation_id = format!("task::{task_id}");
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(task_id.clone()),
+        );
+        metadata.insert(
+            "source_agent_id".to_string(),
+            serde_json::Value::String(created_by.unwrap_or("").to_string()),
+        );
+        metadata.insert(
+            "assigned_to".to_string(),
+            serde_json::Value::String(assigned_to.unwrap_or("").to_string()),
+        );
+        metadata.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+        metadata.insert(
+            "description".to_string(),
+            serde_json::Value::String(truncate_collaboration_excerpt(description, 800)),
+        );
+        let content = format!(
+            "任务创建: {title}\n描述: {}\n指派: {}\n创建者: {}",
+            truncate_collaboration_excerpt(description, 240),
+            assigned_to.unwrap_or(""),
+            created_by.unwrap_or("")
+        );
+        let event_id = self
+            .memory
+            .append_memory_event_async("task_post", &content, &conversation_id, metadata)
+            .await
+            .map_err(|e| format!("Task event append failed: {e}"))?;
+
+        let mut proj_meta = HashMap::new();
+        proj_meta.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(task_id.clone()),
+        );
+        let _ = append_memory_projection(self, "task", &task_id, &event_id, "owner", proj_meta)
+            .await;
+
+        if let Some(created_by) = created_by.filter(|v| !v.trim().is_empty()) {
+            if let Ok(agent) = resolve_agent_entry_for_collaboration(&self.registry, created_by) {
+                let mut meta = HashMap::new();
+                meta.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id.clone()),
+                );
+                let _ = append_memory_projection(
+                    self,
+                    "agent",
+                    &agent.id.to_string(),
+                    &event_id,
+                    "owner",
+                    meta,
+                )
+                .await;
+            }
+        }
+        if let Some(assigned_to) = assigned_to.filter(|v| !v.trim().is_empty()) {
+            if let Ok(agent) = resolve_agent_entry_for_collaboration(&self.registry, assigned_to) {
+                let mut meta = HashMap::new();
+                meta.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id.clone()),
+                );
+                let _ = append_memory_projection(
+                    self,
+                    "agent",
+                    &agent.id.to_string(),
+                    &event_id,
+                    "participant",
+                    meta,
+                )
+                .await;
+            }
+        }
+
+        Ok(task_id)
     }
 
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
-        self.memory
+        let claimed = self
+            .memory
             .task_claim(agent_id)
             .await
-            .map_err(|e| format!("Task claim failed: {e}"))
+            .map_err(|e| format!("Task claim failed: {e}"))?;
+        let Some(task) = claimed.clone() else {
+            return Ok(None);
+        };
+        let task_id = task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if task_id.is_empty() {
+            return Ok(claimed);
+        }
+        let title = task
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let description = task
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let created_by = task
+            .get("created_by")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let conversation_id = format!("task::{task_id}");
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(task_id.clone()),
+        );
+        metadata.insert(
+            "source_agent_id".to_string(),
+            serde_json::Value::String(agent_id.to_string()),
+        );
+        metadata.insert(
+            "created_by".to_string(),
+            serde_json::Value::String(created_by.to_string()),
+        );
+        metadata.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+        let content = format!(
+            "任务领取: {title}\n领取者: {agent_id}\n创建者: {created_by}\n描述: {}",
+            truncate_collaboration_excerpt(description, 240)
+        );
+        let event_id = self
+            .memory
+            .append_memory_event_async("task_claim", &content, &conversation_id, metadata)
+            .await
+            .map_err(|e| format!("Task claim event append failed: {e}"))?;
+        let mut proj_meta = HashMap::new();
+        proj_meta.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(task_id.clone()),
+        );
+        let _ = append_memory_projection(self, "task", &task_id, &event_id, "owner", proj_meta)
+            .await;
+        if let Ok(agent) = resolve_agent_entry_for_collaboration(&self.registry, agent_id) {
+            let mut meta = HashMap::new();
+            meta.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(task_id.clone()),
+            );
+            let _ = append_memory_projection(
+                self,
+                "agent",
+                &agent.id.to_string(),
+                &event_id,
+                "participant",
+                meta,
+            )
+            .await;
+        }
+        if !created_by.trim().is_empty() {
+            if let Ok(agent) = resolve_agent_entry_for_collaboration(&self.registry, created_by) {
+                let mut meta = HashMap::new();
+                meta.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id.clone()),
+                );
+                let _ = append_memory_projection(
+                    self,
+                    "agent",
+                    &agent.id.to_string(),
+                    &event_id,
+                    "owner",
+                    meta,
+                )
+                .await;
+            }
+        }
+
+        Ok(claimed)
     }
 
     async fn task_complete(&self, task_id: &str, result: &str) -> Result<(), String> {
         self.memory
             .task_complete(task_id, result)
             .await
-            .map_err(|e| format!("Task complete failed: {e}"))
+            .map_err(|e| format!("Task complete failed: {e}"))?;
+
+        if !task_id.trim().is_empty() {
+            let conversation_id = format!("task::{task_id}");
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(task_id.to_string()),
+            );
+            metadata.insert(
+                "result_excerpt".to_string(),
+                serde_json::Value::String(truncate_collaboration_excerpt(result, 600)),
+            );
+            let content = format!(
+                "任务完成: {task_id}\n结果: {}",
+                truncate_collaboration_excerpt(result, 320)
+            );
+            if let Ok(event_id) = self
+                .memory
+                .append_memory_event_async("task_complete", &content, &conversation_id, metadata)
+                .await
+                .map_err(|e| format!("Task complete event append failed: {e}"))
+            {
+                let mut proj_meta = HashMap::new();
+                proj_meta.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id.to_string()),
+                );
+                let _ =
+                    append_memory_projection(self, "task", task_id, &event_id, "owner", proj_meta)
+                        .await;
+            }
+        }
+
+        Ok(())
     }
 
     async fn task_list(&self, status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {

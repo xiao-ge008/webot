@@ -2,12 +2,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::path_resolver;
+
+const APP_PREF_KEY_PROVIDER_MODEL_STATE_NORMALIZED_V1: &str = "provider_model_state_normalized_v2";
+static PROVIDER_MODEL_STATE_MIGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PROVIDER_MODEL_STATE_MIGRATED_IN_PROCESS: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportedSkillRecord {
@@ -98,8 +104,67 @@ pub struct ChatGroupRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskRuntimeBindingRecord {
+    pub task_id: String,
+    pub owner_agent_id: String,
+    pub runtime_key: Option<String>,
+    pub source_type: String,
+    pub display_name: Option<String>,
+    pub origin_conversation_type: Option<String>,
+    pub origin_conversation_id: Option<String>,
+    pub origin_chat_session_id: Option<String>,
+    pub origin_message_id: Option<String>,
+    pub creator_participant_id: Option<String>,
+    pub creator_participant_name: Option<String>,
+    pub executor_agent_id: Option<String>,
+    pub executor_agent_name: Option<String>,
+    pub report_actor_agent_id: Option<String>,
+    pub report_actor_agent_name: Option<String>,
+    pub max_runs: Option<i64>,
+    pub final_summary_prompt: Option<String>,
+    pub notify_on_final: bool,
+    pub metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskDeliveryRecord {
+    pub id: String,
+    pub task_id: String,
+    pub owner_agent_id: String,
+    pub runtime_key: Option<String>,
+    pub delivery_kind: String,
+    pub dedupe_key: String,
+    pub status: String,
+    pub origin_conversation_type: Option<String>,
+    pub origin_conversation_id: Option<String>,
+    pub origin_chat_session_id: Option<String>,
+    pub origin_message_id: Option<String>,
+    pub creator_participant_id: Option<String>,
+    pub creator_participant_name: Option<String>,
+    pub executor_agent_id: Option<String>,
+    pub executor_agent_name: Option<String>,
+    pub report_actor_agent_id: Option<String>,
+    pub report_actor_agent_name: Option<String>,
+    pub task_name: Option<String>,
+    pub run_count: Option<i64>,
+    pub summary_text: Option<String>,
+    pub error_text: Option<String>,
+    pub payload: Value,
+    pub created_at: String,
+    pub updated_at: String,
+    pub reported_at: Option<String>,
+    pub acknowledged_at: Option<String>,
+}
+
 pub fn normalize_provider_id(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "nvidia-nim" => "nvidia".to_string(),
+        _ => normalized,
+    }
 }
 
 pub fn normalize_model_name(value: &str) -> String {
@@ -254,7 +319,7 @@ pub fn ensure_db() -> Result<PathBuf, String> {
         .ok_or_else(|| "数据库目录无效".to_string())?;
     fs::create_dir_all(parent).map_err(|e| format!("创建数据库目录失败: {e}"))?;
 
-    let mut conn = Connection::open(&db_path).map_err(|e| format!("打开数据库失败: {e}"))?;
+    let mut conn = open_sqlite_connection(&db_path)?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS agent_skill_toggles (
@@ -382,14 +447,125 @@ pub fn ensure_db() -> Result<PathBuf, String> {
 
         CREATE INDEX IF NOT EXISTS idx_chat_group_admins_group_id
             ON chat_group_admins(group_id);
+
+        CREATE TABLE IF NOT EXISTS task_runtime_bindings (
+            task_id TEXT PRIMARY KEY,
+            owner_agent_id TEXT NOT NULL,
+            runtime_key TEXT NULL,
+            source_type TEXT NOT NULL DEFAULT 'custom',
+            display_name TEXT NULL,
+            origin_conversation_type TEXT NULL,
+            origin_conversation_id TEXT NULL,
+            origin_chat_session_id TEXT NULL,
+            origin_message_id TEXT NULL,
+            creator_participant_id TEXT NULL,
+            creator_participant_name TEXT NULL,
+            executor_agent_id TEXT NULL,
+            executor_agent_name TEXT NULL,
+            report_actor_agent_id TEXT NULL,
+            report_actor_agent_name TEXT NULL,
+            max_runs INTEGER NULL,
+            final_summary_prompt TEXT NULL,
+            notify_on_final INTEGER NOT NULL DEFAULT 1,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_task_runtime_bindings_runtime_key
+            ON task_runtime_bindings(runtime_key);
+
+        CREATE INDEX IF NOT EXISTS idx_task_runtime_bindings_owner_agent
+            ON task_runtime_bindings(owner_agent_id);
+
+        CREATE TABLE IF NOT EXISTS task_deliveries (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            owner_agent_id TEXT NOT NULL,
+            runtime_key TEXT NULL,
+            delivery_kind TEXT NOT NULL DEFAULT 'final',
+            dedupe_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            origin_conversation_type TEXT NULL,
+            origin_conversation_id TEXT NULL,
+            origin_chat_session_id TEXT NULL,
+            origin_message_id TEXT NULL,
+            creator_participant_id TEXT NULL,
+            creator_participant_name TEXT NULL,
+            executor_agent_id TEXT NULL,
+            executor_agent_name TEXT NULL,
+            report_actor_agent_id TEXT NULL,
+            report_actor_agent_name TEXT NULL,
+            task_name TEXT NULL,
+            run_count INTEGER NULL,
+            summary_text TEXT NULL,
+            error_text TEXT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reported_at TEXT NULL,
+            acknowledged_at TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_task_deliveries_task_id
+            ON task_deliveries(task_id);
+
+        CREATE INDEX IF NOT EXISTS idx_task_deliveries_runtime_status
+            ON task_deliveries(runtime_key, status, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_task_deliveries_session_status
+            ON task_deliveries(origin_chat_session_id, status, created_at DESC);
         "#,
     )
     .map_err(|e| format!("初始化数据库结构失败: {e}"))?;
     ensure_agent_profile_override_columns(&conn)?;
     ensure_chat_group_columns(&conn)?;
-    migrate_provider_model_state(&mut conn)?;
+    ensure_provider_model_state_migrated(&mut conn)?;
 
     Ok(db_path)
+}
+
+fn ensure_provider_model_state_migrated(conn: &mut Connection) -> Result<(), String> {
+    if PROVIDER_MODEL_STATE_MIGRATED_IN_PROCESS.get().is_some() {
+        return Ok(());
+    }
+
+    let _guard = PROVIDER_MODEL_STATE_MIGRATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "provider/model 迁移锁不可用".to_string())?;
+
+    if PROVIDER_MODEL_STATE_MIGRATED_IN_PROCESS.get().is_some() {
+        return Ok(());
+    }
+
+    if has_provider_model_state_migration_marker(conn)? {
+        let _ = PROVIDER_MODEL_STATE_MIGRATED_IN_PROCESS.set(());
+        return Ok(());
+    }
+
+    migrate_provider_model_state(conn)?;
+    let _ = PROVIDER_MODEL_STATE_MIGRATED_IN_PROCESS.set(());
+    Ok(())
+}
+
+fn has_provider_model_state_migration_marker(conn: &Connection) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare("SELECT value FROM app_prefs WHERE key = ?1")
+        .map_err(|e| format!("查询 provider/model 迁移标记失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![APP_PREF_KEY_PROVIDER_MODEL_STATE_NORMALIZED_V1])
+        .map_err(|e| format!("读取 provider/model 迁移标记失败: {e}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| format!("读取 provider/model 迁移标记行失败: {e}"))?
+    else {
+        return Ok(false);
+    };
+    let value: String = row
+        .get(0)
+        .map_err(|e| format!("解析 provider/model 迁移标记失败: {e}"))?;
+    Ok(value == "1")
 }
 
 fn migrate_provider_model_state(conn: &mut Connection) -> Result<(), String> {
@@ -552,6 +728,18 @@ fn migrate_provider_model_state(conn: &mut Connection) -> Result<(), String> {
         .map_err(|e| format!("回写默认模型失败: {e}"))?;
     }
 
+    tx.execute(
+        r#"
+        INSERT INTO app_prefs(key, value, updated_at)
+        VALUES (?1, '1', CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![APP_PREF_KEY_PROVIDER_MODEL_STATE_NORMALIZED_V1],
+    )
+    .map_err(|e| format!("写入 provider/model 迁移标记失败: {e}"))?;
+
     tx.commit()
         .map_err(|e| format!("提交 provider/model 迁移事务失败: {e}"))?;
     Ok(())
@@ -571,6 +759,29 @@ pub fn bootstrap_storage() -> Result<(), String> {
     let skills = skills_root()?;
     fs::create_dir_all(&skills).map_err(|e| format!("创建 skills 目录失败: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{make_model_id, normalize_model_id, normalize_provider_id};
+
+    #[test]
+    fn normalize_provider_id_merges_nvidia_nim_alias() {
+        assert_eq!(normalize_provider_id("nvidia-nim"), "nvidia");
+        assert_eq!(normalize_provider_id("NVIDIA"), "nvidia");
+    }
+
+    #[test]
+    fn normalize_model_id_uses_normalized_provider_alias() {
+        assert_eq!(
+            normalize_model_id("nvidia-nim::xianyu/glm-4.7"),
+            "nvidia::xianyu/glm-4.7"
+        );
+        assert_eq!(
+            make_model_id("nvidia-nim", "xianyu/glm-4.7"),
+            "nvidia::xianyu/glm-4.7"
+        );
+    }
 }
 
 fn should_enable_legacy_migration() -> bool {
@@ -1088,10 +1299,7 @@ pub fn set_memory_enhancement_config(config: &Value) -> Result<(), String> {
             value = excluded.value,
             updated_at = CURRENT_TIMESTAMP
         "#,
-        params![
-            APP_PREF_KEY_MEMORY_ENHANCEMENT_CONFIG,
-            config.to_string()
-        ],
+        params![APP_PREF_KEY_MEMORY_ENHANCEMENT_CONFIG, config.to_string()],
     )
     .map_err(|e| format!("写入记忆增强配置失败: {e}"))?;
     Ok(())
@@ -1111,7 +1319,9 @@ pub fn get_memory_enhancement_config() -> Result<Option<Value>, String> {
     else {
         return Ok(None);
     };
-    let value: String = row.get(0).map_err(|e| format!("解析记忆增强配置失败: {e}"))?;
+    let value: String = row
+        .get(0)
+        .map_err(|e| format!("解析记忆增强配置失败: {e}"))?;
     let config = serde_json::from_str::<Value>(&value)
         .map_err(|e| format!("反序列化记忆增强配置失败: {e}"))?;
     Ok(Some(config))
@@ -1504,7 +1714,9 @@ pub fn upsert_agent_profile_override(
     let merged_channel_binding = if channel_binding.is_some() {
         channel_binding.and_then(normalize_nullable_json)
     } else {
-        current.as_ref().and_then(|item| item.channel_binding.clone())
+        current
+            .as_ref()
+            .and_then(|item| item.channel_binding.clone())
     };
     let merged_avatar_url = if avatar_url.is_some() {
         avatar_url.and_then(normalize_nullable_text)
@@ -1636,8 +1848,8 @@ pub fn create_chat_group(record: &ChatGroupRecord) -> Result<(), String> {
         return Err("leader_agent_id 不能为空".to_string());
     }
 
-    let tags_json = serde_json::to_string(&record.tags)
-        .map_err(|e| format!("序列化群标签 JSON 失败: {e}"))?;
+    let tags_json =
+        serde_json::to_string(&record.tags).map_err(|e| format!("序列化群标签 JSON 失败: {e}"))?;
     let limits_json = serde_json::to_string(&record.limits)
         .map_err(|e| format!("序列化群阈值 JSON 失败: {e}"))?;
 
@@ -1703,7 +1915,8 @@ pub fn create_chat_group(record: &ChatGroupRecord) -> Result<(), String> {
         .map_err(|e| format!("写入群管理员失败: {e}"))?;
     }
 
-    tx.commit().map_err(|e| format!("提交群创建事务失败: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("提交群创建事务失败: {e}"))?;
     Ok(())
 }
 
@@ -1721,8 +1934,8 @@ pub fn update_chat_group(record: &ChatGroupRecord) -> Result<(), String> {
         return Err("leader_agent_id 不能为空".to_string());
     }
 
-    let tags_json = serde_json::to_string(&record.tags)
-        .map_err(|e| format!("序列化群标签 JSON 失败: {e}"))?;
+    let tags_json =
+        serde_json::to_string(&record.tags).map_err(|e| format!("序列化群标签 JSON 失败: {e}"))?;
     let limits_json = serde_json::to_string(&record.limits)
         .map_err(|e| format!("序列化群阈值 JSON 失败: {e}"))?;
 
@@ -1745,17 +1958,17 @@ pub fn update_chat_group(record: &ChatGroupRecord) -> Result<(), String> {
                 updated_at = CURRENT_TIMESTAMP
             WHERE group_id = ?1
             "#,
-        params![
-            group_id,
-            name,
-            record.description.trim(),
-            tags_json,
-            leader,
-            record.system_prompt.trim(),
-            record.group_mode.trim(),
-            limits_json,
-        ],
-    )
+            params![
+                group_id,
+                name,
+                record.description.trim(),
+                tags_json,
+                leader,
+                record.system_prompt.trim(),
+                record.group_mode.trim(),
+                limits_json,
+            ],
+        )
         .map_err(|e| format!("更新群记录失败: {e}"))?;
 
     if changed == 0 {
@@ -1813,7 +2026,8 @@ pub fn update_chat_group(record: &ChatGroupRecord) -> Result<(), String> {
         .map_err(|e| format!("写入群管理员失败: {e}"))?;
     }
 
-    tx.commit().map_err(|e| format!("提交群更新事务失败: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("提交群更新事务失败: {e}"))?;
     Ok(())
 }
 
@@ -1838,7 +2052,10 @@ pub fn get_chat_group(group_id: &str) -> Result<Option<ChatGroupRecord>, String>
         .query(params![id])
         .map_err(|e| format!("执行群查询失败: {e}"))?;
 
-    let Some(row) = rows.next().map_err(|e| format!("读取群查询结果失败: {e}"))? else {
+    let Some(row) = rows
+        .next()
+        .map_err(|e| format!("读取群查询结果失败: {e}"))?
+    else {
         return Ok(None);
     };
 
@@ -1853,7 +2070,8 @@ pub fn get_chat_group(group_id: &str) -> Result<Option<ChatGroupRecord>, String>
     let limits_json: String = row.get(7).map_err(|e| format!("读取群阈值失败: {e}"))?;
     let created_at: String = row.get(8).map_err(|e| format!("读取创建时间失败: {e}"))?;
     let updated_at: String = row.get(9).map_err(|e| format!("读取更新时间失败: {e}"))?;
-    let limits = serde_json::from_str::<Value>(&limits_json).unwrap_or_else(|_| serde_json::json!({}));
+    let limits =
+        serde_json::from_str::<Value>(&limits_json).unwrap_or_else(|_| serde_json::json!({}));
 
     let member_agent_ids = list_chat_group_member_ids(&group_id)?;
     let mut admin_agent_ids = list_chat_group_admin_ids(&group_id)?;
@@ -1906,7 +2124,8 @@ pub fn list_chat_groups() -> Result<Vec<ChatGroupRecord>, String> {
         }
         let group_mode: String = row.get(6).map_err(|e| format!("读取群模式失败: {e}"))?;
         let limits_json: String = row.get(7).map_err(|e| format!("读取群阈值失败: {e}"))?;
-        let limits = serde_json::from_str::<Value>(&limits_json).unwrap_or_else(|_| serde_json::json!({}));
+        let limits =
+            serde_json::from_str::<Value>(&limits_json).unwrap_or_else(|_| serde_json::json!({}));
         out.push(ChatGroupRecord {
             group_id,
             name: row.get(1).map_err(|e| format!("读取群名称失败: {e}"))?,
@@ -1946,7 +2165,8 @@ pub fn delete_chat_group(group_id: &str) -> Result<(), String> {
     .map_err(|e| format!("删除群管理员失败: {e}"))?;
     tx.execute("DELETE FROM chat_groups WHERE group_id = ?1", params![id])
         .map_err(|e| format!("删除群记录失败: {e}"))?;
-    tx.commit().map_err(|e| format!("提交删除群事务失败: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("提交删除群事务失败: {e}"))?;
     Ok(())
 }
 
@@ -2197,11 +2417,509 @@ pub fn upsert_agent_context_file(
     Ok(())
 }
 
+pub fn upsert_task_runtime_binding(record: &TaskRuntimeBindingRecord) -> Result<(), String> {
+    let task_id = record.task_id.trim();
+    if task_id.is_empty() {
+        return Err("task_id 不能为空".to_string());
+    }
+    let owner_agent_id = record.owner_agent_id.trim();
+    if owner_agent_id.is_empty() {
+        return Err("owner_agent_id 不能为空".to_string());
+    }
+    let metadata_json = serde_json::to_string(&record.metadata)
+        .map_err(|e| format!("序列化任务元数据失败: {e}"))?;
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        INSERT INTO task_runtime_bindings(
+            task_id,
+            owner_agent_id,
+            runtime_key,
+            source_type,
+            display_name,
+            origin_conversation_type,
+            origin_conversation_id,
+            origin_chat_session_id,
+            origin_message_id,
+            creator_participant_id,
+            creator_participant_name,
+            executor_agent_id,
+            executor_agent_name,
+            report_actor_agent_id,
+            report_actor_agent_name,
+            max_runs,
+            final_summary_prompt,
+            notify_on_final,
+            metadata_json,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+            ?19, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(task_id) DO UPDATE SET
+            owner_agent_id = excluded.owner_agent_id,
+            runtime_key = excluded.runtime_key,
+            source_type = excluded.source_type,
+            display_name = excluded.display_name,
+            origin_conversation_type = excluded.origin_conversation_type,
+            origin_conversation_id = excluded.origin_conversation_id,
+            origin_chat_session_id = excluded.origin_chat_session_id,
+            origin_message_id = excluded.origin_message_id,
+            creator_participant_id = excluded.creator_participant_id,
+            creator_participant_name = excluded.creator_participant_name,
+            executor_agent_id = excluded.executor_agent_id,
+            executor_agent_name = excluded.executor_agent_name,
+            report_actor_agent_id = excluded.report_actor_agent_id,
+            report_actor_agent_name = excluded.report_actor_agent_name,
+            max_runs = excluded.max_runs,
+            final_summary_prompt = excluded.final_summary_prompt,
+            notify_on_final = excluded.notify_on_final,
+            metadata_json = excluded.metadata_json,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            task_id,
+            owner_agent_id,
+            record.runtime_key.as_deref(),
+            record.source_type.trim(),
+            record.display_name.as_deref(),
+            record.origin_conversation_type.as_deref(),
+            record.origin_conversation_id.as_deref(),
+            record.origin_chat_session_id.as_deref(),
+            record.origin_message_id.as_deref(),
+            record.creator_participant_id.as_deref(),
+            record.creator_participant_name.as_deref(),
+            record.executor_agent_id.as_deref(),
+            record.executor_agent_name.as_deref(),
+            record.report_actor_agent_id.as_deref(),
+            record.report_actor_agent_name.as_deref(),
+            record.max_runs,
+            record.final_summary_prompt.as_deref(),
+            if record.notify_on_final { 1 } else { 0 },
+            metadata_json,
+        ],
+    )
+    .map_err(|e| format!("写入任务元数据失败: {e}"))?;
+    Ok(())
+}
+
+pub fn get_task_runtime_binding(task_id: &str) -> Result<Option<TaskRuntimeBindingRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                task_id,
+                owner_agent_id,
+                runtime_key,
+                source_type,
+                display_name,
+                origin_conversation_type,
+                origin_conversation_id,
+                origin_chat_session_id,
+                origin_message_id,
+                creator_participant_id,
+                creator_participant_name,
+                executor_agent_id,
+                executor_agent_name,
+                report_actor_agent_id,
+                report_actor_agent_name,
+                max_runs,
+                final_summary_prompt,
+                notify_on_final,
+                metadata_json,
+                created_at,
+                updated_at
+            FROM task_runtime_bindings
+            WHERE task_id = ?1
+            "#,
+        )
+        .map_err(|e| format!("准备查询任务元数据失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![task_id.trim()])
+        .map_err(|e| format!("执行任务元数据查询失败: {e}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| format!("读取任务元数据失败: {e}"))?
+    else {
+        return Ok(None);
+    };
+    map_task_runtime_binding_row(row).map(Some)
+}
+
+pub fn create_or_update_task_delivery(record: &TaskDeliveryRecord) -> Result<(), String> {
+    let delivery_id = record.id.trim();
+    if delivery_id.is_empty() {
+        return Err("delivery id 不能为空".to_string());
+    }
+    let task_id = record.task_id.trim();
+    if task_id.is_empty() {
+        return Err("task_id 不能为空".to_string());
+    }
+    let owner_agent_id = record.owner_agent_id.trim();
+    if owner_agent_id.is_empty() {
+        return Err("owner_agent_id 不能为空".to_string());
+    }
+    let dedupe_key = record.dedupe_key.trim();
+    if dedupe_key.is_empty() {
+        return Err("dedupe_key 不能为空".to_string());
+    }
+    let payload_json = serde_json::to_string(&record.payload)
+        .map_err(|e| format!("序列化任务投递载荷失败: {e}"))?;
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        INSERT INTO task_deliveries(
+            id,
+            task_id,
+            owner_agent_id,
+            runtime_key,
+            delivery_kind,
+            dedupe_key,
+            status,
+            origin_conversation_type,
+            origin_conversation_id,
+            origin_chat_session_id,
+            origin_message_id,
+            creator_participant_id,
+            creator_participant_name,
+            executor_agent_id,
+            executor_agent_name,
+            report_actor_agent_id,
+            report_actor_agent_name,
+            task_name,
+            run_count,
+            summary_text,
+            error_text,
+            payload_json,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+            ?19, ?20, ?21, ?22, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(dedupe_key) DO UPDATE SET
+            owner_agent_id = excluded.owner_agent_id,
+            runtime_key = excluded.runtime_key,
+            delivery_kind = excluded.delivery_kind,
+            status = excluded.status,
+            origin_conversation_type = excluded.origin_conversation_type,
+            origin_conversation_id = excluded.origin_conversation_id,
+            origin_chat_session_id = excluded.origin_chat_session_id,
+            origin_message_id = excluded.origin_message_id,
+            creator_participant_id = excluded.creator_participant_id,
+            creator_participant_name = excluded.creator_participant_name,
+            executor_agent_id = excluded.executor_agent_id,
+            executor_agent_name = excluded.executor_agent_name,
+            report_actor_agent_id = excluded.report_actor_agent_id,
+            report_actor_agent_name = excluded.report_actor_agent_name,
+            task_name = excluded.task_name,
+            run_count = excluded.run_count,
+            summary_text = excluded.summary_text,
+            error_text = excluded.error_text,
+            payload_json = excluded.payload_json,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            delivery_id,
+            task_id,
+            owner_agent_id,
+            record.runtime_key.as_deref(),
+            record.delivery_kind.trim(),
+            dedupe_key,
+            record.status.trim(),
+            record.origin_conversation_type.as_deref(),
+            record.origin_conversation_id.as_deref(),
+            record.origin_chat_session_id.as_deref(),
+            record.origin_message_id.as_deref(),
+            record.creator_participant_id.as_deref(),
+            record.creator_participant_name.as_deref(),
+            record.executor_agent_id.as_deref(),
+            record.executor_agent_name.as_deref(),
+            record.report_actor_agent_id.as_deref(),
+            record.report_actor_agent_name.as_deref(),
+            record.task_name.as_deref(),
+            record.run_count,
+            record.summary_text.as_deref(),
+            record.error_text.as_deref(),
+            payload_json,
+        ],
+    )
+    .map_err(|e| format!("写入任务投递失败: {e}"))?;
+    Ok(())
+}
+
+pub fn list_pending_task_deliveries(
+    runtime_key: Option<&str>,
+    chat_session_id: Option<&str>,
+    conversation_type: Option<&str>,
+    conversation_id: Option<&str>,
+) -> Result<Vec<TaskDeliveryRecord>, String> {
+    let conn = open_conn()?;
+    let runtime_key = runtime_key.map(str::trim).filter(|value| !value.is_empty());
+    let chat_session_id = chat_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let conversation_type = conversation_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let conversation_id = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                id,
+                task_id,
+                owner_agent_id,
+                runtime_key,
+                delivery_kind,
+                dedupe_key,
+                status,
+                origin_conversation_type,
+                origin_conversation_id,
+                origin_chat_session_id,
+                origin_message_id,
+                creator_participant_id,
+                creator_participant_name,
+                executor_agent_id,
+                executor_agent_name,
+                report_actor_agent_id,
+                report_actor_agent_name,
+                task_name,
+                run_count,
+                summary_text,
+                error_text,
+                payload_json,
+                created_at,
+                updated_at,
+                reported_at,
+                acknowledged_at
+            FROM task_deliveries
+            WHERE status = 'pending'
+              AND (?1 IS NULL OR runtime_key = ?1)
+              AND (?2 IS NULL OR origin_chat_session_id = ?2)
+              AND (?3 IS NULL OR origin_conversation_type = ?3)
+              AND (?4 IS NULL OR origin_conversation_id = ?4)
+            ORDER BY created_at ASC
+            "#,
+        )
+        .map_err(|e| format!("准备任务投递查询失败: {e}"))?;
+    let rows = stmt
+        .query_map(
+            params![
+                runtime_key,
+                chat_session_id,
+                conversation_type,
+                conversation_id
+            ],
+            map_task_delivery_row,
+        )
+        .map_err(|e| format!("执行任务投递查询失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析任务投递失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn get_task_delivery(delivery_id: &str) -> Result<Option<TaskDeliveryRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                id,
+                task_id,
+                owner_agent_id,
+                runtime_key,
+                delivery_kind,
+                dedupe_key,
+                status,
+                origin_conversation_type,
+                origin_conversation_id,
+                origin_chat_session_id,
+                origin_message_id,
+                creator_participant_id,
+                creator_participant_name,
+                executor_agent_id,
+                executor_agent_name,
+                report_actor_agent_id,
+                report_actor_agent_name,
+                task_name,
+                run_count,
+                summary_text,
+                error_text,
+                payload_json,
+                created_at,
+                updated_at,
+                reported_at,
+                acknowledged_at
+            FROM task_deliveries
+            WHERE id = ?1
+            "#,
+        )
+        .map_err(|e| format!("准备读取任务投递失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![delivery_id.trim()])
+        .map_err(|e| format!("执行读取任务投递失败: {e}"))?;
+    let Some(row) = rows.next().map_err(|e| format!("读取任务投递失败: {e}"))? else {
+        return Ok(None);
+    };
+    map_task_delivery_row(row)
+        .map(Some)
+        .map_err(|e| format!("解析任务投递失败: {e}"))
+}
+
+pub fn mark_task_delivery_status(delivery_id: &str, status: &str) -> Result<(), String> {
+    let normalized_status = status.trim();
+    if normalized_status.is_empty() {
+        return Err("status 不能为空".to_string());
+    }
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        UPDATE task_deliveries
+        SET
+            status = ?2,
+            reported_at = CASE
+                WHEN ?2 = 'reported' AND reported_at IS NULL THEN CURRENT_TIMESTAMP
+                ELSE reported_at
+            END,
+            acknowledged_at = CASE
+                WHEN ?2 = 'acknowledged' THEN CURRENT_TIMESTAMP
+                ELSE acknowledged_at
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?1
+        "#,
+        params![delivery_id.trim(), normalized_status],
+    )
+    .map_err(|e| format!("更新任务投递状态失败: {e}"))?;
+    Ok(())
+}
+
+fn map_task_runtime_binding_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<TaskRuntimeBindingRecord, String> {
+    let metadata_json: String = row
+        .get(18)
+        .map_err(|e| format!("读取任务元数据 JSON 失败: {e}"))?;
+    let metadata =
+        serde_json::from_str(&metadata_json).unwrap_or(Value::Object(Default::default()));
+    Ok(TaskRuntimeBindingRecord {
+        task_id: row.get(0).map_err(|e| format!("读取 task_id 失败: {e}"))?,
+        owner_agent_id: row
+            .get(1)
+            .map_err(|e| format!("读取 owner_agent_id 失败: {e}"))?,
+        runtime_key: row
+            .get(2)
+            .map_err(|e| format!("读取 runtime_key 失败: {e}"))?,
+        source_type: row
+            .get(3)
+            .map_err(|e| format!("读取 source_type 失败: {e}"))?,
+        display_name: row
+            .get(4)
+            .map_err(|e| format!("读取 display_name 失败: {e}"))?,
+        origin_conversation_type: row
+            .get(5)
+            .map_err(|e| format!("读取 origin_conversation_type 失败: {e}"))?,
+        origin_conversation_id: row
+            .get(6)
+            .map_err(|e| format!("读取 origin_conversation_id 失败: {e}"))?,
+        origin_chat_session_id: row
+            .get(7)
+            .map_err(|e| format!("读取 origin_chat_session_id 失败: {e}"))?,
+        origin_message_id: row
+            .get(8)
+            .map_err(|e| format!("读取 origin_message_id 失败: {e}"))?,
+        creator_participant_id: row
+            .get(9)
+            .map_err(|e| format!("读取 creator_participant_id 失败: {e}"))?,
+        creator_participant_name: row
+            .get(10)
+            .map_err(|e| format!("读取 creator_participant_name 失败: {e}"))?,
+        executor_agent_id: row
+            .get(11)
+            .map_err(|e| format!("读取 executor_agent_id 失败: {e}"))?,
+        executor_agent_name: row
+            .get(12)
+            .map_err(|e| format!("读取 executor_agent_name 失败: {e}"))?,
+        report_actor_agent_id: row
+            .get(13)
+            .map_err(|e| format!("读取 report_actor_agent_id 失败: {e}"))?,
+        report_actor_agent_name: row
+            .get(14)
+            .map_err(|e| format!("读取 report_actor_agent_name 失败: {e}"))?,
+        max_runs: row
+            .get(15)
+            .map_err(|e| format!("读取 max_runs 失败: {e}"))?,
+        final_summary_prompt: row
+            .get(16)
+            .map_err(|e| format!("读取 final_summary_prompt 失败: {e}"))?,
+        notify_on_final: row
+            .get::<_, i64>(17)
+            .map_err(|e| format!("读取 notify_on_final 失败: {e}"))?
+            != 0,
+        metadata,
+        created_at: row
+            .get(19)
+            .map_err(|e| format!("读取 created_at 失败: {e}"))?,
+        updated_at: row
+            .get(20)
+            .map_err(|e| format!("读取 updated_at 失败: {e}"))?,
+    })
+}
+
+fn map_task_delivery_row(row: &rusqlite::Row<'_>) -> Result<TaskDeliveryRecord, rusqlite::Error> {
+    let payload_json: String = row.get(21)?;
+    let payload = serde_json::from_str(&payload_json).unwrap_or(Value::Object(Default::default()));
+    Ok(TaskDeliveryRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        owner_agent_id: row.get(2)?,
+        runtime_key: row.get(3)?,
+        delivery_kind: row.get(4)?,
+        dedupe_key: row.get(5)?,
+        status: row.get(6)?,
+        origin_conversation_type: row.get(7)?,
+        origin_conversation_id: row.get(8)?,
+        origin_chat_session_id: row.get(9)?,
+        origin_message_id: row.get(10)?,
+        creator_participant_id: row.get(11)?,
+        creator_participant_name: row.get(12)?,
+        executor_agent_id: row.get(13)?,
+        executor_agent_name: row.get(14)?,
+        report_actor_agent_id: row.get(15)?,
+        report_actor_agent_name: row.get(16)?,
+        task_name: row.get(17)?,
+        run_count: row.get(18)?,
+        summary_text: row.get(19)?,
+        error_text: row.get(20)?,
+        payload,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
+        reported_at: row.get(24)?,
+        acknowledged_at: row.get(25)?,
+    })
+}
+
 fn open_conn() -> Result<Connection, String> {
     let db = ensure_db()?;
-    Connection::open(db).map_err(|e| format!("打开数据库失败: {e}"))
+    open_sqlite_connection(&db)
 }
 
 fn db_path() -> Result<PathBuf, String> {
     path_resolver::management_db_path()
+}
+
+fn open_sqlite_connection(db: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(db).map_err(|e| format!("打开数据库失败: {e}"))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| format!("设置数据库 busy_timeout 失败: {e}"))?;
+    Ok(conn)
 }

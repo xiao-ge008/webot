@@ -41,7 +41,8 @@
     ],
     "resources": [
       "resources/mpv",
-      "resources/openfang"
+      "resources/openfang",
+      "resources/skills"
     ]
   }
 }

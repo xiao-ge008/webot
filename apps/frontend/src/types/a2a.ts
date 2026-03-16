@@ -15,7 +15,15 @@ export interface A2AWorkCardData {
   agentColor?: string;
   status: A2AWorkStatus;
   summary?: string;
+  objective?: string;
+  requestPayloadText?: string;
   startedAt: string;
   finishedAt?: string;
+  finalReportText?: string;
+  latestEventAt?: string;
+  latestEventTitle?: string;
+  latestEventKind?: 'started' | 'progress' | 'final' | 'failed';
+  bindingSessionId?: string;
+  bindingSourceMessageId?: string;
   logs: A2AWorkLogItem[];
 }

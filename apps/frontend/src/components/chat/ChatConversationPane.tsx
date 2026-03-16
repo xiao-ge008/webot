@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -21,6 +21,7 @@ import {
   Clock3,
   Trash2,
   ListChecks,
+  Gauge,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { looksLikeProtocolOnlyText, normalizeIncomingSpec, parseJsonSafely, extractUiRawText, repairUiJsonString, sanitizeAiUiOutput, getBestEffortUiJsonBlocks } from '@/components/chat/chat-page-helpers';
@@ -28,10 +29,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Agent } from '@/types';
 import type { ChatAttachment, Message, MessageTrace } from '@/data/mock-chats';
-import type { ChatTaskCardData } from '@/types/chat-task';
+import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task';
 import type { A2AWorkCardData } from '@/types/a2a';
 import { DynamicUIRenderer } from '@/components/chat/DynamicUIRenderer';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Progress } from '@/components/ui/progress';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { uploadManagementAgentChatAsset } from '@/services/management-client';
 
 type UserActivitySource = 'input' | 'send' | 'focus' | 'keydown' | 'ui_action';
@@ -41,10 +44,25 @@ const APP_FILE_MAX_BYTES = 32 * 1024 * 1024;
 const A2A_PLACEHOLDER_AGENT_ID = 'unknown-agent';
 const A2A_PLACEHOLDER_AGENT_NAME = '子智能体';
 
+function formatCount(value: number): string {
+  return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
+}
+
 export interface ChatSendPayload {
   displayText: string;
   submitText: string;
   attachments?: ChatAttachment[];
+}
+
+export interface ChatContextUsageMeter {
+  tokenCount?: number | null;
+  loading?: boolean;
+  updatedAt?: number | null;
+  pressurePercent: number;
+  recentMessageCount: number;
+  recentCharCount: number;
+  messageThreshold: number;
+  charThreshold: number;
 }
 
 export interface ChatConversationPaneProps {
@@ -53,10 +71,12 @@ export interface ChatConversationPaneProps {
   messages: Message[];
   isSending: boolean;
   inputLocked: boolean;
+  autoConversationEnabled?: boolean;
   streamState: 'idle' | 'streaming' | 'waiting';
   streamingMessage?: Message | null;
   hideHeader?: boolean;
   inputToolbar?: ReactNode;
+  contextUsage?: ChatContextUsageMeter;
   onUserActivity?: (source: UserActivitySource) => void;
   onSendMessage: (payload: ChatSendPayload) => void;
   onSendSilentMessage: (text: string) => void;
@@ -66,7 +86,8 @@ export interface ChatConversationPaneProps {
   onConfirmCreateTaskCard?: (messageId: string) => void;
   onCancelTaskCard: (messageId: string) => void;
   onDeleteTaskCard: (messageId: string) => void;
-  onOpenTaskCardDetails: (taskId: string) => void;
+  onToggleAutoConversation?: () => void;
+  onOpenTaskCardDetails: (input: { taskId?: string; messageId: string }) => void;
   onOpenA2aCardDetails: (messageId: string, cardId: string) => void;
   onConfirmGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
   onCancelGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
@@ -106,6 +127,129 @@ interface ComposerAttachmentDraft {
   size?: number;
   previewUrl?: string;
   error?: string;
+}
+
+function estimateAttachmentPromptChars(attachments: ComposerAttachmentDraft[]): number {
+  return attachments.reduce((sum, attachment) => {
+    const parts = [
+      attachment.name,
+      attachment.relativePath,
+      attachment.savedPath,
+      attachment.mimeType,
+      attachment.kind === 'image' ? '图片' : '附件',
+    ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+    return sum + parts.join(' ').length + 24;
+  }, 0);
+}
+
+function estimateDraftTokenDelta(text: string, attachments: ComposerAttachmentDraft[]): number {
+  const normalizedText = text.trim();
+  const attachmentChars = estimateAttachmentPromptChars(attachments);
+  const tokenSource = `${normalizedText}\n${attachments
+    .map((item) => [item.name, item.relativePath, item.savedPath, item.mimeType].filter(Boolean).join(' '))
+    .join('\n')}`;
+  const cjkChars = Array.from(tokenSource).filter((char) => /[\u4e00-\u9fff]/.test(char)).length;
+  const totalChars = normalizedText.length + attachmentChars;
+  if (totalChars <= 0) {
+    return 0;
+  }
+  const otherChars = Math.max(0, totalChars - cjkChars);
+  return Math.max(1, cjkChars + Math.ceil(otherChars / 4));
+}
+
+interface MessageRenderGroup {
+  id: string;
+  isUser: boolean;
+  messages: Message[];
+}
+
+const MarkdownBlock = memo(function MarkdownBlock({
+  className,
+  content,
+}: {
+  className: string;
+  content: string;
+}) {
+  return (
+    <div className={className}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+});
+
+function hasRuntimeLogData(msg: Message): boolean {
+  return Boolean(
+    (msg.thinkingTrace?.length ?? 0) > 0
+    || (msg.toolTrace?.length ?? 0) > 0
+    || (msg.debugNativeFrames || '').trim()
+    || (msg.debugRawStream || '').trim()
+    || (msg.uiRawText || '').trim()
+    || (msg.debugNormalizedUiRawText || '').trim()
+    || (msg.debugRepairedUiRawText || '').trim()
+    || (msg.debugUiContractWarnings || '').trim()
+    || (msg.text || '').trim()
+    || msg.spec != null
+    || (msg.debugNormalizedSpecText || '').trim()
+    || typeof msg.debugProfileIntroDetected === 'boolean'
+    || (msg.debugLegacySanitizer || '').trim()
+    || (msg.debugSchemaSanitizer || '').trim()
+    || typeof msg.debugMixedSegmentCount === 'number'
+    || (msg.debugDonePayload || '').trim()
+  );
+}
+
+function DeferredUiCard({
+  shouldDefer,
+  children,
+}: {
+  shouldDefer: boolean;
+  children: ReactNode;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [ready, setReady] = useState(!shouldDefer);
+
+  useEffect(() => {
+    if (!shouldDefer) {
+      setReady(true);
+      return;
+    }
+    if (ready) {
+      return;
+    }
+    if (typeof IntersectionObserver === 'undefined') {
+      setReady(true);
+      return;
+    }
+
+    const node = containerRef.current;
+    if (!node) {
+      return;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        setReady(true);
+        observer.disconnect();
+      }
+    }, {
+      rootMargin: '360px 0px',
+    });
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [ready, shouldDefer]);
+
+  return (
+    <div ref={containerRef}>
+      {ready ? children : (
+        <div className="rounded-xl border border-dashed border-border/60 bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">
+          A2UI 卡片将按滚动位置择机渲染
+        </div>
+      )}
+    </div>
+  );
 }
 
 function isPlaceholderA2aCard(card: A2AWorkCardData): boolean {
@@ -190,6 +334,42 @@ function isTauriRuntime(): boolean {
   return Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
 }
 
+function normalizeOptionIntentText(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[\s\u2705\u2714\u2716\u274c\u25cb\u25ef\u2022\-*#]+/g, '')
+    .replace(/[（(].*?[）)]/g, '')
+    .replace(/\s+/g, '');
+}
+
+function resolveTaskProposalOptionIntent(
+  raw: string,
+): 'confirm' | 'cancel' | null {
+  const normalized = normalizeOptionIntentText(raw).toLowerCase();
+  if (!normalized) return null;
+  if (
+    normalized === 'confirm'
+    || normalized === 'ok'
+    || normalized === 'yes'
+    || normalized === '确认'
+    || normalized === '创建任务'
+    || normalized.includes('确认创建任务')
+    || (normalized.includes('确认') && normalized.includes('任务'))
+    || normalized.includes('立即创建')
+  ) {
+    return 'confirm';
+  }
+  if (
+    normalized === 'cancel'
+    || normalized.includes('取消')
+    || normalized.includes('暂不创建')
+    || normalized.includes('放弃创建')
+  ) {
+    return 'cancel';
+  }
+  return null;
+}
+
 function formatAttachmentSize(size?: number): string {
   if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) {
     return '';
@@ -247,10 +427,12 @@ export function ChatConversationPane({
   messages,
   isSending,
   inputLocked,
+  autoConversationEnabled = false,
   streamState,
   streamingMessage,
   hideHeader = false,
   inputToolbar,
+  contextUsage,
   onUserActivity,
   onSendMessage,
   onSendSilentMessage,
@@ -260,6 +442,7 @@ export function ChatConversationPane({
   onConfirmCreateTaskCard,
   onCancelTaskCard,
   onDeleteTaskCard,
+  onToggleAutoConversation,
   onOpenTaskCardDetails,
   onOpenA2aCardDetails,
   onConfirmGroupUpgrade,
@@ -277,12 +460,55 @@ export function ChatConversationPane({
   const [copiedTraceKey, setCopiedTraceKey] = useState('');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const autoStickToBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
+  const taskHighlightTimerRef = useRef<number | null>(null);
   const mixedSegmentsCacheRef = useRef<Map<string, MixedRenderSegment[]>>(new Map());
   const imageInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerAttachmentsRef = useRef<ComposerAttachmentDraft[]>([]);
   const isDesktopRuntime = isTauriRuntime();
+  const draftCharCount = useMemo(
+    () => inputValue.trim().length + estimateAttachmentPromptChars(composerAttachments),
+    [composerAttachments, inputValue],
+  );
+  const estimatedTokenDelta = useMemo(
+    () => estimateDraftTokenDelta(inputValue, composerAttachments),
+    [composerAttachments, inputValue],
+  );
+  const estimatedMessageCount = useMemo(() => {
+    if (!inputValue.trim() && composerAttachments.length === 0) {
+      return contextUsage?.recentMessageCount ?? 0;
+    }
+    return (contextUsage?.recentMessageCount ?? 0) + 1;
+  }, [composerAttachments.length, contextUsage?.recentMessageCount, inputValue]);
+  const estimatedCharCount = (contextUsage?.recentCharCount ?? 0) + draftCharCount;
+  const estimatedPressurePercent = useMemo(() => {
+    if (!contextUsage) {
+      return 0;
+    }
+    const messageRatio = estimatedMessageCount / Math.max(1, contextUsage.messageThreshold);
+    const charRatio = estimatedCharCount / Math.max(1, contextUsage.charThreshold);
+    return Math.max(0, Math.min(100, Math.round(Math.max(messageRatio, charRatio) * 100)));
+  }, [contextUsage, estimatedCharCount, estimatedMessageCount]);
+  const meterTextClass = estimatedPressurePercent >= 85
+    ? 'text-rose-500'
+    : estimatedPressurePercent >= 60
+      ? 'text-amber-500'
+      : 'text-muted-foreground';
+  const estimatedContextTokenCount = contextUsage?.tokenCount != null
+    ? contextUsage.tokenCount + estimatedTokenDelta
+    : ((contextUsage?.recentMessageCount ?? 0) === 0 && (contextUsage?.recentCharCount ?? 0) === 0
+      ? estimatedTokenDelta
+      : null);
+  const currentTokenText = contextUsage?.tokenCount != null
+    ? `当前 ${formatCount(contextUsage.tokenCount)} token`
+    : ((contextUsage?.recentMessageCount ?? 0) === 0 && (contextUsage?.recentCharCount ?? 0) === 0
+      ? '当前 0 token'
+      : '当前 token 暂不可用');
 
   const revokeComposerPreview = useCallback((previewUrl?: string) => {
     if (!previewUrl || !previewUrl.startsWith('blob:')) {
@@ -296,6 +522,39 @@ export function ChatConversationPane({
   useEffect(() => () => {
     composerAttachmentsRef.current.forEach((item) => revokeComposerPreview(item.previewUrl));
   }, [revokeComposerPreview]);
+
+  const isNearBottom = useCallback((node: HTMLDivElement | null, threshold = 96): boolean => {
+    if (!node) return true;
+    const distance = node.scrollHeight - node.clientHeight - node.scrollTop;
+    return distance <= threshold;
+  }, []);
+
+  const flushScrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    const node = scrollRef.current;
+    if (!node) return;
+    node.scrollTo({
+      top: node.scrollHeight,
+      behavior,
+    });
+  }, []);
+
+  const scheduleScrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    if (scrollRafRef.current != null) {
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      flushScrollToBottom(behavior);
+    });
+  }, [flushScrollToBottom]);
+
+  useEffect(() => () => {
+    if (scrollRafRef.current != null) {
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+  }, []);
 
   const appendImageToInput = useCallback((source: string, altText?: string) => {
     const src = source.trim();
@@ -408,22 +667,22 @@ export function ChatConversationPane({
       onUserActivity('ui_action');
     }
 
-    if (isGroupUpgradeConfirmAction || isGroupUpgradeCancelAction) {
-      const payloadRecord = payload && typeof payload === 'object' ? payload as GroupUpgradeActionPayload : {};
-      if (isGroupUpgradeConfirmAction) {
-        onConfirmGroupUpgrade?.(payloadRecord, ctx);
-      } else {
-        onCancelGroupUpgrade?.(payloadRecord, ctx);
-      }
-      return;
-    }
-
     if (isAgentManagementConfirmAction || isAgentManagementCancelAction) {
       const payloadRecord = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
       if (isAgentManagementConfirmAction) {
         onConfirmAgentManagement?.(payloadRecord, ctx);
       } else {
         onCancelAgentManagement?.(payloadRecord, ctx);
+      }
+      return;
+    }
+
+    if (isGroupUpgradeConfirmAction || isGroupUpgradeCancelAction) {
+      const payloadRecord = payload && typeof payload === 'object' ? payload as GroupUpgradeActionPayload : {};
+      if (isGroupUpgradeConfirmAction) {
+        onConfirmGroupUpgrade?.(payloadRecord, ctx);
+      } else {
+        onCancelGroupUpgrade?.(payloadRecord, ctx);
       }
       return;
     }
@@ -489,12 +748,9 @@ export function ChatConversationPane({
         );
 
         if (looksLikeTaskProposal) {
-          const token = prompt.trim();
-          const tokenLower = token.toLowerCase();
-          const isConfirm = tokenLower === 'confirm' || token === '确认' || token === '创建任务';
-          const isCancel = tokenLower === 'cancel' || token === '取消';
+          const intent = resolveTaskProposalOptionIntent(prompt);
 
-          if (isConfirm) {
+          if (intent === 'confirm') {
             if (typeof onConfirmCreateTaskCard === 'function') {
               onConfirmCreateTaskCard(messageId);
             } else {
@@ -503,7 +759,7 @@ export function ChatConversationPane({
             return;
           }
 
-          if (isCancel) {
+          if (intent === 'cancel') {
             onCancelTaskCard(messageId);
             return;
           }
@@ -551,11 +807,11 @@ export function ChatConversationPane({
     messages,
     onCancelAgentManagement,
     onCancelTaskCard,
-    onCancelGroupUpgrade,
     onConfirmAgentManagement,
     onConfirmCreateTaskCard,
-    onConfirmGroupUpgrade,
     onCreateTaskCard,
+    onCancelGroupUpgrade,
+    onConfirmGroupUpgrade,
     onSendSilentMessage,
     onUserActivity,
   ]);
@@ -685,11 +941,39 @@ export function ChatConversationPane({
     }
   };
 
+  const handleScroll = useCallback(() => {
+    autoStickToBottomRef.current = isNearBottom(scrollRef.current);
+  }, [isNearBottom]);
+
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const node = scrollRef.current;
+    if (!node) {
+      return;
     }
-  }, [messages, streamingMessage]);
+    autoStickToBottomRef.current = isNearBottom(node);
+  }, [isNearBottom]);
+
+  useEffect(() => {
+    if (!autoStickToBottomRef.current) {
+      return;
+    }
+    scheduleScrollToBottom('auto');
+  }, [messages, streamingMessage, scheduleScrollToBottom]);
+
+  useEffect(() => {
+    const node = contentRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver(() => {
+      if (!autoStickToBottomRef.current) {
+        return;
+      }
+      scheduleScrollToBottom('auto');
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [scheduleScrollToBottom]);
 
   useEffect(() => {
     const hasRunningMessage = messages.some((msg) => msg.role === 'agent' && msg.streaming && msg.generationStartedAt != null)
@@ -811,12 +1095,156 @@ export function ChatConversationPane({
     return 'bg-warning';
   };
 
+  const taskKindLabel = (kind?: ChatTaskCardData['taskKind']): string => {
+    if (kind === 'chat_async') return '聊天异步任务';
+    if (kind === 'manual_schedule') return '任务中心定时任务';
+    if (kind === 'a2a_delegate') return '智能体委派任务';
+    return '聊天定时任务';
+  };
+
+  const taskReportStatusLabel = (status?: ChatTaskCardData['reportStatus']): string => {
+    if (status === 'acknowledged') return '已同步到当前会话';
+    if (status === 'reported') return '已生成会话回执';
+    return '待汇报';
+  };
+
+  const taskTimelineLabel = (kind: ChatTaskLifecycleItem['kind']): string => {
+    if (kind === 'created') return '草案';
+    if (kind === 'started') return '启动';
+    if (kind === 'progress') return '进度';
+    if (kind === 'anomaly') return '异常';
+    if (kind === 'final') return '总结';
+    if (kind === 'cancelled') return '取消';
+    return '失败';
+  };
+
+  const taskTimelineClass = (entry: ChatTaskLifecycleItem): string => {
+    if (entry.level === 'success' || entry.kind === 'final') return 'text-success';
+    if (entry.level === 'error' || entry.kind === 'anomaly' || entry.kind === 'failed') return 'text-destructive';
+    return 'text-primary';
+  };
+
+  const formatTaskTimelineTime = (raw: string): string => {
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return raw;
+    return date.toLocaleString();
+  };
+
+  const a2aEventLabel = (kind?: A2AWorkCardData['latestEventKind']): string => {
+    if (kind === 'started') return '启动';
+    if (kind === 'final') return '总结';
+    if (kind === 'failed') return '失败';
+    return '进度';
+  };
+
+  const a2aEventClass = (card: A2AWorkCardData): string => {
+    if (card.status === 'failed' || card.latestEventKind === 'failed') return 'text-destructive';
+    if (card.status === 'completed' || card.latestEventKind === 'final') return 'text-success';
+    return 'text-primary';
+  };
+
+  type ConversationAsyncItem =
+    | {
+      id: string;
+      messageId: string;
+      kind: 'task';
+      sortAt: number;
+      active: boolean;
+      taskCard: ChatTaskCardData;
+    }
+    | {
+      id: string;
+      messageId: string;
+      kind: 'a2a';
+      sortAt: number;
+      active: boolean;
+      a2aCard: A2AWorkCardData;
+    };
+
+  const conversationAsyncItems = useMemo<ConversationAsyncItem[]>(() => {
+    const unique = new Map<string, ConversationAsyncItem>();
+    messages.forEach((message) => {
+      if (message.taskCard) {
+        const card = message.taskCard;
+        const key = `task:${card.taskId || message.id}`;
+        const sortAtRaw = Date.parse(card.latestReportAt || card.updatedAt || card.createdAt);
+        unique.set(key, {
+          id: key,
+          messageId: message.id,
+          kind: 'task',
+          sortAt: Number.isFinite(sortAtRaw) ? sortAtRaw : 0,
+          active: card.stage === 'running' || card.stage === 'scheduled',
+          taskCard: card,
+        });
+      }
+      if (message.a2aCards && message.a2aCards.length > 0) {
+        getVisibleA2aCards(message.a2aCards).forEach((card) => {
+          const key = `a2a:${card.id}`;
+          const sortAtRaw = Date.parse(card.latestEventAt || card.finishedAt || card.startedAt);
+          unique.set(key, {
+            id: key,
+            messageId: message.id,
+            kind: 'a2a',
+            sortAt: Number.isFinite(sortAtRaw) ? sortAtRaw : 0,
+            active: card.status === 'working',
+            a2aCard: card,
+          });
+        });
+      }
+    });
+    return [...unique.values()].sort((left, right) => {
+      const leftActive = left.active ? 1 : 0;
+      const rightActive = right.active ? 1 : 0;
+      if (leftActive !== rightActive) {
+        return rightActive - leftActive;
+      }
+      return right.sortAt - left.sortAt;
+    });
+  }, [messages]);
+
+  const scrollToTaskMessage = useCallback((messageId: string) => {
+    const container = contentRef.current;
+    if (!container || !messageId) {
+      return;
+    }
+    const escaped = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+      ? CSS.escape(messageId)
+      : messageId.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const target = container.querySelector(`[data-message-id="${escaped}"]`) as HTMLElement | null;
+    if (!target) {
+      return;
+    }
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setHighlightedMessageId(messageId);
+    if (taskHighlightTimerRef.current != null) {
+      window.clearTimeout(taskHighlightTimerRef.current);
+    }
+    taskHighlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedMessageId((current) => (current === messageId ? null : current));
+      taskHighlightTimerRef.current = null;
+    }, 2400);
+  }, []);
+
+  useEffect(() => () => {
+    if (taskHighlightTimerRef.current != null) {
+      window.clearTimeout(taskHighlightTimerRef.current);
+    }
+  }, []);
+
   const renderTaskCard = (msg: Message, taskCard: ChatTaskCardData) => {
     const stage = taskCard.stage;
     const logCount = taskCard.logCount ?? taskCard.runCount;
     const errorCount = taskCard.errorCount ?? 0;
     const hasFinalSummary = taskCard.finalSummaryReady === true;
-    const canViewDetails = Boolean(taskCard.taskId);
+    const canViewDetails = Boolean(
+      taskCard.taskId
+      || taskCard.timeline?.length
+      || taskCard.finalSummaryText
+      || taskCard.errorSummary
+      || taskCard.bindingSourceMessageId,
+    );
+    const latestTimelineEntries = (taskCard.timeline ?? []).slice(-3).reverse();
+    const finalSummaryPreview = (taskCard.finalSummaryText || '').trim();
     const canCreate = (stage === 'proposal' || stage === 'failed') && taskCard.canCreate === true;
     const canCancelProposal = stage === 'proposal' && taskCard.canCancel === true;
     const canCancelRunning = (stage === 'scheduled' || stage === 'running') && taskCard.canCancel === true;
@@ -837,7 +1265,9 @@ export function ChatConversationPane({
         : '进行中（等待首次执行）';
       deliveryClass = 'text-primary';
     } else if (stage === 'running') {
-      deliveryStatus = `执行中（已记录 ${logCount} 轮执行${errorCount > 0 ? `，异常 ${errorCount} 次` : ''}）`;
+      deliveryStatus = logCount > 0
+        ? `执行中（已记录 ${logCount} 轮执行${errorCount > 0 ? `，异常 ${errorCount} 次` : ''}）`
+        : '执行中（等待首次执行结果）';
       deliveryClass = 'text-primary';
     } else if (stage === 'completed') {
       if (hasFinalSummary) {
@@ -875,15 +1305,50 @@ export function ChatConversationPane({
             </div>
             <div>
               <span className="font-semibold">执行进度：</span>
-              {taskCard.maxRuns > 0 ? `${taskCard.runCount}/${taskCard.maxRuns}` : `${taskCard.runCount} 次`}
+              {taskCard.maxRuns > 0
+                ? `${taskCard.runCount}/${taskCard.maxRuns}${typeof taskCard.progressPercent === 'number' ? `（${taskCard.progressPercent}%）` : ''}`
+                : `${taskCard.runCount} 次`}
             </div>
+            <div><span className="font-semibold">任务类型：</span>{taskKindLabel(taskCard.taskKind)}</div>
+            <div><span className="font-semibold">执行人：</span>{taskCard.executorAgentName || '-'}</div>
+            <div><span className="font-semibold">汇报人：</span>{taskCard.reportActorName || taskCard.executorAgentName || '-'}</div>
+            <div><span className="font-semibold">汇报状态：</span>{taskReportStatusLabel(taskCard.reportStatus)}</div>
             <div>
               <span className="font-semibold">聊天回执：</span>
               <span className={deliveryClass}>{deliveryStatus}</span>
             </div>
+            {taskCard.errorSummary ? <div><span className="font-semibold">异常摘要：</span>{taskCard.errorSummary}</div> : null}
+            {finalSummaryPreview ? (
+              <div><span className="font-semibold">最终总结：</span>{finalSummaryPreview.length > 160 ? `${finalSummaryPreview.slice(0, 160)}...` : finalSummaryPreview}</div>
+            ) : null}
             {taskCard.nextRun ? <div><span className="font-semibold">下次执行：</span>{new Date(taskCard.nextRun).toLocaleString()}</div> : null}
             {taskCard.lastRun ? <div><span className="font-semibold">上次执行：</span>{new Date(taskCard.lastRun).toLocaleString()}</div> : null}
           </div>
+          {latestTimelineEntries.length > 0 ? (
+            <div className="rounded-xl border border-border/60 bg-muted/10 p-2.5 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/80">任务时间线</span>
+                <span className="text-[10px] text-muted-foreground">{taskCard.timeline?.length || 0} 条</span>
+              </div>
+              <div className="space-y-2">
+                {latestTimelineEntries.map((entry) => (
+                  <div key={entry.id} className="rounded-lg border border-border/50 bg-background/80 px-2.5 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className={cn('text-[11px] font-semibold', taskTimelineClass(entry))}>
+                        {taskTimelineLabel(entry.kind)} · {entry.title}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground">{formatTaskTimelineTime(entry.at)}</span>
+                    </div>
+                    {entry.detail ? (
+                      <div className="mt-1 text-[11px] leading-5 text-foreground/80 whitespace-pre-wrap break-words">
+                        {entry.detail}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <div className="flex flex-wrap items-center gap-2">
             {(stage === 'proposal' || stage === 'failed') ? (
               <Button
@@ -944,13 +1409,13 @@ export function ChatConversationPane({
                 删除
               </Button>
             ) : null}
-            {canViewDetails && taskCard.taskId ? (
+            {canViewDetails ? (
               <Button
                 type="button"
                 size="sm"
                 variant="ghost"
                 className="h-7 rounded-md px-3 text-[11px] font-semibold gap-1.5"
-                onClick={() => onOpenTaskCardDetails(taskCard.taskId as string)}
+                onClick={() => onOpenTaskCardDetails({ taskId: taskCard.taskId, messageId: msg.id })}
               >
                 <ListChecks className="w-3 h-3" />
                 查看详情
@@ -959,6 +1424,143 @@ export function ChatConversationPane({
           </div>
         </CardContent>
       </Card>
+    );
+  };
+
+  const renderConversationTaskList = () => {
+    if (conversationAsyncItems.length === 0) {
+      return null;
+    }
+    const visibleTasks = conversationAsyncItems.slice(0, 10);
+    return (
+      <div className="mb-4 rounded-2xl border border-border/60 bg-gradient-to-br from-muted/30 via-background to-muted/10 p-3 shadow-sm">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/80">当前会话异步任务</p>
+            <p className="text-xs text-muted-foreground">定时任务、长任务和 A2A 协作都只在当前聊天里闭环管理</p>
+          </div>
+          <div className="rounded-full border border-border/70 bg-background/80 px-2.5 py-1 text-[11px] font-medium text-foreground/80">
+            {conversationAsyncItems.length} 项
+          </div>
+        </div>
+        <div className="space-y-2">
+          {visibleTasks.map((item) => {
+            if (item.kind === 'task') {
+              const { messageId, taskCard: card } = item;
+              const latestEntry = card.timeline?.[card.timeline.length - 1];
+              const canOpenDetails = Boolean(
+                card.taskId
+                || card.timeline?.length
+                || card.finalSummaryText
+                || card.errorSummary,
+              );
+              return (
+                <div
+                  key={item.id}
+                  className="flex items-start justify-between gap-3 rounded-xl border border-border/60 bg-background/85 px-3 py-2.5"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-sm font-semibold">{card.taskName}</span>
+                      <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-bold text-white', taskStageClass(card.stage))}>
+                        {taskStageLabel(card.stage)}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      {taskKindLabel(card.taskKind)} · {card.maxRuns > 0 ? `${card.runCount}/${card.maxRuns}` : `${card.runCount} 次`}
+                      {typeof card.progressPercent === 'number' ? ` · ${card.progressPercent}%` : ''}
+                    </div>
+                    {latestEntry ? (
+                      <div className="mt-1 text-[11px] leading-5 text-foreground/80">
+                        <span className={cn('font-semibold', taskTimelineClass(latestEntry))}>{taskTimelineLabel(latestEntry.kind)}</span>
+                        {' · '}
+                        {latestEntry.title}
+                        {latestEntry.detail ? `：${latestEntry.detail}` : ''}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 rounded-md px-3 text-[11px] font-semibold"
+                      onClick={() => scrollToTaskMessage(messageId)}
+                    >
+                      定位
+                    </Button>
+                    {canOpenDetails ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 rounded-md px-3 text-[11px] font-semibold gap-1.5"
+                        onClick={() => onOpenTaskCardDetails({ taskId: card.taskId, messageId })}
+                      >
+                        <ListChecks className="w-3 h-3" />
+                        详情
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            }
+
+            const { messageId, a2aCard: card } = item;
+            const latestLabel = card.latestEventTitle || card.summary || a2aStatusText(card);
+            const latestDetail = card.finalReportText || card.logs[card.logs.length - 1]?.detail || card.objective || '';
+            return (
+              <div
+                key={item.id}
+                className="flex items-start justify-between gap-3 rounded-xl border border-border/60 bg-background/85 px-3 py-2.5"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-semibold">{getA2aCardDisplayName(card)}</span>
+                    <span className={cn(
+                      'rounded-full px-2 py-0.5 text-[10px] font-bold text-white',
+                      card.status === 'completed' ? 'bg-success' : card.status === 'failed' ? 'bg-destructive' : 'bg-primary',
+                    )}>
+                      {a2aStatusText(card)}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    A2A 协作任务 · {card.logs.length} 条调用日志
+                    {card.bindingSessionId ? ' · 已绑定当前会话' : ''}
+                  </div>
+                  <div className="mt-1 text-[11px] leading-5 text-foreground/80">
+                    <span className={cn('font-semibold', a2aEventClass(card))}>{a2aEventLabel(card.latestEventKind)}</span>
+                    {' · '}
+                    {latestLabel}
+                    {latestDetail ? `：${latestDetail.length > 120 ? `${latestDetail.slice(0, 120)}...` : latestDetail}` : ''}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-md px-3 text-[11px] font-semibold"
+                    onClick={() => scrollToTaskMessage(messageId)}
+                  >
+                    定位
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 rounded-md px-3 text-[11px] font-semibold gap-1.5"
+                    onClick={() => onOpenA2aCardDetails(messageId, card.id)}
+                  >
+                    <ListChecks className="w-3 h-3" />
+                    详情
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
     );
   };
 
@@ -1031,6 +1633,19 @@ export function ChatConversationPane({
                       </>
                     ) : null}
                   </div>
+                  {card.objective ? (
+                    <div className="mt-1 text-[11px] leading-5 text-foreground/80">
+                      任务目标：{card.objective.length > 110 ? `${card.objective.slice(0, 110)}...` : card.objective}
+                    </div>
+                  ) : null}
+                  {card.finalReportText ? (
+                    <div className="mt-1 text-[11px] leading-5 text-foreground/80">
+                      最终汇报：{card.finalReportText.length > 110 ? `${card.finalReportText.slice(0, 110)}...` : card.finalReportText}
+                    </div>
+                  ) : null}
+                </div>
+                <div className="shrink-0 text-[10px] text-muted-foreground">
+                  {card.logs.length} 条日志
                 </div>
               </button>
             );
@@ -1223,8 +1838,17 @@ export function ChatConversationPane({
       });
   };
 
-  const renderProcessPanel = (msg: Message) =>
-    renderTraceBlock(`${msg.id}-runtime-log`, '运行日志', buildRuntimeLogRows(msg));
+  const buildRuntimeLogRowsForMessages = (items: Message[]): MessageTrace[] =>
+    items
+      .flatMap((item) => buildRuntimeLogRows(item))
+      .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+
+  const renderProcessPanel = (key: string, items: Message[]) => {
+    if (!items.some((item) => hasRuntimeLogData(item))) {
+      return null;
+    }
+    return renderTraceBlock(`${key}-runtime-log`, '运行日志', buildRuntimeLogRowsForMessages(items));
+  };
 
   const hasMeaningfulMarkdownText = (msg: Message): boolean => {
     const text = (msg.text || '').trim();
@@ -1316,7 +1940,11 @@ export function ChatConversationPane({
     return parsed;
   }, []);
 
-  const renderMessageBody = (msg: Message, isUser: boolean) => (
+  const renderMessageBody = (
+    msg: Message,
+    isUser: boolean,
+    options?: { deferHeavyUi?: boolean; includeProcessPanel?: boolean },
+  ) => (
     <>
       {msg.attachments && msg.attachments.length > 0 ? (
         <div className={cn('mb-3 grid gap-2', msg.attachments.length > 1 ? 'sm:grid-cols-2' : 'grid-cols-1')}>
@@ -1332,6 +1960,8 @@ export function ChatConversationPane({
                   <img
                     src={attachment.assetUrl}
                     alt={attachment.name}
+                    loading="lazy"
+                    decoding="async"
                     className="h-40 w-full object-cover"
                   />
                 </a>
@@ -1364,11 +1994,7 @@ export function ChatConversationPane({
           {renderTaskCard(msg, msg.taskCard)}
           {msg.a2aCards && msg.a2aCards.length > 0 ? renderA2aCards(msg, msg.a2aCards) : null}
           {msg.text?.trim() ? (
-            <div className={cn('chat-markdown chat-markdown-agent mt-2')}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {msg.text}
-              </ReactMarkdown>
-            </div>
+            <MarkdownBlock className={cn('chat-markdown chat-markdown-agent mt-2')} content={msg.text} />
           ) : null}
         </>
       ) : (
@@ -1388,17 +2014,25 @@ export function ChatConversationPane({
         if (!isUser && mixedSegments.length > 0) {
           return (
             <>
-              {!isUser ? renderProcessPanel(msg) : null}
+              {!isUser && options?.includeProcessPanel !== false ? renderProcessPanel(msg.id, [msg]) : null}
               {mixedSegments.map((segment, index) => (
                 segment.kind === 'markdown' ? (
-                  <div key={`mixed-markdown-${msg.id}-${index}`} className={cn('chat-markdown', 'chat-markdown-agent', index > 0 ? 'mt-3' : '')}>
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {segment.content}
-                    </ReactMarkdown>
-                  </div>
+                  <MarkdownBlock
+                    key={`mixed-markdown-${msg.id}-${index}`}
+                    className={cn('chat-markdown', 'chat-markdown-agent', index > 0 ? 'mt-3' : '')}
+                    content={segment.content}
+                  />
                 ) : (
                   <div key={`mixed-ui-${msg.id}-${index}`} className={index > 0 ? 'mt-3' : ''}>
-                    {renderSimpleCardSpec(segment.spec) ?? <DynamicUIRenderer schema={segment.spec as any} onAction={(actionId, payload) => handleUiAction(actionId, payload, { messageId: msg.id })} agentId={agent.id} />}
+                    {renderSimpleCardSpec(segment.spec) ?? (
+                      <DeferredUiCard shouldDefer={Boolean(options?.deferHeavyUi)}>
+                        <DynamicUIRenderer
+                          schema={segment.spec as any}
+                          onAction={(actionId, payload) => handleUiAction(actionId, payload, { messageId: msg.id })}
+                          agentId={agent.id}
+                        />
+                      </DeferredUiCard>
+                    )}
                   </div>
                 )
               ))}
@@ -1413,17 +2047,24 @@ export function ChatConversationPane({
           : (hasMarkdown ? (msg.text || '') : '');
         return (
           <>
-            {!isUser ? renderProcessPanel(msg) : null}
+            {!isUser && options?.includeProcessPanel !== false ? renderProcessPanel(msg.id, [msg]) : null}
             {markdownContent ? (
-              <div className={cn('chat-markdown', isUser ? 'chat-markdown-user' : 'chat-markdown-agent')}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {markdownContent}
-                </ReactMarkdown>
-              </div>
+              <MarkdownBlock
+                className={cn('chat-markdown', isUser ? 'chat-markdown-user' : 'chat-markdown-agent')}
+                content={markdownContent}
+              />
             ) : null}
             {!isUser && shouldRenderCard && (
               <div className="mt-3">
-                {renderSimpleCardSpec(msg.spec) ?? <DynamicUIRenderer schema={msg.spec as any} onAction={(actionId, payload) => handleUiAction(actionId, payload, { messageId: msg.id })} agentId={agent.id} />}
+                {renderSimpleCardSpec(msg.spec) ?? (
+                  <DeferredUiCard shouldDefer={Boolean(options?.deferHeavyUi)}>
+                    <DynamicUIRenderer
+                      schema={msg.spec as any}
+                      onAction={(actionId, payload) => handleUiAction(actionId, payload, { messageId: msg.id })}
+                      agentId={agent.id}
+                    />
+                  </DeferredUiCard>
+                )}
               </div>
             )}
             {!isUser && msg.a2aCards && msg.a2aCards.length > 0 ? renderA2aCards(msg, msg.a2aCards) : null}
@@ -1448,6 +2089,36 @@ export function ChatConversationPane({
     });
     return map;
   }, [messages]);
+  const messageGroups = useMemo(() => {
+    const groups: MessageRenderGroup[] = [];
+    for (const msg of stableMessages) {
+      const isUser = msg.role === 'user';
+      const previousGroup = groups[groups.length - 1];
+      const previousMessage = previousGroup?.messages[previousGroup.messages.length - 1];
+      if (!previousGroup || !previousMessage) {
+        groups.push({ id: msg.id, isUser, messages: [msg] });
+        continue;
+      }
+
+      const previousTimestamp = previousMessage.timestamp ? Date.parse(previousMessage.timestamp) : NaN;
+      const currentTimestamp = msg.timestamp ? Date.parse(msg.timestamp) : NaN;
+      const withinWindow = Number.isFinite(previousTimestamp) && Number.isFinite(currentTimestamp)
+        ? Math.abs(currentTimestamp - previousTimestamp) <= 120_000
+        : false;
+      const sameAgent = !isUser && !previousGroup.isUser
+        ? ((previousMessage.agentId || previousMessage.agentName) === (msg.agentId || msg.agentName))
+        : false;
+
+      const shouldKeepSeparateGroups = hasRuntimeLogData(previousMessage) || hasRuntimeLogData(msg);
+      if (!isUser && !previousGroup.isUser && sameAgent && withinWindow && !shouldKeepSeparateGroups) {
+        previousGroup.messages.push(msg);
+        continue;
+      }
+
+      groups.push({ id: msg.id, isUser, messages: [msg] });
+    }
+    return groups;
+  }, [stableMessages]);
   const activeStreaming = useMemo(
     () => streamingMessage ?? messages.find((msg) => msg.streaming) ?? null,
     [messages, streamingMessage],
@@ -1455,31 +2126,22 @@ export function ChatConversationPane({
 
   const messageRows = useMemo(() => (
     <>
-      {stableMessages.map((msg, index) => {
-        const isUser = msg.role === 'user';
-        const originalIndex = messageIndexMap.get(msg.id) ?? index;
+      {messageGroups.map((group, groupIndex) => {
+        const groupMessages = group.messages;
+        const msg = groupMessages[groupMessages.length - 1];
+        const isUser = group.isUser;
+        const originalIndex = messageIndexMap.get(msg.id) ?? groupIndex;
+        const deferHeavyUi = !isUser && stableMessages.length > 18 && originalIndex < stableMessages.length - 6;
         const canRegenerate = canRegenerateAt(originalIndex);
         const messageAgentName = !isUser ? (msg.agentName || agent.name) : '';
         const messageAgentAvatarUrl = !isUser ? (msg.agentAvatarUrl || agent.avatarUrl) : undefined;
         const messageAgentColor = !isUser ? (msg.agentColor || agent.color) : undefined;
-        const prev = index > 0 ? stableMessages[index - 1] : null;
-        const sameRole = prev?.role === msg.role;
-        const sameAgent = !isUser && sameRole
-          ? ((prev?.agentId || prev?.agentName) === (msg.agentId || msg.agentName))
-          : false;
-        const prevTs = prev?.timestamp ? Date.parse(prev.timestamp) : NaN;
-        const currTs = msg.timestamp ? Date.parse(msg.timestamp) : NaN;
-        const withinWindow = Number.isFinite(prevTs) && Number.isFinite(currTs)
-          ? Math.abs(currTs - prevTs) <= 120_000
-          : false;
-        const isGrouped = Boolean(!isUser && sameAgent && withinWindow);
-        const rowMarginClass = isGrouped ? 'mb-2' : 'mb-6';
-        const showMeta = !isGrouped;
+        const showMeta = true;
         const elapsedText = msg.role === 'agent' && msg.generationElapsedMs != null
           ? formatElapsed(msg.generationElapsedMs)
           : '';
         return (
-          <div key={msg.id} className={cn('chat-message-row', rowMarginClass, isUser ? 'chat-message-row-user' : 'chat-message-row-agent', isGrouped && 'chat-message-row-compact')}>
+          <div key={group.id} className={cn('chat-message-row', 'mb-6', isUser ? 'chat-message-row-user' : 'chat-message-row-agent')}>
             {!isUser && showMeta && (
               <div className="chat-avatar-frame">
                 <AgentAvatar name={messageAgentName} avatarUrl={messageAgentAvatarUrl} color={messageAgentColor} size="md" />
@@ -1516,47 +2178,71 @@ export function ChatConversationPane({
               )}
               <div className={cn('chat-bubble-container flex w-full', isUser ? 'justify-end' : 'justify-start mt-1')}>
                 <div className={cn('chat-bubble', isUser ? 'chat-bubble-user' : 'chat-bubble-agent')}>
-                  {renderMessageBody(msg, isUser)}
+                  {!isUser ? renderProcessPanel(group.id, groupMessages) : null}
+                  <div className={cn(groupMessages.length > 1 ? 'space-y-4' : '')}>
+                    {groupMessages.map((item, itemIndex) => (
+                      <div
+                        key={item.id}
+                        data-message-id={item.id}
+                        className={cn(
+                          'transition-colors',
+                          itemIndex > 0 ? 'border-t border-border/40 pt-4' : '',
+                          highlightedMessageId === item.id ? 'rounded-xl bg-primary/5 ring-1 ring-primary/30 px-3 py-3' : '',
+                        )}
+                      >
+                        {renderMessageBody(item, isUser, {
+                          deferHeavyUi,
+                          includeProcessPanel: false,
+                        })}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>
           </div>
         );
       })}
+    </>
+  ), [agent.avatarUrl, agent.color, agent.name, canRegenerateAt, messageGroups, messageIndexMap, onRegenerateMessage, renderMessageBody, stableMessages]);
 
-      {activeStreaming && (
-        <div className="chat-message-row chat-message-row-agent mb-6">
-          <div className="chat-avatar-frame">
-            <AgentAvatar
-              name={activeStreaming.agentName || agent.name}
-              avatarUrl={activeStreaming.agentAvatarUrl || agent.avatarUrl}
-              color={activeStreaming.agentColor || agent.color}
-              size="md"
-            />
+  const streamingRow = useMemo(() => {
+    if (!activeStreaming) {
+      return null;
+    }
+    return (
+      <div className="chat-message-row chat-message-row-agent mb-6">
+        <div className="chat-avatar-frame">
+          <AgentAvatar
+            name={activeStreaming.agentName || agent.name}
+            avatarUrl={activeStreaming.agentAvatarUrl || agent.avatarUrl}
+            color={activeStreaming.agentColor || agent.color}
+            size="md"
+          />
+        </div>
+        <div className="flex flex-col w-full min-w-0">
+          <div className="chat-message-meta">
+            <span className="inline-flex items-center gap-1.5 text-xs font-bold text-muted-foreground">
+              {activeStreaming.agentName || agent.name}
+            </span>
+            <span className="text-[10px] text-muted-foreground/60">
+              {activeStreaming.generationStartedAt != null
+                ? formatElapsed(Math.max(0, nowMs - activeStreaming.generationStartedAt))
+                : '...'}
+            </span>
           </div>
-          <div className="flex flex-col w-full min-w-0">
-            <div className="chat-message-meta">
-              <span className="inline-flex items-center gap-1.5 text-xs font-bold text-muted-foreground">
-                {activeStreaming.agentName || agent.name}
-              </span>
-              <span className="text-[10px] text-muted-foreground/60">
-                {activeStreaming.generationStartedAt != null
-                  ? formatElapsed(Math.max(0, nowMs - activeStreaming.generationStartedAt))
-                  : '...'}
-              </span>
-            </div>
-            <div className="chat-bubble-container flex w-full justify-start mt-1">
-              <div className="chat-bubble chat-bubble-agent">{renderMessageBody(activeStreaming, false)}</div>
-            </div>
+          <div className="chat-bubble-container flex w-full justify-start mt-1">
+            <div className="chat-bubble chat-bubble-agent">{renderMessageBody(activeStreaming, false, { deferHeavyUi: false })}</div>
           </div>
         </div>
-      )}
-    </>
-  ), [activeStreaming, agent.avatarUrl, agent.color, agent.name, canRegenerateAt, messageIndexMap, nowMs, onRegenerateMessage, renderMessageBody, stableMessages]);
+      </div>
+    );
+  }, [activeStreaming, agent.avatarUrl, agent.color, agent.name, nowMs, renderMessageBody]);
 
   const readyAttachmentCount = composerAttachments.filter((item) => item.status === 'ready').length;
   const uploadingAttachmentCount = composerAttachments.filter((item) => item.status === 'uploading').length;
   const canSendMessage = !inputLocked && uploadingAttachmentCount === 0 && (inputValue.trim().length > 0 || readyAttachmentCount > 0);
+  const showAutoConversationToggle = typeof onToggleAutoConversation === 'function';
 
   return (
     <div className="chat-main">
@@ -1605,8 +2291,12 @@ export function ChatConversationPane({
         </div>
       ) : null}
 
-      <div ref={scrollRef} className="chat-messages">
-        {messageRows}
+      <div ref={scrollRef} className="chat-messages" onScroll={handleScroll}>
+        <div ref={contentRef} className="chat-messages-content">
+          {renderConversationTaskList()}
+          {messageRows}
+          {streamingRow}
+        </div>
       </div>
 
       <div className="chat-input-area">
@@ -1652,7 +2342,7 @@ export function ChatConversationPane({
                   onUserActivity('focus');
                 }
               }}
-              placeholder={t('chat.inputPlaceholder')}
+              placeholder={autoConversationEnabled ? '自动群聊中，点击“自动中”可退出并恢复手动输入。' : t('chat.inputPlaceholder')}
               className="chat-input-field focus-visible:ring-0 focus-visible:ring-offset-0"
               disabled={inputLocked}
             />
@@ -1734,12 +2424,72 @@ export function ChatConversationPane({
                 >
                   <Paperclip className="w-4 h-4" />
                 </Button>
+                {contextUsage ? (
+                  <TooltipProvider delayDuration={150}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className={cn('w-8 h-8 rounded-lg transition-colors', meterTextClass, 'hover:text-foreground')}
+                          title="查看上下文压力"
+                        >
+                          {contextUsage.loading ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Gauge className="h-4 w-4" />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="top" align="start" className="w-[260px] p-3">
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-3 text-xs">
+                            <span className="font-medium text-foreground">上下文压力</span>
+                            <span className="text-muted-foreground">{estimatedPressurePercent}%</span>
+                          </div>
+                          <Progress value={estimatedPressurePercent} className="h-1.5" />
+                          <div className="space-y-1 text-[11px] leading-relaxed text-muted-foreground">
+                            <div>{currentTokenText}</div>
+                            {estimatedContextTokenCount != null && estimatedTokenDelta > 0 ? (
+                              <div>发送后约 {formatCount(estimatedContextTokenCount)} token</div>
+                            ) : null}
+                            <div>
+                              近段上下文 {formatCount(contextUsage.recentMessageCount)} 条消息 / {formatCount(contextUsage.recentCharCount)} 字
+                            </div>
+                            <div>
+                              自动压缩阈值: {formatCount(contextUsage.messageThreshold)} 条消息 或 {formatCount(contextUsage.charThreshold)} 字
+                            </div>
+                          </div>
+                        </div>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : null}
               </div>
               <div className="flex items-center gap-2">
                 {uploadingAttachmentCount > 0 ? (
                   <span className="text-[11px] text-muted-foreground">
                     附件上传中 {uploadingAttachmentCount}
                   </span>
+                ) : null}
+                {!isSending && showAutoConversationToggle ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={autoConversationEnabled ? 'default' : 'outline'}
+                    className={cn(
+                      'h-8 rounded-full px-3 text-xs transition-colors',
+                      autoConversationEnabled ? 'bg-black text-white hover:bg-zinc-800' : 'border-border/60 text-muted-foreground hover:text-foreground',
+                    )}
+                    onClick={onToggleAutoConversation}
+                    title={autoConversationEnabled ? '停止自动群聊' : '开启自动群聊'}
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <Zap className="h-3.5 w-3.5" />
+                      {autoConversationEnabled ? '自动中' : '自动'}
+                    </span>
+                  </Button>
                 ) : null}
                 {isSending ? (
                   <Button onClick={onStopStreaming} size="sm" variant="outline" className="chat-stop-button" title="终止输出">

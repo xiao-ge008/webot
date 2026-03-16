@@ -69,6 +69,8 @@ pub fn run() {
             commands::get_api_base_url,
             commands::get_openfang_base_url,
             commands::get_status,
+            commands::get_app_metadata,
+            commands::download_and_install_update,
             commands::pick_skill_folder,
             commands::pick_avatar_file,
             commands::launch_mpv,

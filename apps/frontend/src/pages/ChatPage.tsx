@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { SetStateAction } from 'react';
 import type { CSSProperties } from 'react';
-import { useNavigate, useParams, Link } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { compileSpecStream } from '@json-render/core';
 import { Button } from '@/components/ui/button';
@@ -10,7 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AgentAvatar } from '@/components/ui/agent-avatar';
 import { Badge } from '@/components/ui/badge';
-import { Search, Plus, GripVertical, X } from 'lucide-react';
+import { Search, Plus, GripVertical, Settings, ListChecks, X } from 'lucide-react';
 import { mockAgents } from '@/data/mock-agents';
 import { type ChatAttachment, type Message, type MessageToolCall, type MessageTrace } from '@/data/mock-chats';
 import { cn } from '@/lib/utils';
@@ -18,19 +18,25 @@ import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 import { ChatRenderer } from '@/components/chat/ChatRenderer';
 import type { ChatSendPayload, GroupUpgradeActionPayload } from '@/components/chat/ChatConversationPane';
 import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog';
+import type { TaskDetailsTask } from '@/components/tasks/TaskDetailsDialog';
 import { A2AWorkDetailsDialog } from '@/components/tasks/A2AWorkDetailsDialog';
 import type { Agent } from '@/types';
-import type { Task, TaskRunRecord } from '@/types/tasks';
-import type { ChatTaskCardData } from '@/types/chat-task';
+import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord } from '@/types/tasks';
+import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
+import type { GroupQueueItem, GroupQueueReason, GroupQueueStatus, GroupSessionRuntime } from '@/types/group';
 import { CHAT_CHANNELS, CHAT_RENDER_MODES } from '@/main/types';
-import { cancelAgentChat, sendAgentChat, subscribeAgentChatStream, withChatRenderContext } from '@/services/agent-client';
+import { cancelAgentChat, compactAgentSession, sendAgentChat, stopAgent, subscribeAgentChatStream, withChatRenderContext } from '@/services/agent-client';
 import type { StoredChatSession } from '@/services/chat-session-store';
 import { chatRuntimeStore, useChatRuntimeSelector } from '@/services/chat-runtime-store';
 import { ensureChatRuntimeStreamPump } from '@/services/chat-runtime-stream-pump';
+import {
+    buildIdentityBundle,
+    executeAgentManagementAction,
+    type AgentManagementProgressEvent,
+} from '@/services/agent-management-workflow';
 import { getManagementAgentDetail, listManagementAgents } from '@/services/management-client';
 import { createChatGroup } from '@/services/group-client';
-import { executeAgentManagementAction } from '@/services/agent-management-workflow';
 import { requestJson } from '@/services/transport';
 import {
     createTask,
@@ -38,10 +44,12 @@ import {
     getTaskDetail,
     getTaskFinalSummary,
     hasTaskFinalSummaryDelivered,
+    listPendingTaskReportDeliveries,
     listTaskRuns,
     pauseTask,
     runTaskNow,
     setTaskCenterAgentId,
+    updateTaskReportDeliveryStatus,
 } from '@/services/task-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import {
@@ -102,6 +110,7 @@ const GROUP_UPGRADE_SYSTEM_PREAMBLE = [
 const REMOTE_SESSION_INITIAL_BATCH = 20;
 const REMOTE_SESSION_LOAD_MORE_BATCH = 20;
 const REMOTE_SESSION_DETAIL_CONCURRENCY = 6;
+const AUTO_CONVERSATION_IDLE_MS = 4_000;
 
 function buildGroupUpgradeSystemPreamble(): string {
     return GROUP_UPGRADE_SYSTEM_PREAMBLE;
@@ -396,6 +405,41 @@ function inferSessionSource(label: string): 'app' | 'web' | 'unknown' {
     return 'unknown';
 }
 
+function isGroupScopedSessionLabel(label: string): boolean {
+    const normalized = label.trim().toLowerCase();
+    if (!normalized) {
+        return false;
+    }
+    return normalized.startsWith('groupmem_');
+}
+
+const GROUP_SESSION_ROTATE_MESSAGE_THRESHOLD = 24;
+const GROUP_SESSION_ROTATE_CHAR_THRESHOLD = 32_000;
+const GROUP_QUEUE_HISTORY_LIMIT = 18;
+const GROUP_SESSION_COMPACT_COOLDOWN_MS = 60_000;
+
+function isActiveGroupQueueStatus(status: GroupQueueStatus): boolean {
+    return status === 'queued' || status === 'running';
+}
+
+function compactGroupRuntimeNote(raw: string, maxLen = 96): string {
+    const normalized = raw.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLen ? `${normalized.slice(0, maxLen)}...` : normalized;
+}
+
+function trimGroupQueue(items: GroupQueueItem[]): GroupQueueItem[] {
+    const active = items.filter((item) => isActiveGroupQueueStatus(item.status));
+    const finished = items.filter((item) => !isActiveGroupQueueStatus(item.status)).slice(-Math.max(0, GROUP_QUEUE_HISTORY_LIMIT - active.length));
+    return [...finished, ...active].slice(-GROUP_QUEUE_HISTORY_LIMIT);
+}
+
+function compactSessionDigestLine(raw: string, maxLen = 120): string {
+    const normalized = raw.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLen ? `${normalized.slice(0, maxLen)}...` : normalized;
+}
+
 function getRemoteSessionId(session: StoredChatSession | null | undefined): string {
     if (!session) return '';
     const explicit = typeof session.remoteSessionId === 'string' ? session.remoteSessionId.trim() : '';
@@ -455,6 +499,36 @@ interface BackendSessionSummary {
     displayTitle: string;
     updatedAt: number;
     source: 'app' | 'web' | 'unknown';
+}
+
+function parseBackendContextWindowTokens(raw: Record<string, unknown>): number | null {
+    const candidates = [
+        raw.context_window_tokens,
+        raw.contextWindowTokens,
+        raw.context_tokens,
+        raw.contextTokens,
+    ];
+    for (const candidate of candidates) {
+        if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+            return Math.floor(candidate);
+        }
+    }
+    return null;
+}
+
+function parseBackendMessageCount(raw: Record<string, unknown>): number | null {
+    const candidates = [
+        raw.message_count,
+        raw.messageCount,
+        raw.messages_count,
+        raw.messagesCount,
+    ];
+    for (const candidate of candidates) {
+        if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+            return Math.floor(candidate);
+        }
+    }
+    return null;
 }
 
 function pickSessionTitle(raw: Record<string, unknown>): string {
@@ -517,10 +591,21 @@ function parseBackendSessionSummaries(payload: unknown): BackendSessionSummary[]
             ? item.label.trim()
             : (typeof item.session_label === 'string' ? item.session_label.trim() : '');
         const rawTitle = pickSessionTitle(item);
+        const normalizedTitle = normalizeSessionDisplayTitle(rawTitle, '');
+        const messageCount = parseBackendMessageCount(item);
+        if (messageCount === 0) {
+            // 模型切换、流式失败恢复、后台 stop 后，OpenFang 可能残留仅创建壳但没有任何消息的会话。
+            // 这类远端空会话不应进入左侧历史列表，否则会出现“会话 xxxxxxxx”一串空记录。
+            continue;
+        }
+        if (!sessionLabel && !normalizedTitle) {
+            // OpenFang 首次初始化时会残留一个无 label 的默认会话，这类空壳会话不应展示到应用会话列表。
+            continue;
+        }
         out.push({
             sessionId,
             sessionLabel,
-            displayTitle: normalizeSessionDisplayTitle(rawTitle, '') || `会话 ${sessionId.slice(0, 8)}`,
+            displayTitle: normalizedTitle || `会话 ${sessionId.slice(0, 8)}`,
             updatedAt: parseBackendTimestampMs(item.updated_at ?? item.updatedAt ?? item.created_at ?? item.createdAt),
             source: inferSessionSource(sessionLabel),
         });
@@ -528,6 +613,160 @@ function parseBackendSessionSummaries(payload: unknown): BackendSessionSummary[]
 
     out.sort((a, b) => b.updatedAt - a.updatedAt);
     return out;
+}
+
+function areMessagesEquivalentByContent(left: Message[], right: Message[]): boolean {
+    if (left.length !== right.length) {
+        return false;
+    }
+    for (let index = 0; index < left.length; index += 1) {
+        const l = left[index];
+        const r = right[index];
+        if (!l || !r) {
+            return false;
+        }
+        if (
+            l.role !== r.role
+            || l.text !== r.text
+            || JSON.stringify(l.attachments ?? null) !== JSON.stringify(r.attachments ?? null)
+            || JSON.stringify(l.tools ?? null) !== JSON.stringify(r.tools ?? null)
+        ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function areMessagesContentCompatible(left: Message, right: Message): boolean {
+    if (left.role !== right.role) {
+        return false;
+    }
+    const leftAgentId = (left.agentId || '').trim();
+    const rightAgentId = (right.agentId || '').trim();
+    if (leftAgentId || rightAgentId) {
+        if (!leftAgentId || !rightAgentId || leftAgentId !== rightAgentId) {
+            return false;
+        }
+    }
+    const leftAgentName = (left.agentName || '').trim();
+    const rightAgentName = (right.agentName || '').trim();
+    if (!leftAgentId && !rightAgentId && (leftAgentName || rightAgentName)) {
+        if (!leftAgentName || !rightAgentName || leftAgentName !== rightAgentName) {
+            return false;
+        }
+    }
+    if (JSON.stringify(left.attachments ?? null) !== JSON.stringify(right.attachments ?? null)) {
+        return false;
+    }
+    if (JSON.stringify(left.tools ?? null) !== JSON.stringify(right.tools ?? null)) {
+        return false;
+    }
+    const leftText = (left.text || '').trim();
+    const rightText = (right.text || '').trim();
+    if (leftText && rightText) {
+        if (leftText === rightText) {
+            return true;
+        }
+        if (leftText.includes(rightText) || rightText.includes(leftText)) {
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+function pickRicherText(left: string, right: string): string {
+    const a = left.trim();
+    const b = right.trim();
+    if (!a) return right;
+    if (!b) return left;
+    if (a === b) return left;
+    if (a.includes(b)) return left;
+    if (b.includes(a)) return right;
+    return b.length >= a.length ? right : left;
+}
+
+function hydrateRecoveredMessage(base: Message | undefined, recovered: Message): Message {
+    if (!base || base.role !== recovered.role) {
+        return recovered;
+    }
+    const mergedText = pickRicherText(base.text || '', recovered.text || '');
+    return {
+        ...base,
+        ...recovered,
+        text: mergedText,
+        agentId: recovered.agentId ?? base.agentId,
+        agentName: recovered.agentName ?? base.agentName,
+        agentAvatarUrl: recovered.agentAvatarUrl ?? base.agentAvatarUrl,
+        agentColor: recovered.agentColor ?? base.agentColor,
+        agentPortraitUrl: recovered.agentPortraitUrl ?? base.agentPortraitUrl,
+        attachments: (recovered.attachments?.length ?? 0) > 0 ? recovered.attachments : base.attachments,
+        tools: (recovered.tools?.length ?? 0) > 0 ? recovered.tools : base.tools,
+        thinkingTrace: (recovered.thinkingTrace?.length ?? 0) > 0 ? recovered.thinkingTrace : base.thinkingTrace,
+        toolTrace: (recovered.toolTrace?.length ?? 0) > 0 ? recovered.toolTrace : base.toolTrace,
+        taskCard: recovered.taskCard ?? base.taskCard,
+        a2aCards: (recovered.a2aCards?.length ?? 0) > 0 ? recovered.a2aCards : base.a2aCards,
+    };
+}
+
+function mergeRecoveredMessages(local: Message[], remote: Message[]): Message[] {
+    if (remote.length === 0) {
+        return local;
+    }
+    if (local.length === 0) {
+        return remote;
+    }
+    if (areMessagesEquivalentByContent(local, remote)) {
+        return local;
+    }
+    const merged: Message[] = [];
+    let localIndex = 0;
+    let remoteIndex = 0;
+
+    while (localIndex < local.length || remoteIndex < remote.length) {
+        const localMessage = local[localIndex];
+        const remoteMessage = remote[remoteIndex];
+
+        if (!localMessage) {
+            merged.push(remoteMessage);
+            remoteIndex += 1;
+            continue;
+        }
+        if (!remoteMessage) {
+            merged.push(localMessage);
+            localIndex += 1;
+            continue;
+        }
+
+        if (areMessagesContentCompatible(localMessage, remoteMessage)) {
+            merged.push(hydrateRecoveredMessage(localMessage, remoteMessage));
+            localIndex += 1;
+            remoteIndex += 1;
+            continue;
+        }
+
+        const nextRemote = remote[remoteIndex + 1];
+        if (nextRemote && areMessagesContentCompatible(localMessage, nextRemote)) {
+            merged.push(remoteMessage);
+            remoteIndex += 1;
+            continue;
+        }
+
+        const nextLocal = local[localIndex + 1];
+        if (nextLocal && areMessagesContentCompatible(nextLocal, remoteMessage)) {
+            merged.push(localMessage);
+            localIndex += 1;
+            continue;
+        }
+
+        merged.push(pickRicherText(localMessage.text || '', remoteMessage.text || '') === (localMessage.text || '')
+            ? localMessage
+            : hydrateRecoveredMessage(localMessage, remoteMessage));
+        localIndex += 1;
+        remoteIndex += 1;
+    }
+
+    return merged;
 }
 
 function buildSessionFromBackendPayload(
@@ -556,6 +795,7 @@ function buildSessionFromBackendPayload(
             return {
                 id: `remote_msg_${Date.now()}_${index}`,
                 role,
+                agentId: role === 'agent' ? ownerAgentId?.trim() || undefined : undefined,
                 text,
                 attachments: normalized.attachments,
                 tools,
@@ -651,7 +891,7 @@ function mergeRemoteSessions(current: StoredChatSession[], incoming: StoredChatS
                 id: matched.id || remote.id || toRemoteStorageSessionId(remoteSessionId),
                 title: mergedTitle,
                 updatedAt: Math.max(matched.updatedAt, remote.updatedAt),
-                messages: remote.messages.length > 0 ? remote.messages : matched.messages,
+                messages: mergeRecoveredMessages(matched.messages, remote.messages),
                 remoteSessionId,
                 remoteSessionOwnerAgentId: remote.remoteSessionOwnerAgentId ?? matched.remoteSessionOwnerAgentId,
                 sessionLabel: remote.sessionLabel ?? matched.sessionLabel,
@@ -722,12 +962,22 @@ function mergeFixedLabelRestoredSession(
         : -1;
     const resolvedIndex = targetIndex >= 0 ? targetIndex : 0;
     const target = sanitizedCurrent[resolvedIndex];
-    const keepCustomTitle = Boolean(target.title?.trim()) && target.autoTitle === false;
+    const targetTitle = (target.title || '').trim();
+    const restoredTitle = (sanitizedRestored.title || '').trim();
+    const keepLocalTitle = Boolean(targetTitle)
+        && targetTitle !== '当前会话'
+        && (
+            target.autoTitle === false
+            || !restoredTitle
+            || restoredTitle === targetTitle
+            || restoredTitle.includes(targetTitle)
+            || target.messages.length > 0
+        );
     const nextTarget: StoredChatSession = {
         ...target,
-        title: keepCustomTitle ? target.title : (sanitizedRestored.title || target.title),
+        title: keepLocalTitle ? target.title : (sanitizedRestored.title || target.title),
         updatedAt: Math.max(target.updatedAt, sanitizedRestored.updatedAt),
-        messages: sanitizedRestored.messages.length > 0 ? sanitizedRestored.messages : target.messages,
+        messages: mergeRecoveredMessages(target.messages, sanitizedRestored.messages),
         sessionLabel: fixedLabel,
         remoteSessionId: undefined,
         remoteSessionOwnerAgentId: undefined,
@@ -863,6 +1113,32 @@ function buildIdleAutoPrompt(params: {
     return lines.join('\n');
 }
 
+function buildAutoConversationPrompt(params: {
+    leaderName: string;
+    context: string;
+}): string {
+    const lines = [
+        '[system:auto-conversation]',
+        `你是群聊主持人 ${params.leaderName}，当前需要继续主持这场群聊。`,
+        '不要等待用户发言，由你承接上下文并持续推进讨论。',
+        '请先简短总结当前进度，再明确 @ 点名下一位最相关的成员继续发言；一次优先点名 1 人，必要时最多 2 人。',
+        '尽量让成员轮流发言，避免同一人连续主导；如果讨论已经充分，请先给出阶段结论，再决定是否需要点名补充。',
+        '如果本轮已经可以收束，请直接给出收束结论，并在最后单独写上“终止讨论”以结束自动循环；不要重复寒暄，不要提及系统或提示词。',
+        '控制在 2-4 句，保持自然、具体、非重复。',
+    ];
+    if (params.context.trim()) {
+        lines.push('最近群聊摘要：');
+        lines.push(params.context);
+    } else {
+        lines.push('当前还没有明确上下文，请你直接开场并点名第一位成员发言。');
+    }
+    return lines.join('\n');
+}
+
+function isDocumentHidden(): boolean {
+    return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+}
+
 function formatEveryMsInCard(everyMs: number): string {
     const safe = Math.max(1000, Math.floor(everyMs));
     if (safe % 86_400_000 === 0) return `每 ${safe / 86_400_000} 天`;
@@ -941,14 +1217,38 @@ function buildTaskExecutionPrompt(objective: string, maxRuns: number): string {
     ].join('\n');
 }
 
-function createProposalTaskCardFromAssistantText(raw: string): ChatTaskCardData | null {
+function normalizeAssistantTaskDraftText(raw: string): string {
     const text = raw.replace(/\r\n/g, '\n').trim();
-    if (!text) return null;
-    const normalizedText = text
+    if (!text) return '';
+    const normalized = text
         .replace(/\*\*([^*]+)\*\*/g, '$1')
-        .replace(/`([^`]+)`/g, '$1')
-        .replace(/^\s*[-*]\s+/gm, '')
-        .trim();
+        .replace(/`([^`]+)`/g, '$1');
+    const lines = normalized
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => !/^\|?(?:\s*:?-{3,}:?\s*\|)+\s*$/.test(line))
+        .map((line) => {
+            if (!line.includes('|')) {
+                return line.replace(/^\s*[-*]\s+/, '');
+            }
+            const cells = line
+                .split('|')
+                .map((cell) => cell.trim())
+                .filter(Boolean);
+            if (cells.length >= 2) {
+                return `${cells[0]}: ${cells.slice(1).join(' ')}`.trim();
+            }
+            return line.replace(/\|/g, ' ').replace(/\s+/g, ' ').trim();
+        })
+        .filter(Boolean);
+    return lines.join('\n').trim();
+}
+
+function createProposalTaskCardFromAssistantText(raw: string): ChatTaskCardData | null {
+    const text = normalizeAssistantTaskDraftText(raw);
+    if (!text) return null;
+    const normalizedText = text.trim();
 
     const asksForConfirmation = /(请确认|确认无误|确认后|回复.?确认|是否创建)/i.test(normalizedText);
     const scheduleHint = /(定时任务|执行间隔|总执行次数|总次数|每隔|每\s*\d*\s*(秒钟?|分钟|分|小时|天|日|周))/i.test(normalizedText);
@@ -979,6 +1279,13 @@ function createProposalTaskCardFromAssistantText(raw: string): ChatTaskCardData 
     const taskName = (nameMatch?.[1] || objectiveMatch?.[1] || '定时任务').trim();
     const objective = (objectiveMatch?.[1] || nameMatch?.[1] || taskName).trim();
     const now = new Date().toISOString();
+    const draftEntry = buildTaskTimelineEntry({
+        kind: 'created',
+        title: '已识别任务草案',
+        detail: `${formatEveryMsInCard(everyMs)}，计划执行 ${maxRuns} 次`,
+        at: now,
+        level: 'info',
+    });
     return {
         taskName,
         objective,
@@ -996,6 +1303,10 @@ function createProposalTaskCardFromAssistantText(raw: string): ChatTaskCardData 
         canDelete: false,
         notifyOnComplete: true,
         completedNotified: false,
+        taskKind: 'chat_schedule',
+        reportStatus: 'pending',
+        progressPercent: 0,
+        timeline: [draftEntry],
     };
 }
 
@@ -1003,6 +1314,13 @@ function createProposalTaskCard(raw: string): ChatTaskCardData | null {
     const parsed = createProposalTaskCardFromAssistantText(raw);
     if (!parsed) return null;
     const now = new Date().toISOString();
+    const draftEntry = buildTaskTimelineEntry({
+        kind: 'created',
+        title: '已识别任务草案',
+        detail: parsed.scheduleText,
+        at: now,
+        level: 'info',
+    });
     return {
         taskName: parsed.taskName,
         objective: parsed.objective,
@@ -1020,6 +1338,181 @@ function createProposalTaskCard(raw: string): ChatTaskCardData | null {
         canDelete: false,
         notifyOnComplete: true,
         completedNotified: false,
+        taskKind: 'chat_schedule',
+        reportStatus: 'pending',
+        progressPercent: 0,
+        timeline: parsed.timeline ?? [draftEntry],
+    };
+}
+
+type ParsedAgentManagementSummaryItem = {
+    nickname: string;
+    aliases: string[];
+    englishName: string;
+    description: string;
+    tags: string[];
+    persona?: string;
+};
+
+type ParsedAgentManagementCommon = {
+    provider?: string;
+    model?: string;
+    worldview?: string;
+    serviceTarget?: string;
+    guardrails?: string;
+};
+
+function splitAgentSummaryList(raw: string | undefined): string[] {
+    const text = (raw || '').trim();
+    if (!text) return [];
+    return Array.from(new Set(
+        text
+            .split(/[、，,\/|；;\n]+/g)
+            .map((item) => item.trim())
+            .filter(Boolean),
+    ));
+}
+
+function extractAgentSummaryValue(block: string, label: string): string {
+    const match = block.match(new RegExp(`(?:^|\\n)\\s*[-*]?\\s*${label}\\s*[：:]\\s*([^\\n]+)`, 'i'));
+    return (match?.[1] || '').trim();
+}
+
+function parseAgentManagementSummaryText(raw: string): {
+    mode: 'create' | 'update';
+    items: ParsedAgentManagementSummaryItem[];
+    common: ParsedAgentManagementCommon;
+} | null {
+    const text = raw.replace(/\r\n/g, '\n').trim();
+    if (!text) return null;
+    if (!/确认/.test(text) || !/(创建|修改|更新)/.test(text)) {
+        return null;
+    }
+
+    const items: ParsedAgentManagementSummaryItem[] = [];
+    const itemPattern = /\*\*([^\n*（(]+)[（(]([a-z0-9][a-z0-9-]*)[)）]\*\*([\s\S]*?)(?=\n\s*\*\*|$)/gi;
+    let match: RegExpExecArray | null = null;
+    while ((match = itemPattern.exec(text)) !== null) {
+        const block = match[3] || '';
+        const aliasLine = extractAgentSummaryValue(block, '昵称');
+        const aliases = splitAgentSummaryList(aliasLine);
+        const nickname = aliases[0] || (match[1] || '').trim();
+        const description = extractAgentSummaryValue(block, '描述') || `${nickname} 的专属角色身份`;
+        const tags = splitAgentSummaryList(extractAgentSummaryValue(block, '标签'));
+        const persona = extractAgentSummaryValue(block, '人格') || undefined;
+        items.push({
+            nickname,
+            aliases,
+            englishName: (match[2] || '').trim(),
+            description,
+            tags,
+            persona,
+        });
+    }
+    if (items.length === 0) {
+        return null;
+    }
+
+    const commonBlock = (text.match(/\*\*共同设定\*\*([\s\S]*)$/i)?.[1] || '').trim();
+    const modelRaw = extractAgentSummaryValue(commonBlock, '模型');
+    const [provider, model] = modelRaw.includes('/') ? modelRaw.split('/', 2).map((item) => item.trim()) : ['', ''];
+    const worldview = extractAgentSummaryValue(commonBlock, '世界观') || undefined;
+    const serviceTarget = extractAgentSummaryValue(commonBlock, '服务对象') || undefined;
+    const guardrails = extractAgentSummaryValue(commonBlock, '禁忌') || undefined;
+
+    return {
+        mode: /(修改|更新)/.test(text) && !/创建/.test(text) ? 'update' : 'create',
+        items,
+        common: {
+            provider: provider || undefined,
+            model: model || undefined,
+            worldview,
+            serviceTarget,
+            guardrails,
+        },
+    };
+}
+
+function createAgentManagementConfirmSpecFromAssistantText(raw: string): Record<string, unknown> | null {
+    const parsed = parseAgentManagementSummaryText(raw);
+    if (!parsed || parsed.items.length === 0) {
+        return null;
+    }
+
+    const payloadItems = parsed.items.map((item) => {
+        const bundle = buildIdentityBundle({
+            displayName: item.nickname,
+            englishName: item.englishName,
+            description: item.description,
+            tags: item.tags,
+            provider: parsed.common.provider,
+            model: parsed.common.model,
+            aliases: item.aliases,
+            persona: item.persona,
+            worldview: parsed.common.worldview,
+            serviceTarget: parsed.common.serviceTarget,
+            guardrails: parsed.common.guardrails,
+        });
+        return {
+            nickname: item.nickname,
+            englishName: item.englishName,
+            description: item.description,
+            tags: item.tags,
+            provider: parsed.common.provider,
+            model: parsed.common.model,
+            contextFiles: {
+                ...bundle.contextFiles,
+                SYSTEM_PROMPT: bundle.systemPrompt,
+            },
+        };
+    });
+
+    return {
+        type: 'AgentManagementConfirmCard',
+        props: {
+            mode: parsed.mode,
+            confirmAction: 'confirm_agent_management',
+            cancelAction: 'cancel_agent_management',
+            items: payloadItems,
+            summaryItems: payloadItems.map((item) => {
+                const row = item as Record<string, unknown>;
+                const tags = Array.isArray(row.tags) ? row.tags.join(' / ') : '';
+                return `${row.nickname || ''}（${row.englishName || ''}）${tags ? `，标签：${tags}` : ''}`;
+            }),
+        },
+    };
+}
+
+function summarizeAgentManagementPayload(payload: Record<string, unknown>): {
+    taskName: string;
+    objective: string;
+} {
+    const mode = String(payload.mode || 'create').trim().toLowerCase();
+    const rawItems = Array.isArray(payload.items)
+        ? payload.items
+        : Array.isArray(payload.agents)
+            ? payload.agents
+            : [];
+    const items = rawItems
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+        .map((item) => ({
+            nickname: String(item.nickname || item.targetName || item.name || '').trim(),
+            englishName: String(item.englishName || item.english_name || '').trim(),
+        }))
+        .filter((item) => item.nickname || item.englishName);
+    if (items.length === 0) {
+        items.push({
+            nickname: String(payload.nickname || payload.targetName || payload.name || '').trim(),
+            englishName: String(payload.englishName || '').trim(),
+        });
+    }
+    const label = items
+        .filter((item) => item.nickname || item.englishName)
+        .map((item) => item.englishName ? `${item.nickname || item.englishName}（${item.englishName}）` : item.nickname)
+        .join('、') || '未命名智能体';
+    return {
+        taskName: mode === 'update' ? '智能体修改任务' : '智能体创建任务',
+        objective: `${mode === 'update' ? '修改' : '创建'}：${label}`,
     };
 }
 
@@ -1031,6 +1524,9 @@ function resolveCardStage(task: Task, card: ChatTaskCardData, runCount: number):
         return 'completed';
     }
     const hasStarted = runCount > 0 || Boolean(task.runInfo.lastRun);
+    if (task.enabled && !hasStarted) {
+        return 'running';
+    }
     if (task.runInfo.lastStatus === 'error' && hasStarted) {
         return task.enabled ? 'scheduled' : 'failed';
     }
@@ -1038,6 +1534,139 @@ function resolveCardStage(task: Task, card: ChatTaskCardData, runCount: number):
         return 'cancelled';
     }
     return 'scheduled';
+}
+
+function calculateTaskProgressPercent(runCount: number, maxRuns: number): number | undefined {
+    if (!Number.isFinite(maxRuns) || maxRuns <= 0) {
+        return undefined;
+    }
+    const safeRunCount = Math.max(0, Math.floor(runCount));
+    return Math.max(0, Math.min(100, Math.round((safeRunCount / maxRuns) * 100)));
+}
+
+function buildTaskTimelineEntry(input: {
+    kind: ChatTaskLifecycleItem['kind'];
+    title: string;
+    detail?: string;
+    at?: string;
+    runCount?: number;
+    level?: ChatTaskLifecycleItem['level'];
+    idSeed?: string;
+}): ChatTaskLifecycleItem {
+    const at = (input.at || new Date().toISOString()).trim() || new Date().toISOString();
+    const safeTitle = input.title.trim() || '任务状态更新';
+    const safeDetail = (input.detail || '').trim() || undefined;
+    return {
+        id: input.idSeed?.trim() || generateId(),
+        kind: input.kind,
+        title: safeTitle,
+        detail: safeDetail,
+        at,
+        runCount: typeof input.runCount === 'number' && Number.isFinite(input.runCount)
+            ? Math.max(0, Math.floor(input.runCount))
+            : undefined,
+        level: input.level,
+    };
+}
+
+function appendTaskTimeline(
+    card: ChatTaskCardData,
+    entry: ChatTaskLifecycleItem,
+): ChatTaskCardData {
+    const existing = Array.isArray(card.timeline) ? card.timeline : [];
+    const nextTimeline = existing.some((item) => item.id === entry.id)
+        ? existing
+        : [...existing, entry].sort((left, right) => Date.parse(left.at) - Date.parse(right.at)).slice(-18);
+    return {
+        ...card,
+        timeline: nextTimeline,
+        latestReportAt: entry.at,
+        latestReportKind:
+            entry.kind === 'progress'
+            || entry.kind === 'anomaly'
+            || entry.kind === 'final'
+            || entry.kind === 'failed'
+            || entry.kind === 'started'
+                ? entry.kind
+                : card.latestReportKind,
+    };
+}
+
+function buildTaskDeliveryTimelineEntry(delivery: TaskReportDelivery): ChatTaskLifecycleItem {
+    const payload = isTaskDeliveryPayloadRecord(delivery.payload) ? delivery.payload : undefined;
+    const payloadStatus = typeof payload?.status === 'string' ? payload.status.trim().toLowerCase() : '';
+    const runCount = typeof delivery.runCount === 'number' ? Math.max(0, delivery.runCount) : undefined;
+    if (delivery.deliveryKind === 'anomaly' || payloadStatus === 'alert' || payloadStatus === 'anomaly') {
+        return buildTaskTimelineEntry({
+            idSeed: `task_delivery_timeline_${delivery.id}`,
+            kind: 'anomaly',
+            title: '触发异常汇报',
+            detail: (delivery.errorText || delivery.summaryText || '任务命中异常条件。').trim(),
+            at: delivery.createdAt,
+            runCount,
+            level: 'error',
+        });
+    }
+    if (delivery.deliveryKind === 'progress') {
+        return buildTaskTimelineEntry({
+            idSeed: `task_delivery_timeline_${delivery.id}`,
+            kind: 'progress',
+            title: runCount ? `第 ${runCount} 轮进度回传` : '任务进度回传',
+            detail: (delivery.summaryText || delivery.errorText || '任务已产生新的执行进度。').trim(),
+            at: delivery.createdAt,
+            runCount,
+            level: 'info',
+        });
+    }
+    if (payloadStatus === 'failed' || delivery.errorText) {
+        return buildTaskTimelineEntry({
+            idSeed: `task_delivery_timeline_${delivery.id}`,
+            kind: 'failed',
+            title: '任务执行失败',
+            detail: (delivery.errorText || delivery.summaryText || '任务执行失败。').trim(),
+            at: delivery.createdAt,
+            runCount,
+            level: 'error',
+        });
+    }
+    return buildTaskTimelineEntry({
+        idSeed: `task_delivery_timeline_${delivery.id}`,
+        kind: 'final',
+        title: '最终总结已回传',
+        detail: (delivery.summaryText || '任务已完成。').trim(),
+        at: delivery.createdAt,
+        runCount,
+        level: 'success',
+    });
+}
+
+function resolveTaskConversationScope(
+    runtimeKey: string,
+    sessionOwnerAgentId: string,
+    chatAgentId: string,
+): { conversationType: TaskConversationType; conversationId: string } {
+    const normalizedRuntimeKey = runtimeKey.trim();
+    if (normalizedRuntimeKey.startsWith('group:')) {
+        const groupId = normalizedRuntimeKey.slice('group:'.length).trim();
+        return {
+            conversationType: 'group',
+            conversationId: groupId || normalizedRuntimeKey,
+        };
+    }
+    return {
+        conversationType: 'dm',
+        conversationId: sessionOwnerAgentId.trim() || chatAgentId.trim(),
+    };
+}
+
+function isTaskDeliveryPayloadRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value != null && !Array.isArray(value);
+}
+
+function hasAsyncWorkHandoff(message: Message): boolean {
+    const taskStage = message.taskCard?.stage;
+    const hasAsyncTask = taskStage === 'scheduled' || taskStage === 'running';
+    return hasAsyncTask;
 }
 
 interface AgentChatReadinessMeta {
@@ -1073,6 +1702,7 @@ function buildAgentChatUnavailableMessage(meta?: AgentChatReadinessMeta): string
 interface AgentDirectoryItem {
     id: string;
     name: string;
+    aliases: string[];
     avatarUrl?: string;
     color?: string;
 }
@@ -1146,7 +1776,11 @@ function findAgentByAlias(
         return undefined;
     }
     for (const item of directory.values()) {
-        if (normalizeLookupKey(item.id) === normalized || normalizeLookupKey(item.name) === normalized) {
+        if (
+            normalizeLookupKey(item.id) === normalized
+            || normalizeLookupKey(item.name) === normalized
+            || item.aliases.some((row) => normalizeLookupKey(row) === normalized)
+        ) {
             return item;
         }
     }
@@ -1233,7 +1867,8 @@ function extractAgentTargetFromToolPayload(
     if (!agentName) {
         const nameRegex = /(?:agent[_-]?name|callee[_-]?agent[_-]?name|target[_-]?agent[_-]?name|to[_-]?name)\s*[:=]\s*["']?([^\n"',}]{1,64})/i;
         const xmlNameRegex = /<arg_name>\s*(?:agent_name|callee_agent_name|target_agent_name)\s*<\/arg_name>\s*<arg_value>\s*([^<]+)\s*<\/arg_value>/i;
-        const nameMatch = raw.match(xmlNameRegex) ?? raw.match(nameRegex);
+        const errorNameRegex = /Agent not found:\s*([^\n\r]+)/i;
+        const nameMatch = raw.match(xmlNameRegex) ?? raw.match(nameRegex) ?? raw.match(errorNameRegex);
         agentName = nameMatch?.[1]?.trim() || '';
     }
 
@@ -1252,6 +1887,81 @@ function extractAgentTargetFromToolPayload(
         agentName: resolvedAgentName,
         directoryHit,
     };
+}
+
+function extractA2aObjectiveFromToolPayload(
+    parsedTool: Record<string, unknown> | null,
+    raw: string,
+): string {
+    const payloadCandidates: unknown[] = [
+        parsedTool,
+        parsedTool?.input,
+        parsedTool?.args,
+        parsedTool?.arguments,
+        parsedTool?.payload,
+        parsedTool?.params,
+    ];
+    const objectivePaths: string[][] = [
+        ['task'],
+        ['task_description'],
+        ['taskDescription'],
+        ['request'],
+        ['prompt'],
+        ['message'],
+        ['content'],
+        ['instruction'],
+        ['instructions'],
+        ['goal'],
+        ['target', 'task'],
+        ['target', 'prompt'],
+        ['payload', 'task'],
+    ];
+
+    for (const candidate of payloadCandidates) {
+        for (const path of objectivePaths) {
+            const value = readNestedString(candidate, path);
+            if (value) {
+                return value;
+            }
+        }
+    }
+
+    const regexes: RegExp[] = [
+        /(?:task|task_description|taskDescription|request|prompt|message|content|instruction)\s*[:=]\s*["']?([\s\S]{1,220})/i,
+        /<arg_name>\s*(?:task|request|prompt|message|content)\s*<\/arg_name>\s*<arg_value>\s*([\s\S]{1,220}?)\s*<\/arg_value>/i,
+    ];
+    for (const regex of regexes) {
+        const match = raw.match(regex);
+        const value = match?.[1]?.trim();
+        if (value) {
+            return value;
+        }
+    }
+    return '';
+}
+
+function compactA2aText(raw: string, maxLen = 160): string {
+    const normalized = raw.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLen ? `${normalized.slice(0, maxLen)}...` : normalized;
+}
+
+function compactGroupDispatchText(raw: string, maxLen = 680): string {
+    const normalized = raw.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLen ? `${normalized.slice(0, maxLen)}...` : normalized;
+}
+
+function buildGroupDispatchHandoffMessage(message: Message): string {
+    const speaker = (message.agentName || message.agentId || '上一位成员').trim() || '上一位成员';
+    const compact = compactGroupDispatchText(message.text || '');
+    return [
+        '[system:group-mention-handoff]',
+        `群内上一位成员 ${speaker} 刚刚完成了一轮公开回复。你现在仅基于必要信息接棒，不要重复复述整段原文。`,
+        compact
+            ? `需接棒的关键信息：${compact}`
+            : '需接棒的关键信息：围绕当前议题继续推进，补充你的判断、下一步或结论。',
+    ].join('\n');
 }
 
 function inferAgentFromText(
@@ -1284,6 +1994,10 @@ function ensureA2aCard(
         agentAvatarUrl?: string;
         agentColor?: string;
         summary?: string;
+        objective?: string;
+        requestPayloadText?: string;
+        bindingSessionId?: string;
+        bindingSourceMessageId?: string;
     },
 ): { cards: A2AWorkCardData[]; index: number } {
     const isIncomingPlaceholder =
@@ -1334,6 +2048,10 @@ function ensureA2aCard(
                 agentAvatarUrl: placeholder.agentAvatarUrl || incoming.agentAvatarUrl,
                 agentColor: placeholder.agentColor || incoming.agentColor,
                 summary: placeholder.summary || incoming.summary,
+                objective: placeholder.objective || incoming.objective,
+                requestPayloadText: placeholder.requestPayloadText || incoming.requestPayloadText,
+                bindingSessionId: placeholder.bindingSessionId || incoming.bindingSessionId,
+                bindingSourceMessageId: placeholder.bindingSourceMessageId || incoming.bindingSourceMessageId,
             };
             return { cards: nextCards, index: placeholderIndex };
         }
@@ -1348,20 +2066,38 @@ function ensureA2aCard(
         agentColor: incoming.agentColor,
         status: 'working',
         summary: incoming.summary,
+        objective: incoming.objective,
+        requestPayloadText: incoming.requestPayloadText,
         startedAt: now,
+        latestEventAt: now,
+        latestEventTitle: incoming.summary || '开始执行',
+        latestEventKind: 'started',
+        bindingSessionId: incoming.bindingSessionId,
+        bindingSourceMessageId: incoming.bindingSourceMessageId,
         logs: [],
     };
     return { cards: [...cards, created], index: cards.length };
 }
 
-function withA2aLog(card: A2AWorkCardData, log: Omit<A2AWorkLogItem, 'id'>): A2AWorkCardData {
+function withA2aLog(
+    card: A2AWorkCardData,
+    log: Omit<A2AWorkLogItem, 'id'>,
+    eventKind: A2AWorkCardData['latestEventKind'] = 'progress',
+): A2AWorkCardData {
+    const at = log.at || new Date().toISOString();
+    const title = log.title.trim() || '状态更新';
     return {
         ...card,
+        latestEventAt: at,
+        latestEventTitle: title,
+        latestEventKind: eventKind,
         logs: [
             ...card.logs,
             {
-                id: generateId(),
                 ...log,
+                id: generateId(),
+                at,
+                title,
             },
         ].slice(-80),
     };
@@ -1391,6 +2127,10 @@ function upsertA2aFinalResultLog(card: A2AWorkCardData, detail: string): A2AWork
     }
     return {
         ...card,
+        finalReportText: normalized,
+        latestEventAt: now,
+        latestEventTitle: '最终结果',
+        latestEventKind: 'final',
         logs: nextLogs.slice(-80),
     };
 }
@@ -1406,8 +2146,12 @@ interface ChatPageProps {
     uiVariant?: 'full' | 'embedded';
     inputToolbar?: ReactNode;
     idleAuto?: IdleAutoConfig;
+    autoConversationEnabled?: boolean;
+    autoConversationLeader?: Agent;
+    onAutoConversationEnabledChange?: (enabled: boolean) => void;
     extraReplyAgents?: Agent[];
     selectExtraReplyAgents?: (message: string) => Agent[];
+    resolvePrimaryReplyAgent?: (message: string) => Agent | null;
     mentionDispatchAgents?: Agent[];
     mentionDispatchMaxDepth?: number;
     mentionDispatchMaxTargets?: number;
@@ -1415,6 +2159,8 @@ interface ChatPageProps {
     agentCooldownMs?: number;
     duplicateSuppressionThreshold?: number;
     stopAuthorityAgentIds?: string[];
+    groupRuntimeEnabled?: boolean;
+    groupLeaderAgentId?: string;
     transformUserMessage?: (text: string) => string;
 }
 
@@ -1442,8 +2188,12 @@ export function ChatPage({
     uiVariant: uiVariantProp,
     inputToolbar: inputToolbarProp,
     idleAuto: idleAutoProp,
+    autoConversationEnabled: autoConversationEnabledProp,
+    autoConversationLeader: autoConversationLeaderProp,
+    onAutoConversationEnabledChange: onAutoConversationEnabledChangeProp,
     extraReplyAgents: extraReplyAgentsProp,
     selectExtraReplyAgents: selectExtraReplyAgentsProp,
+    resolvePrimaryReplyAgent: resolvePrimaryReplyAgentProp,
     mentionDispatchAgents: mentionDispatchAgentsProp,
     mentionDispatchMaxDepth: mentionDispatchMaxDepthProp,
     mentionDispatchMaxTargets: mentionDispatchMaxTargetsProp,
@@ -1451,6 +2201,8 @@ export function ChatPage({
     agentCooldownMs: agentCooldownMsProp,
     duplicateSuppressionThreshold: duplicateSuppressionThresholdProp,
     stopAuthorityAgentIds: stopAuthorityAgentIdsProp,
+    groupRuntimeEnabled: groupRuntimeEnabledProp,
+    groupLeaderAgentId: groupLeaderAgentIdProp,
     transformUserMessage: transformUserMessageProp,
 }: ChatPageProps = {}) {
 
@@ -1471,9 +2223,11 @@ export function ChatPage({
     const [pendingCreateTaskMessageId, setPendingCreateTaskMessageId] = useState<string | null>(null);
     const [taskActionBusy, setTaskActionBusy] = useState(false);
     const [taskDetailsOpen, setTaskDetailsOpen] = useState(false);
-    const [taskDetailsItem, setTaskDetailsItem] = useState<Task | null>(null);
+    const [taskDetailsItem, setTaskDetailsItem] = useState<TaskDetailsTask | null>(null);
     const [taskDetailRuns, setTaskDetailRuns] = useState<TaskRunRecord[]>([]);
     const [taskDetailFinalSummary, setTaskDetailFinalSummary] = useState<{ runCount: number; content: string; createdAt: string } | null>(null);
+    const [taskDetailsChatCard, setTaskDetailsChatCard] = useState<ChatTaskCardData | null>(null);
+    const [taskDetailsMessageId, setTaskDetailsMessageId] = useState<string | null>(null);
     const [a2aDetailsOpen, setA2aDetailsOpen] = useState(false);
     const [a2aDetailsCard, setA2aDetailsCard] = useState<A2AWorkCardData | null>(null);
     const [a2aDetailsTarget, setA2aDetailsTarget] = useState<{ messageId: string; cardId: string } | null>(null);
@@ -1489,6 +2243,9 @@ export function ChatPage({
     const [remoteLoadingMore, setRemoteLoadingMore] = useState(false);
     const [remotePendingCount, setRemotePendingCount] = useState(0);
     const [remoteMoreAvailable, setRemoteMoreAvailable] = useState(false);
+    const [activeSessionContextTokens, setActiveSessionContextTokens] = useState<number | null>(null);
+    const [activeSessionContextLoading, setActiveSessionContextLoading] = useState(false);
+    const [activeSessionContextUpdatedAt, setActiveSessionContextUpdatedAt] = useState<number | null>(null);
 
     const messagesRef = useRef<Message[]>([]);
     const isSendingRef = useRef(isSending);
@@ -1497,6 +2254,7 @@ export function ChatPage({
     const autoDispatchAbortTokenRef = useRef(0);
     const activeRequestIdRef = useRef<string | null>(null);
     const activeRequestSessionIdRef = useRef<string>('');
+    const detachedRequestIdsRef = useRef<Set<string>>(new Set());
     const streamingDraftRef = useRef<Message | null>(null);
     const pendingMessageIdRef = useRef<string | null>(null);
     const patchBufferRef = useRef<Map<string, string>>(new Map());
@@ -1512,6 +2270,8 @@ export function ChatPage({
     const pendingSilentMessagesRef = useRef<string[]>([]);
     const streamPatchTimerRef = useRef<number | null>(null);
     const pendingSilentCountRef = useRef(0);
+    const compactingSessionIdsRef = useRef<Set<string>>(new Set());
+    const requestGroupQueueMapRef = useRef<Map<string, { sessionId: string; itemId: string; speakerId: string }>>(new Map());
     const agentDirectoryRef = useRef<Map<string, AgentDirectoryItem>>(new Map());
     const agentReadinessRef = useRef<Map<string, AgentChatReadinessMeta>>(new Map());
     const remoteHistorySyncedKeysRef = useRef<Set<string>>(new Set());
@@ -1519,12 +2279,23 @@ export function ChatPage({
     const remoteSessionSummaryMapRef = useRef<Map<string, BackendSessionSummary>>(new Map());
     const remoteBatchLoadingRef = useRef(false);
     const remoteSyncTokenRef = useRef(0);
+    const activeSessionContextRequestRef = useRef(0);
+    const agentManagementBusyRef = useRef(false);
     const lastUserActivityAtRef = useRef<number>(Date.now());
     const lastIdleAutoTriggeredAtRef = useRef<number>(0);
     const idleAutoTriggerCountRef = useRef<number>(0);
+    const autoConversationProgressAtRef = useRef<number>(Date.now());
     const chatAgentId = id || agent.id;
+    const isNuwaManagementAgent = useMemo(() => {
+        const candidates = [chatAgentId, agent.id, agent.name]
+            .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+            .filter(Boolean);
+        return candidates.includes('nuwa') || candidates.includes('女娲');
+    }, [agent.id, agent.name, chatAgentId]);
     const sessionOwnerAgentId = (sessionOwnerAgentIdProp ?? chatAgentId).trim() || chatAgentId;
     const runtimeAgentId = (runtimeKeyProp ?? chatAgentId).trim() || chatAgentId;
+    const groupRuntimeEnabled = groupRuntimeEnabledProp ?? false;
+    const groupLeaderAgentId = (groupLeaderAgentIdProp ?? sessionOwnerAgentId).trim() || sessionOwnerAgentId;
     const runtimeAgentIdRef = useRef(runtimeAgentId);
     runtimeAgentIdRef.current = runtimeAgentId;
     const baseSessionLabel = (sessionLabelProp ?? '').trim();
@@ -1540,14 +2311,13 @@ export function ChatPage({
     const groupUpgradeEnabled = groupUpgradeEnabledProp ?? true;
     const baseSystemPreamble = (systemPreambleProp ?? '').trim();
     const groupUpgradePreamble = groupUpgradeEnabled ? buildGroupUpgradeSystemPreamble() : '';
-    const systemPreamble = [baseSystemPreamble, groupUpgradePreamble].filter(Boolean).join('\n\n');
-    const systemPreambleRef = useRef(systemPreamble);
-    systemPreambleRef.current = systemPreamble;
     const extraReplyAgents = useMemo(() => extraReplyAgentsProp ?? [], [extraReplyAgentsProp]);
     const extraReplyAgentsRef = useRef(extraReplyAgents);
     extraReplyAgentsRef.current = extraReplyAgents;
     const selectExtraReplyAgentsRef = useRef(selectExtraReplyAgentsProp);
     selectExtraReplyAgentsRef.current = selectExtraReplyAgentsProp;
+    const resolvePrimaryReplyAgentRef = useRef(resolvePrimaryReplyAgentProp);
+    resolvePrimaryReplyAgentRef.current = resolvePrimaryReplyAgentProp;
     const mentionDispatchAgents = useMemo(() => mentionDispatchAgentsProp ?? [], [mentionDispatchAgentsProp]);
     const mentionDispatchAgentsRef = useRef(mentionDispatchAgents);
     mentionDispatchAgentsRef.current = mentionDispatchAgents;
@@ -1571,10 +2341,17 @@ export function ChatPage({
     const idleAutoCooldownMs = Number.isFinite(Number(idleAutoConfig.cooldownMs)) ? Math.max(0, Number(idleAutoConfig.cooldownMs)) : 600_000;
     const idleAutoAgentOverride = idleAutoConfig.agentOverride;
     const idleAutoAgentRef = useRef<Agent>(idleAutoAgentOverride ?? agent);
+    const autoConversationEnabled = autoConversationEnabledProp ?? false;
+    const autoConversationLeader = autoConversationLeaderProp ?? idleAutoAgentOverride ?? agent;
+    const autoConversationLeaderRef = useRef<Agent>(autoConversationLeader);
     const sessions = useChatRuntimeSelector(runtimeAgentId, (state) => state.sessions);
     const activeSessionId = useChatRuntimeSelector(runtimeAgentId, (state) => state.activeSessionId);
-    const inputLocked = isSending || streamState !== 'idle' || pendingSilentCount > 0 || silentDispatching || multiReplyDispatching;
-    const sessionActionLocked = isSending || streamState !== 'idle';
+    const sessionStreamState = (sessions.find((session) => session.id === activeSessionId)?.streamState ?? 'idle');
+    const effectiveStreamState: StreamState = streamState !== 'idle'
+        ? streamState
+        : (sessionStreamState === 'streaming' || sessionStreamState === 'waiting' ? sessionStreamState : 'idle');
+    const inputLocked = autoConversationEnabled || isSending || effectiveStreamState !== 'idle' || pendingSilentCount > 0 || silentDispatching || multiReplyDispatching;
+    const sessionActionLocked = isSending || effectiveStreamState !== 'idle';
     const markUserActivity = useCallback((_source?: string) => {
         lastUserActivityAtRef.current = Date.now();
     }, []);
@@ -1585,7 +2362,55 @@ export function ChatPage({
         () => sessions.find((session) => session.id === activeSessionId) ?? null,
         [sessions, activeSessionId],
     );
+    const sessionContextDigestText = useMemo(() => {
+        const summary = activeSession?.contextDigest?.summary?.trim() || '';
+        if (!summary) return '';
+        return [
+            '[system:session-context-digest]',
+            '以下为当前会话的阶段摘要。请优先沿用此摘要理解上下文，避免重复展开历史噪音：',
+            summary,
+        ].join('\n');
+    }, [activeSession?.contextDigest?.summary]);
+    const systemPreamble = [
+        baseSystemPreamble,
+        groupUpgradePreamble,
+        !groupRuntimeEnabled ? sessionContextDigestText : '',
+    ].filter(Boolean).join('\n\n');
+    const systemPreambleRef = useRef(systemPreamble);
+    systemPreambleRef.current = systemPreamble;
     const messages = useMemo(() => activeSession?.messages ?? [], [activeSession]);
+    useEffect(() => {
+        if (groupRuntimeEnabled || !activeSessionId || !activeSession) {
+            return;
+        }
+        const nextDigest = buildSessionContextDigest(activeSession);
+        const currentDigest = activeSession.contextDigest;
+        const nextSummary = nextDigest?.summary || '';
+        const currentSummary = currentDigest?.summary || '';
+        const nextIntent = nextDigest?.lastUserIntent || '';
+        const currentIntent = currentDigest?.lastUserIntent || '';
+        if (nextSummary === currentSummary && nextIntent === currentIntent) {
+            return;
+        }
+        chatRuntimeStore.updateSessions(runtimeAgentIdRef.current, (prev) => prev.map((session) => (
+            session.id === activeSessionId
+                ? {
+                    ...session,
+                    contextDigest: nextDigest,
+                }
+                : session
+        )));
+    }, [activeSession, activeSessionId, groupRuntimeEnabled]);
+    const activeTaskSyncIds = useMemo(() => (
+        [...new Set(
+            messages
+                .filter((message) => Boolean(message.taskCard?.taskId))
+                .map((message) => message.taskCard as ChatTaskCardData)
+                .filter((card) => Boolean(card.taskId))
+                .filter((card) => card.stage !== 'cancelled' && card.stage !== 'failed' && card.stage !== 'completed')
+                .map((card) => card.taskId as string),
+        )]
+    ), [messages]);
     const pendingCreateTaskMessage = pendingCreateTaskMessageId
         ? messages.find((message) => message.id === pendingCreateTaskMessageId) ?? null
         : null;
@@ -1769,6 +2594,152 @@ export function ChatPage({
         chatRuntimeStore.setActiveSessionId(runtimeAgentIdRef.current, nextId);
     };
 
+    const patchSessionState = (sessionId: string, updater: (session: ChatSession) => ChatSession): void => {
+        const sid = sessionId.trim();
+        if (!sid) return;
+        setSessions((prev) => prev.map((session) => (
+            session.id === sid ? updater(session) : session
+        )));
+    };
+
+    const ensureGroupRuntimeState = (runtime?: GroupSessionRuntime): GroupSessionRuntime => ({
+        version: '1.0',
+        status: runtime?.status ?? 'idle',
+        leaderAgentId: runtime?.leaderAgentId || groupLeaderAgentId,
+        currentSpeakerId: runtime?.currentSpeakerId,
+        lastCompletedSpeakerId: runtime?.lastCompletedSpeakerId,
+        queueVersion: runtime?.queueVersion ?? 0,
+        queue: trimGroupQueue(runtime?.queue ?? []),
+        stopRequested: runtime?.stopRequested === true,
+        stopReason: runtime?.stopReason,
+        lastCompactedAt: runtime?.lastCompactedAt,
+        lastEventAt: runtime?.lastEventAt,
+        memoryDigest: runtime?.memoryDigest,
+    });
+
+    const patchGroupRuntime = (
+        sessionId: string,
+        updater: (runtime: GroupSessionRuntime) => GroupSessionRuntime,
+    ): void => {
+        if (!groupRuntimeEnabled) return;
+        patchSessionState(sessionId, (session) => {
+            const nextRuntime = ensureGroupRuntimeState(updater(ensureGroupRuntimeState(session.groupRuntime)));
+            return {
+                ...session,
+                groupRuntime: nextRuntime,
+            };
+        });
+    };
+
+    const createGroupQueueItem = (
+        agentId: string,
+        agentName: string | undefined,
+        reason: GroupQueueReason,
+        options?: { depth?: number; sourceMessageId?: string; note?: string },
+    ): GroupQueueItem => ({
+        id: generateId(),
+        agentId: agentId.trim(),
+        agentName: agentName?.trim() || undefined,
+        status: 'queued',
+        reason,
+        depth: options?.depth,
+        sourceMessageId: options?.sourceMessageId?.trim() || undefined,
+        note: options?.note?.trim() || undefined,
+        createdAt: new Date().toISOString(),
+    });
+
+    const setGroupQueuePlan = (sessionId: string, items: GroupQueueItem[]): void => {
+        if (!groupRuntimeEnabled) return;
+        patchGroupRuntime(sessionId, (runtime) => ({
+            ...runtime,
+            status: items.length > 0 ? 'running' : 'idle',
+            currentSpeakerId: undefined,
+            queueVersion: runtime.queueVersion + 1,
+            queue: trimGroupQueue(items),
+            stopRequested: false,
+            stopReason: undefined,
+            lastEventAt: new Date().toISOString(),
+        }));
+    };
+
+    const appendGroupQueueItems = (sessionId: string, items: GroupQueueItem[]): void => {
+        if (!groupRuntimeEnabled || items.length === 0) return;
+        patchGroupRuntime(sessionId, (runtime) => {
+            const queue = [...runtime.queue];
+            for (const item of items) {
+                const hasActiveDuplicate = queue.some((row) => (
+                    isActiveGroupQueueStatus(row.status)
+                    && row.agentId === item.agentId
+                    && row.reason === item.reason
+                    && (row.sourceMessageId || '') === (item.sourceMessageId || '')
+                ));
+                if (!hasActiveDuplicate) {
+                    queue.push(item);
+                }
+            }
+            return {
+                ...runtime,
+                status: queue.some((row) => isActiveGroupQueueStatus(row.status)) ? 'running' : runtime.status,
+                queue: trimGroupQueue(queue),
+                lastEventAt: new Date().toISOString(),
+            };
+        });
+    };
+
+    const updateGroupQueueItem = (
+        sessionId: string,
+        itemId: string | undefined,
+        status: GroupQueueStatus,
+        options?: { speakerId?: string; note?: string },
+    ): void => {
+        const sid = sessionId.trim();
+        const queueItemId = (itemId || '').trim();
+        if (!groupRuntimeEnabled || !sid || !queueItemId) return;
+        patchGroupRuntime(sid, (runtime) => {
+            const nowIso = new Date().toISOString();
+            const queue = runtime.queue.map((item) => {
+                if (item.id !== queueItemId) return item;
+                return {
+                    ...item,
+                    status,
+                    startedAt: status === 'running' ? (item.startedAt || nowIso) : item.startedAt,
+                    finishedAt: status === 'done' || status === 'skipped' || status === 'cancelled' ? nowIso : item.finishedAt,
+                    note: options?.note?.trim() || item.note,
+                };
+            });
+            const hasActive = queue.some((item) => isActiveGroupQueueStatus(item.status));
+            return {
+                ...runtime,
+                status: runtime.stopRequested ? 'stopped' : (hasActive ? 'running' : 'idle'),
+                currentSpeakerId: status === 'running' ? options?.speakerId?.trim() || runtime.currentSpeakerId : (hasActive ? runtime.currentSpeakerId : undefined),
+                lastCompletedSpeakerId: status === 'done' ? options?.speakerId?.trim() || runtime.lastCompletedSpeakerId : runtime.lastCompletedSpeakerId,
+                queue: trimGroupQueue(queue),
+                lastEventAt: nowIso,
+            };
+        });
+    };
+
+    const cancelPendingGroupQueue = (sessionId: string, reason: string): void => {
+        const sid = sessionId.trim();
+        if (!groupRuntimeEnabled || !sid) return;
+        patchGroupRuntime(sid, (runtime) => {
+            const nowIso = new Date().toISOString();
+            return {
+                ...runtime,
+                status: 'stopped',
+                stopRequested: true,
+                stopReason: reason.trim() || '用户终止',
+                currentSpeakerId: undefined,
+                queue: trimGroupQueue(runtime.queue.map((item) => (
+                    isActiveGroupQueueStatus(item.status)
+                        ? { ...item, status: 'cancelled', finishedAt: nowIso, note: reason.trim() || item.note }
+                        : item
+                ))),
+                lastEventAt: nowIso,
+            };
+        });
+    };
+
     const syncRemoteQueueMeta = (remainingCount: number) => {
         const nextCount = Math.max(0, Math.floor(remainingCount));
         setRemotePendingCount(nextCount);
@@ -1844,7 +2815,7 @@ export function ChatPage({
         }
     };
 
-    const resolveRequestSessionTarget = (sessionId?: string): { sessionId?: string; sessionLabel?: string } => {
+    const resolveRequestSessionTarget = useCallback((sessionId?: string): { sessionId?: string; sessionLabel?: string } => {
         const sid = (sessionId || activeSessionIdRef.current || '').trim();
         if (!sid) return {};
         const label = resolveSessionLabel(sid);
@@ -1861,7 +2832,61 @@ export function ChatPage({
             };
         }
         return { sessionLabel: label ? label : undefined };
-    };
+    }, [resolveSessionLabel, sessions]);
+
+    const refreshActiveSessionContextTokens = useCallback(async (
+        sessionId?: string,
+        options?: { silent?: boolean },
+    ): Promise<void> => {
+        const sid = (sessionId || activeSessionIdRef.current || '').trim();
+        if (!sid) {
+            setActiveSessionContextTokens(null);
+            setActiveSessionContextUpdatedAt(null);
+            setActiveSessionContextLoading(false);
+            return;
+        }
+        const target = resolveRequestSessionTarget(sid);
+        if (!target.sessionId && !target.sessionLabel) {
+            setActiveSessionContextTokens(null);
+            setActiveSessionContextUpdatedAt(null);
+            setActiveSessionContextLoading(false);
+            return;
+        }
+
+        const requestId = activeSessionContextRequestRef.current + 1;
+        activeSessionContextRequestRef.current = requestId;
+        if (!options?.silent) {
+            setActiveSessionContextLoading(true);
+        }
+
+        try {
+            const query = target.sessionId
+                ? `session_id=${encodeURIComponent(target.sessionId)}`
+                : `session_label=${encodeURIComponent(target.sessionLabel || '')}`;
+            const payload = await requestJson<unknown>(
+                `/api/chat/${encodeURIComponent(sessionOwnerAgentId)}/session?${query}`,
+            );
+            if (activeSessionContextRequestRef.current !== requestId) {
+                return;
+            }
+            const container = payload && typeof payload === 'object'
+                ? payload as Record<string, unknown>
+                : {};
+            const parsedTokens = parseBackendContextWindowTokens(container);
+            const fallbackZero = Array.isArray(container.messages) && container.messages.length === 0 ? 0 : null;
+            setActiveSessionContextTokens(parsedTokens ?? fallbackZero);
+            setActiveSessionContextUpdatedAt(Date.now());
+        } catch {
+            if (activeSessionContextRequestRef.current !== requestId) {
+                return;
+            }
+            setActiveSessionContextTokens(null);
+        } finally {
+            if (activeSessionContextRequestRef.current === requestId) {
+                setActiveSessionContextLoading(false);
+            }
+        }
+    }, [resolveRequestSessionTarget, sessionOwnerAgentId]);
 
     const enqueueSilentMessage = (text: string) => {
         pendingSilentMessagesRef.current.push(text);
@@ -2027,7 +3052,33 @@ export function ChatPage({
         const next = typeof updater === 'function'
             ? (updater as (input: Message[]) => Message[])(prevMessages)
             : updater;
+        if (sid === activeSessionIdRef.current) {
+            messagesRef.current = next;
+        }
         syncMessagesToSession(sid, next);
+    };
+
+    const appendSessionSystemMessage = (sessionId: string, text: string) => {
+        const trimmed = text.trim();
+        if (!sessionId || !trimmed) {
+            return;
+        }
+        commitMessages((prev) => [...prev, {
+            id: generateId(),
+            role: 'system',
+            text: trimmed,
+            timestamp: new Date().toISOString(),
+        }], { sessionId });
+    };
+
+    const getSessionMessagesSnapshot = (sessionId?: string): Message[] => {
+        const sid = (sessionId || activeSessionIdRef.current || '').trim();
+        if (!sid) {
+            return messagesRef.current;
+        }
+        const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
+        const session = runtimeState.sessions.find((item) => item.id === sid);
+        return session?.messages ?? messagesRef.current;
     };
 
     const appendLocalAgentMessage = (text: string) => {
@@ -2046,6 +3097,554 @@ export function ChatPage({
             timestamp: now,
         }]);
     };
+
+    const buildSessionContextDigest = (session: ChatSession | null | undefined): ChatSession['contextDigest'] => {
+        if (!session) return undefined;
+        const offset = typeof session.remoteContextOffset === 'number' && Number.isFinite(session.remoteContextOffset)
+            ? Math.max(0, Math.min(session.messages.length, Math.floor(session.remoteContextOffset)))
+            : 0;
+        const rows = session.messages
+            .slice(offset)
+            .filter((item) => item.role === 'user' || item.role === 'agent')
+            .filter((item) => Boolean((item.text || '').trim()))
+            .slice(-8);
+        if (rows.length === 0) {
+            return undefined;
+        }
+        const lastUser = [...rows].reverse().find((item) => item.role === 'user');
+        const recentTurns = rows
+            .slice(-4)
+            .map((item) => `${item.role === 'user' ? '用户' : (item.agentName || item.agentId || '助手')}: ${compactSessionDigestLine(item.text || '', 96)}`)
+            .filter(Boolean)
+            .join(' | ');
+        const summary = [
+            lastUser ? `当前诉求：${compactSessionDigestLine(lastUser.text || '', 120)}` : '',
+            recentTurns ? `最近进展：${compactSessionDigestLine(recentTurns, 220)}` : '',
+        ].filter(Boolean).join('\n');
+        if (!summary) return undefined;
+        return {
+            summary,
+            lastUserIntent: lastUser ? compactSessionDigestLine(lastUser.text || '', 120) : undefined,
+            updatedAt: new Date().toISOString(),
+        };
+    };
+
+    const buildRecoveredSessionLabelForLocalSession = (sessionId: string): string => {
+        const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
+        const session = runtimeState.sessions.find((item) => item.id === sessionId);
+        const baseLabel = (session?.sessionLabel || resolveSessionLabel(sessionId) || sessionId).trim();
+        const normalizedBase = normalizeLabelComponent(baseLabel || chatAgentId || 'chat', 72) || 'chat';
+        return `${normalizedBase}_recover_${Date.now().toString(36)}`;
+    };
+
+    const recoverSessionBinding = (
+        sessionId: string,
+        recoveredSessionLabel: string,
+        recoveredRemoteSessionId?: string,
+        noticeText?: string,
+    ) => {
+        const sid = sessionId.trim();
+        const nextLabel = recoveredSessionLabel.trim();
+        if (!sid || !nextLabel) {
+            return;
+        }
+        setSessions((prev) => {
+            const idx = prev.findIndex((session) => session.id === sid);
+            if (idx < 0) return prev;
+            const current = prev[idx];
+            const nextSession: ChatSession = {
+                ...current,
+                sessionLabel: nextLabel,
+                remoteSessionId: recoveredRemoteSessionId?.trim() || undefined,
+                remoteSessionOwnerAgentId: recoveredRemoteSessionId?.trim() ? sessionOwnerAgentId : undefined,
+                remoteContextOffset: current.messages.length,
+                updatedAt: Date.now(),
+            };
+            const next = [...prev];
+            next[idx] = nextSession;
+            if (idx !== 0) {
+                next.sort((a, b) => b.updatedAt - a.updatedAt);
+            }
+            return next;
+        });
+        if (noticeText?.trim()) {
+            appendSessionSystemMessage(sid, noticeText);
+        }
+    };
+
+    const getSessionContextPressure = (session: ChatSession | null | undefined): { messageCount: number; charCount: number } => {
+        if (!session) {
+            return { messageCount: 0, charCount: 0 };
+        }
+        const offset = typeof session.remoteContextOffset === 'number' && Number.isFinite(session.remoteContextOffset)
+            ? Math.max(0, Math.min(session.messages.length, Math.floor(session.remoteContextOffset)))
+            : 0;
+        const recentMessages = session.messages.slice(offset);
+        const messageCount = recentMessages.filter((item) => item.role === 'user' || item.role === 'agent').length;
+        const charCount = recentMessages.reduce((sum, item) => sum + (item.text || '').trim().length, 0);
+        return { messageCount, charCount };
+    };
+
+    const shouldCompactSessionBeforeSend = (session: ChatSession | null | undefined): boolean => {
+        if (!session) {
+            return false;
+        }
+        const lastCompactedAtRaw = groupRuntimeEnabled
+            ? session.groupRuntime?.lastCompactedAt
+            : session.lastCompactedAt;
+        const lastCompactedAt = lastCompactedAtRaw ? Date.parse(lastCompactedAtRaw) : NaN;
+        if (Number.isFinite(lastCompactedAt) && (Date.now() - lastCompactedAt) < GROUP_SESSION_COMPACT_COOLDOWN_MS) {
+            return false;
+        }
+        const pressure = getSessionContextPressure(session);
+        return (
+            pressure.messageCount >= GROUP_SESSION_ROTATE_MESSAGE_THRESHOLD
+            || pressure.charCount >= GROUP_SESSION_ROTATE_CHAR_THRESHOLD
+        );
+    };
+
+    const getRecoveryNoticeText = (reason?: 'session_conflict' | 'context_overflow'): string => {
+        if (reason === 'context_overflow') {
+            return groupRuntimeEnabled
+                ? '检测到当前群会话上下文过长，系统已自动压缩会话摘要并重试当前消息。'
+                : '检测到当前私聊会话上下文过长，系统已自动压缩会话摘要并重试当前消息。';
+        }
+        return '检测到原会话执行链被后台任务占用，系统已自动切换到恢复会话并重试当前消息。';
+    };
+
+    const ensureSessionCompactedIfNeeded = async (
+        sessionId: string,
+        participantAgentIds?: string[],
+        options?: { force?: boolean },
+    ): Promise<boolean> => {
+        const sid = sessionId.trim();
+        if (!sid) {
+            return false;
+        }
+        const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
+        const session = runtimeState.sessions.find((item) => item.id === sid) ?? null;
+        const forceCompact = options?.force === true;
+        if (!forceCompact && !shouldCompactSessionBeforeSend(session)) {
+            return false;
+        }
+        if (compactingSessionIdsRef.current.has(sid)) {
+            return true;
+        }
+
+        compactingSessionIdsRef.current.add(sid);
+        try {
+            const sessionLabel = (session?.sessionLabel || resolveSessionLabel(sid) || '').trim();
+            const sessionRemoteId = getRemoteSessionId(session);
+            const candidateAgentIds = Array.from(new Set(
+                (participantAgentIds ?? [])
+                    .map((item) => item.trim())
+                    .filter(Boolean),
+            ));
+            if (candidateAgentIds.length === 0) {
+                candidateAgentIds.push(chatAgentId);
+            }
+
+            let compacted = false;
+            const errors: string[] = [];
+            for (const targetAgentId of candidateAgentIds) {
+                const result = await compactAgentSession({
+                    agentId: targetAgentId,
+                    sessionLabel: sessionLabel || undefined,
+                    sessionId: !sessionLabel && targetAgentId === chatAgentId ? (sessionRemoteId || undefined) : undefined,
+                });
+                if (result.success) {
+                    compacted = true;
+                } else if (result.message) {
+                    errors.push(result.message);
+                }
+            }
+
+            if (compacted) {
+                setSessions((prev) => prev.map((item) => {
+                    if (item.id !== sid) return item;
+                    const nowIso = new Date().toISOString();
+                    return {
+                        ...item,
+                        remoteContextOffset: item.messages.length,
+                        contextDigest: buildSessionContextDigest(item),
+                        lastCompactedAt: nowIso,
+                        groupRuntime: item.groupRuntime
+                            ? {
+                                ...item.groupRuntime,
+                                lastCompactedAt: nowIso,
+                                lastEventAt: nowIso,
+                            }
+                            : item.groupRuntime,
+                    };
+                }));
+                appendSessionSystemMessage(
+                    sid,
+                    groupRuntimeEnabled
+                        ? '当前群聊上下文已自动压缩：系统已清理重复历史并折叠为阶段摘要，继续沿用当前会话。'
+                        : '当前私聊上下文已自动压缩：系统已清理重复历史并折叠为阶段摘要，继续沿用当前会话。',
+                );
+                void refreshActiveSessionContextTokens(sid, { silent: true });
+                return true;
+            }
+
+            if (errors.length > 0) {
+                appendSessionSystemMessage(sid, `会话自动压缩失败：${compactGroupRuntimeNote(errors[0], 140)}`);
+            }
+            return false;
+        } finally {
+            compactingSessionIdsRef.current.delete(sid);
+        }
+    };
+
+    useEffect(() => {
+        const sid = activeSessionId.trim();
+        if (!sid) {
+            setActiveSessionContextTokens(null);
+            setActiveSessionContextUpdatedAt(null);
+            setActiveSessionContextLoading(false);
+            return;
+        }
+        if (effectiveStreamState !== 'idle') {
+            return;
+        }
+        const timer = window.setTimeout(() => {
+            void refreshActiveSessionContextTokens(sid, { silent: true });
+        }, 180);
+        return () => {
+            window.clearTimeout(timer);
+        };
+    }, [
+        activeSessionId,
+        activeSession?.messages.length,
+        effectiveStreamState,
+        refreshActiveSessionContextTokens,
+    ]);
+
+    const activeSessionPressure = useMemo(() => getSessionContextPressure(activeSession), [activeSession]);
+    const activeSessionPressurePercent = useMemo(() => {
+        const messageRatio = activeSessionPressure.messageCount / GROUP_SESSION_ROTATE_MESSAGE_THRESHOLD;
+        const charRatio = activeSessionPressure.charCount / GROUP_SESSION_ROTATE_CHAR_THRESHOLD;
+        return Math.max(0, Math.min(100, Math.round(Math.max(messageRatio, charRatio) * 100)));
+    }, [activeSessionPressure]);
+    const contextUsageMeter = useMemo(() => ({
+        tokenCount: activeSessionContextTokens,
+        loading: activeSessionContextLoading,
+        updatedAt: activeSessionContextUpdatedAt,
+        pressurePercent: activeSessionPressurePercent,
+        recentMessageCount: activeSessionPressure.messageCount,
+        recentCharCount: activeSessionPressure.charCount,
+        messageThreshold: GROUP_SESSION_ROTATE_MESSAGE_THRESHOLD,
+        charThreshold: GROUP_SESSION_ROTATE_CHAR_THRESHOLD,
+    }), [
+        activeSessionContextLoading,
+        activeSessionContextTokens,
+        activeSessionContextUpdatedAt,
+        activeSessionPressure,
+        activeSessionPressurePercent,
+    ]);
+
+    const releaseRequestForAsyncWork = (requestId: string, draft: Message) => {
+        const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
+        const pendingId = pendingMessageIdRef.current;
+        const hasWorkingA2a = (draft.a2aCards ?? []).some((card) => card.status === 'working');
+        const fallbackText = hasWorkingA2a
+            ? '已转入异步协作执行，后续进展会继续回传到当前会话。你可以继续输入新的问题。'
+            : '任务已转入异步执行，后续结果会继续回传到当前会话。你可以继续输入新的问题。';
+        const finalized: Message = {
+            ...draft,
+            cardPending: false,
+            streaming: false,
+            thinking: false,
+            generationElapsedMs: Math.max(0, Date.now() - (draft.generationStartedAt || Date.now())),
+            text: (draft.text || '').trim() || fallbackText,
+            tools: (draft.tools ?? []).map((tool) => ({ ...tool, running: false })),
+        };
+
+        detachedRequestIdsRef.current.add(requestId);
+        finalizedRequestIdRef.current = requestId;
+
+        if (pendingId && requestSessionId) {
+            patchSessionMessageById(requestSessionId, pendingId, finalized);
+        } else {
+            setStreamingMessage(finalized);
+        }
+        const queueBinding = requestGroupQueueMapRef.current.get(requestId);
+        if (queueBinding) {
+            updateGroupQueueItem(queueBinding.sessionId, queueBinding.itemId, 'done', {
+                speakerId: queueBinding.speakerId,
+                note: compactGroupRuntimeNote(finalized.text || fallbackText),
+            });
+            requestGroupQueueMapRef.current.delete(requestId);
+        }
+
+        clearWaitingFinalizeTimer();
+        clearStreamPatchTimer();
+        patchBufferRef.current.delete(requestId);
+        rawAssistantStreamRef.current = '';
+        thinkingSnapshotRef.current = '';
+        doneReceivedRef.current = false;
+        activeRequestIdRef.current = null;
+        unbindRuntimeRequest(requestId);
+        activeRequestSessionIdRef.current = '';
+        streamingDraftRef.current = null;
+        pendingMessageIdRef.current = null;
+        if (watchdogRef.current != null) {
+            window.clearTimeout(watchdogRef.current);
+            watchdogRef.current = null;
+        }
+        if (requestSessionId) {
+            setSessionStreamState(requestSessionId, 'idle');
+        }
+        setStreamingMessage(null);
+        setIsSending(false);
+        setSilentDispatching(false);
+        setStreamState('idle');
+    };
+
+    function resolveTaskReportSpeaker(delivery: TaskReportDelivery): Agent {
+        // 聊天内任务回执：发言人与头像以“执行人”为准，避免显示成当前会话智能体或错误的汇报者。
+        const reportActorId = (delivery.executorAgentId || delivery.reportActorAgentId || chatAgentId).trim() || chatAgentId;
+        if (reportActorId === agent.id || reportActorId === chatAgentId) {
+            const directoryHit = agentDirectoryRef.current.get(reportActorId);
+            return {
+                ...agent,
+                id: reportActorId,
+                name: delivery.executorAgentName?.trim()
+                    || delivery.reportActorAgentName?.trim()
+                    || agent.name,
+                title: delivery.executorAgentName?.trim()
+                    || delivery.reportActorAgentName?.trim()
+                    || agent.title,
+                avatarUrl: agent.avatarUrl || directoryHit?.avatarUrl,
+                color: agent.color || directoryHit?.color || '#111827',
+            };
+        }
+        const directoryHit = agentDirectoryRef.current.get(reportActorId);
+        if (directoryHit) {
+            const fallback = buildFallbackAgent(reportActorId);
+            return {
+                ...fallback,
+                id: directoryHit.id,
+                name: delivery.executorAgentName?.trim()
+                    || delivery.reportActorAgentName?.trim()
+                    || directoryHit.name
+                    || fallback.name,
+                title: delivery.executorAgentName?.trim()
+                    || delivery.reportActorAgentName?.trim()
+                    || directoryHit.name
+                    || fallback.title,
+                avatarUrl: directoryHit.avatarUrl || fallback.avatarUrl,
+                color: directoryHit.color || fallback.color,
+            };
+        }
+        const fallback = buildFallbackAgent(reportActorId);
+        return {
+            ...fallback,
+            id: reportActorId,
+            name: delivery.executorAgentName?.trim()
+                || delivery.reportActorAgentName?.trim()
+                || fallback.name,
+            title: delivery.executorAgentName?.trim()
+                || delivery.reportActorAgentName?.trim()
+                || fallback.title,
+        };
+    }
+
+    function buildTaskReportMessageText(delivery: TaskReportDelivery): string {
+        const payload = isTaskDeliveryPayloadRecord(delivery.payload) ? delivery.payload : undefined;
+        const payloadStatus = typeof payload?.status === 'string' ? payload.status.trim().toLowerCase() : '';
+        const taskName = delivery.taskName?.trim() || '未命名任务';
+        const executorName = delivery.executorAgentName?.trim()
+            || delivery.reportActorAgentName?.trim()
+            || delivery.executorAgentId?.trim()
+            || delivery.reportActorAgentId?.trim()
+            || '当前智能体';
+        const reportActorName = delivery.reportActorAgentName?.trim()
+            || delivery.executorAgentName?.trim()
+            || delivery.reportActorAgentId?.trim()
+            || delivery.executorAgentId?.trim()
+            || executorName;
+        const taskRunText = typeof delivery.runCount === 'number' ? `${Math.max(0, delivery.runCount)} 次` : '未知';
+        const summaryText = (delivery.summaryText || '').trim();
+        const errorText = (delivery.errorText || '').trim();
+        const isProgress = delivery.deliveryKind === 'progress' || payloadStatus === 'running' || payloadStatus === 'progress';
+        const isAnomaly = delivery.deliveryKind === 'anomaly' || payloadStatus === 'alert' || payloadStatus === 'anomaly';
+        const failed = payloadStatus === 'failed' || Boolean(errorText);
+        const body = failed
+            ? (errorText || summaryText || '任务执行失败，但暂未返回更多错误摘要。')
+            : (summaryText || '任务已执行完成，暂未返回总结内容。');
+        const lines = isProgress
+            ? [
+                `任务进度：${taskName}`,
+                `执行人：${executorName}`,
+                `汇报人：${reportActorName}`,
+                `当前轮次：${taskRunText}`,
+                `进度摘要：${summaryText || '任务已产生新的执行结果。'}`,
+            ]
+            : isAnomaly
+            ? [
+                `任务告警：${taskName}`,
+                `执行人：${executorName}`,
+                `汇报人：${reportActorName}`,
+                `触发轮次：${taskRunText}`,
+                `告警摘要：${body}`,
+                '如果需要，我可以继续帮你停止监控、调整阈值，或分析这次命中原因。',
+            ]
+            : failed
+            ? [
+                `任务失败报告：${taskName}`,
+                `执行人：${executorName}`,
+                `汇报人：${reportActorName}`,
+                `已执行：${taskRunText}`,
+                `失败摘要：${body}`,
+                '要我重试、调整方案后重试，还是继续当前问题？',
+            ]
+            : [
+                `任务报告：${taskName}`,
+                `执行人：${executorName}`,
+                `汇报人：${reportActorName}`,
+                `已执行：${taskRunText}`,
+                `结论：${body}`,
+            ];
+        return lines.join('\n');
+    }
+
+    async function consumePendingTaskReportDeliveries(sessionId?: string): Promise<number> {
+        const targetSessionId = (sessionId || activeSessionIdRef.current || '').trim();
+        if (!targetSessionId) {
+            return 0;
+        }
+        const scope = resolveTaskConversationScope(
+            runtimeAgentIdRef.current,
+            sessionOwnerAgentId,
+            chatAgentId,
+        );
+        const deliveriesMap = new Map<string, TaskReportDelivery>();
+        const queryCandidates: Array<{
+            runtimeKey?: string;
+            chatSessionId?: string;
+            conversationType?: TaskConversationType;
+            conversationId?: string;
+        }> = [
+            {
+                runtimeKey: runtimeAgentIdRef.current,
+                chatSessionId: targetSessionId,
+                conversationType: scope.conversationType,
+                conversationId: scope.conversationId,
+            },
+            {
+                runtimeKey: runtimeAgentIdRef.current,
+                chatSessionId: targetSessionId,
+            },
+            {
+                chatSessionId: targetSessionId,
+            },
+        ];
+        for (const candidate of queryCandidates) {
+            try {
+                const rows = await listPendingTaskReportDeliveries(candidate);
+                for (const row of rows) {
+                    deliveriesMap.set(row.id, row);
+                }
+            } catch {
+                // 某个查询条件失败时退回到更宽松的过滤条件。
+            }
+        }
+        const deliveries = [...deliveriesMap.values()];
+        if (!deliveries.length) {
+            return 0;
+        }
+
+        const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
+        const session = runtimeState.sessions.find((item) => item.id === targetSessionId);
+        const knownMessageIds = new Set((session?.messages ?? []).map((item) => item.id));
+        let inserted = 0;
+
+        const orderedDeliveries = [...deliveries].sort(
+            (left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt),
+        );
+
+        for (const delivery of orderedDeliveries) {
+            const messageId = `task_delivery_${delivery.id}`;
+            const payload = isTaskDeliveryPayloadRecord(delivery.payload) ? delivery.payload : undefined;
+            const payloadStatus = typeof payload?.status === 'string' ? payload.status.trim().toLowerCase() : '';
+            const nextRunCount = typeof delivery.runCount === 'number' ? Math.max(0, delivery.runCount) : undefined;
+            const reportActorName = delivery.reportActorAgentName?.trim()
+                || delivery.executorAgentName?.trim()
+                || undefined;
+            const executorAgentName = delivery.executorAgentName?.trim()
+                || delivery.reportActorAgentName?.trim()
+                || undefined;
+            const errorSummary = (delivery.errorText || delivery.summaryText || '').trim() || undefined;
+            const timelineEntry = buildTaskDeliveryTimelineEntry(delivery);
+            const isProgress = delivery.deliveryKind === 'progress' || payloadStatus === 'running' || payloadStatus === 'progress';
+            const isFinal = delivery.deliveryKind === 'final';
+            const isFailed = payloadStatus === 'failed' || Boolean(delivery.errorText);
+            const isAnomaly = delivery.deliveryKind === 'anomaly' || payloadStatus === 'alert' || payloadStatus === 'anomaly';
+            const shouldEmitChatMessage = isFinal || isFailed || isAnomaly;
+            const hasMessage = knownMessageIds.has(messageId);
+            const ackStatus = hasMessage || !shouldEmitChatMessage ? 'acknowledged' : 'reported';
+
+            // 进度回执仅更新卡片，不落聊天消息，避免用户边聊天边被刷屏。
+            if (shouldEmitChatMessage && !hasMessage) {
+                const speaker = resolveTaskReportSpeaker(delivery);
+                const reportMessage: Message = {
+                    id: messageId,
+                    role: 'agent',
+                    agentId: speaker.id,
+                    agentName: speaker.name,
+                    agentAvatarUrl: speaker.avatarUrl,
+                    agentColor: speaker.color,
+                    agentPortraitUrl: speaker.portraitUrl,
+                    text: buildTaskReportMessageText(delivery),
+                    meta: `task_report:${delivery.id}`,
+                    timestamp: new Date().toISOString(),
+                };
+                commitMessages((prev) => [...prev, reportMessage], { sessionId: targetSessionId });
+                knownMessageIds.add(messageId);
+                inserted += 1;
+            }
+
+            updateTaskCardByTaskId(delivery.taskId, (card) => {
+                let nextCard = appendTaskTimeline(card, timelineEntry);
+                const resolvedRunCount = nextRunCount ?? nextCard.runCount;
+                nextCard = {
+                    ...nextCard,
+                    bindingSessionId: nextCard.bindingSessionId || targetSessionId,
+                    runCount: resolvedRunCount,
+                    progressPercent: calculateTaskProgressPercent(resolvedRunCount, nextCard.maxRuns) ?? nextCard.progressPercent,
+                    executorAgentName: executorAgentName || nextCard.executorAgentName,
+                    reportActorName: reportActorName || nextCard.reportActorName,
+                    reportStatus: ackStatus,
+                    errorSummary: isFailed || isAnomaly ? errorSummary : nextCard.errorSummary,
+                    finalSummaryReady: isFinal ? Boolean(delivery.summaryText || delivery.errorText) : nextCard.finalSummaryReady,
+                    finalSummaryText: isFinal ? (delivery.summaryText || delivery.errorText || nextCard.finalSummaryText) : nextCard.finalSummaryText,
+                    stage: isFinal
+                        ? 'completed'
+                        : isFailed
+                            ? 'failed'
+                            : isProgress || isAnomaly
+                                ? 'running'
+                                : nextCard.stage,
+                    updatedAt: new Date().toISOString(),
+                };
+                return nextCard;
+            });
+
+            try {
+                await updateTaskReportDeliveryStatus(delivery.id, 'acknowledged');
+                updateTaskCardByTaskId(delivery.taskId, (card) => ({
+                    ...card,
+                    reportStatus: 'acknowledged',
+                    updatedAt: new Date().toISOString(),
+                }));
+            } catch {
+                // ack 失败时保留已汇报状态，下一轮继续重试。
+            }
+        }
+
+        return inserted;
+    }
 
     useEffect(() => {
         messagesRef.current = messages;
@@ -2071,11 +3670,15 @@ export function ChatPage({
         idleAutoAgentRef.current = idleAutoAgentOverride ?? agent;
     }, [idleAutoAgentOverride, agent]);
 
-    const displayIsSending = isSending || multiReplyDispatching;
+    useEffect(() => {
+        autoConversationLeaderRef.current = autoConversationLeader;
+    }, [autoConversationLeader]);
+
+    const displayIsSending = isSending || multiReplyDispatching || effectiveStreamState !== 'idle';
 
     useEffect(() => {
-        streamStateRef.current = streamState;
-    }, [streamState]);
+        streamStateRef.current = effectiveStreamState;
+    }, [effectiveStreamState]);
 
     useEffect(() => {
         activeSessionIdRef.current = activeSessionId;
@@ -2092,6 +3695,20 @@ export function ChatPage({
     }, [idleAutoScope, idleAutoScopeId]);
 
     useEffect(() => {
+        if (autoConversationEnabled) {
+            autoConversationProgressAtRef.current = Date.now() - AUTO_CONVERSATION_IDLE_MS;
+            lastUserActivityAtRef.current = Date.now();
+            return;
+        }
+        autoConversationProgressAtRef.current = Date.now();
+    }, [activeSessionId, autoConversationEnabled, runtimeAgentId]);
+
+    useEffect(() => {
+        if (!autoConversationEnabled) return;
+        autoConversationProgressAtRef.current = Date.now();
+    }, [messages, streamState]);
+
+    useEffect(() => {
         let cancelled = false;
 
         const loadAgent = async () => {
@@ -2104,6 +3721,12 @@ export function ChatPage({
                             {
                                 id: row.id,
                                 name: row.nickname?.trim() || row.name || row.id,
+                                aliases: [
+                                    row.id,
+                                    row.nickname?.trim() || '',
+                                    row.name || '',
+                                    row.english_name || '',
+                                ].filter((item, index, list) => item && list.indexOf(item) === index),
                                 avatarUrl: row.identity.avatar_url,
                                 color: row.identity.color,
                             },
@@ -2199,6 +3822,9 @@ export function ChatPage({
         setTaskDetailsOpen(false);
         setTaskDetailsItem(null);
         setTaskDetailRuns([]);
+        setTaskDetailFinalSummary(null);
+        setTaskDetailsChatCard(null);
+        setTaskDetailsMessageId(null);
         setA2aDetailsOpen(false);
         setA2aDetailsCard(null);
         setStreamingMessage(null);
@@ -2256,7 +3882,8 @@ export function ChatPage({
                     }
                 } else {
                     const sessionsPayload = await requestJson<unknown>(`/api/chat/${encodeURIComponent(sessionOwnerAgentId)}/sessions`);
-                    const summaries = parseBackendSessionSummaries(sessionsPayload);
+                    const summaries = parseBackendSessionSummaries(sessionsPayload)
+                        .filter((summary) => !isGroupScopedSessionLabel(summary.sessionLabel));
                     const summaryMap = new Map<string, BackendSessionSummary>();
                     for (const item of summaries) {
                         summaryMap.set(item.sessionId, item);
@@ -2332,6 +3959,9 @@ export function ChatPage({
 
     useEffect(() => {
         const unsubscribe = subscribeAgentChatStream((chunk) => {
+            if (detachedRequestIdsRef.current.has(chunk.requestId)) {
+                return;
+            }
             if (!activeRequestIdRef.current || chunk.requestId !== activeRequestIdRef.current) {
                 return;
             }
@@ -2495,6 +4125,7 @@ export function ChatPage({
 
                     if (toolName.toLowerCase() === 'agent_send') {
                         const target = extractAgentTargetFromToolPayload(parsedTool, raw, agentDirectoryRef.current);
+                        const objective = extractA2aObjectiveFromToolPayload(parsedTool, raw);
                         const resolvedAgentId = target.agentId;
                         const resolvedAgentName = target.agentName;
                         const cardId = `a2a-${resolvedAgentId}`;
@@ -2506,17 +4137,24 @@ export function ChatPage({
                             agentAvatarUrl: target.directoryHit?.avatarUrl,
                             agentColor: target.directoryHit?.color,
                             summary: '工作中',
+                            objective: objective || undefined,
+                            requestPayloadText: compactA2aText(toLogText(parsedTool || raw), 400),
+                            bindingSessionId: activeSessionIdRef.current || undefined,
+                            bindingSourceMessageId: next.id,
                         });
                         const updatedCard = withA2aLog(
                             {
                                 ...ensured.cards[ensured.index],
                                 status: 'working',
-                                summary: '工作中',
+                                summary: objective ? `正在处理：${compactA2aText(objective, 72)}` : '工作中',
+                                objective: ensured.cards[ensured.index].objective || objective || undefined,
                             },
                             {
                                 at: new Date().toISOString(),
                                 title: '开始执行',
+                                detail: objective || undefined,
                             },
+                            'started',
                         );
                         ensured.cards[ensured.index] = updatedCard;
                         next.a2aCards = ensured.cards;
@@ -2551,6 +4189,7 @@ export function ChatPage({
 
                     if (toolName.toLowerCase() === 'agent_send') {
                         const target = extractAgentTargetFromToolPayload(parsedTool, raw, agentDirectoryRef.current);
+                        const objective = extractA2aObjectiveFromToolPayload(parsedTool, raw);
                         const resolvedAgentId = target.agentId;
                         const resolvedAgentName = target.agentName;
                         const cardId = `a2a-${resolvedAgentId}`;
@@ -2561,6 +4200,10 @@ export function ChatPage({
                             agentName: resolvedAgentName,
                             agentAvatarUrl: target.directoryHit?.avatarUrl,
                             agentColor: target.directoryHit?.color,
+                            objective: objective || undefined,
+                            requestPayloadText: compactA2aText(toLogText(parsedTool || raw), 400),
+                            bindingSessionId: activeSessionIdRef.current || undefined,
+                            bindingSourceMessageId: next.id,
                         });
                         if (resolvedAgentId === 'unknown-agent') {
                             const fallbackIndex = currentCards.findIndex((card) => card.status === 'working');
@@ -2572,6 +4215,8 @@ export function ChatPage({
                         const inferredFromReadable = !isError && readable
                             ? inferAgentFromText(readable, agentDirectoryRef.current)
                             : undefined;
+                        const eventAt = new Date().toISOString();
+                        const successDetail = (readable || '委派调用已成功提交。').trim();
                         const cardBase: A2AWorkCardData = {
                             ...ensured.cards[ensured.index],
                             agentId: inferredFromReadable?.id || resolvedAgentId || ensured.cards[ensured.index].agentId,
@@ -2584,17 +4229,25 @@ export function ChatPage({
                                 ensured.cards[ensured.index].agentColor
                                 || inferredFromReadable?.color
                                 || target.directoryHit?.color,
-                            status: isError ? 'failed' : 'working',
-                            summary: isError ? '失败' : '工作中',
-                            finishedAt: isError ? new Date().toISOString() : undefined,
+                            status: isError ? 'failed' : 'completed',
+                            summary: isError
+                                ? `调用失败：${compactA2aText(readable || '未返回可读结果', 72)}`
+                                : `调用成功：${compactA2aText(successDetail, 72)}`,
+                            objective: ensured.cards[ensured.index].objective || objective || undefined,
+                            requestPayloadText: ensured.cards[ensured.index].requestPayloadText || compactA2aText(toLogText(parsedTool || raw), 400),
+                            latestEventAt: eventAt,
+                            finishedAt: eventAt,
+                            finalReportText: isError ? (readable || toLogText(parsedTool)) : successDetail,
+                            latestEventTitle: isError ? '执行失败' : '最终结果',
+                            latestEventKind: isError ? 'failed' : 'final',
                         };
                         const updatedCard = isError
                             ? withA2aLog(cardBase, {
-                                at: new Date().toISOString(),
+                                at: eventAt,
                                 title: '执行失败',
                                 detail: readable || toLogText(parsedTool),
-                            })
-                            : cardBase;
+                            }, 'failed')
+                            : upsertA2aFinalResultLog(cardBase, successDetail);
                         ensured.cards[ensured.index] = updatedCard;
                         next.a2aCards = ensured.cards;
                     }
@@ -2646,24 +4299,23 @@ export function ChatPage({
                 next.streaming = false;
                 next.tools = (next.tools ?? []).map((tool) => ({ ...tool, running: false }));
                 if (next.a2aCards && next.a2aCards.length > 0) {
-                    const inferredAgent = inferAgentFromText(next.text || '', agentDirectoryRef.current);
+                    // A2A 委派链路以工具回执为准：tool_result 收到后会自动结项。
+                    // 如果主智能体输出已结束但仍存在 working 卡片，视为未收到回执并标记失败，避免卡片长期悬挂。
+                    const fallbackDetail = '主智能体输出已结束，但未收到委派回执。';
                     next.a2aCards = next.a2aCards.map((card) => {
                         if (card.status !== 'working') return card;
-                        const resolvedAgent = card.agentId === 'unknown-agent' ? inferredAgent : undefined;
-                        const finalDetail = (next.text || '').trim();
-                        return upsertA2aFinalResultLog(
-                            {
-                                ...card,
-                                agentId: resolvedAgent?.id || card.agentId,
-                                agentName: resolvedAgent?.name || card.agentName,
-                                agentAvatarUrl: card.agentAvatarUrl || resolvedAgent?.avatarUrl,
-                                agentColor: card.agentColor || resolvedAgent?.color,
-                                status: 'completed',
-                                summary: '已完成',
-                                finishedAt: card.finishedAt || new Date().toISOString(),
-                            },
-                            finalDetail || '主智能体输出完成，子任务已完成。',
-                        );
+                        const at = new Date().toISOString();
+                        return withA2aLog({
+                            ...card,
+                            status: 'failed',
+                            summary: `失败：${compactA2aText(fallbackDetail, 72)}`,
+                            finishedAt: card.finishedAt || at,
+                            finalReportText: card.finalReportText || fallbackDetail,
+                        }, {
+                            at,
+                            title: '执行失败',
+                            detail: fallbackDetail,
+                        }, 'failed');
                     });
                 }
                 next.cardPending = false;
@@ -2687,8 +4339,12 @@ export function ChatPage({
                         return {
                             ...card,
                             status: 'failed',
-                            summary: '失败',
+                            summary: `失败：${compactA2aText(detail, 72)}`,
                             finishedAt: new Date().toISOString(),
+                            finalReportText: detail,
+                            latestEventAt: new Date().toISOString(),
+                            latestEventTitle: '执行失败',
+                            latestEventKind: 'failed',
                             logs: [{
                                 id: generateId(),
                                 at: new Date().toISOString(),
@@ -2717,14 +4373,25 @@ export function ChatPage({
                     next.uiStreamState = 'ready';
                     next.cardPending = false;
                 }
-                next.text = fallbackText && !looksLikeProtocolOnlyText(fallbackText)
-                    ? fallbackText
-                    : '已根据工具调用日志生成兜底卡片。';
+                if (fallbackText && !looksLikeProtocolOnlyText(fallbackText)) {
+                    next.text = fallbackText;
+                } else if ((next.toolTrace?.length ?? 0) === 0) {
+                    next.text = '本次回复暂未返回可展示内容。';
+                } else {
+                    next.text = '';
+                }
             }
 
             streamingDraftRef.current = next;
             const pendingId = pendingMessageIdRef.current;
             const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
+            const shouldReleaseForAsyncWork = chunk.kind !== 'done'
+                && chunk.kind !== 'error'
+                && hasAsyncWorkHandoff(next);
+            if (shouldReleaseForAsyncWork) {
+                releaseRequestForAsyncWork(chunk.requestId, next);
+                return;
+            }
             if (pendingId) {
                 if (chunk.kind === 'done' || chunk.kind === 'error') {
                     flushPendingStreamDraft();
@@ -2776,6 +4443,7 @@ export function ChatPage({
             agentOverride?: Agent;
             userDisplayText?: string;
             userAttachments?: Message['attachments'];
+            groupQueueItemId?: string;
         },
     ) => {
         const text = rawText.trim();
@@ -2786,6 +4454,13 @@ export function ChatPage({
         const appendUser = options?.appendUser ?? true;
         const dispatchAgentId = (options?.agentIdOverride ?? chatAgentId).trim() || chatAgentId;
         const dispatchAgent = options?.agentOverride ?? (dispatchAgentId === agent.id ? agent : buildFallbackAgent(dispatchAgentId));
+        const groupQueueItemId = (options?.groupQueueItemId || '').trim();
+        const queueSessionId = activeSessionIdRef.current.trim();
+        try {
+            await consumePendingTaskReportDeliveries(activeSessionIdRef.current);
+        } catch {
+            // 回执拉取失败不阻断当前对话发送。
+        }
 
         const requestId = generateId();
         const startedAt = Date.now();
@@ -2821,10 +4496,14 @@ export function ChatPage({
                 ],
             };
             commitMessages((prev) => (userMsg ? [...prev, userMsg, failed] : [...prev, failed]));
+            updateGroupQueueItem(queueSessionId, groupQueueItemId, 'skipped', {
+                speakerId: dispatchAgentId,
+                note: compactGroupRuntimeNote(reasonText),
+            });
             setSilentDispatching(false);
             return;
         }
-        const history = buildHistory(messagesRef.current);
+        const history = buildHistory(getSessionMessagesSnapshot(activeSessionIdRef.current));
         const outgoingAttachments = (options?.userAttachments ?? [])
             .filter((item): item is NonNullable<Message['attachments']>[number] => Boolean(item))
             .map((item) => ({
@@ -2870,6 +4549,17 @@ export function ChatPage({
 
         activeRequestIdRef.current = requestId;
         activeRequestSessionIdRef.current = activeSessionIdRef.current;
+        const requestSessionIdForRequest = activeRequestSessionIdRef.current;
+        if (requestSessionIdForRequest && groupQueueItemId) {
+            requestGroupQueueMapRef.current.set(requestId, {
+                sessionId: requestSessionIdForRequest,
+                itemId: groupQueueItemId,
+                speakerId: dispatchAgentId,
+            });
+            updateGroupQueueItem(requestSessionIdForRequest, groupQueueItemId, 'running', {
+                speakerId: dispatchAgentId,
+            });
+        }
         finalizedRequestIdRef.current = null;
         clearStreamPatchTimer();
         streamingDraftRef.current = draft;
@@ -2889,20 +4579,40 @@ export function ChatPage({
         bindRuntimeRequest(requestId, activeRequestSessionIdRef.current, draft.id);
                 commitMessages((prev) => (userMsg ? [...prev, userMsg, draft] : [...prev, draft]));
         setStreamingMessage(draft);
+        const watchdogRequestId = requestId;
+        const watchdogMessageId = draft.id;
         watchdogRef.current = window.setTimeout(() => {
-            const current = streamingDraftRef.current;
-            if (!current || doneReceivedRef.current || chunkCountRef.current > 0) {
+            if (activeRequestIdRef.current !== watchdogRequestId) {
                 return;
             }
+            if (pendingMessageIdRef.current !== watchdogMessageId) {
+                return;
+            }
+            const current = streamingDraftRef.current;
+            if (!current || current.id !== watchdogMessageId) {
+                return;
+            }
+            if (doneReceivedRef.current || chunkCountRef.current > 0) {
+                return;
+            }
+            watchdogRef.current = null;
+            const hasAnyOutput =
+                Boolean((current.text || '').trim())
+                || Boolean((current.uiRawText || '').trim())
+                || Boolean((current.debugRawStream || '').trim())
+                || (current.toolTrace?.length ?? 0) > 0;
+            if (hasAnyOutput) {
+                return;
+            }
+            const warningText = '上游暂未返回输出流，仍在等待回流（如长时间无响应可点击“终止输出”）。';
             const next: Message = {
                 ...current,
                 debugWatchdogTriggered: true,
                 debugChunkCount: 0,
                 debugLastChunkKind: 'none',
                 debugLastEvent: 'watchdog_timeout',
-                cardPending: false,
                 generationElapsedMs: Math.max(0, Date.now() - (current.generationStartedAt || Date.now())),
-                text: current.text || '上游未返回任何输出流，请检查运行时或工具结果回流。',
+                meta: current.meta ? `${current.meta}\n${warningText}` : warningText,
                 toolTrace: pushTrace(current.toolTrace, {
                     id: generateId(),
                     title: '无输出 watchdog',
@@ -2913,34 +4623,71 @@ export function ChatPage({
             streamingDraftRef.current = next;
             setStreamingMessage(next);
             if (activeRequestSessionIdRef.current) {
-                setSessionStreamState(activeRequestSessionIdRef.current, 'idle');
+                setSessionStreamState(activeRequestSessionIdRef.current, 'waiting');
             }
-            setStreamState('idle');
-            setIsSending(false);
-            setSilentDispatching(false);
+            setStreamState('waiting');
         }, 10000);
 
         let keepWaiting = false;
         try {
-            const requestSessionTarget = resolveRequestSessionTarget(activeRequestSessionIdRef.current);
-            const result = await sendAgentChat(withChatRenderContext({
-                agentId: dispatchAgentId,
-                message: text,
-                history,
-                attachments: outgoingAttachments,
-                stream: true,
-                requestId,
-                sessionId: requestSessionTarget.sessionId,
-                sessionLabel: requestSessionTarget.sessionLabel,
-                systemPreamble: systemPreambleRef.current || undefined,
-            }, {
-                channel: CHAT_CHANNELS.app,
-                renderMode: CHAT_RENDER_MODES.jsonRender,
-            }));
+            const compactionTargets = Array.from(new Set([
+                dispatchAgentId,
+                ...mentionDispatchAgentsRef.current.map((item) => item.id).filter(Boolean),
+            ]));
+            await ensureSessionCompactedIfNeeded(requestSessionIdForRequest, compactionTargets);
+
+            const sendCurrentRequest = async () => {
+                const requestSessionTarget = resolveRequestSessionTarget(requestSessionIdForRequest);
+                return sendAgentChat(withChatRenderContext({
+                    agentId: dispatchAgentId,
+                    message: text,
+                    history,
+                    attachments: outgoingAttachments,
+                    stream: true,
+                    requestId,
+                    sessionId: requestSessionTarget.sessionId,
+                    sessionLabel: requestSessionTarget.sessionLabel,
+                    systemPreamble: systemPreambleRef.current || undefined,
+                }, {
+                    channel: CHAT_CHANNELS.app,
+                    renderMode: CHAT_RENDER_MODES.jsonRender,
+                }));
+            };
+
+            let result = await sendCurrentRequest();
+            if (!result.success && result.recoveryReason === 'context_overflow' && requestSessionIdForRequest) {
+                const compacted = await ensureSessionCompactedIfNeeded(
+                    requestSessionIdForRequest,
+                    compactionTargets,
+                    { force: true },
+                );
+                if (compacted) {
+                    result = await sendCurrentRequest();
+                }
+            }
+
+            if (watchdogRef.current != null) {
+                window.clearTimeout(watchdogRef.current);
+                watchdogRef.current = null;
+            }
+
+            if (detachedRequestIdsRef.current.has(requestId)) {
+                keepWaiting = false;
+                return;
+            }
 
             if (finalizedRequestIdRef.current === requestId) {
                 keepWaiting = false;
                 return;
+            }
+
+            if (result.recoveredSessionLabel && requestSessionIdForRequest) {
+                recoverSessionBinding(
+                    requestSessionIdForRequest,
+                    result.recoveredSessionLabel,
+                    result.recoveredRemoteSessionId,
+                    getRecoveryNoticeText(result.recoveryReason),
+                );
             }
 
             const finalDraft = streamingDraftRef.current
@@ -2998,6 +4745,15 @@ export function ChatPage({
             if (finalDraft.spec == null && rawAssistantStreamRef.current) {
                 finalDraft.spec = tryParseInlineSpecFromText(rawAssistantStreamRef.current);
             }
+            const taskCardCandidateText = finalDraft.text || result.text || result.content || rawAssistantStreamRef.current || '';
+            if (finalDraft.spec == null && isNuwaManagementAgent) {
+                const recoveredAgentManagementSpec = createAgentManagementConfirmSpecFromAssistantText(
+                    taskCardCandidateText || finalDraft.text || rawAssistantStreamRef.current || '',
+                );
+                if (recoveredAgentManagementSpec) {
+                    finalDraft.spec = recoveredAgentManagementSpec;
+                }
+            }
             try {
                 finalDraft.debugNormalizedSpecText = finalDraft.spec == null
                     ? ''
@@ -3013,13 +4769,25 @@ export function ChatPage({
             const profileSchemaReady = Boolean(getManifestSchemaFromCache('ProfileIntroCard'));
             finalDraft.debugLegacySanitizer = finalDraft.debugProfileIntroDetected && !profileSchemaReady ? 'ProfileIntroCard' : '';
             finalDraft.debugSchemaSanitizer = profileSchemaReady ? 'manifest-cache-ready+fallback-patch' : 'manifest-prompt-only';
-            const taskCardCandidateText = finalDraft.text || result.text || result.content || rawAssistantStreamRef.current || '';
             finalDraft.text = cleanupAssistantText(finalDraft.text || '', finalDraft.spec);
+            // 即使没有收到前端订阅到的 done/error chunk，这里也已经进入请求收尾阶段，
+            // 必须显式清掉流式标记，避免旧失败消息继续被当成 activeStreaming 复用。
+            finalDraft.thinking = false;
+            finalDraft.streaming = false;
+            finalDraft.tools = (finalDraft.tools ?? []).map((tool) => ({ ...tool, running: false }));
+            finalDraft.uiStreamState = finalDraft.spec != null || (finalDraft.uiRawText || '').trim()
+                ? 'ready'
+                : 'idle';
             if (!finalDraft.text && !finalDraft.spec && !doneReceivedRef.current && finalDraft.cardPending) {
                 finalDraft.text = '卡片生成未完成，请重试。';
             }
             if (!finalDraft.text && !finalDraft.spec && (finalDraft.toolTrace?.length ?? 0) > 0) {
-                finalDraft.text = '已调用工具处理中，请稍后重试。';
+                const fallbackText = extractLatestToolReadableText(finalDraft.toolTrace);
+                if (fallbackText && !looksLikeProtocolOnlyText(fallbackText)) {
+                    finalDraft.text = fallbackText;
+                } else {
+                    finalDraft.text = '已调用工具处理中，请稍后重试。';
+                }
             }
             if (!result.success) {
                 finalDraft.toolTrace = pushTrace(finalDraft.toolTrace, {
@@ -3032,6 +4800,14 @@ export function ChatPage({
                     finalDraft.text = result.error || result.content || '请求失败';
                 }
             }
+            if (result.recoveredSessionLabel) {
+                finalDraft.toolTrace = pushTrace(finalDraft.toolTrace, {
+                    id: generateId(),
+                    title: '会话已恢复',
+                    detail: `已切换到恢复会话：${result.recoveredSessionLabel}`,
+                    at: new Date().toISOString(),
+                });
+            }
             if (!finalDraft.taskCard) {
                 const proposalFromLlm = createProposalTaskCard(taskCardCandidateText || finalDraft.text || '');
                 if (proposalFromLlm) {
@@ -3041,10 +4817,25 @@ export function ChatPage({
             const protocolOnly = looksLikeProtocolOnlyText(finalDraft.text || '');
             const hasRenderable = Boolean(finalDraft.spec) || (!protocolOnly && Boolean(finalDraft.text));
             if (!hasRenderable && doneReceivedRef.current) {
-                finalDraft.text = extractLatestToolReadableText(finalDraft.toolTrace) || '本次回复暂未返回可展示内容。';
+                const fallbackSpec = buildFallbackSpecFromToolTrace(finalDraft.toolTrace);
+                if (finalDraft.spec == null && fallbackSpec != null) {
+                    finalDraft.spec = fallbackSpec;
+                    finalDraft.debugSpecSource = finalDraft.debugSpecSource === 'none'
+                        ? 'tool_result'
+                        : finalDraft.debugSpecSource;
+                }
+                const fallbackText = extractLatestToolReadableText(finalDraft.toolTrace);
+                if (fallbackText && !looksLikeProtocolOnlyText(fallbackText)) {
+                    finalDraft.text = fallbackText;
+                } else if ((finalDraft.toolTrace?.length ?? 0) === 0) {
+                    finalDraft.text = '本次回复暂未返回可展示内容。';
+                } else {
+                    finalDraft.text = '';
+                }
             }
-            keepWaiting = result.success && !doneReceivedRef.current;
-            finalDraft.cardPending = keepWaiting ? true : false;
+            // sendAgentChat(stream=true) 只有在流结束后才 resolve；这里不应再进入 waiting 收尾。
+            keepWaiting = false;
+            finalDraft.cardPending = false;
 
             const draftId = pendingMessageIdRef.current;
             const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
@@ -3052,6 +4843,13 @@ export function ChatPage({
                 patchSessionMessageById(requestSessionId, draftId, finalDraft);
             } else {
                 commitMessages((prev) => [...prev, finalDraft]);
+            }
+            const queueBinding = requestGroupQueueMapRef.current.get(requestId);
+            if (queueBinding) {
+                updateGroupQueueItem(queueBinding.sessionId, queueBinding.itemId, result.success ? 'done' : 'skipped', {
+                    speakerId: queueBinding.speakerId,
+                    note: compactGroupRuntimeNote(finalDraft.text || result.error || ''),
+                });
             }
             setStreamingMessage(null);
             if (keepWaiting) {
@@ -3087,6 +4885,13 @@ export function ChatPage({
                         }),
                     };
                     patchSessionMessageById(requestSessionId, pendingId, finalized);
+                    const queueBinding = requestGroupQueueMapRef.current.get(requestId);
+                    if (queueBinding) {
+                        updateGroupQueueItem(queueBinding.sessionId, queueBinding.itemId, 'done', {
+                            speakerId: queueBinding.speakerId,
+                            note: compactGroupRuntimeNote(finalized.text || ''),
+                        });
+                    }
                     patchBufferRef.current.delete(requestId);
                     rawAssistantStreamRef.current = '';
                     thinkingSnapshotRef.current = '';
@@ -3115,6 +4920,9 @@ export function ChatPage({
                 setStreamState('idle');
             }
         } catch (error) {
+            if (detachedRequestIdsRef.current.has(requestId)) {
+                return;
+            }
             const message = error instanceof Error ? error.message : '发送失败';
             const failed: Message = {
                 id: generateId(),
@@ -3138,21 +4946,35 @@ export function ChatPage({
                 ],
             };
             commitMessages((prev) => [...prev, failed]);
-            if (activeRequestSessionIdRef.current) {
-                setSessionStreamState(activeRequestSessionIdRef.current, 'idle');
+            const queueBinding = requestGroupQueueMapRef.current.get(requestId);
+            if (queueBinding) {
+                updateGroupQueueItem(queueBinding.sessionId, queueBinding.itemId, 'skipped', {
+                    speakerId: queueBinding.speakerId,
+                    note: compactGroupRuntimeNote(message),
+                });
+            }
+            if (activeRequestSessionIdRef.current === requestSessionIdForRequest && requestSessionIdForRequest) {
+                setSessionStreamState(requestSessionIdForRequest, 'idle');
             }
             setStreamState('idle');
         } finally {
+            requestGroupQueueMapRef.current.delete(requestId);
+            const detached = detachedRequestIdsRef.current.delete(requestId);
             patchBufferRef.current.delete(requestId);
+            if (detached) {
+                return;
+            }
             if (!keepWaiting) {
                 clearWaitingFinalizeTimer();
                 clearStreamPatchTimer();
-                activeRequestIdRef.current = null;
-                unbindRuntimeRequest(requestId);
-                if (activeRequestSessionIdRef.current) {
-                    setSessionStreamState(activeRequestSessionIdRef.current, 'idle');
+                if (activeRequestIdRef.current === requestId) {
+                    activeRequestIdRef.current = null;
                 }
-                activeRequestSessionIdRef.current = '';
+                unbindRuntimeRequest(requestId);
+                if (activeRequestSessionIdRef.current === requestSessionIdForRequest && requestSessionIdForRequest) {
+                    setSessionStreamState(requestSessionIdForRequest, 'idle');
+                    activeRequestSessionIdRef.current = '';
+                }
                 streamingDraftRef.current = null;
                 pendingMessageIdRef.current = null;
                 rawAssistantStreamRef.current = '';
@@ -3262,7 +5084,6 @@ export function ChatPage({
             if (seen.has(key)) continue;
             seen.add(key);
             out.push(token);
-            if (out.length >= 12) break;
         }
         return out;
     };
@@ -3284,6 +5105,18 @@ export function ChatPage({
             }
         }
         return map;
+    };
+
+    const resolveMentionedAgentIds = (text: string): Set<string> => {
+        const directory = buildMentionDirectory(mentionDispatchAgentsRef.current);
+        const agentIds = new Set<string>();
+        for (const token of extractMentions(text)) {
+            const hit = directory.get(token.toLowerCase());
+            const targetId = (hit?.id || '').trim();
+            if (!targetId) continue;
+            agentIds.add(targetId);
+        }
+        return agentIds;
     };
 
     const mentionProcessedRef = useRef<Set<string>>(new Set());
@@ -3316,6 +5149,35 @@ export function ChatPage({
         pendingSilentMessagesRef.current = [];
         setPendingSilentCount(0);
         setMultiReplyDispatching(false);
+        autoConversationProgressAtRef.current = Date.now();
+        onAutoConversationEnabledChangeProp?.(false);
+        const requestId = activeRequestIdRef.current;
+        const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
+        const pendingId = pendingMessageIdRef.current;
+        if (requestId) {
+            void cancelAgentChat({ requestId }).catch(() => {
+                // ignore cancel errors
+            });
+        }
+        if (pendingId && streamingDraftRef.current) {
+            patchSessionMessageById(requestSessionId, pendingId, {
+                ...streamingDraftRef.current,
+                cardPending: false,
+                streaming: false,
+                thinking: false,
+                generationElapsedMs: Math.max(0, Date.now() - (streamingDraftRef.current.generationStartedAt || Date.now())),
+                text: streamingDraftRef.current.text || '已终止后续讨论链。',
+                tools: (streamingDraftRef.current.tools ?? []).map((tool) => ({ ...tool, running: false })),
+            });
+        }
+        if (requestSessionId) {
+            cancelPendingGroupQueue(requestSessionId, '用户终止讨论链');
+        }
+        activeRequestIdRef.current = null;
+        activeRequestSessionIdRef.current = '';
+        pendingMessageIdRef.current = null;
+        streamingDraftRef.current = null;
+        finalizedRequestIdRef.current = requestId;
     };
 
     useEffect(() => {
@@ -3394,13 +5256,23 @@ export function ChatPage({
                         if (seenTargets.has(targetId)) continue;
                         seenTargets.add(targetId);
                         targets.push(hit);
-                        if (targets.length >= mentionDispatchMaxTargets) {
+                        if (mentionDispatchMaxTargets > 0 && targets.length >= mentionDispatchMaxTargets) {
                             break;
                         }
                     }
                     if (!targets.length) {
                         continue;
                     }
+                    const mentionQueueItems = targets.map((target) => createGroupQueueItem(
+                        target.id,
+                        target.name,
+                        'mention_handoff',
+                        {
+                            depth: depth + 1,
+                            sourceMessageId: msg.id,
+                        },
+                    ));
+                    appendGroupQueueItems(activeSessionIdRef.current, mentionQueueItems);
 
                     const getActiveSessionMessagesSnapshot = (): Message[] => {
                         const sid = activeSessionIdRef.current;
@@ -3416,6 +5288,7 @@ export function ChatPage({
                         }
                         const targetId = target.id.trim();
                         if (!targetId) continue;
+                        const queueItemId = mentionQueueItems.find((item) => item.agentId === targetId)?.id;
 
                         const readiness = agentReadinessRef.current.get(targetId);
                         if (isAgentChatUnavailable(readiness)) {
@@ -3439,19 +5312,22 @@ export function ChatPage({
                                 generationStartedAt: Date.now(),
                                 generationElapsedMs: 0,
                             }]);
+                            updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'skipped', {
+                                speakerId: targetId,
+                                note: compactGroupRuntimeNote(fallbackText),
+                            });
                             continue;
                         }
 
                         if (agentCooldownMs > 0) {
                             const lastSpokeAt = agentLastSpokeAtRef.current.get(targetId);
                             if (typeof lastSpokeAt === 'number' && Date.now() - lastSpokeAt < agentCooldownMs) {
+                                updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'skipped', {
+                                    speakerId: targetId,
+                                    note: '冷却中，已跳过本轮接力',
+                                });
                                 continue;
                             }
-                        }
-
-                        const budget = tryConsumeTurnBudget(targetId);
-                        if (!budget.ok) {
-                            break;
                         }
 
                         const history = buildHistory(getActiveSessionMessagesSnapshot());
@@ -3481,19 +5357,53 @@ export function ChatPage({
 
                         commitMessages((prev) => [...prev, draft]);
 
-                        const requestSessionTarget = resolveRequestSessionTarget();
-                        const result = await sendAgentChat(withChatRenderContext({
-                            agentId: targetId,
-                            message: (msg.text || '').trim(),
-                            history,
-                            stream: false,
-                            sessionId: requestSessionTarget.sessionId,
-                            sessionLabel: requestSessionTarget.sessionLabel,
-                            systemPreamble: systemPreambleRef.current || undefined,
-                        }, {
-                            channel: CHAT_CHANNELS.app,
-                            renderMode: CHAT_RENDER_MODES.jsonRender,
-                        }));
+                        const requestId = generateId();
+                        await ensureSessionCompactedIfNeeded(activeSessionIdRef.current, [targetId, senderId, groupLeaderAgentId]);
+                        const sendCurrentMentionRequest = async () => {
+                            const requestSessionTarget = resolveRequestSessionTarget();
+                            return sendAgentChat(withChatRenderContext({
+                                agentId: targetId,
+                                message: buildGroupDispatchHandoffMessage(msg),
+                                history,
+                                stream: false,
+                                requestId,
+                                sessionId: requestSessionTarget.sessionId,
+                                sessionLabel: requestSessionTarget.sessionLabel,
+                                systemPreamble: systemPreambleRef.current || undefined,
+                            }, {
+                                channel: CHAT_CHANNELS.app,
+                                renderMode: CHAT_RENDER_MODES.jsonRender,
+                            }));
+                        };
+                        updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'running', {
+                            speakerId: targetId,
+                        });
+                        let result = await sendCurrentMentionRequest();
+                        if (!result.success && result.recoveryReason === 'context_overflow') {
+                            const compacted = await ensureSessionCompactedIfNeeded(
+                                activeSessionIdRef.current,
+                                [targetId, senderId, groupLeaderAgentId],
+                                { force: true },
+                            );
+                            if (compacted) {
+                                result = await sendCurrentMentionRequest();
+                            }
+                        }
+                        const requestStopped = autoDispatchAbortTokenRef.current !== abortToken;
+                        if (requestStopped) {
+                            break;
+                        }
+                        if (result.recoveredSessionLabel) {
+                            const currentSessionId = activeSessionIdRef.current.trim();
+                            if (currentSessionId) {
+                                recoverSessionBinding(
+                                    currentSessionId,
+                                    result.recoveredSessionLabel,
+                                    result.recoveredRemoteSessionId,
+                                    getRecoveryNoticeText(result.recoveryReason),
+                                );
+                            }
+                        }
 
                         const raw = (result.text || result.content || '').trim();
                         const spec = raw ? tryParseInlineSpecFromText(raw) : null;
@@ -3507,14 +5417,11 @@ export function ChatPage({
                             ? cleanupAssistantText(raw, spec)
                             : (result.success ? '' : fallbackText);
 
-                        if (!result.success && budget.consumedNew) {
-                            refundTurnBudget(targetId);
-                        }
-
                         if (result.success && finalText && isNearDuplicate(finalText, baselineTexts)) {
-                            if (budget.consumedNew) {
-                                refundTurnBudget(targetId);
-                            }
+                            updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'skipped', {
+                                speakerId: targetId,
+                                note: '与本轮已有回复高度重复，已跳过',
+                            });
                             commitMessages((prev) => prev.filter((row) => row.id !== draftId));
                             continue;
                         }
@@ -3532,6 +5439,10 @@ export function ChatPage({
                                 generationElapsedMs: Math.max(0, Date.now() - startedAt),
                             };
                         }));
+                        updateGroupQueueItem(activeSessionIdRef.current, queueItemId, result.success ? 'done' : 'skipped', {
+                            speakerId: targetId,
+                            note: compactGroupRuntimeNote(finalText || fallbackText),
+                        });
                     }
                 }
             } finally {
@@ -3549,16 +5460,43 @@ export function ChatPage({
         if (!text) return;
         markUserActivity('send');
         const transformed = transformUserMessageRef.current ? transformUserMessageRef.current(text) : text;
-        resetTurnBudget(chatAgentId);
+        const primaryReplyAgent = (() => {
+            const resolver = resolvePrimaryReplyAgentRef.current;
+            if (!resolver) return null;
+            try {
+                return resolver(transformed) ?? null;
+            } catch {
+                return null;
+            }
+        })();
+        const primaryReplyAgentId = (primaryReplyAgent?.id || chatAgentId).trim() || chatAgentId;
+        const extras = resolveExtraReplyAgents(transformed)
+            .filter((item) => item?.id && item.id.trim() && item.id.trim() !== primaryReplyAgentId)
+            .filter((item) => item.id.trim() !== runtimeAgentIdRef.current);
+        const queueSessionId = activeSessionIdRef.current.trim();
+        const explicitMentionAgentIds = resolveMentionedAgentIds(transformed);
+        const primaryQueueItem = createGroupQueueItem(
+            primaryReplyAgentId,
+            primaryReplyAgent?.name || buildFallbackAgent(primaryReplyAgentId).name,
+            explicitMentionAgentIds.has(primaryReplyAgentId) ? 'user_mention' : 'user_primary',
+        );
+        const extraQueueItems = extras.map((item) => createGroupQueueItem(
+            item.id,
+            item.name,
+            explicitMentionAgentIds.has(item.id.trim()) ? 'user_mention' : 'user_followup',
+        ));
+        if (queueSessionId) {
+            setGroupQueuePlan(queueSessionId, [primaryQueueItem, ...extraQueueItems]);
+        }
+        resetTurnBudget(primaryReplyAgentId);
         await sendMessageInternal(transformed, {
             appendUser: true,
+            agentIdOverride: primaryReplyAgentId,
+            agentOverride: primaryReplyAgent ?? undefined,
             userDisplayText: displayText || transformed,
             userAttachments: payload.attachments,
+            groupQueueItemId: primaryQueueItem.id,
         });
-
-        const extras = resolveExtraReplyAgents(transformed)
-            .filter((item) => item?.id && item.id.trim() && item.id.trim() !== chatAgentId)
-            .filter((item) => item.id.trim() !== runtimeAgentIdRef.current);
         if (extras.length === 0) {
             return;
         }
@@ -3583,6 +5521,7 @@ export function ChatPage({
                 }
                 const extraId = extra.id.trim();
                 if (!extraId) continue;
+                const queueItemId = extraQueueItems.find((item) => item.agentId === extraId)?.id;
 
                 const readiness = agentReadinessRef.current.get(extraId);
                 if (isAgentChatUnavailable(readiness)) {
@@ -3606,11 +5545,22 @@ export function ChatPage({
                         generationStartedAt: Date.now(),
                         generationElapsedMs: 0,
                     }]);
+                    updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'skipped', {
+                        speakerId: extraId,
+                        note: compactGroupRuntimeNote(fallbackText),
+                    });
                     continue;
                 }
 
-                const budget = tryConsumeTurnBudget(extraId);
+                const bypassTurnBudget = explicitMentionAgentIds.has(extraId);
+                const budget = bypassTurnBudget
+                    ? { ok: true, consumedNew: false }
+                    : tryConsumeTurnBudget(extraId);
                 if (!budget.ok) {
+                    updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'cancelled', {
+                        speakerId: extraId,
+                        note: '当前轮次发言名额已满',
+                    });
                     break;
                 }
 
@@ -3640,19 +5590,53 @@ export function ChatPage({
 
                 commitMessages((prev) => [...prev, draft]);
 
-                const requestSessionTarget = resolveRequestSessionTarget();
-                const result = await sendAgentChat(withChatRenderContext({
-                    agentId: extraId,
-                    message: transformed.trim(),
-                    history,
-                    stream: false,
-                    sessionId: requestSessionTarget.sessionId,
-                    sessionLabel: requestSessionTarget.sessionLabel,
-                    systemPreamble: systemPreambleRef.current || undefined,
-                }, {
-                    channel: CHAT_CHANNELS.app,
-                    renderMode: CHAT_RENDER_MODES.jsonRender,
-                }));
+                const requestId = generateId();
+                await ensureSessionCompactedIfNeeded(activeSessionIdRef.current, [extraId, primaryReplyAgentId, groupLeaderAgentId]);
+                const sendCurrentExtraRequest = async () => {
+                    const requestSessionTarget = resolveRequestSessionTarget();
+                    return sendAgentChat(withChatRenderContext({
+                        agentId: extraId,
+                        message: transformed.trim(),
+                        history,
+                        stream: false,
+                        requestId,
+                        sessionId: requestSessionTarget.sessionId,
+                        sessionLabel: requestSessionTarget.sessionLabel,
+                        systemPreamble: systemPreambleRef.current || undefined,
+                    }, {
+                        channel: CHAT_CHANNELS.app,
+                        renderMode: CHAT_RENDER_MODES.jsonRender,
+                    }));
+                };
+                updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'running', {
+                    speakerId: extraId,
+                });
+                let result = await sendCurrentExtraRequest();
+                if (!result.success && result.recoveryReason === 'context_overflow') {
+                    const compacted = await ensureSessionCompactedIfNeeded(
+                        activeSessionIdRef.current,
+                        [extraId, primaryReplyAgentId, groupLeaderAgentId],
+                        { force: true },
+                    );
+                    if (compacted) {
+                        result = await sendCurrentExtraRequest();
+                    }
+                }
+                const requestStopped = autoDispatchAbortTokenRef.current !== abortToken;
+                if (requestStopped) {
+                    break;
+                }
+                if (result.recoveredSessionLabel) {
+                    const currentSessionId = activeSessionIdRef.current.trim();
+                    if (currentSessionId) {
+                        recoverSessionBinding(
+                            currentSessionId,
+                            result.recoveredSessionLabel,
+                            result.recoveredRemoteSessionId,
+                            getRecoveryNoticeText(result.recoveryReason),
+                        );
+                    }
+                }
 
                 const raw = (result.text || result.content || '').trim();
                 const spec = raw ? tryParseInlineSpecFromText(raw) : null;
@@ -3674,6 +5658,10 @@ export function ChatPage({
                     if (budget.consumedNew) {
                         refundTurnBudget(extraId);
                     }
+                    updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'skipped', {
+                        speakerId: extraId,
+                        note: '与本轮已有回复高度重复，已跳过',
+                    });
                     commitMessages((prev) => prev.filter((msg) => msg.id !== draftId));
                     continue;
                 }
@@ -3691,6 +5679,10 @@ export function ChatPage({
                         generationElapsedMs: Math.max(0, Date.now() - startedAt),
                     };
                 }));
+                updateGroupQueueItem(activeSessionIdRef.current, queueItemId, result.success ? 'done' : 'skipped', {
+                    speakerId: extraId,
+                    note: compactGroupRuntimeNote(finalText || fallbackText),
+                });
             }
         } finally {
             setMultiReplyDispatching(false);
@@ -3698,11 +5690,11 @@ export function ChatPage({
     };
 
     useEffect(() => {
-        if (!idleAutoEnabled || !idleAutoScopeId || idleAutoMaxPerPage === 0) {
+        if (autoConversationEnabled || !idleAutoEnabled || !idleAutoScopeId || idleAutoMaxPerPage === 0) {
             return;
         }
         const timer = window.setInterval(() => {
-            if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+            if (isDocumentHidden()) {
                 return;
             }
             if (streamStateRef.current !== 'idle') {
@@ -3769,7 +5761,50 @@ export function ChatPage({
         idleAutoMaxPerPage,
         idleAutoScope,
         idleAutoScopeId,
+        autoConversationEnabled,
     ]);
+
+    useEffect(() => {
+        if (!autoConversationEnabled) {
+            return;
+        }
+        const timer = window.setInterval(() => {
+            if (isDocumentHidden()) {
+                return;
+            }
+            if (streamStateRef.current !== 'idle') {
+                return;
+            }
+            if (isSendingRef.current || silentDispatchingRef.current || multiReplyDispatchingRef.current) {
+                return;
+            }
+            if (pendingSilentCountRef.current > 0) {
+                return;
+            }
+            const now = Date.now();
+            if (now - autoConversationProgressAtRef.current < AUTO_CONVERSATION_IDLE_MS) {
+                return;
+            }
+            const leader = autoConversationLeaderRef.current ?? idleAutoAgentRef.current ?? agent;
+            const leaderId = (leader.id || '').trim() || chatAgentId;
+            const context = buildIdleContextSummary(messagesRef.current, true, 8);
+            const prompt = buildAutoConversationPrompt({
+                leaderName: leader.name || leaderId || '主持人',
+                context,
+            });
+            autoConversationProgressAtRef.current = now;
+            lastUserActivityAtRef.current = now;
+            void sendMessageInternal(prompt, {
+                appendUser: false,
+                agentIdOverride: leaderId,
+                agentOverride: leader,
+            });
+        }, 1_500);
+
+        return () => {
+            window.clearInterval(timer);
+        };
+    }, [agent, autoConversationEnabled, chatAgentId]);
 
     const handleCreateTaskCard = (messageId: string) => {
         const target = messagesRef.current.find((message) => message.id === messageId);
@@ -3794,6 +5829,16 @@ export function ChatPage({
         if (!sourceCard || !['proposal', 'failed'].includes(sourceCard.stage)) {
             return;
         }
+        const scope = resolveTaskConversationScope(
+            runtimeAgentIdRef.current,
+            sessionOwnerAgentId,
+            chatAgentId,
+        );
+        const creatorParticipantId = sourceMessage?.agentId?.trim()
+            || (sourceMessage?.role === 'user' ? 'user' : '');
+        const creatorParticipantName = sourceMessage?.agentName?.trim()
+            || (sourceMessage?.role === 'user' ? '用户' : '');
+        const bindingSessionId = activeSessionIdRef.current.trim();
 
         setTaskActionBusy(true);
         try {
@@ -3802,6 +5847,16 @@ export function ChatPage({
                 runtimeKey: runtimeAgentIdRef.current,
                 sourceType: 'chat',
                 sourceRef: encodeChatTaskSourceRef(activeSessionIdRef.current, sourceMessageId),
+                originConversationType: scope.conversationType,
+                originConversationId: scope.conversationId,
+                originChatSessionId: activeSessionIdRef.current,
+                originMessageId: sourceMessageId,
+                creatorParticipantId: creatorParticipantId || undefined,
+                creatorParticipantName: creatorParticipantName || undefined,
+                executorAgentId: chatAgentId,
+                executorAgentName: agent.name,
+                reportActorAgentId: chatAgentId,
+                reportActorAgentName: agent.name,
                 name: sourceCard.taskName,
                 schedule: {
                     kind: 'every',
@@ -3819,13 +5874,20 @@ export function ChatPage({
                     message: created.message || '未知错误',
                     level: 'error',
                 });
-                updateTaskCardMessage(sourceMessageId, (card) => ({
+                updateTaskCardMessage(sourceMessageId, (card) => appendTaskTimeline({
                     ...card,
                     stage: 'failed',
                     canCreate: true,
                     canCancel: true,
+                    bindingSessionId: card.bindingSessionId || bindingSessionId || undefined,
+                    bindingSourceMessageId: card.bindingSourceMessageId || sourceMessageId,
                     updatedAt: new Date().toISOString(),
-                }));
+                }, buildTaskTimelineEntry({
+                    kind: 'failed',
+                    title: '任务创建失败',
+                    detail: created.message || '未知错误',
+                    level: 'error',
+                })));
                 return;
             }
 
@@ -3836,8 +5898,17 @@ export function ChatPage({
             const latestRunCount = latest?.runInfo.runCount ?? task.runInfo.runCount;
             const latestStage = latest
                 ? resolveCardStage(latest, sourceCard, latestRunCount)
-                : 'scheduled';
-            const nextCard: ChatTaskCardData = {
+                : (runResult.success ? 'running' : 'scheduled');
+            const startedEntry = buildTaskTimelineEntry({
+                kind: 'started',
+                title: runResult.success ? '任务已创建并开始执行' : '任务已创建，等待首次执行',
+                detail: runResult.success
+                    ? `${sourceCard.scheduleText}，已绑定当前会话`
+                    : (runResult.message || `${sourceCard.scheduleText}，等待首次调度`),
+                runCount: latestRunCount,
+                level: runResult.success ? 'success' : 'info',
+            });
+            const nextCard: ChatTaskCardData = appendTaskTimeline({
                 ...sourceCard,
                 stage: latestStage,
                 taskId: activeTaskId,
@@ -3849,8 +5920,17 @@ export function ChatPage({
                 canCreate: false,
                 canCancel: true,
                 canDelete: latestRunCount === 0 && !(latest?.runInfo.lastRun || task.runInfo.lastRun),
+                taskKind: 'chat_schedule',
+                creatorParticipantName: creatorParticipantName || sourceCard.creatorParticipantName,
+                executorAgentName: agent.name,
+                reportActorName: agent.name,
+                reportStatus: 'pending',
+                progressPercent: calculateTaskProgressPercent(latestRunCount, sourceCard.maxRuns) ?? sourceCard.progressPercent,
+                errorSummary: undefined,
+                bindingSessionId: bindingSessionId || sourceCard.bindingSessionId,
+                bindingSourceMessageId: sourceMessageId,
                 updatedAt: new Date().toISOString(),
-            };
+            }, startedEntry);
 
             updateTaskCardMessage(sourceMessageId, () => nextCard);
             pushInAppNotice({
@@ -3926,29 +6006,168 @@ export function ChatPage({
         appendLocalAgentMessage('已取消拉群请求。如需多智能体协作，请随时告知。');
     }, [appendLocalAgentMessage, groupUpgradeEnabled]);
 
-    const handleConfirmAgentManagement = useCallback(async (payload: Record<string, unknown>) => {
-        try {
-            const result = await executeAgentManagementAction(payload);
-            appendLocalAgentMessage(result.summary);
-            pushInAppNotice({
-                title: `智能体${result.mode === 'create' ? '创建' : result.mode === 'update' ? '更新' : '删除'}成功`,
-                message: `${result.displayName} (${result.agentId})`,
-                level: 'success',
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            appendLocalAgentMessage(`智能体管理操作失败：${message || '未知错误'}`);
-            pushInAppNotice({
-                title: '智能体管理失败',
-                message: message || '未知错误',
-                level: 'error',
-            });
+    const handleConfirmAgentManagement = useCallback((
+        payload: Record<string, unknown>,
+        ctx?: { messageId?: string },
+    ) => {
+        if (!isNuwaManagementAgent) {
+            appendLocalAgentMessage('仅女娲可执行智能体管理操作。');
+            return;
         }
-    }, [appendLocalAgentMessage]);
+        if (agentManagementBusyRef.current) {
+            return;
+        }
 
-    const handleCancelAgentManagement = useCallback(() => {
-        appendLocalAgentMessage('已取消本次智能体管理操作，需要时我可以继续帮你整理新的创建或修改方案。');
-    }, [appendLocalAgentMessage]);
+        const taskMeta = summarizeAgentManagementPayload(payload);
+        const nowIso = new Date().toISOString();
+        const taskMessageId = generateId();
+        const sourceMessageId = ctx?.messageId;
+        const bindingSessionId = activeSessionIdRef.current.trim();
+        const startEntry = buildTaskTimelineEntry({
+            kind: 'started',
+            title: '已接收长任务，开始异步执行',
+            detail: taskMeta.objective,
+            at: nowIso,
+            level: 'info',
+        });
+        const runningCard: ChatTaskCardData = {
+            taskName: taskMeta.taskName,
+            objective: taskMeta.objective,
+            scheduleText: '立即执行（一次）',
+            everyMs: 0,
+            maxRuns: 1,
+            runCount: 0,
+            executionPrompt: taskMeta.objective,
+            sourceMessageText: JSON.stringify(payload),
+            stage: 'running',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            lastStatus: 'running',
+            canCreate: false,
+            canCancel: false,
+            canDelete: false,
+            notifyOnComplete: true,
+            completedNotified: false,
+            taskKind: 'chat_async',
+            executorAgentName: agent.name,
+            reportActorName: agent.name,
+            reportStatus: 'pending',
+            progressPercent: 10,
+            bindingSessionId: bindingSessionId || undefined,
+            bindingSourceMessageId: sourceMessageId,
+            timeline: [startEntry],
+        };
+        commitMessages((prev) => [...prev, {
+            id: taskMessageId,
+            role: 'agent',
+            agentId: chatAgentId,
+            agentName: agent.name,
+            agentAvatarUrl: agent.avatarUrl,
+            agentColor: agent.color,
+            agentPortraitUrl: agent.portraitUrl,
+            text: sourceMessageId ? `已接收确认，正在异步执行：${taskMeta.objective}` : `正在异步执行：${taskMeta.objective}`,
+            taskCard: runningCard,
+            timestamp: nowIso,
+        }]);
+
+        agentManagementBusyRef.current = true;
+        void (async () => {
+            try {
+                const result = await executeAgentManagementAction(payload, {
+                    onProgress: (event: AgentManagementProgressEvent) => {
+                        const at = new Date().toISOString();
+                        const progressEntry = buildTaskTimelineEntry({
+                            kind: 'progress',
+                            title: event.title,
+                            detail: event.detail,
+                            at,
+                            level: 'info',
+                        });
+                        updateTaskCardMessage(taskMessageId, (card) => appendTaskTimeline({
+                            ...card,
+                            stage: 'running',
+                            updatedAt: at,
+                            progressPercent: typeof event.progressPercent === 'number'
+                                ? Math.max(card.progressPercent ?? 10, Math.min(95, Math.floor(event.progressPercent)))
+                                : card.progressPercent,
+                            reportStatus: 'acknowledged',
+                        }, progressEntry));
+                        // 长任务进度只更新任务卡片与时间线，不在聊天流里持续插入进度消息，避免刷屏。
+                    },
+                });
+                const finishedAt = new Date().toISOString();
+                const finalEntry = buildTaskTimelineEntry({
+                    kind: 'final',
+                    title: result.mode === 'create' ? '长任务执行完成，已创建智能体' : '长任务执行完成，已更新智能体',
+                    detail: result.summary,
+                    at: finishedAt,
+                    runCount: 1,
+                    level: 'success',
+                });
+                updateTaskCardMessage(taskMessageId, (card) => appendTaskTimeline({
+                    ...card,
+                    stage: 'completed',
+                    runCount: 1,
+                    logCount: 1,
+                    updatedAt: finishedAt,
+                    lastRun: finishedAt,
+                    lastStatus: 'ok',
+                    progressPercent: 100,
+                    finalSummaryReady: true,
+                    finalSummaryText: result.summary,
+                    canDelete: false,
+                    reportStatus: 'acknowledged',
+                }, finalEntry));
+                appendLocalAgentMessage(result.summary);
+                pushInAppNotice({
+                    title: result.mode === 'create' ? '智能体已创建' : '智能体已更新',
+                    message: `${result.displayName} (${result.agentId})`,
+                    level: 'success',
+                });
+            } catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                const failedAt = new Date().toISOString();
+                const failedEntry = buildTaskTimelineEntry({
+                    kind: 'failed',
+                    title: '长任务执行失败',
+                    detail: detail || '未知错误',
+                    at: failedAt,
+                    runCount: 1,
+                    level: 'error',
+                });
+                updateTaskCardMessage(taskMessageId, (card) => appendTaskTimeline({
+                    ...card,
+                    stage: 'failed',
+                    updatedAt: failedAt,
+                    lastRun: failedAt,
+                    lastStatus: 'error',
+                    errorCount: 1,
+                    errorSummary: detail || '未知错误',
+                    progressPercent: 100,
+                    canDelete: false,
+                    reportStatus: 'acknowledged',
+                }, failedEntry));
+                appendLocalAgentMessage(`执行失败：${detail || '未知错误'}`);
+                pushInAppNotice({
+                    title: '智能体管理失败',
+                    message: detail || '未知错误',
+                    level: 'error',
+                });
+            } finally {
+                agentManagementBusyRef.current = false;
+            }
+        })();
+    }, [agent, appendLocalAgentMessage, chatAgentId, isNuwaManagementAgent]);
+
+    const handleCancelAgentManagement = useCallback((
+        _payload: Record<string, unknown>,
+        _ctx?: { messageId?: string },
+    ) => {
+        if (!isNuwaManagementAgent) {
+            return;
+        }
+        appendLocalAgentMessage('已取消本次智能体创建/修改请求。');
+    }, [appendLocalAgentMessage, isNuwaManagementAgent]);
 
     const handleConfirmCreateTask = async () => {
         const sourceMessageId = pendingCreateTaskMessage?.id;
@@ -3965,14 +6184,19 @@ export function ChatPage({
         if (!target?.taskCard || taskActionBusy) return;
         const card = target.taskCard;
         if (card.stage === 'proposal') {
-            updateTaskCardMessage(messageId, (prev) => ({
+            updateTaskCardMessage(messageId, (prev) => appendTaskTimeline({
                 ...prev,
                 stage: 'cancelled',
                 canCreate: false,
                 canCancel: false,
                 canDelete: false,
                 updatedAt: new Date().toISOString(),
-            }));
+            }, buildTaskTimelineEntry({
+                kind: 'cancelled',
+                title: '已取消任务草案',
+                detail: '当前任务不会再创建。',
+                level: 'info',
+            })));
             pushInAppNotice({
                 title: '已取消',
                 message: '任务创建已取消。',
@@ -3997,7 +6221,14 @@ export function ChatPage({
             const canDeleteAfterCancel = latest
                 ? latest.runInfo.runCount === 0 && !latest.runInfo.lastRun
                 : card.runCount === 0 && !card.lastRun;
-            updateTaskCardByTaskId(taskId, (prev) => ({
+            const shouldRecoverAgent =
+                Boolean(latest?.runInfo.lastRun)
+                || latest?.runInfo.lastStatus === 'running'
+                || latest?.runInfo.lastStatus === 'error'
+                || Boolean(card.lastRun)
+                || card.lastStatus === 'running'
+                || card.lastStatus === 'error';
+            updateTaskCardByTaskId(taskId, (prev) => appendTaskTimeline({
                 ...prev,
                 stage: 'cancelled',
                 canCancel: false,
@@ -4006,7 +6237,35 @@ export function ChatPage({
                 lastRun: latest?.runInfo.lastRun ?? prev.lastRun,
                 lastStatus: latest?.runInfo.lastStatus ?? 'cancelled',
                 updatedAt: new Date().toISOString(),
-            }));
+            }, buildTaskTimelineEntry({
+                kind: 'cancelled',
+                title: '任务已停止并取消',
+                detail: card.taskName,
+                runCount: latest?.runInfo.runCount ?? prev.runCount,
+                level: 'info',
+            })));
+            if (shouldRecoverAgent) {
+                const currentSessionId = activeSessionIdRef.current.trim();
+                const recoveredSessionLabel = currentSessionId
+                    ? buildRecoveredSessionLabelForLocalSession(currentSessionId)
+                    : '';
+                const stopResult = await stopAgent({ agentId: sessionOwnerAgentId });
+                if (!stopResult.success) {
+                    pushInAppNotice({
+                        title: '智能体恢复提示',
+                        message: stopResult.message || '已取消任务，但停止当前执行链失败，系统将继续尝试新会话恢复。',
+                        level: 'error',
+                    });
+                }
+                if (currentSessionId && recoveredSessionLabel) {
+                    recoverSessionBinding(
+                        currentSessionId,
+                        recoveredSessionLabel,
+                        undefined,
+                        '已停止异常任务占用，并切换到新的恢复会话。你现在可以继续输入，不会再复用旧任务链路。',
+                    );
+                }
+            }
             pushInAppNotice({
                 title: '任务已取消',
                 message: card.taskName,
@@ -4052,18 +6311,87 @@ export function ChatPage({
         }
     };
 
-    const handleOpenTaskCardDetails = async (taskId: string) => {
-        const detail = await getTaskDetail(taskId);
-        if (!detail) {
+    const handleOpenTaskCardDetails = async ({
+        taskId,
+        messageId,
+    }: {
+        taskId?: string;
+        messageId: string;
+    }) => {
+        const sourceMessage = messagesRef.current.find((item) => item.id === messageId);
+        const sourceCard = sourceMessage?.taskCard;
+        if (!sourceCard && !taskId) {
             pushInAppNotice({
                 title: '读取任务详情失败',
-                message: `任务不存在：${taskId}`,
+                message: '未找到对应的聊天任务卡片。',
                 level: 'error',
             });
             return;
         }
+
+        setTaskDetailsMessageId(messageId);
+        setTaskDetailsChatCard(sourceCard ? { ...sourceCard, timeline: sourceCard.timeline?.map((item) => ({ ...item })) } : null);
+
+        const fallbackTask: TaskDetailsTask | null = sourceCard ? {
+            id: sourceCard.taskId || messageId,
+            name: sourceCard.taskName || '聊天异步任务',
+            jobType: sourceCard.taskKind === 'chat_async'
+                ? '聊天长任务'
+                : sourceCard.taskKind === 'manual_schedule'
+                    ? '任务中心定时任务'
+                    : sourceCard.taskKind === 'a2a_delegate'
+                        ? '协作委派任务'
+                        : '聊天定时任务',
+            enabled: sourceCard.stage !== 'cancelled',
+            agentId: agent.id,
+            agentName: agent.name,
+            agentAvatarUrl: agent.avatarUrl,
+            agentColor: agent.color,
+            createdAt: sourceCard.createdAt,
+            maxRuns: sourceCard.maxRuns,
+            runInfo: {
+                lastStatus: sourceCard.lastStatus,
+                runCount: sourceCard.runCount,
+            },
+        } : null;
+
+        if (!taskId) {
+            setTaskDetailsItem(fallbackTask);
+            setTaskDetailRuns([]);
+            setTaskDetailFinalSummary(null);
+            setTaskDetailsOpen(true);
+            return;
+        }
+
+        const detail = await getTaskDetail(taskId);
+        if (!detail) {
+            setTaskDetailsItem(fallbackTask);
+            setTaskDetailRuns([]);
+            setTaskDetailFinalSummary(null);
+            if (!fallbackTask) {
+                pushInAppNotice({
+                    title: '读取任务详情失败',
+                    message: `任务不存在：${taskId}`,
+                    level: 'error',
+                });
+                return;
+            }
+            pushInAppNotice({
+                title: '已切换到聊天闭环详情',
+                message: '后端任务明细暂不可用，已展示当前会话中的闭环详情。',
+                level: 'info',
+            });
+            setTaskDetailsOpen(true);
+            return;
+        }
         const runs = await listTaskRuns(taskId);
-        setTaskDetailsItem(detail);
+        setTaskDetailsItem({
+            ...detail,
+            agentId: agent.id,
+            agentName: agent.name,
+            agentAvatarUrl: agent.avatarUrl,
+            agentColor: agent.color,
+        });
         setTaskDetailRuns(runs);
         setTaskDetailFinalSummary(getTaskFinalSummary(taskId));
         setTaskDetailsOpen(true);
@@ -4099,68 +6427,143 @@ export function ChatPage({
     }, [a2aDetailsOpen, a2aDetailsTarget, messages]);
 
     useEffect(() => {
-        const syncTaskCards = () => {
-            const taskCards = messagesRef.current
-                .filter((message) => Boolean(message.taskCard?.taskId))
-                .map((message) => message.taskCard as ChatTaskCardData)
-                .filter((card) => card.taskId)
-                .filter((card) => card.stage !== 'cancelled' && card.stage !== 'failed' && card.stage !== 'completed');
-            const uniqueTaskIds = [...new Set(taskCards.map((card) => card.taskId as string))];
-            if (uniqueTaskIds.length === 0) return;
+        let cancelled = false;
+        let timer: number | null = null;
 
-            void Promise.all(uniqueTaskIds.map(async (taskId) => {
-                const [detail, runs] = await Promise.all([
-                    getTaskDetail(taskId),
-                    listTaskRuns(taskId),
-                ]);
-                if (!detail) return;
-                const seedCard = messagesRef.current.find((item) => item.taskCard?.taskId === taskId)?.taskCard;
-                if (!seedCard) return;
-
-                const runCount = Math.max(detail.runInfo.runCount, runs.length);
-                const stage = resolveCardStage(detail, seedCard, runCount);
-
-                if (stage === 'completed' && detail.enabled) {
-                    await pauseTask(taskId);
+        const pollPendingTaskDeliveries = async () => {
+            const sessionId = activeSessionIdRef.current.trim();
+            if (!sessionId) {
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void pollPendingTaskDeliveries();
+                    }, 3_000);
                 }
-
-                updateTaskCardByTaskId(taskId, (card) => {
-                    const finalSummary = getTaskFinalSummary(taskId);
-                    const errorCount = runs.filter((run) => run.status === 'error').length;
-                    const next: ChatTaskCardData = {
-                        ...card,
-                        stage,
-                        runCount,
-                        logCount: runs.length,
-                        errorCount,
-                        finalSummaryReady: Boolean(finalSummary),
-                        nextRun: detail.runInfo.nextRun,
-                        lastRun: detail.runInfo.lastRun,
-                        lastStatus: detail.runInfo.lastStatus,
-                        canDelete: runCount === 0 && !detail.runInfo.lastRun,
-                        canCancel: stage === 'scheduled' || stage === 'running',
-                        updatedAt: new Date().toISOString(),
-                    };
-                    if (stage === 'completed' && !card.completedNotified && card.notifyOnComplete !== false) {
-                        next.completedNotified = true;
-                        const finalDelivered = hasTaskFinalSummaryDelivered(taskId, runCount);
-                        pushInAppNotice({
-                            title: '任务执行完成',
-                            message: finalDelivered
-                                ? `${card.taskName} 已完成并回传最终总结`
-                                : `${card.taskName} 已达到完成条件，正在生成最终总结`,
-                            level: 'success',
-                        });
-                    }
-                    return next;
-                });
-            }));
+                return;
+            }
+            if (
+                isDocumentHidden()
+                || streamStateRef.current !== 'idle'
+                || isSendingRef.current
+                || silentDispatchingRef.current
+                || multiReplyDispatchingRef.current
+            ) {
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void pollPendingTaskDeliveries();
+                    }, 3_000);
+                }
+                return;
+            }
+            try {
+                await consumePendingTaskReportDeliveries(sessionId);
+            } catch {
+                // 当前轮询失败时等待下一轮重试。
+            } finally {
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void pollPendingTaskDeliveries();
+                    }, 3_000);
+                }
+            }
         };
 
-        syncTaskCards();
-        const timer = window.setInterval(syncTaskCards, 5_000);
-        return () => window.clearInterval(timer);
-    }, []);
+        void pollPendingTaskDeliveries();
+
+        return () => {
+            cancelled = true;
+            if (timer != null) {
+                window.clearTimeout(timer);
+            }
+        };
+    }, [activeSessionId, runtimeAgentId, chatAgentId, sessionOwnerAgentId, agent.id, agent.name, agent.avatarUrl, agent.color, agent.portraitUrl]);
+
+    useEffect(() => {
+        if (activeTaskSyncIds.length === 0) {
+            return;
+        }
+
+        let cancelled = false;
+        let timer: number | null = null;
+        let syncing = false;
+
+        const syncTaskCards = async () => {
+            if (cancelled || syncing || isDocumentHidden()) {
+                return;
+            }
+            syncing = true;
+            try {
+                await Promise.all(activeTaskSyncIds.map(async (taskId) => {
+                    const [detail, runs] = await Promise.all([
+                        getTaskDetail(taskId),
+                        listTaskRuns(taskId),
+                    ]);
+                    if (!detail) return;
+                    const seedCard = messagesRef.current.find((item) => item.taskCard?.taskId === taskId)?.taskCard;
+                    if (!seedCard) return;
+
+                    const runCount = Math.max(detail.runInfo.runCount, runs.length);
+                    const stage = resolveCardStage(detail, seedCard, runCount);
+
+                    if (stage === 'completed' && detail.enabled) {
+                        await pauseTask(taskId);
+                    }
+
+                    updateTaskCardByTaskId(taskId, (card) => {
+                        const finalSummary = getTaskFinalSummary(taskId);
+                        const errorCount = runs.filter((run) => run.status === 'error').length;
+                        const next: ChatTaskCardData = {
+                            ...card,
+                            stage,
+                            runCount,
+                            logCount: runs.length,
+                            errorCount,
+                            finalSummaryReady: Boolean(finalSummary),
+                            finalSummaryText: finalSummary?.content || card.finalSummaryText,
+                            nextRun: detail.runInfo.nextRun,
+                            lastRun: detail.runInfo.lastRun,
+                            lastStatus: detail.runInfo.lastStatus,
+                            canDelete: runCount === 0 && !detail.runInfo.lastRun,
+                            canCancel: stage === 'scheduled' || stage === 'running',
+                            taskKind: card.taskKind || 'chat_schedule',
+                            executorAgentName: card.executorAgentName || agent.name,
+                            reportActorName: card.reportActorName || agent.name,
+                            progressPercent: calculateTaskProgressPercent(runCount, card.maxRuns) ?? card.progressPercent,
+                            errorSummary: errorCount > 0 ? (runs.find((run) => run.status === 'error')?.output || card.errorSummary) : card.errorSummary,
+                            updatedAt: new Date().toISOString(),
+                        };
+                        if (stage === 'completed' && !card.completedNotified && card.notifyOnComplete !== false) {
+                            next.completedNotified = true;
+                            const finalDelivered = hasTaskFinalSummaryDelivered(taskId, runCount);
+                            pushInAppNotice({
+                                title: '任务执行完成',
+                                message: finalDelivered
+                                    ? `${card.taskName} 已完成并回传最终总结`
+                                    : `${card.taskName} 已达到完成条件，正在生成最终总结`,
+                                level: 'success',
+                            });
+                        }
+                        return next;
+                    });
+                }));
+            } finally {
+                syncing = false;
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void syncTaskCards();
+                    }, 5_000);
+                }
+            }
+        };
+
+        void syncTaskCards();
+
+        return () => {
+            cancelled = true;
+            if (timer != null) {
+                window.clearTimeout(timer);
+            }
+        };
+    }, [activeTaskSyncIds]);
 
     const handleSendSilentMessage = (rawText: string) => {
         const text = rawText.trim();
@@ -4214,6 +6617,8 @@ export function ChatPage({
         pendingSilentMessagesRef.current = [];
         setPendingSilentCount(0);
         setMultiReplyDispatching(false);
+        autoConversationProgressAtRef.current = Date.now();
+        onAutoConversationEnabledChangeProp?.(false);
 
         const requestId = activeRequestIdRef.current;
         const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
@@ -4241,6 +6646,9 @@ export function ChatPage({
                 };
                 patchSessionMessageById(requestSessionId, pendingId, finalized);
             }
+        }
+        if (requestSessionId) {
+            cancelPendingGroupQueue(requestSessionId, '用户手动终止输出');
         }
         clearWaitingFinalizeTimer();
         activeRequestIdRef.current = null;
@@ -4365,19 +6773,21 @@ export function ChatPage({
         setInfoSidebarCollapsed(true);
     }, [isEmbedded]);
 
-    const chatNode = (
-        <ChatRenderer
-            agent={agent}
-            sessionTitle={fixedSessionTitleProp ?? activeSession?.title}
-            messages={messages}
-            isSending={displayIsSending}
-            inputLocked={inputLocked}
-            streamState={streamState}
-            streamingMessage={streamingMessage}
-            hideHeader={isEmbedded}
-            inputToolbar={inputToolbarProp}
-            onUserActivity={markUserActivity}
-            onSendMessage={handleSendMessage}
+        const chatNode = (
+            <ChatRenderer
+                agent={agent}
+                sessionTitle={fixedSessionTitleProp ?? activeSession?.title}
+                messages={messages}
+                isSending={displayIsSending}
+                inputLocked={inputLocked}
+                autoConversationEnabled={autoConversationEnabled}
+                streamState={effectiveStreamState}
+                streamingMessage={streamingMessage}
+                hideHeader={isEmbedded}
+                inputToolbar={inputToolbarProp}
+                contextUsage={contextUsageMeter}
+                onUserActivity={markUserActivity}
+                onSendMessage={handleSendMessage}
             onSendSilentMessage={handleSendSilentMessage}
             onRegenerateMessage={handleRegenerateMessage}
             onStopStreaming={handleStopStreaming}
@@ -4385,6 +6795,15 @@ export function ChatPage({
             onConfirmCreateTaskCard={handleConfirmCreateTaskCard}
             onCancelTaskCard={handleCancelTaskCard}
             onDeleteTaskCard={handleDeleteTaskCard}
+            onToggleAutoConversation={onAutoConversationEnabledChangeProp ? () => {
+                markUserActivity('ui_action');
+                if (autoConversationEnabled) {
+                    stopAutoDispatchChain();
+                    return;
+                }
+                autoConversationProgressAtRef.current = Date.now() - AUTO_CONVERSATION_IDLE_MS;
+                onAutoConversationEnabledChangeProp(true);
+            } : undefined}
             onOpenTaskCardDetails={handleOpenTaskCardDetails}
             onOpenA2aCardDetails={handleOpenA2aCardDetails}
             onConfirmGroupUpgrade={handleConfirmGroupUpgrade}
@@ -4472,16 +6891,21 @@ export function ChatPage({
             </Dialog>
             <TaskDetailsDialog
                 open={taskDetailsOpen}
-                onOpenChange={setTaskDetailsOpen}
-                task={taskDetailsItem ? {
-                    ...taskDetailsItem,
-                    agentId: agent.id,
-                    agentName: agent.name,
-                    agentAvatarUrl: agent.avatarUrl,
-                    agentColor: agent.color,
-                } : null}
+                onOpenChange={(open) => {
+                    setTaskDetailsOpen(open);
+                    if (!open) {
+                        setTaskDetailsItem(null);
+                        setTaskDetailRuns([]);
+                        setTaskDetailFinalSummary(null);
+                        setTaskDetailsChatCard(null);
+                        setTaskDetailsMessageId(null);
+                    }
+                }}
+                task={taskDetailsItem}
                 runs={taskDetailRuns}
                 finalSummary={taskDetailFinalSummary}
+                chatTaskCard={taskDetailsChatCard}
+                sourceMessageId={taskDetailsMessageId}
             />
             <A2AWorkDetailsDialog
                 open={a2aDetailsOpen}
@@ -4637,17 +7061,43 @@ export function ChatPage({
                         <GripVertical className="w-4 h-4 text-muted-foreground/40" />
                     </div>
                 </div>
-                <div className="chat-info-panel">
-                    {agent.portraitUrl ? (
-                        <div className="chat-info-portrait-card">
+                    <div className="chat-info-panel">
+                        {agent.portraitUrl ? (
+                        <div className="chat-info-portrait-card group relative overflow-hidden">
                             <img
                                 src={agent.portraitUrl}
                                 alt={`${agent.name} portrait`}
                                 className="chat-info-portrait-img"
+                                loading="lazy"
+                                decoding="async"
                             />
+                            <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-end bg-gradient-to-t from-black/55 via-black/15 to-transparent px-3 pb-3 pt-10 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                                <div className="pointer-events-auto flex items-center gap-2">
+                                    <Button
+                                        type="button"
+                                        size="icon"
+                                        variant="secondary"
+                                        className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                        title={t('chat.agentSettings')}
+                                        onClick={() => navigate(`/edit/${agent.id}`)}
+                                    >
+                                        <Settings className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                        type="button"
+                                        size="icon"
+                                        variant="secondary"
+                                        className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                        title="任务管理"
+                                        onClick={() => navigate(`/agent/${encodeURIComponent(agent.id)}/tasks`)}
+                                    >
+                                        <ListChecks className="h-4 w-4" />
+                                    </Button>
+                                </div>
+                            </div>
                         </div>
                     ) : (
-                        <div className="chat-info-portrait-placeholder">
+                        <div className="chat-info-portrait-placeholder group relative overflow-hidden">
                             <AgentAvatar
                                 name={agent.name}
                                 avatarUrl={agent.avatarUrl}
@@ -4655,6 +7105,30 @@ export function ChatPage({
                                 size="xl"
                                 className="chat-info-portrait-fallback-avatar"
                             />
+                            <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-end bg-gradient-to-t from-black/55 via-black/15 to-transparent px-3 pb-3 pt-10 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                                <div className="pointer-events-auto flex items-center gap-2">
+                                    <Button
+                                        type="button"
+                                        size="icon"
+                                        variant="secondary"
+                                        className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                        title={t('chat.agentSettings')}
+                                        onClick={() => navigate(`/edit/${agent.id}`)}
+                                    >
+                                        <Settings className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                        type="button"
+                                        size="icon"
+                                        variant="secondary"
+                                        className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                        title="任务管理"
+                                        onClick={() => navigate(`/agent/${encodeURIComponent(agent.id)}/tasks`)}
+                                    >
+                                        <ListChecks className="h-4 w-4" />
+                                    </Button>
+                                </div>
+                            </div>
                         </div>
                     )}
 
@@ -4686,12 +7160,6 @@ export function ChatPage({
                                     {tag}
                                 </Badge>
                             ))}
-                        </div>
-
-                        <div className="pt-2">
-                            <Button variant="outline" size="sm" className="w-full rounded-lg h-9 font-semibold text-xs border-border/60 hover:bg-accent/5 hover:border-accent/40 hover:text-accent transition-all duration-300" asChild>
-                                <Link to={`/edit/${agent.id}`}>{t('chat.agentSettings')}</Link>
-                            </Button>
                         </div>
                     </div>
                 </div>

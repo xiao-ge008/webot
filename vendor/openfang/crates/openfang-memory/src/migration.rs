@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -45,6 +45,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 9 {
         migrate_v9(conn)?;
+    }
+
+    if current_version < 10 {
+        migrate_v10(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -384,6 +388,52 @@ fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
         ",
     )?;
 
+    Ok(())
+}
+
+/// Version 10: Add explicit memory event/projection tables for unified multi-subject memory.
+fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS memory_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            group_id TEXT NOT NULL DEFAULT '',
+            task_id TEXT NOT NULL DEFAULT '',
+            source_agent_id TEXT NOT NULL DEFAULT '',
+            target_agent_id TEXT NOT NULL DEFAULT '',
+            speaker_agent_id TEXT NOT NULL DEFAULT '',
+            speaker_user_id TEXT NOT NULL DEFAULT '',
+            participant_ids TEXT NOT NULL DEFAULT '[]',
+            reply_to_event_id TEXT NOT NULL DEFAULT '',
+            tool_use_id TEXT NOT NULL DEFAULT '',
+            delegation_depth INTEGER NOT NULL DEFAULT 0,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_events_conversation ON memory_events(conversation_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_events_group ON memory_events(group_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_events_source_agent ON memory_events(source_agent_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_events_target_agent ON memory_events(target_agent_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS memory_projections (
+            projection_id TEXT PRIMARY KEY,
+            subject_type TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            projection_role TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_projections_subject ON memory_projections(subject_type, subject_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_projections_event ON memory_projections(event_id);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (10, datetime('now'), 'Add explicit memory event and projection tables');
+        ",
+    )?;
     Ok(())
 }
 

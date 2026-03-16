@@ -36,6 +36,18 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to another agent and get the response.
     async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String>;
 
+    /// Persist a collaboration summary after one agent successfully calls another.
+    async fn record_agent_collaboration(
+        &self,
+        caller_agent_id: &str,
+        target_agent_id: &str,
+        request: &str,
+        response: &str,
+    ) -> Result<(), String> {
+        let _ = (caller_agent_id, target_agent_id, request, response);
+        Ok(())
+    }
+
     /// List all running agents.
     fn list_agents(&self) -> Vec<AgentInfo>;
 
@@ -47,6 +59,19 @@ pub trait KernelHandle: Send + Sync {
 
     /// Recall a value from shared memory.
     fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String>;
+
+    /// Query an agent's unified memory context using natural language or a soft key.
+    async fn query_agent_memory(
+        &self,
+        agent_id: &str,
+        query: &str,
+        limit: usize,
+        subject_type: Option<&str>,
+        subject_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let _ = (agent_id, query, limit, subject_type, subject_id);
+        Ok(Vec::new())
+    }
 
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;

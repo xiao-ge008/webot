@@ -16,6 +16,8 @@ pub struct DesktopState {
     handle: Mutex<Option<EmbeddedServerHandle>>,
 }
 
+const DEFAULT_UI_SKILL_NAME: &str = "ui-skill";
+
 fn openfang_binary_name() -> &'static str {
     #[cfg(target_os = "windows")]
     {
@@ -57,19 +59,7 @@ fn resolve_bundled_openfang() -> Option<(PathBuf, PathBuf)> {
     let binary_name = openfang_binary_name();
     let aliases = openfang_platform_aliases();
 
-    let mut resource_roots = Vec::new();
-    // Dev: src-tauri/resources (when running `tauri dev`)
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    resource_roots.push(manifest_dir.join("resources"));
-
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            resource_roots.push(exe_dir.join("resources"));
-            resource_roots.push(exe_dir.join("..").join("Resources"));
-            resource_roots.push(exe_dir.join("..").join("resources"));
-            resource_roots.push(exe_dir.to_path_buf());
-        }
-    }
+    let resource_roots = bundled_resource_roots();
 
     for root in resource_roots {
         for alias in &aliases {
@@ -87,15 +77,88 @@ fn resolve_bundled_openfang() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-#[cfg(target_os = "windows")]
-fn apply_no_window(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    command.creation_flags(CREATE_NO_WINDOW);
+fn bundled_resource_roots() -> Vec<PathBuf> {
+    let mut resource_roots = Vec::new();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    resource_roots.push(manifest_dir.join("resources"));
+
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            resource_roots.push(exe_dir.join("resources"));
+            resource_roots.push(exe_dir.join("..").join("Resources"));
+            resource_roots.push(exe_dir.join("..").join("resources"));
+            resource_roots.push(exe_dir.to_path_buf());
+        }
+    }
+
+    resource_roots
 }
 
-#[cfg(not(target_os = "windows"))]
-fn apply_no_window(_command: &mut std::process::Command) {}
+fn resolve_bundled_ui_skill_dir() -> Option<PathBuf> {
+    for root in bundled_resource_roots() {
+        let candidate = root.join("skills").join(DEFAULT_UI_SKILL_NAME);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn merge_missing_entries(source: &PathBuf, target: &PathBuf) -> Result<bool, String> {
+    if !source.is_dir() {
+        return Ok(false);
+    }
+
+    fs::create_dir_all(target)
+        .map_err(|err| format!("创建默认技能目录失败({}): {err}", target.display()))?;
+
+    let entries = fs::read_dir(source)
+        .map_err(|err| format!("读取默认技能目录失败({}): {err}", source.display()))?;
+    let mut changed = false;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("读取默认技能目录项失败: {err}"))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("读取默认技能文件类型失败({}): {err}", source_path.display()))?;
+
+        if file_type.is_dir() {
+            if merge_missing_entries(&source_path, &target_path)? {
+                changed = true;
+            }
+            continue;
+        }
+
+        if file_type.is_file() && !target_path.exists() {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("创建技能目标目录失败({}): {err}", parent.display()))?;
+            }
+            fs::copy(&source_path, &target_path).map_err(|err| {
+                format!(
+                    "复制默认技能文件失败({} -> {}): {err}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn ensure_default_ui_skill(webot_home: &PathBuf) -> Result<(), String> {
+    let Some(source_dir) = resolve_bundled_ui_skill_dir() else {
+        return Ok(());
+    };
+
+    let target_dir = webot_home.join("skills").join(DEFAULT_UI_SKILL_NAME);
+    let _ = merge_missing_entries(&source_dir, &target_dir)?;
+    Ok(())
+}
 
 fn ensure_openfang_config(webot_home: &PathBuf) -> Result<(), String> {
     let config_path = webot_home.join("config.toml");
@@ -136,6 +199,7 @@ pub fn bootstrap() -> Result<DesktopState, String> {
     env::set_var("OPENFANG_HOME", &webot_home);
     env::set_var("WEBOT_ENABLE_LEGACY_MIGRATION", "0");
     assignment_store::bootstrap_storage().map_err(|err| format!("初始化本地目录失败: {err}"))?;
+    ensure_default_ui_skill(&webot_home)?;
 
     env::set_var("OPENFANG_BASE_URL", "http://127.0.0.1:4200");
 

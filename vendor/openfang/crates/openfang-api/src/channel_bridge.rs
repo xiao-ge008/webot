@@ -204,6 +204,27 @@ impl KernelBridgeAdapter {
         }
 
         let result = run_result.map_err(|e| format!("{e}"))?;
+        if let Err(error) = self
+            .kernel
+            .record_group_interaction_memory(
+                agent_id,
+                label,
+                build_participant_scope(label, &context.sender_platform_id).as_deref(),
+                &context.channel_type,
+                context.conversation_id.as_deref(),
+                context.thread_id.as_deref(),
+                &context.sender_platform_id,
+                message,
+                &result.response,
+            )
+            .await
+        {
+            warn!(
+                agent_id = %agent_id,
+                label = %label,
+                "Failed to persist group interaction memory: {error}"
+            );
+        }
         Ok(result.response)
     }
 }

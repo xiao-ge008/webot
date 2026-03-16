@@ -250,12 +250,59 @@ export interface ManagementProviderOption {
   source?: string;
   protocol?: string;
   isCustom?: boolean;
+  connectionStatus?: string;
+  connectionMessage?: string;
+}
+
+function scoreManagementProviderOption(item: ManagementProviderOption): number {
+  let score = 0;
+  if (item.healthy) score += 32;
+  if (item.configured) score += 16;
+  if (item.hasApiKey) score += 8;
+  if (item.runtimeLoaded) score += 4;
+  if (item.modelDiscovered) score += 2;
+  if (item.modelCount > 0) score += 1;
+  return score;
+}
+
+function mergeManagementProviderOption(
+  current: ManagementProviderOption,
+  incoming: ManagementProviderOption,
+): ManagementProviderOption {
+  const preferIncoming =
+    scoreManagementProviderOption(incoming) >= scoreManagementProviderOption(current);
+  const primary = preferIncoming ? incoming : current;
+  const secondary = preferIncoming ? current : incoming;
+  return {
+    ...primary,
+    displayName: primary.displayName || secondary.displayName,
+    authStatus: primary.authStatus || secondary.authStatus,
+    baseUrl: primary.baseUrl || secondary.baseUrl,
+    modelCount: Math.max(primary.modelCount, secondary.modelCount),
+    enabled: primary.enabled,
+    linked: primary.linked || secondary.linked,
+    hasApiKey: primary.hasApiKey || secondary.hasApiKey,
+    hasBaseUrl: primary.hasBaseUrl || secondary.hasBaseUrl,
+    configured: primary.configured || secondary.configured,
+    runtimeLoaded: primary.runtimeLoaded || secondary.runtimeLoaded,
+    modelDiscovered: primary.modelDiscovered || secondary.modelDiscovered,
+    healthy: primary.healthy || secondary.healthy,
+    healthStatus:
+      primary.healthStatus ||
+      secondary.healthStatus ||
+      (primary.healthy || secondary.healthy ? 'healthy' : undefined),
+    source: primary.source || secondary.source,
+    protocol: primary.protocol || secondary.protocol,
+    isCustom: primary.isCustom ?? secondary.isCustom,
+    connectionStatus: primary.connectionStatus || secondary.connectionStatus,
+    connectionMessage: primary.connectionMessage || secondary.connectionMessage,
+  };
 }
 
 export async function listManagementProviders(): Promise<ManagementProviderOption[]> {
   const payload = await requestJson<unknown>('/api/management/providers');
   const rows = isRecord(payload) && Array.isArray(payload.providers) ? payload.providers : [];
-  return rows
+  const parsedRows = rows
     .filter(isRecord)
     .map((row) => ({
       providerId: asString(row.id),
@@ -275,8 +322,54 @@ export async function listManagementProviders(): Promise<ManagementProviderOptio
       source: asString(row.source) || undefined,
       protocol: asString(row.protocol) || undefined,
       isCustom: typeof row.is_custom === 'boolean' ? row.is_custom : undefined,
+      connectionStatus: asString(row.connection_status) || undefined,
+      connectionMessage: asString(row.connection_message) || undefined,
     }))
     .filter((item) => item.providerId.length > 0);
+  const merged = new Map<string, ManagementProviderOption>();
+  for (const item of parsedRows) {
+    const existing = merged.get(item.providerId);
+    if (existing) {
+      merged.set(item.providerId, mergeManagementProviderOption(existing, item));
+      continue;
+    }
+    merged.set(item.providerId, item);
+  }
+  return Array.from(merged.values());
+}
+
+export interface ManagementProviderTestResult {
+  ok: boolean;
+  status: string;
+  message: string;
+  model_count?: number;
+}
+
+export async function testManagementProviderConnection(
+  providerId: string,
+): Promise<ManagementProviderTestResult> {
+  const payload = await requestJson<unknown>('/api/management/providers/test', {
+    method: 'POST',
+    body: {
+      provider_id: providerId,
+    },
+  });
+  if (!isRecord(payload)) {
+    return {
+      ok: false,
+      status: 'invalid_response',
+      message: '供应商检测返回格式异常',
+    };
+  }
+  return {
+    ok: asBool(payload.ok),
+    status: asString(payload.status),
+    message: asString(payload.message, '供应商检测失败'),
+    model_count:
+      typeof payload.model_count === 'number' && Number.isFinite(payload.model_count)
+        ? payload.model_count
+        : undefined,
+  };
 }
 
 export async function toggleManagementProviderEnabled(
@@ -1080,6 +1173,71 @@ export async function setManagementAgentContextFile(
   };
 }
 
+export interface GenerateManagementAgentContextBundleInput {
+  input: string;
+  provider?: string;
+  model?: string;
+}
+
+export interface GenerateManagementAgentContextBundleResult {
+  status?: string;
+  agent_id?: string;
+  provider: string;
+  model: string;
+  target: string;
+  fallback?: boolean;
+  error?: string;
+  content: string;
+  system_prompt: string;
+  files: ManagementAgentContextFile[];
+}
+
+export async function generateAndApplyManagementAgentContextBundle(
+  agentId: string,
+  input: GenerateManagementAgentContextBundleInput,
+): Promise<GenerateManagementAgentContextBundleResult> {
+  const payload = await requestJson<unknown>(
+    `/api/management/agents/${encodeURIComponent(agentId)}/context-files`,
+    {
+      method: 'POST',
+      body: input,
+    },
+  );
+  if (!isRecord(payload)) {
+    throw new Error('生成身份文件失败：返回数据异常');
+  }
+  const rows = Array.isArray(payload.files) ? payload.files : [];
+  const files: ManagementAgentContextFile[] = [];
+  for (const row of rows) {
+    if (!isRecord(row)) {
+      continue;
+    }
+    const fileName = asString(row.name);
+    if (!isManagementContextFileName(fileName)) {
+      continue;
+    }
+    files.push({
+      name: fileName,
+      content: asString(row.content),
+      exists: Boolean(row.exists ?? true),
+      source: asString(row.source) || undefined,
+      updated_at: asString(row.updated_at) || undefined,
+    });
+  }
+  return {
+    status: asString(payload.status) || undefined,
+    agent_id: asString(payload.agent_id) || undefined,
+    provider: asString(payload.provider),
+    model: asString(payload.model),
+    target: asString(payload.target),
+    fallback: typeof payload.fallback === 'boolean' ? payload.fallback : undefined,
+    error: asString(payload.error) || undefined,
+    content: asString(payload.content),
+    system_prompt: asString(payload.system_prompt),
+    files,
+  };
+}
+
 export interface ManagementAgentWorkspaceInfo {
   privateWorkspace: string;
   sharedWorkspace: string;
@@ -1553,11 +1711,21 @@ export async function patchManagementAgentConfig(
 export async function updateManagementAgentModel(
   agentId: string,
   input: { provider: string; model: string },
-): Promise<unknown> {
-  return requestJson(`/api/management/agents/${encodeURIComponent(agentId)}/model`, {
+): Promise<{ model?: { provider: string; model: string } }> {
+  const payload = await requestJson<unknown>(`/api/management/agents/${encodeURIComponent(agentId)}/model`, {
     method: 'PUT',
     body: input,
   });
+  if (!isRecord(payload)) {
+    throw new Error('更新智能体模型失败：返回数据异常');
+  }
+  const model = isRecord(payload.model) ? payload.model : {};
+  const provider = asString(model.provider).trim();
+  const name = asString(model.model).trim();
+  if (provider && name) {
+    return { model: { provider, model: name } };
+  }
+  return {};
 }
 
 export interface OptimizePromptInput {

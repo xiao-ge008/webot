@@ -38,6 +38,7 @@ import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+import { formatCurrentModelLabel, formatModelLabel } from '@/lib/model-label';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import {
   type AgentConfigPatchInput,
@@ -58,7 +59,6 @@ import {
   getManagementAgentWorkspaces,
   type ManagementAgentMemoryItem,
   type ManagementContextFileName,
-  type ManagementModelOption,
   type TelegramChannelConfig,
   getManagementAgentContextFiles,
   getManagementAgentDetail,
@@ -977,6 +977,7 @@ export function EditAgentPage() {
   const [modelOptionsLoaded, setModelOptionsLoaded] = useState(false);
   const [modelOptionsLoading, setModelOptionsLoading] = useState(false);
   const [currentModel, setCurrentModel] = useState<{ providerId: string; modelName: string } | null>(null);
+  const [selectedProviderId, setSelectedProviderId] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
   const [portraitUrl, setPortraitUrl] = useState('');
   const [hasPortrait, setHasPortrait] = useState(false);
@@ -1081,6 +1082,58 @@ export function EditAgentPage() {
     () => modelOptions.find((item) => modelOptionValue(item) === selectedModelId) ?? null,
     [modelOptions, selectedModelId],
   );
+
+  const providerOptions = useMemo(() => {
+    const providers = uniqueSorted(modelOptions.map((item) => item.providerId).filter(Boolean));
+    const currentProvider = currentModel?.providerId?.trim() || '';
+    const withCurrent =
+      currentProvider && !providers.includes(currentProvider) ? uniqueSorted([currentProvider, ...providers]) : providers;
+    if (selectedProviderId && !withCurrent.includes(selectedProviderId)) {
+      return uniqueSorted([selectedProviderId, ...withCurrent]);
+    }
+    return withCurrent;
+  }, [currentModel?.providerId, modelOptions, selectedProviderId]);
+
+  const filteredModelOptions = useMemo(() => {
+    if (!selectedProviderId) {
+      return modelOptions;
+    }
+    return modelOptions.filter((item) => item.providerId === selectedProviderId);
+  }, [modelOptions, selectedProviderId]);
+
+  useEffect(() => {
+    // 当用户切换供应商时，确保模型下拉的 value 一定落在当前供应商的候选集中。
+    if (!selectedProviderId) {
+      return;
+    }
+    if (filteredModelOptions.length === 0) {
+      return;
+    }
+    const hasSelected = filteredModelOptions.some((item) => modelOptionValue(item) === selectedModelId);
+    if (hasSelected) {
+      return;
+    }
+    const preferred =
+      filteredModelOptions.find(
+        (item) => currentModel && item.providerId === currentModel.providerId && item.modelName === currentModel.modelName,
+      ) ?? filteredModelOptions[0];
+    if (preferred) {
+      setSelectedModelId(modelOptionValue(preferred));
+    }
+  }, [currentModel, filteredModelOptions, selectedModelId, selectedProviderId]);
+
+  useEffect(() => {
+    // 首次进入时用当前模型的 provider 作为默认供应商选择。
+    if (selectedProviderId) {
+      return;
+    }
+    if (currentModel?.providerId) {
+      setSelectedProviderId(currentModel.providerId);
+    } else if (selectedModel?.providerId) {
+      setSelectedProviderId(selectedModel.providerId);
+    }
+  }, [currentModel?.providerId, selectedModel?.providerId, selectedProviderId]);
+
   const otherSkills = useMemo(() => {
     const grouped = new Set([...builtinSkills, ...customSkills, ...systemUiSkills]);
     return uniqueSorted(availableSkills.filter((item) => !grouped.has(item)));
@@ -1580,7 +1633,7 @@ export function EditAgentPage() {
         modelId: item.modelId,
         providerId: item.providerId,
         modelName: item.modelName,
-        displayName: item.displayName,
+        displayName: formatModelLabel(item.providerId, item.modelName, item.displayName),
       }));
       const hit = nextOptions.find(
         (item) => item.providerId === detailModel.providerId && item.modelName === detailModel.modelName,
@@ -1590,7 +1643,7 @@ export function EditAgentPage() {
           modelId: `current::${detailModel.providerId}::${detailModel.modelName}`,
           providerId: detailModel.providerId,
           modelName: detailModel.modelName,
-          displayName: `${detailModel.providerId}/${detailModel.modelName}（当前）`,
+          displayName: formatCurrentModelLabel(detailModel.providerId, detailModel.modelName),
         };
         nextOptions = [synthetic, ...nextOptions];
       }
@@ -1645,7 +1698,7 @@ export function EditAgentPage() {
 
         const resolvedEnglishName = detail.english_name?.trim();
         const fallbackFromName = isValidEnglishName(detail.name) ? detail.name.trim() : '';
-        setName(resolvedEnglishName || fallbackFromName || detail.id || id || '');
+        setName(resolvedEnglishName || fallbackFromName || '');
         setNickname(detail.nickname || '');
         setAgentId(detail.id);
         const detailTags = detail.tags || [];
@@ -1658,11 +1711,12 @@ export function EditAgentPage() {
           modelName: detail.model.model,
         };
         setCurrentModel(detailModel);
+        setSelectedProviderId(detailModel.providerId);
         const synthetic: ModelOption = {
           modelId: `current::${detailModel.providerId}::${detailModel.modelName}`,
           providerId: detailModel.providerId,
           modelName: detailModel.modelName,
-          displayName: `${detailModel.providerId}/${detailModel.modelName}（当前）`,
+          displayName: formatCurrentModelLabel(detailModel.providerId, detailModel.modelName),
         };
         setModelOptions([synthetic]);
         setSelectedModelId(modelOptionValue(synthetic));
@@ -1940,20 +1994,44 @@ export function EditAgentPage() {
     }
 
     const normalizedEnglishName = name.trim();
-    if (!normalizedEnglishName) {
-      alert('请输入英文名称');
-      return;
-    }
-    if (!isValidEnglishName(normalizedEnglishName)) {
+    if (normalizedEnglishName && !isValidEnglishName(normalizedEnglishName)) {
       alert('英文名称仅支持小写英文、数字和中杠（-）');
       return;
     }
     setSaving(true);
     try {
-      await updateManagementAgentModel(id, {
+      const modelUpdate = await updateManagementAgentModel(id, {
         provider: selectedModel.providerId,
         model: selectedModel.modelName,
       });
+      if (modelUpdate.model?.provider && modelUpdate.model?.model) {
+        const nextProviderId = modelUpdate.model.provider;
+        const nextModelName = modelUpdate.model.model;
+        const nextCurrentModel = { providerId: nextProviderId, modelName: nextModelName };
+        setCurrentModel(nextCurrentModel);
+        setSelectedProviderId(nextProviderId);
+
+        const synthetic: ModelOption = {
+          modelId: `current:${nextProviderId}::${nextModelName}`,
+          providerId: nextProviderId,
+          modelName: nextModelName,
+          displayName: formatCurrentModelLabel(nextProviderId, nextModelName),
+        };
+        setModelOptions((prev) => {
+          const next: ModelOption[] = [];
+          const seen = new Set<string>();
+          const pushUnique = (item: ModelOption) => {
+            const key = modelOptionValue(item);
+            if (seen.has(key)) return;
+            seen.add(key);
+            next.push(item);
+          };
+          pushUnique(synthetic);
+          prev.forEach(pushUnique);
+          return next;
+        });
+        setSelectedModelId(modelOptionValue(synthetic));
+      }
 
       const normalizedWorkerKeys = normalizeCollaborationWorkerKeys(collaborationSelectedWorkers);
       const effectiveWorkerKeys = normalizedWorkerKeys.filter((key) => {
@@ -1984,7 +2062,7 @@ export function EditAgentPage() {
       );
 
       const configPatch: AgentConfigPatchInput = {
-        english_name: normalizedEnglishName,
+        english_name: normalizedEnglishName || undefined,
         nickname: nickname.trim(),
         description: bio,
         tags: nextTags,
@@ -2505,13 +2583,28 @@ export function EditAgentPage() {
                 </CardHeader>
                 <CardContent className="p-8 pt-4 space-y-6">
                   <div className="space-y-3">
+                    <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">供应商</Label>
+                    <Select value={selectedProviderId} onValueChange={setSelectedProviderId}>
+                      <SelectTrigger className="h-12 rounded-xl bg-muted/20 border-border shadow-inner">
+                        <SelectValue placeholder="请选择供应商" />
+                      </SelectTrigger>
+                      <SelectContent className="rounded-xl">
+                        {providerOptions.map((providerId) => (
+                          <SelectItem key={providerId} value={providerId}>
+                            {providerId}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-3">
                     <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">对话模型</Label>
                     <Select value={selectedModelId} onValueChange={setSelectedModelId}>
                       <SelectTrigger className="h-12 rounded-xl bg-muted/20 border-border shadow-inner">
                         <SelectValue placeholder={t('edit.modelRequired')} />
                       </SelectTrigger>
                       <SelectContent className="rounded-xl">
-                        {modelOptions.map((option) => (
+                        {filteredModelOptions.map((option) => (
                           <SelectItem key={option.modelId} value={modelOptionValue(option)}>
                             {option.displayName}
                           </SelectItem>

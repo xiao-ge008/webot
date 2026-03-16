@@ -1,0 +1,285 @@
+{
+  "version": "1.0",
+  "components": [
+    {
+      "name": "ImageCover",
+      "type": "ImageCover",
+      "description": "单图封面预览组件，支持本地/网络图片、点击回填到输入框、全屏预览。",
+      "propsSchema": {
+        "src": "string，必填，图片地址（支持本地路径与网络 URL）",
+        "title": "string，可选，图片标题",
+        "subtitle": "string，可选，副标题",
+        "aspectRatio": "string，可选，如 16/9、4/3、1/1",
+        "maxWidth": "number|string，可选，最大宽度",
+        "maxHeight": "number|string，可选，最大高度",
+        "sendOnClick": "boolean，可选，点击封面是否发送到聊天输入框",
+        "onClickAction": "string，可选，默认 insert_image"
+      }
+    },
+    {
+      "name": "ImageAlbum",
+      "type": "ImageAlbum",
+      "description": "相册网格组件，适合多图展示，支持点击全屏查看、切换与缩放。",
+      "propsSchema": {
+        "images": "Array<string|object>，必填，图片数组",
+        "columns": "number，可选，网格列数",
+        "gap": "number|string，可选，网格间距",
+        "maxHeight": "number|string，可选，预览区最大高度",
+        "sendOnClick": "boolean，可选，点击封面是否发送到聊天输入框",
+        "onClickAction": "string，可选，默认 insert_image"
+      }
+    },
+    {
+      "name": "ImageCarousel",
+      "type": "ImageCarousel",
+      "description": "轮播图片组件，支持自动播放、循环、缩略图与全屏查看。",
+      "propsSchema": {
+        "images": "Array<string|object>，必填，图片数组",
+        "autoplay": "boolean，可选，是否自动播放",
+        "intervalMs": "number，可选，自动播放间隔毫秒",
+        "loop": "boolean，可选，是否循环",
+        "showThumbs": "boolean，可选，是否显示缩略图",
+        "sendOnClick": "boolean，可选，点击封面是否发送到聊天输入框",
+        "onClickAction": "string，可选，默认 insert_image"
+      }
+    },
+    {
+      "name": "VideoCover",
+      "type": "VideoCover",
+      "description": "单视频封面卡片组件，支持本地视频与流媒体链接，点击后全屏播放。",
+      "propsSchema": {
+        "src": "string，必填，视频地址（本地路径或网络 URL）",
+        "poster": "string，可选，封面图地址",
+        "title": "string，可选，标题",
+        "description": "string，可选，描述",
+        "duration": "string|number，可选，时长文本或秒数",
+        "kind": "string，可选，direct 或 stream",
+        "openMode": "string，可选，dialog/webview/external，默认自动判断",
+        "clickAction": "string，可选，open/send/sendAndOpen",
+        "sendAction": "string，可选，默认 insert_video"
+      }
+    },
+    {
+      "name": "VideoGallery",
+      "type": "VideoGallery",
+      "description": "视频网格组件，适合多视频展示与播放列表浏览。",
+      "propsSchema": {
+        "videos": "Array<string|object>，必填，视频数组",
+        "columns": "number，可选，网格列数",
+        "gap": "number，可选，间距",
+        "aspectRatio": "string，可选，卡片比例，如 16/9",
+        "openMode": "string，可选，dialog/webview/external",
+        "sendAction": "string，可选，默认 insert_video"
+      }
+    },
+    {
+      "name": "VideoCarousel",
+      "type": "VideoCarousel",
+      "description": "视频轮播组件，支持自动轮播、缩略图切换和弹窗播放。",
+      "propsSchema": {
+        "videos": "Array<string|object>，必填，视频数组",
+        "height": "number，可选，主区域高度",
+        "autoplayMs": "number，可选，自动轮播间隔，0 表示关闭",
+        "showThumbs": "boolean，可选，是否显示缩略图",
+        "openMode": "string，可选，dialog/webview/external",
+        "sendAction": "string，可选，默认 insert_video"
+      }
+    },
+    {
+      "name": "WebViewCard",
+      "type": "WebViewCard",
+      "description": "网页/HTML 片段预览组件，点击后弹窗无头 WebView 渲染。",
+      "propsSchema": {
+        "url": "string，可选，网页 URL",
+        "html": "string，可选，HTML 片段或完整 HTML",
+        "title": "string，可选，卡片标题",
+        "description": "string，可选，卡片描述",
+        "favicon": "string，可选，站点图标 URL",
+        "image": "string，可选，卡片封面图 URL",
+        "preview": "object，可选，抓取到的网页预览数据",
+        "preview.title": "string，可选，网页标题",
+        "preview.description": "string，可选，网页描述",
+        "preview.siteName": "string，可选，站点名",
+        "preview.image": "string，可选，预览图 URL",
+        "preview.favicon": "string，可选，预览图标 URL",
+        "dialogHeight": "number，可选，弹窗高度"
+      }
+    },
+    {
+      "name": "AudioPlayer",
+      "type": "AudioPlayer",
+      "description": "音频播放器组件，支持 TTS 语音、音乐、FM 直播流播放。",
+      "propsSchema": {
+        "src": "string，可选，音频地址",
+        "title": "string，可选，标题",
+        "artist": "string，可选，作者/歌手",
+        "album": "string，可选，专辑",
+        "cover": "string，可选，封面图 URL",
+        "duration": "string|number，可选，时长文本或秒数",
+        "live": "boolean，可选，是否直播流",
+        "autoplay": "boolean，可选，是否自动播放",
+        "loop": "boolean，可选，循环播放",
+        "speed": "number，可选，初始倍速（0.75/1/1.25/1.5/2）",
+        "volume": "number，可选，初始音量（0-1）",
+        "showQueue": "boolean，可选，是否显示列表",
+        "sendAction": "string，可选，默认 insert_audio"
+      }
+    },
+    {
+      "name": "AudioPlaylist",
+      "type": "AudioPlaylist",
+      "description": "音频列表播放器组件，适合播客/节目/歌单连续播放。",
+      "propsSchema": {
+        "audios": "Array<string|object>，必填，音频数组",
+        "playlist": "Array<string|object>，可选，音频数组别名",
+        "showQueue": "boolean，可选，默认 true",
+        "loop": "boolean，可选，是否循环",
+        "autoPlayOnSelect": "boolean，可选，选择列表项后是否自动播放",
+        "sendAction": "string，可选，默认 insert_audio"
+      }
+    },
+    {
+      "name": "MarkdownPreviewCard",
+      "type": "MarkdownPreviewCard",
+      "description": "Markdown 预览组件：App 支持本地文件/内联，Web 支持内联内容预览与下载保存。",
+      "propsSchema": {
+        "markdown": "string，可选，内联 markdown 内容",
+        "content": "string，可选，内联 markdown 内容别名",
+        "text": "string，可选，内联 markdown 内容别名",
+        "filePath": "string，可选，本地 markdown 文件路径",
+        "path": "string，可选，本地 markdown 文件路径别名",
+        "file": "string，可选，本地 markdown 文件路径别名",
+        "title": "string，可选，卡片标题",
+        "description": "string，可选，卡片描述",
+        "previewLines": "number，可选，摘要行数（2-8）",
+        "dialogHeight": "number，可选，全屏预览弹窗高度"
+      }
+    },
+    {
+      "name": "OfficePreviewCard",
+      "type": "OfficePreviewCard",
+      "description": "办公文档预览组件：聊天内文件卡片，点击全屏预览并支持保存。",
+      "propsSchema": {
+        "src": "string，可选，文档地址（本地路径或网络 URL）",
+        "url": "string，可选，文档地址别名",
+        "path": "string，可选，本地文档路径别名",
+        "file": "string，可选，本地文档路径别名",
+        "fileType": "string，可选，docx/excel/pdf/pptx（不传则按扩展名推断）",
+        "title": "string，可选，卡片标题",
+        "description": "string，可选，卡片描述",
+        "fileName": "string，可选，显示用文件名",
+        "dialogHeight": "number，可选，全屏预览弹窗高度"
+      }
+    },
+    {
+      "name": "OptionSelector",
+      "type": "OptionSelector",
+      "description": "选项交互组件：建议混排在回复结尾，单选即触发、多选提交触发，触发后可禁用并静默进入下一轮。",
+      "propsSchema": {
+        "title": "string，可选，卡片标题",
+        "description": "string，可选，卡片副标题",
+        "mode": "string，可选，single 或 multiple，默认 single",
+        "options": "Array<object>，必填，选项列表（支持 items/choices 别名）",
+        "options[].id": "string，可选，选项唯一 ID",
+        "options[].label": "string，必填，按钮展示文本",
+        "options[].hint": "string，可选，按钮下方简要提示",
+        "options[].value": "string，可选，业务值",
+        "options[].prompt": "string，推荐，点击后提交给 AI 的隐藏内容（hiddenPrompt/nextPrompt/message 也可；不直接展示给用户）",
+        "submitAction": "string，可选，触发动作名，默认 submit_option",
+        "joinWith": "string，可选，多选时拼接分隔符，默认换行",
+        "submitLabel": "string，可选，多选提交按钮文案",
+        "selectedLabel": "string，可选，单选后状态文案",
+        "submittedLabel": "string，可选，多选提交后文案",
+        "minSelect": "number，可选，多选最少选择数量，默认 1",
+        "maxSelect": "number，可选，多选最多选择数量，默认 options 长度",
+        "disabledAfterSubmit": "boolean，可选，触发后是否禁用，默认 true"
+      }
+    },
+    {
+      "name": "ChartCard",
+      "type": "ChartCard",
+      "description": "通用图表卡片：按 chartType 渲染 line/bar/area/pie/radar，适合数据可视化摘要。",
+      "propsSchema": {
+        "chartType": "string，可选，line/bar/area/pie/radar，默认 line",
+        "data": "Array<object>，必填，图表数据",
+        "title": "string，可选，卡片标题",
+        "description": "string，可选，卡片副标题",
+        "height": "number，可选，图表高度（180-560）",
+        "xKey": "string，可选，横轴字段（非 pie）",
+        "series": "Array<object|string>，可选，序列配置",
+        "series[].key": "string，序列字段名",
+        "series[].label": "string，可选，序列展示名",
+        "series[].color": "string，可选，序列颜色",
+        "showLegend": "boolean，可选，是否显示图例",
+        "showGrid": "boolean，可选，是否显示网格",
+        "compact": "boolean，可选，紧凑模式"
+      }
+    },
+    {
+      "name": "PieChartCard",
+      "type": "PieChartCard",
+      "description": "饼图/环图组件：适合占比、份额、构成类数据。",
+      "propsSchema": {
+        "data": "Array<object>，必填，默认字段 name/value",
+        "dataKey": "string，可选，数值字段名，默认 value",
+        "nameKey": "string，可选，名称字段名，默认 name",
+        "innerRadius": "number，可选，内半径（用于环图）",
+        "outerRadius": "number，可选，外半径",
+        "maxItems": "number，可选，最多渲染项数，默认 12",
+        "height": "number，可选，图表高度"
+      }
+    },
+    {
+      "name": "BarChartCard",
+      "type": "BarChartCard",
+      "description": "柱状图组件：适合类别对比场景。",
+      "propsSchema": {
+        "data": "Array<object>，必填，图表数据",
+        "xKey": "string，可选，类目字段",
+        "series": "Array<object|string>，可选，序列配置",
+        "height": "number，可选，图表高度",
+        "showLegend": "boolean，可选，是否显示图例",
+        "showGrid": "boolean，可选，是否显示网格"
+      }
+    },
+    {
+      "name": "LineChartCard",
+      "type": "LineChartCard",
+      "description": "折线图组件：适合时间趋势与变化轨迹。",
+      "propsSchema": {
+        "data": "Array<object>，必填，图表数据",
+        "xKey": "string，可选，横轴字段",
+        "series": "Array<object|string>，可选，序列配置",
+        "height": "number，可选，图表高度",
+        "showLegend": "boolean，可选，是否显示图例",
+        "showGrid": "boolean，可选，是否显示网格",
+        "compact": "boolean，可选，紧凑模式（弱化点标记）"
+      }
+    },
+    {
+      "name": "AreaChartCard",
+      "type": "AreaChartCard",
+      "description": "面积图组件：适合累计趋势与区间变化。",
+      "propsSchema": {
+        "data": "Array<object>，必填，图表数据",
+        "xKey": "string，可选，横轴字段",
+        "series": "Array<object|string>，可选，序列配置",
+        "height": "number，可选，图表高度",
+        "showLegend": "boolean，可选，是否显示图例",
+        "showGrid": "boolean，可选，是否显示网格"
+      }
+    },
+    {
+      "name": "RadarChartCard",
+      "type": "RadarChartCard",
+      "description": "雷达图组件：适合多维评分、能力画像。",
+      "propsSchema": {
+        "data": "Array<object>，必填，图表数据",
+        "xKey": "string，可选，维度字段",
+        "series": "Array<object|string>，可选，序列配置",
+        "height": "number，可选，图表高度",
+        "showLegend": "boolean，可选，是否显示图例"
+      }
+    }
+  ]
+}

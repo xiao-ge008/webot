@@ -121,6 +121,7 @@ pub enum StreamEvent {
         name: String,
         result_preview: String,
         is_error: bool,
+        input: Option<serde_json::Value>,
     },
 }
 

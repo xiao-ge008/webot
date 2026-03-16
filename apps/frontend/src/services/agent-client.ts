@@ -116,16 +116,29 @@ export interface AgentSessionResult {
   message?: string;
 }
 
+export interface CompactAgentSessionInput {
+  agentId: string;
+  sessionId?: string;
+  sessionLabel?: string;
+}
+
+export interface CompactAgentSessionResult {
+  success: boolean;
+  sessionId?: string;
+  message?: string;
+}
+
 const streamSubscribers = new Set<(chunk: AgentChatStreamChunk) => void>();
 const requestToAgentId = new Map<string, string>();
 const requestAbortControllers = new Map<string, AbortController>();
 const skillPromptContextCache = new Map<string, string>();
 const availableSkillComponentsCache = new Map<string, string[]>();
 const skillComponentManifestCache = new Map<string, { description: string; propsSchema: unknown; example: unknown }>();
-  const collaborationHintCache = new Map<string, { expiresAt: number; hint: string }>();
+const collaborationHintCache = new Map<string, { expiresAt: number; hint: string }>();
 const COLLABORATION_HINT_TTL_MS = 5_000;
-const STREAM_IDLE_TIMEOUT_MS = 300_000;
+const STREAM_IDLE_TIMEOUT_MS = 540_000;
 const STREAM_MAX_TIMEOUT_MS = 3_600_000;
+const CHAT_RECOVERY_SETTLE_MS = 500;
 const COLLAB_TAG_DISPATCH = 'webot:collab_dispatcher';
 const COLLAB_CONFIG_BEGIN = '[WEBOT_COLLAB_CONFIG_BEGIN]';
 const COLLAB_CONFIG_END = '[WEBOT_COLLAB_CONFIG_END]';
@@ -522,6 +535,100 @@ function createRequestId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function normalizeSessionLabelComponent(raw: string, maxLen: number): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  let out = '';
+  for (const ch of trimmed) {
+    if (out.length >= maxLen) break;
+    if (
+      (ch >= 'a' && ch <= 'z')
+      || (ch >= 'A' && ch <= 'Z')
+      || (ch >= '0' && ch <= '9')
+      || ch === '-'
+      || ch === '_'
+    ) {
+      out += ch;
+    } else {
+      out += '_';
+    }
+  }
+  return out.replace(/^_+|_+$/g, '');
+}
+
+function buildRecoveredSessionLabel(baseLabel: string, agentId: string): string {
+  const base = normalizeSessionLabelComponent(baseLabel || agentId || 'chat', 72) || 'chat';
+  const stamp = Date.now().toString(36);
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return `${base}_recover_${stamp}_${suffix}`;
+}
+
+type ChatRecoveryReason = 'session_conflict' | 'context_overflow';
+
+function isRecoverableStreamingFailure(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  if (!text) return false;
+  if (text.includes('streaming message failed')) return true;
+  if (text.includes('response failed') && text.includes('500')) return true;
+  return text.includes('http 500') && (text.includes('/message/stream') || text.includes('openfang'));
+}
+
+function isContextOverflowFailure(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes('token limit exceeded')
+    || text.includes('context length')
+    || text.includes('context window')
+    || text.includes('context_length_exceeded')
+    || text.includes('prompt is too long')
+    || text.includes('input too long')
+    || text.includes('max tokens exceeded')
+    || text.includes('too many tokens')
+  );
+}
+
+function resolveChatRecoveryReason(result: AgentChatResult): ChatRecoveryReason | null {
+  if (result.success) return null;
+  const message = result.error || result.content || '';
+  if ((result.content || '').trim()) return null;
+  if (isContextOverflowFailure(message)) {
+    return 'context_overflow';
+  }
+  if (isRecoverableStreamingFailure(message)) {
+    return 'session_conflict';
+  }
+  return null;
+}
+
+async function waitForChatRecoverySettle(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, CHAT_RECOVERY_SETTLE_MS);
+  });
+}
+
+async function recoverAgentChatSession(
+  input: AgentChatInput,
+  reason: ChatRecoveryReason,
+): Promise<{ recoveredInput: AgentChatInput; recoveredSessionLabel: string }> {
+  const recoveredSessionLabel = buildRecoveredSessionLabel(
+    typeof input.sessionLabel === 'string' ? input.sessionLabel.trim() : '',
+    input.agentId,
+  );
+  if (reason === 'session_conflict') {
+    await stopAgent({ agentId: input.agentId });
+    await waitForChatRecoverySettle();
+  }
+  return {
+    recoveredSessionLabel,
+    recoveredInput: {
+      ...input,
+      sessionId: undefined,
+      sessionLabel: recoveredSessionLabel,
+    },
+  };
+}
+
 async function buildCollaborationAgentHint(currentAgentId: string): Promise<string> {
   const cacheHit = collaborationHintCache.get(currentAgentId);
   const now = Date.now();
@@ -553,7 +660,7 @@ async function buildCollaborationAgentHint(currentAgentId: string): Promise<stri
           const hit = agents.find((item) => item.id === id);
           const alias = hit?.nickname?.trim() || hit?.name || id || 'unknown-local-worker';
           const profile = (hit?.description || '').trim().replace(/\s+/g, ' ');
-          return `- ${alias} (id=${id})${profile ? `: ${profile.slice(0, 120)}` : ''}`;
+          return `- local worker: agent_id=${id}; display_name=${alias}${profile ? `; profile=${profile.slice(0, 120)}` : ''}`;
         }
         if (key.startsWith('a2a:')) {
           const name = key.slice('a2a:'.length).trim();
@@ -563,7 +670,7 @@ async function buildCollaborationAgentHint(currentAgentId: string): Promise<stri
             .filter((item) => item.length > 0)
             .slice(0, 4);
           const skillsText = skillNames.length > 0 ? `；skills=${skillNames.join(', ')}` : '';
-          return `- ${name || 'unknown-a2a-worker'}${skillsText}`;
+          return `- external a2a worker: exact_name=${name || 'unknown-a2a-worker'}${skillsText}`;
         }
         return `- ${key}`;
       });
@@ -572,6 +679,8 @@ async function buildCollaborationAgentHint(currentAgentId: string): Promise<stri
         '你当前可调度的白名单如下（仅以下对象允许委派）：',
         selectedLines.length > 0 ? selectedLines.join('\n') : '- 无',
         '严格规则：当用户询问“你有几个小伙伴/可调度对象”时，只能按上述白名单数量回答。',
+        '强制规则：调用本地智能体时，agent_find / agent_send 的参数必须使用 agent_id，绝对不能使用昵称、中文名、display_name 或口头称呼。',
+        '如果是 external a2a worker，只有在白名单未提供 id 时，才允许使用 exact_name，而且必须原样填写。',
         '委派策略：当任务可拆分或需专长时，优先执行 agent_find，再执行 agent_send，并在最终回复汇总每个子智能体的结果。',
       ].join('\n');
     }
@@ -795,6 +904,9 @@ async function runTextToolCallFallback(text: string): Promise<{ text: string; to
 async function buildUiEnvironmentSystemPrompt(input: AgentChatInput): Promise<string> {
   const channel = toStringValue(input.channel, CHAT_CHANNELS.app);
   const renderMode = toStringValue(input.renderMode, CHAT_RENDER_MODES.jsonRender);
+  const normalizedAgentId = toStringValue(input.agentId).trim().toLowerCase();
+  const normalizedAgentName = toStringValue(input.agentName).trim().toLowerCase();
+  const isNuwaManagementAgent = normalizedAgentId === 'nuwa' || normalizedAgentName === '女娲';
   let components: string[] = [];
   try {
     const assignments = await getAgentSkillAssignments(input.agentId);
@@ -839,7 +951,7 @@ async function buildUiEnvironmentSystemPrompt(input: AgentChatInput): Promise<st
     'When using UI, prefer a mixed response: short Markdown explanation plus a small focused UI block.',
     'Do not convert the whole answer into UI unless the user explicitly asks for a fully structured card.',
     'When user intent is ambiguous and multiple follow-up directions are possible, prefer using the built-in `OptionSelector` component to ask for intent instead of asking the user to type a free-form clarification.',
-    'Common built-in components you should actively consider when useful: `OptionSelector`, `AgentManagementConfirmCard`, `LineChartCard`, `BarChartCard`, `AreaChartCard`, `PieChartCard`, `ImageCover`, `ImageAlbum`, `ImageCarousel`, `WebViewCard`, `MarkdownPreviewCard`, `OfficePreviewCard`.',
+    'Common built-in components you should actively consider when useful: `OptionSelector`, `LineChartCard`, `BarChartCard`, `AreaChartCard`, `PieChartCard`, `ImageCover`, `ImageAlbum`, `ImageCarousel`, `WebViewCard`, `MarkdownPreviewCard`, `OfficePreviewCard`, `AgentManagementConfirmCard`.',
     'For disambiguation, intent routing, next-step choices, or asking what the user wants to do next, `OptionSelector` is preferred over plain text questions whenever the options are clear.',
     'Component-first preference order for chat UI: 1) `OptionSelector` for intent clarification and next-step choice, 2) image answers should prefer `ImageCover` / `ImageAlbum` / `ImageCarousel` with visible cover in chat, 3) video answers should prefer `VideoCover` / `VideoGallery` / `VideoCarousel` with visible cover in chat, 4) trend/comparison/numeric answers should prefer chart components such as `LineChartCard` / `BarChartCard` / `AreaChartCard` / `PieChartCard`.',
     'Prefer rich mixed layouts with text plus media/chart components when they make the answer clearer and more readable.',
@@ -884,18 +996,17 @@ async function buildUiEnvironmentSystemPrompt(input: AgentChatInput): Promise<st
     'Preferred chat example: a short Markdown paragraph, then one <UI_JSON>{...}</UI_JSON> block, then optional Markdown notes.',
     'Valid mixed example: Markdown intro + <UI_JSON>{...}</UI_JSON> + Markdown explanation.',
     'Output either valid Markdown, or valid mixed Markdown/UI_JSON content. Do not output almost-JSON.',
+    isNuwaManagementAgent ? '[system:nuwa-management-confirm-card]' : '',
+    isNuwaManagementAgent ? '当你已经进入“请确认创建/修改智能体”的阶段，必须输出 AgentManagementConfirmCard，不允许只输出“现在输出确认卡，请确认是否创建”这类纯文本收尾。' : '',
+    isNuwaManagementAgent ? 'AgentManagementConfirmCard 必须写成 <UI_JSON>{"type":"AgentManagementConfirmCard","props":{...}}</UI_JSON>，type 名称必须精确匹配。' : '',
+    isNuwaManagementAgent ? '创建智能体时，payload.nickname 只能填写一个最终显示昵称，不要把多个别名一起塞进 nickname；其他别名请写进 IDENTITY.md。' : '',
+    isNuwaManagementAgent ? '创建智能体或整套重写身份文件时，payload.contextFiles 或 payload.items[].contextFiles 必须直接携带完整的 IDENTITY.md / SOUL.md / USER.md / MEMORY.md / TOOLS.md / AGENTS.md / BOOTSTRAP.md / HEARTBEAT.md / SYSTEM_PROMPT。不要依赖后续再调用模型生成。' : '',
+    isNuwaManagementAgent ? '如果身份文件内容还没准备完整，就继续追问，不要输出确认卡。' : '',
     collaborationHint ? '[system:multi-agent-collaboration]' : '',
     collaborationHint,
     '[system:task-trigger-keywords]',
     `如果用户表达定时任务意图（触发关键词示例：${CHAT_TASK_TRIGGER_KEYWORDS_HINT}），请先给出“任务创建草案”，并等待用户确认后再创建。\n输出尽量遵循以下固定模板（便于前端识别生成任务卡片）：\n任务名称: <简短名称>\n任务内容: <一句话要做什么>\n执行间隔: 每 <数字> <秒/分钟/小时/天>\n总执行次数: <数字> 次\n请确认是否创建任务（优先引导用户点击任务卡片里的“创建任务/取消”，不要只让用户输入文字确认）。\n注意：即使间隔为 1 分钟，也必须写成“每 1 分钟”，不要写“每分钟”。`,
     '在确认前不要直接执行 cron_add/cron_update/cron_remove/cron_run/cron_list。若用户取消，明确回复“已取消任务创建”。',
-    '[system:agent-management-card]',
-    '当用户表达创建、修改、删除智能体的意图时，先通过对话补齐最少必要信息，再输出 `AgentManagementConfirmCard` 供用户确认，不要在确认前直接当作已经完成。',
-    '创建智能体时默认使用系统默认模型，不要主动追问供应商或模型；若用户未提供英文名，可在卡片 payload 中留空，由系统自动生成。',
-    '`AgentManagementConfirmCard` 推荐 props：`mode`, `title`, `description`, `nickname`, `targetName`, `agentId`, `englishName`, `tags`, `workspaces`, `deleteMode`, `summaryItems`, `payload`。',
-    '创建场景的 `payload` 至少应包含：`mode=create`, `nickname`, `description`, 可选 `englishName`, `tags`, `workspaces`。若未指定 `workspaces`，系统将只保留该智能体默认工作区。',
-    '修改场景的 `payload` 至少应包含：`mode=update`，以及 `agentId` 或可唯一定位的 `targetName`。删除场景的 `payload` 至少应包含：`mode=delete`，以及 `agentId` 或 `targetName`。',
-    '如果信息仍不足以唯一定位修改/删除对象，先继续提问，不要提前输出确认卡片。',
     injectedManifestContexts.length > 0 ? '[system:skill-component-manifests]' : '',
     ...injectedManifestContexts,
     injectedSkillContexts.length > 0 ? '[system:skill-local-component-context]' : '',
@@ -1282,7 +1393,7 @@ export async function getAgentCollaborationEvents(
   }
 }
 
-async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResult> {
+async function sendAgentChatStreamOnce(input: AgentChatInput): Promise<AgentChatResult> {
   const requestId = input.requestId || createRequestId();
   const agentId = input.agentId;
   const controller = new AbortController();
@@ -1740,7 +1851,7 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
     if (streamErrorMessage) {
       return {
         success: false,
-        content: '',
+        content: fullText,
         error: streamErrorMessage,
       };
     }
@@ -1840,14 +1951,9 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : '娴佸紡瀵硅瘽澶辫触';
-    emitChunk({
-      requestId,
-      kind: 'error',
-      value: message,
-    });
     return {
       success: false,
-      content: '',
+      content: fullText,
       error: message,
     };
   } finally {
@@ -1859,6 +1965,51 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
     }
     requestAbortControllers.delete(requestId);
     requestToAgentId.delete(requestId);
+  }
+}
+
+async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResult> {
+  const firstResult = await sendAgentChatStreamOnce(input);
+  const recoveryReason = resolveChatRecoveryReason(firstResult);
+  if (!recoveryReason) {
+    return firstResult;
+  }
+  if (recoveryReason === 'context_overflow') {
+    return {
+      ...firstResult,
+      recoveryReason,
+    };
+  }
+
+  const requestId = input.requestId || createRequestId();
+  emitChunk({
+    requestId,
+    kind: 'log',
+    value: JSON.stringify({
+      phase: 'recovering_session',
+      recovery_reason: recoveryReason,
+      reason: firstResult.error || firstResult.content || 'streaming_message_failed',
+    }),
+    event: 'phase',
+  });
+
+  try {
+    const { recoveredInput, recoveredSessionLabel } = await recoverAgentChatSession({
+      ...input,
+      requestId,
+    }, recoveryReason);
+    const retried = await sendAgentChatStreamOnce(recoveredInput);
+    return {
+      ...retried,
+      recoveredSessionLabel,
+      recoveryReason,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      content: '',
+      error: error instanceof Error ? error.message : '会话恢复失败',
+    };
   }
 }
 
@@ -1874,6 +2025,11 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
     return sendAgentChatStream(streamInput);
   }
 
+  const requestId = input.requestId || createRequestId();
+  const controller = new AbortController();
+  requestToAgentId.set(requestId, input.agentId);
+  requestAbortControllers.set(requestId, controller);
+
   try {
     const outgoingMessage = input.message;
     const attachmentRefs = (input.attachments ?? [])
@@ -1883,36 +2039,96 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
         filename: (item.filename || '').trim(),
         content_type: (item.contentType || '').trim(),
       }));
-    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
-    const sessionLabel = typeof input.sessionLabel === 'string' ? input.sessionLabel.trim() : '';
     if (import.meta.env.DEV) {
       console.debug('[Chat] non-stream outgoing message prepared', {
         agentId: input.agentId,
         outgoingMessage,
       });
     }
-    const result = await requestJson<unknown>(`/api/chat/${encodeURIComponent(input.agentId)}/message`, {
-      method: 'POST',
-      body: {
-        message: outgoingMessage,
-        attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
-        session_id: sessionId || undefined,
-        session_label: sessionLabel || undefined,
-      },
-    });
-    const body = isRecord(result) ? result : {};
-    const content = toStringValue(body.response, toStringValue(body.content));
-    return {
-      success: true,
-      content,
-      text: content,
+    const sendOnce = async (requestInput: AgentChatInput): Promise<AgentChatResult> => {
+      const nextSessionId = typeof requestInput.sessionId === 'string' ? requestInput.sessionId.trim() : '';
+      const nextSessionLabel = typeof requestInput.sessionLabel === 'string' ? requestInput.sessionLabel.trim() : '';
+      const result = await requestJson<unknown>(`/api/chat/${encodeURIComponent(requestInput.agentId)}/message`, {
+        method: 'POST',
+        body: {
+          message: outgoingMessage,
+          attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
+          session_id: nextSessionId || undefined,
+          session_label: nextSessionLabel || undefined,
+        },
+        signal: controller.signal,
+      });
+      const body = isRecord(result) ? result : {};
+      const content = toStringValue(body.response, toStringValue(body.content));
+      return {
+        success: true,
+        content,
+        text: content,
+        recoveredRemoteSessionId: toStringValue(body.session_id) || undefined,
+      };
     };
+
+    try {
+      return await sendOnce(input);
+    } catch (error) {
+      const aborted = error instanceof DOMException && error.name === 'AbortError';
+      if (aborted) {
+        return {
+          success: false,
+          content: '',
+          error: '请求已取消',
+        };
+      }
+
+      const message = error instanceof Error ? error.message : '瀵硅瘽澶辫触';
+      const failed: AgentChatResult = {
+        success: false,
+        content: '',
+        error: message,
+      };
+      const recoveryReason = resolveChatRecoveryReason(failed);
+      if (!recoveryReason) {
+        return failed;
+      }
+      if (recoveryReason === 'context_overflow') {
+        return {
+          ...failed,
+          recoveryReason,
+        };
+      }
+
+      let recoveredSessionLabel = '';
+      try {
+        const recovered = await recoverAgentChatSession({
+          ...input,
+          requestId,
+        }, recoveryReason);
+        recoveredSessionLabel = recovered.recoveredSessionLabel;
+        const retried = await sendOnce(recovered.recoveredInput);
+        return {
+          ...retried,
+          recoveredSessionLabel,
+          recoveryReason,
+        };
+      } catch (recoverError) {
+        return {
+          success: false,
+          content: '',
+          error: recoverError instanceof Error ? recoverError.message : message,
+          recoveredSessionLabel: recoveredSessionLabel || undefined,
+        };
+      }
+    }
   } catch (error) {
+    const aborted = error instanceof DOMException && error.name === 'AbortError';
     return {
       success: false,
       content: '',
-      error: error instanceof Error ? error.message : '瀵硅瘽澶辫触',
+      error: aborted ? '请求已取消' : (error instanceof Error ? error.message : '瀵硅瘽澶辫触'),
     };
+  } finally {
+    requestAbortControllers.delete(requestId);
+    requestToAgentId.delete(requestId);
   }
 }
 
@@ -1986,6 +2202,37 @@ export async function getAgentSession(agentId: string): Promise<AgentSessionResu
       success: false,
       messages: [],
       message: error instanceof Error ? error.message : '会话读取失败',
+    };
+  }
+}
+
+export async function compactAgentSession(input: CompactAgentSessionInput): Promise<CompactAgentSessionResult> {
+  const agentId = input.agentId.trim();
+  if (!agentId) {
+    return {
+      success: false,
+      message: 'agentId 不能为空',
+    };
+  }
+  try {
+    const payload = await requestJson<unknown>(`/api/chat/${encodeURIComponent(agentId)}/session/compact`, {
+      method: 'POST',
+      body: {
+        session_id: typeof input.sessionId === 'string' ? input.sessionId.trim() || undefined : undefined,
+        session_label: typeof input.sessionLabel === 'string' ? input.sessionLabel.trim() || undefined : undefined,
+      },
+    });
+    const data = isRecord(payload) ? payload : {};
+    const result = isRecord(data.result) ? data.result : {};
+    return {
+      success: true,
+      sessionId: toStringValue(data.session_id),
+      message: toStringValue(result.message, toStringValue(data.message, '会话已压缩')),
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : '会话压缩失败',
     };
   }
 }

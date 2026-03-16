@@ -6,13 +6,15 @@ import { chatRuntimeStore } from '@/services/chat-runtime-store';
 import type { StoredChatSession } from '@/services/chat-session-store';
 import {
   bindTaskChatMeta,
+  createTaskReportDelivery,
   hasTaskFinalSummaryDelivered,
   listTaskRuns,
   listTasks,
+  loadTaskRuntimeMeta,
   markTaskFinalSummaryDelivered,
   storeTaskFinalSummary,
 } from '@/services/task-client';
-import { pushSystemNotice } from '@/services/system-notifier';
+import { pushTaskNoticeRouted } from '@/services/task-notice-router';
 import type { Task, TaskRunRecord } from '@/types/tasks';
 
 const DEFAULT_FINAL_SUMMARY_PROMPT = '请基于全部执行日志，输出最终总结报告：总体结论、关键变化、异常与建议。';
@@ -115,6 +117,34 @@ function fallbackSummary(task: Task, runs: readonly TaskRunRecord[]): string {
 
 function toEventMeta(prefix: string, taskId: string, token: string): string {
   return `${prefix}:${taskId}:${token}`;
+}
+
+function parseTaskSourceRef(sourceRef?: string): { sessionId?: string; messageId?: string } {
+  const raw = (sourceRef || '').trim();
+  if (!raw) return {};
+  const separatorIndex = raw.indexOf('::');
+  if (separatorIndex < 0) {
+    return { messageId: raw };
+  }
+  const sessionId = raw.slice(0, separatorIndex).trim();
+  const messageId = raw.slice(separatorIndex + 2).trim();
+  return {
+    sessionId: sessionId || undefined,
+    messageId: messageId || undefined,
+  };
+}
+
+function buildProgressSummary(task: Task, rows: readonly { runNo: number; run: TaskRunRecord }[]): string {
+  const latest = rows[rows.length - 1];
+  if (!latest) {
+    return `任务「${task.name}」产生了新的执行进度。`;
+  }
+  const output = normalizeRunOutput(latest.run.output).replace(/\s+/g, ' ').trim();
+  const preview = output.length > 140 ? `${output.slice(0, 140)}...` : output;
+  return [
+    `第 ${latest.runNo} 轮执行状态：${latest.run.status}`,
+    preview ? `输出摘要：${preview}` : '',
+  ].filter(Boolean).join('\n');
 }
 
 function simpleHash(raw: string): string {
@@ -399,6 +429,14 @@ function buildNoticePreviewFromText(text: string): string {
   return normalized.length > 140 ? `${normalized.slice(0, 140)}...` : normalized;
 }
 
+function buildTaskSummarySessionLabel(taskId: string): string {
+  const normalized = taskId
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return `task_summary_${normalized || 'unknown'}`;
+}
+
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
@@ -443,6 +481,7 @@ async function buildFinalSummary(task: Task, runs: readonly TaskRunRecord[]): Pr
     message: userPrompt,
     history: [],
     stream: false,
+    sessionLabel: buildTaskSummarySessionLabel(task.id),
   }, {
     channel: CHAT_CHANNELS.task,
     renderMode: CHAT_RENDER_MODES.plainText,
@@ -505,15 +544,12 @@ export function TaskDeliveryWatcher() {
     ) => {
       const text = input.message.trim();
       if (!text) return;
-      await pushSystemNotice({
+      await pushTaskNoticeRouted(task, {
         title: input.title,
         message: text,
         level: input.level,
         tag: input.tag,
       });
-      // 预留未来渠道扩展：按 task.delivery.channel / task.delivery.to 路由到 TG/WhatsApp 等
-      void task.delivery.channel;
-      void task.delivery.to;
     };
 
     const allowFallbackToActiveChat = (task: Task): boolean => {
@@ -522,10 +558,40 @@ export function TaskDeliveryWatcher() {
     };
 
     const deliverAnomaly = async (event: TaskAnomalyEvent) => {
+      const meta = await loadTaskRuntimeMeta(event.task.id);
       const latestToken = event.runs.map((run) => run.startTime).join('|');
       const token = simpleHash(`${latestToken}|${event.task.runInfo.runCount}`);
-      const noticeMessage = buildNoticePreviewFromText(buildAnomalyText(event.task, event.runs))
+      const anomalyText = buildAnomalyText(event.task, event.runs);
+      const noticeMessage = buildNoticePreviewFromText(anomalyText)
         || buildAnomalyNotice(event.task, event.runs);
+      await createTaskReportDelivery({
+        taskId: event.task.id,
+        ownerAgentId: event.task.teamId,
+        runtimeKey: meta?.runtimeKey || undefined,
+        deliveryKind: 'anomaly',
+        dedupeKey: `task-anomaly:${event.task.id}:${token}`,
+        originConversationType: meta?.originConversationType,
+        originConversationId: meta?.originConversationId,
+        originChatSessionId: meta?.originChatSessionId,
+        originMessageId: meta?.originMessageId,
+        creatorParticipantId: meta?.creatorParticipantId,
+        creatorParticipantName: meta?.creatorParticipantName,
+        executorAgentId: meta?.executorAgentId || event.task.teamId,
+        executorAgentName: meta?.executorAgentName,
+        reportActorAgentId: meta?.reportActorAgentId || meta?.executorAgentId || event.task.teamId,
+        reportActorAgentName: meta?.reportActorAgentName || meta?.executorAgentName,
+        taskName: event.task.name,
+        runCount: event.task.runInfo.runCount,
+        summaryText: anomalyText,
+        errorText: noticeMessage,
+        payload: {
+          status: 'alert',
+          taskName: event.task.name,
+          ownerAgentId: event.task.teamId,
+          latestRunAt: event.runs[event.runs.length - 1]?.startTime,
+          alertText: anomalyText,
+        },
+      });
       await pushTaskNotice(event.task, {
         title: `任务异常：${event.task.name}`,
         message: noticeMessage,
@@ -535,23 +601,83 @@ export function TaskDeliveryWatcher() {
     };
 
     const deliverProgress = async (event: TaskProgressEvent) => {
-      void allowFallbackToActiveChat(event.task);
-      void event.rows;
-      // 不向聊天插入执行回执；详细日志在任务详情页查看。
+      const meta = await loadTaskRuntimeMeta(event.task.id);
+      const latest = event.rows[event.rows.length - 1];
+      if (!latest) return;
+      const summaryText = buildProgressSummary(event.task, event.rows);
+      await createTaskReportDelivery({
+        taskId: event.task.id,
+        ownerAgentId: event.task.teamId,
+        runtimeKey: meta?.runtimeKey || undefined,
+        deliveryKind: 'progress',
+        dedupeKey: event.dedupeKey,
+        originConversationType: meta?.originConversationType,
+        originConversationId: meta?.originConversationId,
+        originChatSessionId: meta?.originChatSessionId,
+        originMessageId: meta?.originMessageId,
+        creatorParticipantId: meta?.creatorParticipantId,
+        creatorParticipantName: meta?.creatorParticipantName,
+        executorAgentId: meta?.executorAgentId || event.task.teamId,
+        executorAgentName: meta?.executorAgentName,
+        reportActorAgentId: meta?.reportActorAgentId || meta?.executorAgentId || event.task.teamId,
+        reportActorAgentName: meta?.reportActorAgentName || meta?.executorAgentName,
+        taskName: event.task.name,
+        runCount: latest.runNo,
+        summaryText,
+        payload: {
+          status: 'running',
+          runCount: latest.runNo,
+          maxRuns: event.task.maxRuns,
+          taskName: event.task.name,
+          ownerAgentId: event.task.teamId,
+          latestRunAt: latest.run.startTime,
+        },
+      });
     };
 
     const deliverFinal = async (runtime: TaskDispatchRuntime, event: TaskFinalEvent) => {
+      const meta = await loadTaskRuntimeMeta(event.task.id);
       const summaryFallback = fallbackSummary(event.task, event.runs);
       const summary = await withTimeout(
         buildFinalSummary(event.task, event.runs),
         SEND_TIMEOUT_MS,
         summaryFallback,
       );
-      storeTaskFinalSummary(event.task.id, event.runCount, summary.trim() || summaryFallback);
+      const finalText = summary.trim() || summaryFallback;
+      const failed = event.task.runInfo.lastStatus === 'error' || event.runs.some((run) => run.status === 'error');
+      storeTaskFinalSummary(event.task.id, event.runCount, finalText);
+      await createTaskReportDelivery({
+        taskId: event.task.id,
+        ownerAgentId: event.task.teamId,
+        runtimeKey: meta?.runtimeKey || undefined,
+        deliveryKind: 'final',
+        dedupeKey: `task-final:${event.task.id}:${event.runCount}`,
+        originConversationType: meta?.originConversationType,
+        originConversationId: meta?.originConversationId,
+        originChatSessionId: meta?.originChatSessionId,
+        originMessageId: meta?.originMessageId,
+        creatorParticipantId: meta?.creatorParticipantId,
+        creatorParticipantName: meta?.creatorParticipantName,
+        executorAgentId: meta?.executorAgentId || event.task.teamId,
+        executorAgentName: meta?.executorAgentName,
+        reportActorAgentId: meta?.reportActorAgentId || meta?.executorAgentId || event.task.teamId,
+        reportActorAgentName: meta?.reportActorAgentName || meta?.executorAgentName,
+        taskName: event.task.name,
+        runCount: event.runCount,
+        summaryText: finalText,
+        errorText: failed ? finalText : undefined,
+        payload: {
+          status: failed ? 'failed' : 'succeeded',
+          runCount: event.runCount,
+          maxRuns: event.task.maxRuns,
+          taskName: event.task.name,
+          ownerAgentId: event.task.teamId,
+        },
+      });
       await pushTaskNotice(event.task, {
         title: `任务完成：${event.task.name}`,
-        message: summary,
-        level: 'success',
+        message: finalText,
+        level: failed ? 'error' : 'success',
         tag: `task-final-${event.task.id}`,
       });
       markTaskFinalSummaryDelivered(event.task.id, event.runCount);
@@ -637,11 +763,17 @@ export function TaskDeliveryWatcher() {
             }
             : rawTask;
           if (inferred) {
+            const sourceMeta = parseTaskSourceRef(task.sourceRef);
             bindTaskChatMeta(task.id, {
               agentId: taskAgentId,
+              runtimeKey: taskAgentId || undefined,
               sourceType: 'chat',
               sourceRef: task.sourceRef,
               maxRuns: task.maxRuns,
+              originConversationType: 'dm',
+              originConversationId: taskAgentId || undefined,
+              originChatSessionId: sourceMeta.sessionId,
+              originMessageId: sourceMeta.messageId,
             });
           }
           const runtime = getRuntime(task.id);
