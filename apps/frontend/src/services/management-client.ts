@@ -2324,12 +2324,26 @@ export interface GlobalImportedSkill {
   updated_at: string;
 }
 
+export interface GlobalSkillListItem {
+  id: string;
+  name: string;
+  folderName?: string;
+  description?: string;
+  path: string;
+  sourceType: string;
+  category: 'system_ui' | 'builtin' | 'custom' | string;
+  isSystem: boolean;
+  isImported: boolean;
+  canDelete: boolean;
+}
+
 export interface GlobalSkillsPayload {
   storage: {
     dbPath: string;
     skillsRoot: string;
   };
   descriptions: Record<string, string>;
+  items: GlobalSkillListItem[];
   imported: GlobalImportedSkill[];
   localFolders: string[];
   runtime: {
@@ -2348,6 +2362,7 @@ export async function getGlobalSkills(): Promise<GlobalSkillsPayload> {
     return {
       storage: { dbPath: '', skillsRoot: '' },
       descriptions: {},
+      items: [],
       imported: [],
       localFolders: [],
       runtime: { skills: [], total: 0 },
@@ -2371,6 +2386,23 @@ export async function getGlobalSkills(): Promise<GlobalSkillsPayload> {
         .map(([key, value]) => [key, value as string]),
     )
     : {};
+  const items = Array.isArray(payload.items)
+    ? payload.items
+      .filter(isRecord)
+      .map((row) => ({
+        id: asString(row.id),
+        name: asString(row.name),
+        folderName: asString(row.folderName) || undefined,
+        description: asString(row.description) || undefined,
+        path: asString(row.path),
+        sourceType: asString(row.sourceType),
+        category: asString(row.category) || 'custom',
+        isSystem: Boolean(row.isSystem),
+        isImported: Boolean(row.isImported),
+        canDelete: typeof row.canDelete === 'boolean' ? row.canDelete : !Boolean(row.isSystem),
+      }))
+      .filter((row) => row.id.trim().length > 0 && row.name.trim().length > 0)
+    : [];
   const runtimeSkills = Array.isArray(runtime.skills)
     ? runtime.skills
       .filter(isRecord)
@@ -2387,6 +2419,7 @@ export async function getGlobalSkills(): Promise<GlobalSkillsPayload> {
       skillsRoot: asString(storage.skillsRoot),
     },
     descriptions,
+    items,
     imported,
     localFolders: asStringArray(payload.localFolders),
     runtime: {

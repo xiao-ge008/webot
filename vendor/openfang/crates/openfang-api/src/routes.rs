@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use dashmap::DashMap;
+use openfang_kernel::scheduler::SchedulerQuotaScope;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
@@ -313,9 +314,15 @@ pub async fn send_message(
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+    let quota_scope = resolve_scheduler_quota_scope(req.request_origin.as_deref());
     match state
         .kernel
-        .send_message_with_handle(agent_id, &req.message, Some(kernel_handle))
+        .send_message_with_handle_and_quota_scope(
+            agent_id,
+            &req.message,
+            Some(kernel_handle),
+            quota_scope,
+        )
         .await
     {
         Ok(result) => {
@@ -1045,10 +1052,16 @@ pub async fn send_message_stream(
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+    let quota_scope = resolve_scheduler_quota_scope(req.request_origin.as_deref());
     let (rx, _handle) =
         match state
             .kernel
-            .send_message_streaming(agent_id, &req.message, Some(kernel_handle))
+            .send_message_streaming_with_quota_scope(
+                agent_id,
+                &req.message,
+                Some(kernel_handle),
+                quota_scope,
+            )
         {
             Ok(pair) => pair,
             Err(e) => {
@@ -1131,6 +1144,12 @@ pub async fn send_message_stream(
                             "result": result_preview,
                             "is_error": is_error,
                             "input": input,
+                        }))
+                        .unwrap_or_else(|_| Event::default().data("error")),
+                    StreamEvent::Error { message } => Event::default()
+                        .event("error")
+                        .json_data(serde_json::json!({
+                            "error": message,
                         }))
                         .unwrap_or_else(|_| Event::default().data("error")),
                     _ => Event::default().comment("skip"),
@@ -6678,10 +6697,23 @@ pub async fn stop_agent(
 }
 
 /// PUT /api/agents/{id}/model — Switch an agent's model.
+#[derive(serde::Deserialize)]
+pub struct SetAgentModelRequest {
+    model: String,
+    provider: Option<String>,
+}
+
+fn resolve_scheduler_quota_scope(request_origin: Option<&str>) -> SchedulerQuotaScope {
+    match request_origin.map(str::trim) {
+        Some("group_auto") => SchedulerQuotaScope::AutoGroupChat,
+        _ => SchedulerQuotaScope::Ignore,
+    }
+}
+
 pub async fn set_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<SetAgentModelRequest>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
@@ -6692,20 +6724,29 @@ pub async fn set_model(
             )
         }
     };
-    let model = match body["model"].as_str() {
-        Some(m) if !m.is_empty() => m,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'model' field"})),
-            )
-        }
-    };
-    match state.kernel.set_agent_model(agent_id, model) {
+    let model = body.model.trim();
+    if model.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing 'model' field"})),
+        );
+    }
+    let provider = body.provider.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    match state
+        .kernel
+        .set_agent_model_with_provider(agent_id, model, provider)
+    {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::json!({"status": "ok", "model": model})),
+            Json(serde_json::json!({
+                "status": "ok",
+                "model": model,
+                "provider": provider
+            })),
         ),
+        Err(openfang_kernel::error::KernelError::OpenFang(
+            openfang_types::error::OpenFangError::InvalidInput(message),
+        )) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": message}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("{e}")})),

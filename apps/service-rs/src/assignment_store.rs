@@ -160,11 +160,7 @@ pub struct TaskDeliveryRecord {
 }
 
 pub fn normalize_provider_id(value: &str) -> String {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "nvidia-nim" => "nvidia".to_string(),
-        _ => normalized,
-    }
+    value.trim().to_string()
 }
 
 pub fn normalize_model_name(value: &str) -> String {
@@ -267,10 +263,7 @@ fn normalize_provider_toggle_map(input: HashMap<String, bool>) -> HashMap<String
         if normalized.is_empty() {
             continue;
         }
-        output
-            .entry(normalized)
-            .and_modify(|value| *value = *value || enabled)
-            .or_insert(enabled);
+        output.insert(normalized, enabled);
     }
     output
 }
@@ -282,10 +275,7 @@ fn normalize_model_toggle_map(input: HashMap<String, bool>) -> HashMap<String, b
         if normalized.is_empty() {
             continue;
         }
-        output
-            .entry(normalized)
-            .and_modify(|value| *value = *value || enabled)
-            .or_insert(enabled);
+        output.insert(normalized, enabled);
     }
     output
 }
@@ -766,20 +756,20 @@ mod tests {
     use super::{make_model_id, normalize_model_id, normalize_provider_id};
 
     #[test]
-    fn normalize_provider_id_merges_nvidia_nim_alias() {
-        assert_eq!(normalize_provider_id("nvidia-nim"), "nvidia");
-        assert_eq!(normalize_provider_id("NVIDIA"), "nvidia");
+    fn normalize_provider_id_only_trims() {
+        assert_eq!(normalize_provider_id(" nvidia-nim "), "nvidia-nim");
+        assert_eq!(normalize_provider_id("NVIDIA"), "NVIDIA");
     }
 
     #[test]
-    fn normalize_model_id_uses_normalized_provider_alias() {
+    fn normalize_model_id_keeps_provider_and_model_raw_value() {
         assert_eq!(
             normalize_model_id("nvidia-nim::xianyu/glm-4.7"),
-            "nvidia::xianyu/glm-4.7"
+            "nvidia-nim::xianyu/glm-4.7"
         );
         assert_eq!(
             make_model_id("nvidia-nim", "xianyu/glm-4.7"),
-            "nvidia::xianyu/glm-4.7"
+            "nvidia-nim::xianyu/glm-4.7"
         );
     }
 }

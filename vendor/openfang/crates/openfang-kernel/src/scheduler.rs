@@ -40,6 +40,21 @@ impl UsageTracker {
     }
 }
 
+/// Selects which request classes participate in the hourly quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerQuotaScope {
+    /// Skip hourly quota checks and do not accumulate usage into the rolling window.
+    Ignore,
+    /// Only automatic group-chat turns count against the hourly token quota.
+    AutoGroupChat,
+}
+
+impl SchedulerQuotaScope {
+    fn enforces_hourly_token_quota(self) -> bool {
+        matches!(self, Self::AutoGroupChat)
+    }
+}
+
 /// The agent scheduler manages execution ordering and resource quotas.
 pub struct AgentScheduler {
     /// Resource quotas per agent.
@@ -67,7 +82,15 @@ impl AgentScheduler {
     }
 
     /// Record token usage for an agent.
-    pub fn record_usage(&self, agent_id: AgentId, usage: &TokenUsage) {
+    pub fn record_usage(
+        &self,
+        agent_id: AgentId,
+        usage: &TokenUsage,
+        quota_scope: SchedulerQuotaScope,
+    ) {
+        if !quota_scope.enforces_hourly_token_quota() {
+            return;
+        }
         if let Some(mut tracker) = self.usage.get_mut(&agent_id) {
             tracker.reset_if_expired();
             tracker.total_tokens += usage.total();
@@ -75,7 +98,14 @@ impl AgentScheduler {
     }
 
     /// Check if an agent has exceeded its quota.
-    pub fn check_quota(&self, agent_id: AgentId) -> OpenFangResult<()> {
+    pub fn check_quota(
+        &self,
+        agent_id: AgentId,
+        quota_scope: SchedulerQuotaScope,
+    ) -> OpenFangResult<()> {
+        if !quota_scope.enforces_hourly_token_quota() {
+            return Ok(());
+        }
         let quota = match self.quotas.get(&agent_id) {
             Some(q) => q.clone(),
             None => return Ok(()), // No quota = no limit
@@ -144,6 +174,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 50,
             },
+            SchedulerQuotaScope::AutoGroupChat,
         );
         let (tokens, _) = scheduler.get_usage(id).unwrap();
         assert_eq!(tokens, 150);
@@ -164,7 +195,32 @@ mod tests {
                 input_tokens: 60,
                 output_tokens: 50,
             },
+            SchedulerQuotaScope::AutoGroupChat,
         );
-        assert!(scheduler.check_quota(id).is_err());
+        assert!(scheduler
+            .check_quota(id, SchedulerQuotaScope::AutoGroupChat)
+            .is_err());
+    }
+
+    #[test]
+    fn test_non_group_requests_do_not_consume_hourly_quota() {
+        let scheduler = AgentScheduler::new();
+        let id = AgentId::new();
+        let quota = ResourceQuota {
+            max_llm_tokens_per_hour: 100,
+            ..Default::default()
+        };
+        scheduler.register(id, quota);
+        scheduler.record_usage(
+            id,
+            &TokenUsage {
+                input_tokens: 60,
+                output_tokens: 50,
+            },
+            SchedulerQuotaScope::Ignore,
+        );
+        assert!(scheduler.check_quota(id, SchedulerQuotaScope::Ignore).is_ok());
+        let (tokens, _) = scheduler.get_usage(id).unwrap();
+        assert_eq!(tokens, 0);
     }
 }

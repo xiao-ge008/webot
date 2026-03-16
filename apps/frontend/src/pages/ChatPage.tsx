@@ -172,6 +172,75 @@ function normalizeSessionDisplayTitle(raw: string, fallback: string): string {
     return normalized;
 }
 
+function normalizeDuplicateSimilarityText(raw: string): string {
+    return raw
+        .toLowerCase()
+        .replace(/[\s\r\n\t]+/g, ' ')
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function buildDuplicateSimilarityTrigramSet(text: string): Set<string> {
+    const normalized = normalizeDuplicateSimilarityText(text);
+    const compact = normalized.replace(/\s+/g, '');
+    const out = new Set<string>();
+    if (compact.length < 6) return out;
+    for (let index = 0; index < compact.length - 2; index += 1) {
+        out.add(compact.slice(index, index + 3));
+        if (out.size >= 2200) break;
+    }
+    return out;
+}
+
+function computeDuplicateSimilarityJaccard(left: Set<string>, right: Set<string>): number {
+    if (left.size === 0 || right.size === 0) return 0;
+    let intersection = 0;
+    const [small, large] = left.size <= right.size ? [left, right] : [right, left];
+    for (const token of small) {
+        if (large.has(token)) intersection += 1;
+    }
+    const union = left.size + right.size - intersection;
+    return union <= 0 ? 0 : intersection / union;
+}
+
+function shouldSuppressConsecutiveAgentDuplicate(
+    messages: Message[],
+    draftMessageId: string | undefined,
+    agentId: string,
+    finalText: string,
+    threshold: number,
+): boolean {
+    const normalizedAgentId = agentId.trim();
+    const normalizedText = finalText.trim();
+    if (!normalizedAgentId || !normalizedText) {
+        return false;
+    }
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const item = messages[index];
+        if (!item || item.id === draftMessageId || item.role === 'system') {
+            continue;
+        }
+        if (item.role !== 'agent') {
+            return false;
+        }
+        if ((item.agentId || '').trim() !== normalizedAgentId) {
+            return false;
+        }
+        const baseline = (item.text || '').trim();
+        if (!baseline) {
+            return false;
+        }
+        return computeDuplicateSimilarityJaccard(
+            buildDuplicateSimilarityTrigramSet(normalizedText),
+            buildDuplicateSimilarityTrigramSet(baseline),
+        ) >= threshold;
+    }
+
+    return false;
+}
+
 function normalizeLabelComponent(raw: string, maxLen: number): string {
     const trimmed = raw.trim();
     if (!trimmed) return '';
@@ -923,8 +992,247 @@ function mergeRemoteSessions(current: StoredChatSession[], incoming: StoredChatS
         return true;
     });
 
-    next.sort((a, b) => b.updatedAt - a.updatedAt);
-    return next;
+    return normalizeSessionCollection(next);
+}
+
+const SESSION_LEGACY_DUPLICATE_MAX_GAP_MS = 6 * 60 * 60 * 1000;
+const SESSION_STUB_DUPLICATE_MAX_GAP_MS = 24 * 60 * 60 * 1000;
+
+interface SessionComparableFingerprint {
+    title: string;
+    firstUserText: string;
+    lastAgentText: string;
+    lastRenderableText: string;
+    messageCount: number;
+    hasMessages: boolean;
+    hasPayload: boolean;
+}
+
+function normalizeSessionComparableText(raw: string): string {
+    return normalizeDuplicateSimilarityText(raw).replace(/\s+/g, ' ').trim();
+}
+
+function buildSessionComparableFingerprint(session: StoredChatSession): SessionComparableFingerprint {
+    const title = normalizeSessionComparableText(normalizeSessionDisplayTitle(session.title || '', ''));
+    const firstUserText = normalizeSessionComparableText(
+        session.messages.find((item) => item.role === 'user' && item.text.trim() && !isHiddenSystemPromptText(item.text))?.text ?? '',
+    );
+    const lastAgentText = normalizeSessionComparableText(
+        [...session.messages]
+            .reverse()
+            .find((item) => item.role === 'agent' && item.text.trim() && !isHiddenSystemPromptText(item.text))?.text ?? '',
+    );
+    const lastRenderableText = normalizeSessionComparableText(
+        [...session.messages]
+            .reverse()
+            .find((item) => {
+                if (item.role === 'system') return false;
+                if (item.text.trim() && !isHiddenSystemPromptText(item.text)) return true;
+                return Boolean(item.taskCard || (item.a2aCards?.length ?? 0) > 0 || (item.attachments?.length ?? 0) > 0);
+            })?.text ?? '',
+    );
+    const hasPayload = session.messages.some((item) => Boolean(
+        item.taskCard
+        || (item.a2aCards?.length ?? 0) > 0
+        || (item.attachments?.length ?? 0) > 0
+        || (item.tools?.length ?? 0) > 0,
+    ));
+    return {
+        title,
+        firstUserText,
+        lastAgentText,
+        lastRenderableText,
+        messageCount: session.messages.length,
+        hasMessages: session.messages.length > 0,
+        hasPayload,
+    };
+}
+
+function isComparableSessionTextMatch(left: string, right: string): boolean {
+    const a = left.trim();
+    const b = right.trim();
+    if (!a || !b) {
+        return false;
+    }
+    if (a === b) {
+        return true;
+    }
+    if (a.length >= 12 && b.length >= 12 && (a.includes(b) || b.includes(a))) {
+        return true;
+    }
+    return computeDuplicateSimilarityJaccard(
+        buildDuplicateSimilarityTrigramSet(a),
+        buildDuplicateSimilarityTrigramSet(b),
+    ) >= 0.92;
+}
+
+function isLegacyDuplicatedSession(left: StoredChatSession, right: StoredChatSession): boolean {
+    const leftRemoteId = getRemoteSessionId(left);
+    const rightRemoteId = getRemoteSessionId(right);
+    if (leftRemoteId && rightRemoteId && leftRemoteId !== rightRemoteId) {
+        return false;
+    }
+
+    const leftFingerprint = buildSessionComparableFingerprint(left);
+    const rightFingerprint = buildSessionComparableFingerprint(right);
+    if (!leftFingerprint.title || leftFingerprint.title !== rightFingerprint.title) {
+        return false;
+    }
+
+    const updatedGapMs = Math.abs((left.updatedAt || 0) - (right.updatedAt || 0));
+    if (!leftFingerprint.hasMessages || !rightFingerprint.hasMessages) {
+        return updatedGapMs <= SESSION_STUB_DUPLICATE_MAX_GAP_MS;
+    }
+    if (updatedGapMs > SESSION_LEGACY_DUPLICATE_MAX_GAP_MS) {
+        return false;
+    }
+    if (leftFingerprint.firstUserText && rightFingerprint.firstUserText) {
+        return isComparableSessionTextMatch(leftFingerprint.firstUserText, rightFingerprint.firstUserText);
+    }
+    if (leftFingerprint.lastAgentText && rightFingerprint.lastAgentText) {
+        return isComparableSessionTextMatch(leftFingerprint.lastAgentText, rightFingerprint.lastAgentText);
+    }
+    if (leftFingerprint.messageCount === rightFingerprint.messageCount) {
+        return isComparableSessionTextMatch(leftFingerprint.lastRenderableText, rightFingerprint.lastRenderableText)
+            || leftFingerprint.hasPayload === rightFingerprint.hasPayload;
+    }
+    return false;
+}
+
+function getSessionRichnessScore(session: StoredChatSession): number {
+    let score = session.messages.length * 4;
+    if (getRemoteSessionId(session)) score += 40;
+    if ((session.sessionLabel || '').trim()) score += 20;
+    if (session.autoTitle === false) score += 10;
+    if (session.contextDigest?.summary?.trim()) score += 8;
+    if (session.groupRuntime) score += 8;
+    if (session.messages.some((item) => Boolean(item.taskCard || (item.a2aCards?.length ?? 0) > 0))) {
+        score += 12;
+    }
+    return score;
+}
+
+function resolveMergedSessionTitle(
+    left: StoredChatSession,
+    right: StoredChatSession,
+    mergedMessages: Message[],
+): string {
+    const leftTitle = (left.title || '').trim();
+    const rightTitle = (right.title || '').trim();
+    if (left.autoTitle === false && leftTitle) {
+        return left.title;
+    }
+    if (right.autoTitle === false && rightTitle) {
+        return right.title;
+    }
+
+    const normalizedLeft = normalizeSessionDisplayTitle(leftTitle, '');
+    const normalizedRight = normalizeSessionDisplayTitle(rightTitle, '');
+    if (normalizedLeft && !normalizedRight) {
+        return left.title;
+    }
+    if (normalizedRight && !normalizedLeft) {
+        return right.title;
+    }
+    if (normalizedLeft && normalizedRight) {
+        if (isOpaqueSessionTitle(rightTitle)) {
+            return left.title;
+        }
+        if (isOpaqueSessionTitle(leftTitle)) {
+            return right.title;
+        }
+        return normalizedRight.length > normalizedLeft.length ? right.title : left.title;
+    }
+
+    const derivedTitle = deriveSessionTitleFromMessages(mergedMessages);
+    if (derivedTitle) {
+        return derivedTitle;
+    }
+    return left.title || right.title || '当前会话';
+}
+
+function mergeDuplicatedSessionEntries(
+    existing: StoredChatSession,
+    incoming: StoredChatSession,
+    preferredSessionId = '',
+): StoredChatSession {
+    const preferIncomingIdentity = Boolean(preferredSessionId)
+        && incoming.id === preferredSessionId
+        && existing.id !== preferredSessionId;
+    const identitySession = preferIncomingIdentity ? incoming : existing;
+    const detailSession = getSessionRichnessScore(incoming) > getSessionRichnessScore(existing) ? incoming : existing;
+    const mergedMessages = mergeRecoveredMessages(existing.messages, incoming.messages);
+    const streamState = (existing.streamState && existing.streamState !== 'idle')
+        ? existing.streamState
+        : (incoming.streamState && incoming.streamState !== 'idle' ? incoming.streamState : 'idle');
+    const remoteContextOffset = Math.max(existing.remoteContextOffset ?? 0, incoming.remoteContextOffset ?? 0);
+
+    return {
+        ...detailSession,
+        ...identitySession,
+        id: identitySession.id || detailSession.id,
+        title: resolveMergedSessionTitle(existing, incoming, mergedMessages),
+        updatedAt: Math.max(existing.updatedAt, incoming.updatedAt),
+        messages: mergedMessages,
+        remoteSessionId: getRemoteSessionId(existing) || getRemoteSessionId(incoming) || undefined,
+        remoteSessionOwnerAgentId: getRemoteSessionOwnerAgentId(existing) || getRemoteSessionOwnerAgentId(incoming) || undefined,
+        remoteContextOffset: remoteContextOffset > 0 ? remoteContextOffset : undefined,
+        contextDigest: detailSession.contextDigest ?? identitySession.contextDigest,
+        lastCompactedAt: detailSession.lastCompactedAt ?? identitySession.lastCompactedAt,
+        groupRuntime: detailSession.groupRuntime ?? identitySession.groupRuntime,
+        sessionLabel: (identitySession.sessionLabel || detailSession.sessionLabel || '').trim() || undefined,
+        sessionSource: detailSession.sessionSource ?? identitySession.sessionSource,
+        autoTitle: existing.autoTitle === false || incoming.autoTitle === false
+            ? false
+            : (identitySession.autoTitle ?? detailSession.autoTitle),
+        streamState,
+    };
+}
+
+function shouldMergeSessionEntries(left: StoredChatSession, right: StoredChatSession): boolean {
+    if (left.id === right.id) {
+        return true;
+    }
+    const leftRemoteId = getRemoteSessionId(left);
+    const rightRemoteId = getRemoteSessionId(right);
+    if (leftRemoteId && rightRemoteId && leftRemoteId === rightRemoteId) {
+        return true;
+    }
+    const leftLabel = (left.sessionLabel || '').trim();
+    const rightLabel = (right.sessionLabel || '').trim();
+    if (leftLabel && rightLabel && leftLabel === rightLabel) {
+        return true;
+    }
+    return isLegacyDuplicatedSession(left, right);
+}
+
+function normalizeSessionCollection(sessions: StoredChatSession[], preferredSessionId = ''): StoredChatSession[] {
+    if (sessions.length <= 1) {
+        return sessions.slice().sort((left, right) => right.updatedAt - left.updatedAt);
+    }
+
+    const sorted = [...sessions].sort((left, right) => {
+        if (right.updatedAt !== left.updatedAt) {
+            return right.updatedAt - left.updatedAt;
+        }
+        return getSessionRichnessScore(right) - getSessionRichnessScore(left);
+    });
+    const merged: StoredChatSession[] = [];
+    for (const session of sorted) {
+        const matchedIndex = merged.findIndex((item) => shouldMergeSessionEntries(item, session));
+        if (matchedIndex < 0) {
+            merged.push(session);
+            continue;
+        }
+        merged[matchedIndex] = mergeDuplicatedSessionEntries(merged[matchedIndex], session, preferredSessionId);
+    }
+    merged.sort((left, right) => {
+        if (right.updatedAt !== left.updatedAt) {
+            return right.updatedAt - left.updatedAt;
+        }
+        return getSessionRichnessScore(right) - getSessionRichnessScore(left);
+    });
+    return merged;
 }
 
 function buildRemoteSessionStub(summary: BackendSessionSummary, ownerAgentId?: string): StoredChatSession {
@@ -2162,6 +2470,11 @@ interface ChatPageProps {
     groupRuntimeEnabled?: boolean;
     groupLeaderAgentId?: string;
     transformUserMessage?: (text: string) => string;
+    resolveSystemPreamble?: (input: {
+        agentId: string;
+        message: string;
+        mode: 'primary' | 'mention' | 'extra';
+    }) => string | undefined;
 }
 
 function buildFallbackAgent(agentId?: string): Agent {
@@ -2204,6 +2517,7 @@ export function ChatPage({
     groupRuntimeEnabled: groupRuntimeEnabledProp,
     groupLeaderAgentId: groupLeaderAgentIdProp,
     transformUserMessage: transformUserMessageProp,
+    resolveSystemPreamble: resolveSystemPreambleProp,
 }: ChatPageProps = {}) {
 
     const { id: routeAgentId } = useParams();
@@ -2308,6 +2622,8 @@ export function ChatPage({
     }, []);
     const transformUserMessageRef = useRef(transformUserMessageProp);
     transformUserMessageRef.current = transformUserMessageProp;
+    const resolveSystemPreambleRef = useRef(resolveSystemPreambleProp);
+    resolveSystemPreambleRef.current = resolveSystemPreambleProp;
     const groupUpgradeEnabled = groupUpgradeEnabledProp ?? true;
     const baseSystemPreamble = (systemPreambleProp ?? '').trim();
     const groupUpgradePreamble = groupUpgradeEnabled ? buildGroupUpgradeSystemPreamble() : '';
@@ -2378,6 +2694,21 @@ export function ChatPage({
     ].filter(Boolean).join('\n\n');
     const systemPreambleRef = useRef(systemPreamble);
     systemPreambleRef.current = systemPreamble;
+    const getSystemPreambleForRequest = (
+        agentId: string,
+        message: string,
+        mode: 'primary' | 'mention' | 'extra',
+    ): string | undefined => {
+        const resolved = resolveSystemPreambleRef.current?.({
+            agentId,
+            message,
+            mode,
+        })?.trim() || '';
+        if (resolved) {
+            return resolved;
+        }
+        return systemPreambleRef.current || undefined;
+    };
     const messages = useMemo(() => activeSession?.messages ?? [], [activeSession]);
     useEffect(() => {
         if (groupRuntimeEnabled || !activeSessionId || !activeSession) {
@@ -2416,10 +2747,13 @@ export function ChatPage({
         : null;
     const sessionKeywordNormalized = useMemo(() => sessionKeyword.trim().toLocaleLowerCase(), [sessionKeyword]);
     const visibleSessions = useMemo(
-        () => (sessionKeywordNormalized
-            ? sessions.filter((session) => session.title.toLocaleLowerCase().includes(sessionKeywordNormalized))
-            : sessions),
-        [sessions, sessionKeywordNormalized],
+        () => {
+            const sortedSessions = [...sessions].sort((left, right) => right.updatedAt - left.updatedAt);
+            return sessionKeywordNormalized
+                ? sortedSessions.filter((session) => session.title.toLocaleLowerCase().includes(sessionKeywordNormalized))
+                : sortedSessions;
+        },
+        [sessionKeywordNormalized, sessions],
     );
 
     const resolveExtraReplyAgents = (message: string): Agent[] => {
@@ -2583,10 +2917,10 @@ export function ChatPage({
                 ? (updater as (items: ChatSession[]) => ChatSession[])(prev)
                 : updater;
             const fixedLabel = baseSessionLabelRef.current;
-            if (!fixedLabel) {
-                return next;
-            }
-            return sanitizeSessionsForFixedLabel(next, fixedLabel);
+            const normalized = fixedLabel
+                ? sanitizeSessionsForFixedLabel(next, fixedLabel)
+                : next;
+            return normalizeSessionCollection(normalized, activeSessionIdRef.current);
         });
     };
 
@@ -3203,13 +3537,24 @@ export function ChatPage({
         );
     };
 
-    const getRecoveryNoticeText = (reason?: 'session_conflict' | 'context_overflow'): string => {
+    const getRecoveryNoticeText = (reason?: 'session_conflict' | 'context_overflow' | 'quota_exceeded'): string => {
         if (reason === 'context_overflow') {
-            return groupRuntimeEnabled
-                ? '检测到当前群会话上下文过长，系统已自动压缩会话摘要并重试当前消息。'
-                : '检测到当前私聊会话上下文过长，系统已自动压缩会话摘要并重试当前消息。';
+            return '已自动压缩上下文';
         }
-        return '检测到原会话执行链被后台任务占用，系统已自动切换到恢复会话并重试当前消息。';
+        if (reason === 'quota_exceeded') {
+            return '已达小时配额';
+        }
+        return '已切换恢复会话';
+    };
+
+    const formatChatFailureText = (result: { recoveryReason?: 'session_conflict' | 'context_overflow' | 'quota_exceeded'; error?: string; content?: string }): string => {
+        if (result.recoveryReason === 'quota_exceeded') {
+            return '已达小时 token 配额，请稍后再试。';
+        }
+        if (result.recoveryReason === 'context_overflow') {
+            return '上下文过长，请重试。';
+        }
+        return result.error || result.content || '请求失败';
     };
 
     const ensureSessionCompactedIfNeeded = async (
@@ -3279,16 +3624,14 @@ export function ChatPage({
                 }));
                 appendSessionSystemMessage(
                     sid,
-                    groupRuntimeEnabled
-                        ? '当前群聊上下文已自动压缩：系统已清理重复历史并折叠为阶段摘要，继续沿用当前会话。'
-                        : '当前私聊上下文已自动压缩：系统已清理重复历史并折叠为阶段摘要，继续沿用当前会话。',
+                    '已自动压缩上下文',
                 );
                 void refreshActiveSessionContextTokens(sid, { silent: true });
                 return true;
             }
 
             if (errors.length > 0) {
-                appendSessionSystemMessage(sid, `会话自动压缩失败：${compactGroupRuntimeNote(errors[0], 140)}`);
+                appendSessionSystemMessage(sid, '压缩失败');
             }
             return false;
         } finally {
@@ -3787,7 +4130,7 @@ export function ChatPage({
                 : [createEmptySession(1)];
             const sortedSessions = [...loadedSessions].sort((a, b) => b.updatedAt - a.updatedAt);
             const seenSessionIds = new Set<string>();
-            const nextSessions: StoredChatSession[] = sortedSessions
+            const nextSessions = normalizeSessionCollection(sortedSessions
                 .map((session, sessionIndex): StoredChatSession => {
                     const fallbackTitle = t('chat.newSessionAutoTitle', {
                         index: sessionIndex + 1,
@@ -3806,7 +4149,7 @@ export function ChatPage({
                     }
                     seenSessionIds.add(sid);
                     return true;
-                });
+                }), loadedFromLocal?.activeSessionId ?? '');
             const preferredSessionId = loadedFromLocal?.activeSessionId ?? nextSessions[0]?.id ?? '';
             const activeSession = nextSessions.find((session) => session.id === preferredSessionId) ?? nextSessions[0];
             const resolvedActiveSessionId = activeSession?.id ?? '';
@@ -4444,6 +4787,7 @@ export function ChatPage({
             userDisplayText?: string;
             userAttachments?: Message['attachments'];
             groupQueueItemId?: string;
+            requestOrigin?: 'group_auto';
         },
     ) => {
         const text = rawText.trim();
@@ -4455,6 +4799,7 @@ export function ChatPage({
         const dispatchAgentId = (options?.agentIdOverride ?? chatAgentId).trim() || chatAgentId;
         const dispatchAgent = options?.agentOverride ?? (dispatchAgentId === agent.id ? agent : buildFallbackAgent(dispatchAgentId));
         const groupQueueItemId = (options?.groupQueueItemId || '').trim();
+        const requestOrigin = groupRuntimeEnabled ? options?.requestOrigin : undefined;
         const queueSessionId = activeSessionIdRef.current.trim();
         try {
             await consumePendingTaskReportDeliveries(activeSessionIdRef.current);
@@ -4647,7 +4992,8 @@ export function ChatPage({
                     requestId,
                     sessionId: requestSessionTarget.sessionId,
                     sessionLabel: requestSessionTarget.sessionLabel,
-                    systemPreamble: systemPreambleRef.current || undefined,
+                    requestOrigin,
+                    systemPreamble: getSystemPreambleForRequest(dispatchAgentId, text, 'primary'),
                 }, {
                     channel: CHAT_CHANNELS.app,
                     renderMode: CHAT_RENDER_MODES.jsonRender,
@@ -4797,7 +5143,7 @@ export function ChatPage({
                     at: new Date().toISOString(),
                 });
                 if (!finalDraft.text) {
-                    finalDraft.text = result.error || result.content || '请求失败';
+                    finalDraft.text = formatChatFailureText(result);
                 }
             }
             if (result.recoveredSessionLabel) {
@@ -4839,16 +5185,32 @@ export function ChatPage({
 
             const draftId = pendingMessageIdRef.current;
             const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
+            const suppressDuplicate = result.success && shouldSuppressConsecutiveAgentDuplicate(
+                getSessionMessagesSnapshot(requestSessionId),
+                draftId || finalDraft.id,
+                dispatchAgentId,
+                finalDraft.text || '',
+                duplicateSuppressionThreshold,
+            );
             if (draftId) {
-                patchSessionMessageById(requestSessionId, draftId, finalDraft);
-            } else {
+                if (suppressDuplicate) {
+                    commitMessages(
+                        (prev) => prev.filter((msg) => msg.id !== draftId),
+                        { sessionId: requestSessionId },
+                    );
+                } else {
+                    patchSessionMessageById(requestSessionId, draftId, finalDraft);
+                }
+            } else if (!suppressDuplicate) {
                 commitMessages((prev) => [...prev, finalDraft]);
             }
             const queueBinding = requestGroupQueueMapRef.current.get(requestId);
             if (queueBinding) {
-                updateGroupQueueItem(queueBinding.sessionId, queueBinding.itemId, result.success ? 'done' : 'skipped', {
+                updateGroupQueueItem(queueBinding.sessionId, queueBinding.itemId, suppressDuplicate ? 'skipped' : (result.success ? 'done' : 'skipped'), {
                     speakerId: queueBinding.speakerId,
-                    note: compactGroupRuntimeNote(finalDraft.text || result.error || ''),
+                    note: suppressDuplicate
+                        ? '与上一条同成员回复高度重复，已自动去重'
+                        : compactGroupRuntimeNote(finalDraft.text || result.error || ''),
                 });
             }
             setStreamingMessage(null);
@@ -5369,7 +5731,8 @@ export function ChatPage({
                                 requestId,
                                 sessionId: requestSessionTarget.sessionId,
                                 sessionLabel: requestSessionTarget.sessionLabel,
-                                systemPreamble: systemPreambleRef.current || undefined,
+                                requestOrigin: 'group_auto',
+                                systemPreamble: getSystemPreambleForRequest(targetId, buildGroupDispatchHandoffMessage(msg), 'mention'),
                             }, {
                                 channel: CHAT_CHANNELS.app,
                                 renderMode: CHAT_RENDER_MODES.jsonRender,
@@ -5602,7 +5965,8 @@ export function ChatPage({
                         requestId,
                         sessionId: requestSessionTarget.sessionId,
                         sessionLabel: requestSessionTarget.sessionLabel,
-                        systemPreamble: systemPreambleRef.current || undefined,
+                        requestOrigin: 'group_auto',
+                        systemPreamble: getSystemPreambleForRequest(extraId, transformed.trim(), 'extra'),
                     }, {
                         channel: CHAT_CHANNELS.app,
                         renderMode: CHAT_RENDER_MODES.jsonRender,
@@ -5745,6 +6109,7 @@ export function ChatPage({
                 appendUser: false,
                 agentIdOverride: autoAgentId,
                 agentOverride: autoAgent,
+                requestOrigin: idleAutoScope === 'group' ? 'group_auto' : undefined,
             });
         }, 10_000);
 
@@ -5798,6 +6163,7 @@ export function ChatPage({
                 appendUser: false,
                 agentIdOverride: leaderId,
                 agentOverride: leader,
+                requestOrigin: 'group_auto',
             });
         }, 1_500);
 

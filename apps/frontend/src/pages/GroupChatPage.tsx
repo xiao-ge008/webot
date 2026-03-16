@@ -9,6 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { AgentAvatar } from '@/components/ui/agent-avatar';
 import { ChatPage } from '@/pages/ChatPage';
 import { deleteChatGroup, getChatGroup, updateChatGroup } from '@/services/group-client';
@@ -18,9 +19,9 @@ import type { StoredChatSession } from '@/services/chat-session-store';
 import { buildInitialMessages, generateId, mapManagementAgentToUi } from '@/components/chat/chat-page-helpers';
 import type { Message } from '@/data/mock-chats';
 import { cn } from '@/lib/utils';
-import { DEFAULT_GROUP_LIMITS, type ChatGroup, type ChatGroupLimits, type ChatGroupMode, type GroupMemoryDigest, type GroupSessionRuntime } from '@/types/group';
+import { DEFAULT_GROUP_LIMITS, type ChatGroup, type ChatGroupLimits, type ChatGroupMode, type GroupAgentContextDigest, type GroupMemoryDigest, type GroupSessionRuntime } from '@/types/group';
 import type { Agent } from '@/types';
-import { ChevronLeft, ChevronRight, MessageCircle, Plus, Search, Settings, ListChecks, Users, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Info, MessageCircle, Plus, Search, Settings, ListChecks, Users, X } from 'lucide-react';
 
 const MEMBER_DIRECTORY_CACHE_TTL_MS = 60_000;
 let memberDirectoryCache: Map<string, Agent> | null = null;
@@ -149,6 +150,15 @@ function compactDigestLine(raw: string, maxLen: number): string {
     return normalized.length > maxLen ? `${normalized.slice(0, maxLen)}...` : normalized;
 }
 
+function sameStringArray(left?: string[], right?: string[]): boolean {
+    const a = left ?? [];
+    const b = right ?? [];
+    if (a.length !== b.length) {
+        return false;
+    }
+    return a.every((item, index) => item === b[index]);
+}
+
 function createInitialGroupRuntime(leaderAgentId: string): GroupSessionRuntime {
     return {
         version: '1.0',
@@ -170,6 +180,12 @@ function normalizeGroupRuntimeValue(runtime: GroupSessionRuntime | undefined, le
         leaderAgentId: (runtime?.leaderAgentId || leaderAgentId || '').trim() || undefined,
         queue: Array.isArray(runtime?.queue) ? runtime!.queue.slice(-18) : [],
         stopRequested: runtime?.stopRequested === true,
+        agentContextDigests: runtime?.agentContextDigests
+            ? Object.fromEntries(
+                Object.entries(runtime.agentContextDigests)
+                    .map(([agentId, digest]) => [agentId, { ...digest }]),
+            )
+            : undefined,
     };
 }
 
@@ -177,7 +193,7 @@ function buildGroupMemoryDigest(messages: Message[], runtime: GroupSessionRuntim
     const recentRows = messages
         .filter((item) => item.role === 'user' || item.role === 'agent')
         .filter((item) => Boolean((item.text || '').trim()))
-        .slice(-8);
+        .slice(-10);
     if (recentRows.length === 0) {
         return undefined;
     }
@@ -187,15 +203,27 @@ function buildGroupMemoryDigest(messages: Message[], runtime: GroupSessionRuntim
         .slice(-3)
         .map((item) => `${item.agentName || item.agentId || '成员'}: ${compactDigestLine(item.text || '', 72)}`)
         .filter(Boolean);
+    const decisions = recentRows
+        .filter((item) => item.role === 'agent')
+        .slice(-4)
+        .map((item) => compactDigestLine(`${item.agentName || item.agentId || '成员'}：${item.text || ''}`, 92))
+        .filter(Boolean)
+        .slice(-3);
     const activeQueue = runtime.queue
         .filter((item) => item.status === 'queued' || item.status === 'running')
         .slice(0, 4);
+    const openQuestions = activeQueue
+        .map((item) => compactDigestLine(`${item.agentName || item.agentId} ${item.status === 'running' ? '正在处理' : '待处理'}${item.note ? `：${item.note}` : ''}`, 92))
+        .filter(Boolean)
+        .slice(0, 3);
     const pendingLine = activeQueue.length > 0
         ? activeQueue.map((item) => `${item.status === 'running' ? '进行中' : '待发言'} ${item.agentName || item.agentId}`).join('；')
         : '';
     const speakerLine = recentAgents.length > 0 ? recentAgents.join(' | ') : '';
+    const goal = lastUser ? compactDigestLine(lastUser.text || '', 96) : '';
     const summaryParts = [
-        lastUser ? `用户诉求：${compactDigestLine(lastUser.text || '', 96)}` : '',
+        goal ? `用户诉求：${goal}` : '',
+        decisions.length > 0 ? `已达成：${decisions.join('；')}` : '',
         speakerLine ? `近期结论：${compactDigestLine(speakerLine, 180)}` : '',
         pendingLine ? `当前队列：${pendingLine}` : '',
     ].filter(Boolean);
@@ -204,11 +232,148 @@ function buildGroupMemoryDigest(messages: Message[], runtime: GroupSessionRuntim
     }
     return {
         summary: summaryParts.join('\n'),
+        goal: goal || undefined,
+        decisions: decisions.length > 0 ? decisions : undefined,
+        openQuestions: openQuestions.length > 0 ? openQuestions : undefined,
         speakerLine: speakerLine || undefined,
         pendingLine: pendingLine || undefined,
-        lastUserIntent: lastUser ? compactDigestLine(lastUser.text || '', 96) : undefined,
+        lastUserIntent: goal || undefined,
         updatedAt: new Date().toISOString(),
     };
+}
+
+function buildAgentAliasSet(agent: Agent): Set<string> {
+    const aliasSet = new Set<string>();
+    const values = [agent.id, agent.name, agent.title];
+    for (const value of values) {
+        const normalized = (value || '').trim().toLowerCase();
+        if (!normalized) continue;
+        aliasSet.add(normalized);
+    }
+    return aliasSet;
+}
+
+function messageMentionsAgent(message: Message, agent: Agent): boolean {
+    const tokens = extractMentions(message.text || '');
+    if (tokens.length === 0) {
+        return false;
+    }
+    const aliases = buildAgentAliasSet(agent);
+    return tokens.some((token) => aliases.has(token.trim().toLowerCase()));
+}
+
+function buildGroupAgentContextDigests(
+    messages: Message[],
+    runtime: GroupSessionRuntime,
+    agents: Agent[],
+): Record<string, GroupAgentContextDigest> | undefined {
+    const recentRows = messages
+        .filter((item) => item.role === 'user' || item.role === 'agent')
+        .filter((item) => Boolean((item.text || '').trim()))
+        .slice(-16);
+    if (recentRows.length === 0 || agents.length === 0) {
+        return undefined;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const result: Record<string, GroupAgentContextDigest> = {};
+    for (const agent of agents) {
+        const agentId = (agent.id || '').trim();
+        if (!agentId) {
+            continue;
+        }
+
+        const ownRecent = recentRows
+            .filter((item) => item.role === 'agent' && (item.agentId || '').trim() === agentId)
+            .slice(-2)
+            .map((item) => compactDigestLine(item.text || '', 88))
+            .filter(Boolean);
+        const mentionTasks = recentRows
+            .filter((item) => (item.agentId || '').trim() !== agentId)
+            .filter((item) => messageMentionsAgent(item, agent))
+            .slice(-2)
+            .map((item) => {
+                const from = item.role === 'user'
+                    ? '用户'
+                    : (item.agentName || item.agentId || '成员');
+                return compactDigestLine(`${from}：${item.text || ''}`, 96);
+            })
+            .filter(Boolean);
+        const todos = runtime.queue
+            .filter((item) => (item.agentId || '').trim() === agentId)
+            .filter((item) => item.status === 'queued' || item.status === 'running')
+            .slice(0, 3)
+            .map((item) => compactDigestLine(`${item.status === 'running' ? '执行中' : '待处理'}：${item.note || item.agentName || item.agentId}`, 88))
+            .filter(Boolean);
+
+        const ownRecentLine = ownRecent.length > 0 ? `你最近已处理：${ownRecent.join('；')}` : '';
+        const mentionLine = mentionTasks.length > 0 ? `最近点名给你的事项：${mentionTasks.join('；')}` : '';
+        const todoLine = todos.length > 0 ? `当前只与你相关的待办：${todos.join('；')}` : '';
+        const summary = [ownRecentLine, mentionLine, todoLine].filter(Boolean).join('\n');
+        if (!summary) {
+            continue;
+        }
+
+        result[agentId] = {
+            agentId,
+            summary,
+            ownRecentLine: ownRecentLine || undefined,
+            mentionLine: mentionLine || undefined,
+            todoLine: todoLine || undefined,
+            updatedAt,
+        };
+    }
+
+    if (Object.keys(result).length === 0) {
+        return undefined;
+    }
+    return result;
+}
+
+function sameGroupMemoryDigestContent(left?: GroupMemoryDigest, right?: GroupMemoryDigest): boolean {
+    if (!left && !right) {
+        return true;
+    }
+    if (!left || !right) {
+        return false;
+    }
+    return (
+        left.summary === right.summary
+        && left.goal === right.goal
+        && sameStringArray(left.decisions, right.decisions)
+        && sameStringArray(left.openQuestions, right.openQuestions)
+        && left.speakerLine === right.speakerLine
+        && left.pendingLine === right.pendingLine
+        && left.lastUserIntent === right.lastUserIntent
+    );
+}
+
+function sameGroupAgentContextDigestContent(left?: GroupAgentContextDigest, right?: GroupAgentContextDigest): boolean {
+    if (!left && !right) {
+        return true;
+    }
+    if (!left || !right) {
+        return false;
+    }
+    return (
+        left.agentId === right.agentId
+        && left.summary === right.summary
+        && left.ownRecentLine === right.ownRecentLine
+        && left.mentionLine === right.mentionLine
+        && left.todoLine === right.todoLine
+    );
+}
+
+function sameGroupAgentContextDigestMap(
+    left?: Record<string, GroupAgentContextDigest>,
+    right?: Record<string, GroupAgentContextDigest>,
+): boolean {
+    const leftKeys = Object.keys(left ?? {}).sort();
+    const rightKeys = Object.keys(right ?? {}).sort();
+    if (!sameStringArray(leftKeys, rightKeys)) {
+        return false;
+    }
+    return leftKeys.every((key) => sameGroupAgentContextDigestContent(left?.[key], right?.[key]));
 }
 
 function ensureGroupSessionRuntime(session: StoredChatSession, leaderAgentId: string): StoredChatSession {
@@ -727,20 +892,12 @@ export function GroupChatPage() {
             return;
         }
         const nextDigest = buildGroupMemoryDigest(activeSession.messages, activeGroupRuntime);
+        const nextAgentDigests = buildGroupAgentContextDigests(activeSession.messages, activeGroupRuntime, groupMembers);
         const currentDigest = activeSession.groupRuntime?.memoryDigest;
-        const nextSummary = nextDigest?.summary || '';
-        const currentSummary = currentDigest?.summary || '';
-        const nextPending = nextDigest?.pendingLine || '';
-        const currentPending = currentDigest?.pendingLine || '';
-        const nextSpeaker = nextDigest?.speakerLine || '';
-        const currentSpeaker = currentDigest?.speakerLine || '';
-        const nextIntent = nextDigest?.lastUserIntent || '';
-        const currentIntent = currentDigest?.lastUserIntent || '';
+        const currentAgentDigests = activeSession.groupRuntime?.agentContextDigests;
         if (
-            nextSummary === currentSummary
-            && nextPending === currentPending
-            && nextSpeaker === currentSpeaker
-            && nextIntent === currentIntent
+            sameGroupMemoryDigestContent(nextDigest, currentDigest)
+            && sameGroupAgentContextDigestMap(nextAgentDigests, currentAgentDigests)
         ) {
             return;
         }
@@ -751,10 +908,11 @@ export function GroupChatPage() {
                 groupRuntime: {
                     ...normalizeGroupRuntimeValue(session.groupRuntime, group.leaderAgentId),
                     memoryDigest: nextDigest,
+                    agentContextDigests: nextAgentDigests,
                 },
             };
         }));
-    }, [activeGroupRuntime, activeSession, activeSessionId, group, runtimeKey]);
+    }, [activeGroupRuntime, activeSession, activeSessionId, group, groupMembers, runtimeKey]);
 
     const handleCreateSession = () => {
         if (!runtimeKey || !group) return;
@@ -965,52 +1123,81 @@ export function GroupChatPage() {
         };
     }, [group, groupMembers, groupMode, memberDirectory, mentionDirectory, selectedSpeakerId, selectedTargetIds]);
 
-    const dynamicSystemPreamble = useMemo(() => {
-        if (!group) return '';
-        const selected = group.memberAgentIds.filter((id) => id !== speakerId);
-        const selectedLines = selected.map((id) => {
-            const agent = memberDirectory.get(id);
-            const name = agent?.name?.trim() || id;
-            return `- ${name} (id=${id})`;
-        });
-        const dispatchHint = [
-            '[system:group-mention-dispatch]',
-            '本群已开启“@自动转发”：任何成员回复里出现 @某成员，系统会把该句静默转发给被@成员继续讨论。',
-            '规则：需要对方接棒时才@；显式 @ 按出现顺序串行入队，前一位完成后下一位继续；@时把要做的事写清楚；若你@别人来答，请闭麦不要继续输出正文。',
-            '自由抢答也要排队，按关联权重依次补位，单轮最多补位 3 人。',
-            '当一轮发言结束且没有明确停止时，由主持人继续承接总结、点名下一位，或直接安排下一步工作。',
-            '若群内连续 2 分钟无人推进，主持人只允许追问 1 次，不能重复催促。',
-            '终止：当用户说“停止/终止/暂停讨论/闭麦”或点击「终止输出」时，停止继续@与扩展讨论。',
-            `规则补充：显式@人数不再单独限额（最多覆盖当前群成员）；自动讨论链最大深度${groupLimits.mentionMaxDepth}。`,
-        ].join('\n');
-        const runtimeHint = [
-            '[system:group-chat-runtime]',
-            `当前主回复者: ${speaker?.name ?? speakerId} (id=${speakerId || 'unknown'})`,
-            selectedTargetNames.length > 0 ? `本次@对象: ${selectedTargetNames.map((name) => `@${name}`).join(' ')}` : '本次未指定@对象：由主持人按秩序决定是否点名接棒。',
-            `当前群聊模式: ${groupMode === 'free_talk' ? '自由发言（相关成员可主动回应）' : '主持人调度（未@仅主持人回应）'}`,
-            `阈值：自由抢答每轮最多 ${responderQueueLimit} 人顺序发言，冷却 ${Math.round(groupLimits.cooldownMs / 1000)} 秒，重复抑制阈值 ${groupLimits.duplicateThreshold}`,
-            '注意：这是群聊公开消息，你的回复应让群内所有成员都能理解与跟进。',
-            '异步任务汇报规则：进度只更新任务卡片与时间线，不要用聊天正文频繁刷进度；仅异常/失败/最终总结时再汇报一次。',
-            'A2A 委派规则：只能使用稳定的 agent_id（即本群列表里的 id=...），禁止用昵称/中文名/口头称呼进行调用。',
-            selectedLines.length > 0 ? '群成员（可互相委派 A2A，仅限群内白名单）:' : '',
-            selectedLines.length > 0 ? selectedLines.join('\n') : '',
-        ].filter(Boolean).join('\n');
-        const digestContext = activeGroupRuntime.memoryDigest?.summary
-            ? [
-                '[system:group-memory-digest]',
-                '以下是当前群聊的阶段摘要，请优先沿用此摘要理解上下文，避免重复展开旧消息：',
-                activeGroupRuntime.memoryDigest.summary,
-            ].join('\n')
-            : '';
-        const sharedContext = activeSession && !digestContext ? buildGroupSharedContext(activeSession.messages, 8) : '';
-        const queueContext = runningQueueItems.length > 0
-            ? [
-                '[system:group-runtime-queue]',
-                `当前发言队列：${runningQueueItems.map((item) => `${item.status === 'running' ? '进行中' : '待发言'} ${item.agentName || item.agentId}`).join('；')}`,
-            ].join('\n')
-            : '';
-        return [group.systemPrompt, dispatchHint, runtimeHint, queueContext, digestContext, sharedContext].filter(Boolean).join('\n\n');
-    }, [activeGroupRuntime.memoryDigest, activeSession, group, groupLimits, groupMode, memberDirectory, responderQueueLimit, runningQueueItems, selectedTargetNames, speaker, speakerId]);
+    const activeAgentContextDigest = useMemo(
+        () => (speakerId ? activeGroupRuntime.agentContextDigests?.[speakerId] : undefined),
+        [activeGroupRuntime.agentContextDigests, speakerId],
+    );
+    const resolveSystemPreamble = useMemo(() => {
+        if (!group) {
+            return undefined;
+        }
+        return (input: { agentId: string; message: string; mode: 'primary' | 'mention' | 'extra' }) => {
+            const targetAgentId = input.agentId.trim();
+            const targetAgent = memberDirectory.get(targetAgentId) ?? buildFallbackMember(targetAgentId);
+            const targetDigest = activeGroupRuntime.agentContextDigests?.[targetAgentId];
+            const explicitTargeted = selectedTargetIds.includes(targetAgentId)
+                || extractMentions(input.message).some((token) => buildAgentAliasSet(targetAgent).has(token.trim().toLowerCase()));
+            const modeText = input.mode === 'mention'
+                ? '接棒回复'
+                : input.mode === 'extra'
+                    ? '补位回复'
+                    : '主回复';
+            const turnContext = [
+                '[system:group-turn]',
+                `当前响应成员：${targetAgent.name} (id=${targetAgentId || 'unknown'})`,
+                `当前主持：${speaker?.name ?? group.leaderAgentId}`,
+                `当前群模式：${groupMode === 'free_talk' ? '自由发言' : '主持人调度'}`,
+                `当前响应模式：${modeText}`,
+                selectedTargetNames.length > 0 ? `显式@目标：${selectedTargetNames.map((name) => `@${name}`).join(' ')}` : '当前没有显式@目标。',
+                explicitTargeted
+                    ? '本条消息已经明确点名你，请只处理交给你的问题，不要重复复述整段群历史。'
+                    : (groupMode === 'leader_dispatch' && targetAgentId !== group.leaderAgentId
+                        ? '在主持人调度模式下，未被明确点名时不要主动抢答；若收到接棒或补位请求，只回答与你相关的部分。'
+                        : '请基于群公开摘要直接回应当前问题，只补充当前最需要的信息。'),
+                '禁止重复输出群规则、成员名单和旧消息原文；优先使用摘要和与你相关的上下文。',
+            ].filter(Boolean).join('\n');
+
+            const digest = activeGroupRuntime.memoryDigest;
+            const publicDigest = digest
+                ? [
+                    '[system:group-shared-summary]',
+                    '以下是群公开摘要，只沿用摘要，不要再展开旧消息：',
+                    digest.goal ? `当前用户目标：${digest.goal}` : '',
+                    digest.decisions?.length ? `已确认结论：${digest.decisions.join('；')}` : '',
+                    digest.openQuestions?.length ? `待处理事项：${digest.openQuestions.join('；')}` : '',
+                    digest.pendingLine ? `公开队列：${digest.pendingLine}` : '',
+                ].filter(Boolean).join('\n')
+                : '';
+            const privateDigest = targetDigest
+                ? [
+                    '[system:group-agent-context]',
+                    '以下仅保留与你相关的上下文：',
+                    targetDigest.summary,
+                ].join('\n')
+                : '';
+            const targetQueueItems = runningQueueItems
+                .filter((item) => item.agentId === targetAgentId)
+                .slice(0, 3);
+            const queueContext = targetQueueItems.length > 0
+                ? [
+                    '[system:group-agent-queue]',
+                    `当前只与你相关的队列：${targetQueueItems.map((item) => `${item.status === 'running' ? '执行中' : '待发言'} ${item.note || item.agentName || item.agentId}`).join('；')}`,
+                ].join('\n')
+                : '';
+            const fallbackSharedContext = activeSession && !publicDigest && !privateDigest
+                ? buildGroupSharedContext(activeSession.messages, 6)
+                : '';
+
+            return [
+                group.systemPrompt,
+                turnContext,
+                publicDigest,
+                privateDigest,
+                queueContext,
+                fallbackSharedContext,
+            ].filter(Boolean).join('\n\n');
+        };
+    }, [activeGroupRuntime.agentContextDigests, activeGroupRuntime.memoryDigest, activeSession, group, groupMode, memberDirectory, runningQueueItems, selectedTargetIds, selectedTargetNames, speaker]);
 
     const inputToolbar = useMemo(() => {
         if (!group) return null;
@@ -1388,67 +1575,6 @@ export function GroupChatPage() {
                             ) : null}
                         </div>
                     </div>
-
-                    <div className="ml-auto flex items-center gap-2">
-                        <Badge variant="secondary" className="rounded-full px-3 py-1 bg-primary/10 text-primary font-black text-[10px] uppercase tracking-widest">
-                            {t('groupChat.speaker', { defaultValue: '发言' })}: {speaker?.name ?? speakerId}
-                        </Badge>
-                    </div>
-                </div>
-
-                <div className="px-4 pb-3">
-                    <Card className="border-border/70 bg-background/70 shadow-sm">
-                        <CardContent className="px-4 py-3">
-                            <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                                <Badge variant="secondary" className="rounded-full px-2.5 py-1">
-                                    队列状态：{activeGroupRuntime.status === 'running' ? '执行中' : activeGroupRuntime.status === 'stopped' ? '已终止' : '空闲'}
-                                </Badge>
-                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
-                                    当前发言：{speaker?.name ?? speakerId}
-                                </Badge>
-                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
-                                    待处理：{runningQueueItems.length}
-                                </Badge>
-                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
-                                    异步任务：{activeAsyncTaskCount}
-                                </Badge>
-                                {activeGroupRuntime.lastCompactedAt ? (
-                                    <Badge variant="secondary" className="rounded-full px-2.5 py-1 bg-amber-500/10 text-amber-700">
-                                        已压缩：{new Date(activeGroupRuntime.lastCompactedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                    </Badge>
-                                ) : null}
-                                {activeGroupRuntime.stopRequested ? (
-                                    <Badge variant="destructive" className="rounded-full px-2.5 py-1">
-                                        已终止：{activeGroupRuntime.stopReason || '用户终止'}
-                                    </Badge>
-                                ) : null}
-                            </div>
-                            {activeGroupRuntime.memoryDigest?.summary ? (
-                                <div className="mt-2 rounded-xl border border-border/60 bg-muted/25 px-3 py-2 text-[12px] leading-5 text-muted-foreground whitespace-pre-wrap">
-                                    {activeGroupRuntime.memoryDigest.summary}
-                                </div>
-                            ) : null}
-                            {runningQueueItems.length > 0 ? (
-                                <div className="mt-2 flex flex-wrap gap-2">
-                                    {runningQueueItems.map((item) => (
-                                        <div
-                                            key={item.id}
-                                            className={cn(
-                                                'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold',
-                                                item.status === 'running'
-                                                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700'
-                                                    : 'border-border/70 bg-background text-foreground/80',
-                                            )}
-                                        >
-                                            <span>{item.status === 'running' ? '执行中' : '排队中'}</span>
-                                            <span>{item.agentName || item.agentId}</span>
-                                            {item.note ? <span className="text-muted-foreground">· {item.note}</span> : null}
-                                        </div>
-                                    ))}
-                                </div>
-                            ) : null}
-                        </CardContent>
-                    </Card>
                 </div>
 
                 {/* 聊天区域 */}
@@ -1459,7 +1585,7 @@ export function GroupChatPage() {
                             sessionOwnerAgentId={group.leaderAgentId}
                             fixedSessionTitle={group.name}
                             sessionLabel={activeSessionLabel}
-                            systemPreamble={dynamicSystemPreamble}
+                            systemPreamble={group.systemPrompt}
                             groupUpgradeEnabled={false}
                             uiVariant="embedded"
                         inputToolbar={inputToolbar}
@@ -1480,6 +1606,7 @@ export function GroupChatPage() {
                         groupLeaderAgentId={group.leaderAgentId}
                         resolvePrimaryReplyAgent={resolvePrimaryReplyAgent}
                         transformUserMessage={transformUserMessage}
+                        resolveSystemPreamble={resolveSystemPreamble}
                     />
                 </div>
             </div>
@@ -1487,6 +1614,98 @@ export function GroupChatPage() {
             {/* 3) 右栏：立绘 → 成员头像 → 群信息 → 群设置（对齐私聊风格） */}
             <div className="chat-info-sidebar">
                 <div className="chat-info-panel">
+                    <div className="rounded-xl border border-border/60 bg-background/40 px-3 py-2.5">
+                        <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                                <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground">
+                                    当前发言人
+                                </div>
+                                <div className="mt-1 truncate text-sm font-bold">
+                                    {(speaker?.name ?? speakerId) || '未指定'}
+                                </div>
+                            </div>
+                            <Popover>
+                                <PopoverTrigger asChild>
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon"
+                                        className="h-8 w-8 rounded-full border border-border/60 bg-background/80 text-muted-foreground hover:text-foreground"
+                                        title="查看群运行态面板"
+                                    >
+                                        <Info className="h-4 w-4" />
+                                    </Button>
+                                </PopoverTrigger>
+                                <PopoverContent align="end" className="w-[320px] p-0">
+                                    <div className="space-y-0">
+                                        <div className="px-4 py-3">
+                                            <div className="text-sm font-bold">群运行态</div>
+                                            <div className="mt-1 text-[11px] leading-5 text-muted-foreground">
+                                                只展示当前轮次需要看的状态，不再常驻占用顶部空间。
+                                            </div>
+                                        </div>
+                                        <Separator />
+                                        <div className="space-y-3 px-4 py-3 text-[12px]">
+                                            <div className="flex flex-wrap gap-2">
+                                                <Badge variant="secondary" className="rounded-full px-2.5 py-1">
+                                                    队列状态：{activeGroupRuntime.status === 'running' ? '执行中' : activeGroupRuntime.status === 'stopped' ? '已终止' : '空闲'}
+                                                </Badge>
+                                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
+                                                    当前发言：{(speaker?.name ?? speakerId) || '未指定'}
+                                                </Badge>
+                                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
+                                                    待处理：{runningQueueItems.length}
+                                                </Badge>
+                                                <Badge variant="outline" className="rounded-full px-2.5 py-1">
+                                                    异步任务：{activeAsyncTaskCount}
+                                                </Badge>
+                                                {activeGroupRuntime.lastCompactedAt ? (
+                                                    <Badge variant="secondary" className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-700">
+                                                        已压缩：{new Date(activeGroupRuntime.lastCompactedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                    </Badge>
+                                                ) : null}
+                                                {activeGroupRuntime.stopRequested ? (
+                                                    <Badge variant="destructive" className="rounded-full px-2.5 py-1">
+                                                        已终止：{activeGroupRuntime.stopReason || '用户终止'}
+                                                    </Badge>
+                                                ) : null}
+                                            </div>
+                                            {activeGroupRuntime.memoryDigest?.summary ? (
+                                                <div className="rounded-xl border border-border/60 bg-muted/25 px-3 py-2 leading-5 text-muted-foreground whitespace-pre-wrap">
+                                                    {activeGroupRuntime.memoryDigest.summary}
+                                                </div>
+                                            ) : null}
+                                            {activeAgentContextDigest?.summary ? (
+                                                <div className="rounded-xl border border-primary/15 bg-primary/5 px-3 py-2 leading-5 text-foreground/80 whitespace-pre-wrap">
+                                                    <div className="mb-1 text-[11px] font-semibold text-primary">仅对当前发言人保留</div>
+                                                    {activeAgentContextDigest.summary}
+                                                </div>
+                                            ) : null}
+                                            {runningQueueItems.length > 0 ? (
+                                                <div className="flex flex-wrap gap-2">
+                                                    {runningQueueItems.map((item) => (
+                                                        <div
+                                                            key={item.id}
+                                                            className={cn(
+                                                                'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold',
+                                                                item.status === 'running'
+                                                                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700'
+                                                                    : 'border-border/70 bg-background text-foreground/80',
+                                                            )}
+                                                        >
+                                                            <span>{item.status === 'running' ? '执行中' : '排队中'}</span>
+                                                            <span>{item.agentName || item.agentId}</span>
+                                                            {item.note ? <span className="text-muted-foreground">· {item.note}</span> : null}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            ) : null}
+                                        </div>
+                                    </div>
+                                </PopoverContent>
+                            </Popover>
+                        </div>
+                    </div>
                     {speaker?.portraitUrl ? (
                         <div className="chat-info-portrait-card group relative overflow-hidden">
                             <img

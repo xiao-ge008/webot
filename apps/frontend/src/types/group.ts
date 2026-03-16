@@ -26,9 +26,21 @@ export interface GroupQueueItem {
 
 export interface GroupMemoryDigest {
   summary: string;
+  goal?: string;
+  decisions?: string[];
+  openQuestions?: string[];
   speakerLine?: string;
   pendingLine?: string;
   lastUserIntent?: string;
+  updatedAt: string;
+}
+
+export interface GroupAgentContextDigest {
+  agentId: string;
+  summary: string;
+  ownRecentLine?: string;
+  mentionLine?: string;
+  todoLine?: string;
   updatedAt: string;
 }
 
@@ -45,6 +57,7 @@ export interface GroupSessionRuntime {
   lastCompactedAt?: string;
   lastEventAt?: string;
   memoryDigest?: GroupMemoryDigest;
+  agentContextDigests?: Record<string, GroupAgentContextDigest>;
 }
 
 export interface ChatGroupLimits {

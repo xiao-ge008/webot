@@ -37,6 +37,9 @@ pub struct MessageRequest {
     /// Optional file attachments (uploaded via /upload endpoint).
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
+    /// Optional request-origin hint used for quota routing.
+    #[serde(default)]
+    pub request_origin: Option<String>,
 }
 
 /// Response from sending a message.

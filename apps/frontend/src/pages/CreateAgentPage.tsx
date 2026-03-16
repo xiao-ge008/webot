@@ -340,6 +340,42 @@ function uniqueSorted(values: string[]): string[] {
 }
 
 function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSkills>>): SkillCatalog {
+  if (payload.items.length > 0) {
+    const builtin: string[] = [];
+    const custom: string[] = [];
+    const systemUi: string[] = [];
+    const all: string[] = [];
+    const descriptions: Record<string, string> = {};
+
+    for (const item of payload.items) {
+      const name = item.name.trim();
+      if (!name) {
+        continue;
+      }
+      all.push(name);
+      if (item.description?.trim()) {
+        descriptions[name] = item.description.trim();
+      }
+      if (item.category === 'system_ui') {
+        systemUi.push(name);
+        continue;
+      }
+      if (item.category === 'builtin') {
+        builtin.push(name);
+        continue;
+      }
+      custom.push(name);
+    }
+
+    return {
+      all: uniqueSorted(all),
+      custom: uniqueSorted(custom),
+      builtin: uniqueSorted(builtin),
+      systemUi: uniqueSorted(systemUi),
+      descriptions,
+    };
+  }
+
   const runtimeNames: string[] = [];
   const runtimeBuiltin: string[] = [];
   const runtimeCustom: string[] = [];
@@ -537,10 +573,21 @@ export function CreateAgentPage() {
     const enabled = options.filter((item) => item.enabled);
     return (enabled[0] ?? options[0]) || null;
   };
-  const otherSkills = useMemo(() => {
-    const grouped = new Set([...builtinSkills, ...customSkills, ...systemUiSkills]);
-    return uniqueSorted(availableSkills.filter((item) => !grouped.has(item)));
-  }, [availableSkills, builtinSkills, customSkills, systemUiSkills]);
+  const customSkillGroup = useMemo(() => {
+    const systemUiSet = new Set(systemUiSkills);
+    const builtinSet = new Set(builtinSkills);
+    return uniqueSorted(
+      customSkills.filter((item) => !systemUiSet.has(item) && !builtinSet.has(item)),
+    );
+  }, [builtinSkills, customSkills, systemUiSkills]);
+  const builtinSkillGroup = useMemo(() => {
+    const customSet = new Set(customSkillGroup);
+    return uniqueSorted([
+      ...systemUiSkills,
+      ...builtinSkills,
+      ...availableSkills.filter((item) => !customSet.has(item)),
+    ]);
+  }, [availableSkills, builtinSkills, customSkillGroup, systemUiSkills]);
 
   const navItems = [
     { id: 'basic', label: t('edit.nav.basic'), icon: User },
@@ -1114,7 +1161,7 @@ export function CreateAgentPage() {
                     <Hammer className="w-6 h-6 text-primary" /> Skill 选择
                   </CardTitle>
                   <CardDescription className="text-sm font-medium">
-                    预设智能体可用 Skill（创建后自动写入分配）。已按全局/自定义/系统 UI 分类。
+                    预设智能体可用 Skill（创建后自动写入分配）。已整理为内置与自定义两组。
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="p-8 pt-4 space-y-6">
@@ -1129,84 +1176,18 @@ export function CreateAgentPage() {
                   ) : (
                     <>
                       <div className="rounded-2xl border overflow-hidden bg-background">
-                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">系统 UI Skills</div>
-                        {systemUiSkills.length === 0 ? (
+                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">内置 Skills</div>
+                        {builtinSkillGroup.length === 0 ? (
                           <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
                         ) : (
-                          systemUiSkills.map((skill, index) => {
-                            const enabled = selectedSkills.includes(skill);
-                            return (
-                              <div
-                                key={`ui-${skill}`}
-                                className={cn(
-                                  'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== systemUiSkills.length - 1 && 'border-b',
-                                )}
-                              >
-                                <div className="flex items-center gap-3 min-w-0">
-                                  <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
-                                    <FileText className="w-4 h-4 text-muted-foreground" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="text-sm font-semibold truncate">{skill}</div>
-                                    <div className="text-xs text-muted-foreground truncate">
-                                      {skillDescriptions[skill] || '未提供功能描述'}
-                                    </div>
-                                  </div>
-                                </div>
-                                <Switch checked={enabled} onCheckedChange={(checked) => toggleSkillSelection(skill, checked)} />
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-
-                      <div className="rounded-2xl border overflow-hidden bg-background">
-                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">全局/自定义 Skills</div>
-                        {customSkills.length === 0 ? (
-                          <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
-                        ) : (
-                          customSkills.map((skill, index) => {
-                            const enabled = selectedSkills.includes(skill);
-                            return (
-                              <div
-                                key={`custom-${skill}`}
-                                className={cn(
-                                  'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== customSkills.length - 1 && 'border-b',
-                                )}
-                              >
-                                <div className="flex items-center gap-3 min-w-0">
-                                  <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
-                                    <FileText className="w-4 h-4 text-muted-foreground" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="text-sm font-semibold truncate">{skill}</div>
-                                    <div className="text-xs text-muted-foreground truncate">
-                                      {skillDescriptions[skill] || '未提供功能描述'}
-                                    </div>
-                                  </div>
-                                </div>
-                                <Switch checked={enabled} onCheckedChange={(checked) => toggleSkillSelection(skill, checked)} />
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-
-                      <div className="rounded-2xl border overflow-hidden bg-background">
-                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">系统内置 Skills</div>
-                        {builtinSkills.length === 0 ? (
-                          <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
-                        ) : (
-                          builtinSkills.map((skill, index) => {
+                          builtinSkillGroup.map((skill, index) => {
                             const enabled = selectedSkills.includes(skill);
                             return (
                               <div
                                 key={`builtin-${skill}`}
                                 className={cn(
                                   'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== builtinSkills.length - 1 && 'border-b',
+                                  index !== builtinSkillGroup.length - 1 && 'border-b',
                                 )}
                               >
                                 <div className="flex items-center gap-3 min-w-0">
@@ -1227,17 +1208,19 @@ export function CreateAgentPage() {
                         )}
                       </div>
 
-                      {otherSkills.length > 0 && (
-                        <div className="rounded-2xl border overflow-hidden bg-background">
-                          <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">其他可用 Skills</div>
-                          {otherSkills.map((skill, index) => {
+                      <div className="rounded-2xl border overflow-hidden bg-background">
+                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">自定义 Skills</div>
+                        {customSkillGroup.length === 0 ? (
+                          <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
+                        ) : (
+                          customSkillGroup.map((skill, index) => {
                             const enabled = selectedSkills.includes(skill);
                             return (
                               <div
-                                key={`other-${skill}`}
+                                key={`custom-${skill}`}
                                 className={cn(
                                   'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== otherSkills.length - 1 && 'border-b',
+                                  index !== customSkillGroup.length - 1 && 'border-b',
                                 )}
                               >
                                 <div className="flex items-center gap-3 min-w-0">
@@ -1254,9 +1237,9 @@ export function CreateAgentPage() {
                                 <Switch checked={enabled} onCheckedChange={(checked) => toggleSkillSelection(skill, checked)} />
                               </div>
                             );
-                          })}
-                        </div>
-                      )}
+                          })
+                        )}
+                      </div>
                     </>
                   )}
                 </CardContent>

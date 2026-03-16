@@ -157,6 +157,9 @@ impl StandaloneChat {
             } => {
                 self.chat.tool_result(&name, &result_preview, is_error);
             }
+            StreamEvent::Error { message } => {
+                self.chat.tool_result("stream", &message, true);
+            }
         }
     }
 

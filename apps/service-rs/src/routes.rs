@@ -29,6 +29,30 @@ use crate::error::ApiError;
 use crate::path_resolver;
 use crate::AppState;
 
+const DEFAULT_UI_SKILL_NAME: &str = "ui-skill";
+
+#[derive(Debug, Clone)]
+struct RuntimeSkillListEntry {
+    name: String,
+    description: Option<String>,
+    source_type: String,
+}
+
+#[derive(Debug, Clone)]
+struct LocalSkillListEntry {
+    folder_name: String,
+    display_name: String,
+    description: Option<String>,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ImportedSkillListEntry {
+    record: assignment_store::ImportedSkillRecord,
+    folder_name: Option<String>,
+    description: Option<String>,
+}
+
 async fn probe_openfang_health(state: &Arc<AppState>) -> Result<Value, ApiError> {
     match state.openfang.get_json("/api/health").await {
         Ok(upstream) => {
@@ -1336,8 +1360,9 @@ pub async fn chat_session_compact(
         Ok(value) => value,
         Err(err) => {
             if session_ctx.switched {
-                let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id)
-                    .await;
+                let _ =
+                    switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id)
+                        .await;
             }
             return Err(err);
         }
@@ -2325,49 +2350,6 @@ const WORKSPACE_MCP_SERVER_PREFIX: &str = "agent-workspace-";
 const WORKSPACE_MCP_TIMEOUT_SECS: u64 = 20;
 const SYSTEM_HIDDEN_MCP_SERVER_NAMES: [&str; 2] = ["agent", "mcp"];
 const AGENT_PROFILE_DIR_NAME: &str = "agent_profile";
-const OPENFANG_SUPPORTED_PROVIDERS: [&str; 41] = [
-    "anthropic",
-    "gemini",
-    "google-ai",
-    "openai",
-    "groq",
-    "openrouter",
-    "deepseek",
-    "together",
-    "mistral",
-    "fireworks",
-    "ollama",
-    "vllm",
-    "lmstudio",
-    "perplexity",
-    "cohere",
-    "ai21",
-    "cerebras",
-    "sambanova",
-    "huggingface",
-    "xai",
-    "replicate",
-    "github-copilot",
-    "codex",
-    "qwen",
-    "minimax",
-    "zhipu",
-    "zhipu_coding",
-    "zhipu-ai",
-    "zai",
-    "zai_coding",
-    "moonshot",
-    "qianfan",
-    "volcengine",
-    "volcengine_coding",
-    "bedrock",
-    "nvidia-nim",
-    "nvidia",
-    "302-ai",
-    "alibaba-bailian",
-    "custom-openai",
-    "custom-claude",
-];
 const KNOWN_CONTEXT_FILES: [&str; 8] = [
     "SOUL.md",
     "USER.md",
@@ -2949,147 +2931,6 @@ fn strip_workspace_mcp_names(names: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn is_supported_openfang_provider(provider: &str) -> bool {
-    OPENFANG_SUPPORTED_PROVIDERS
-        .iter()
-        .any(|item| item.eq_ignore_ascii_case(provider.trim()))
-        || provider.trim().eq_ignore_ascii_case("claude-code")
-}
-
-fn normalize_runtime_provider_id(value: &str) -> String {
-    let normalized = assignment_store::normalize_provider_id(value);
-    match normalized.as_str() {
-        // OpenFang runtime/model catalog currently uses `nvidia` as provider id,
-        // while webot historical configs may still carry `nvidia-nim`.
-        "nvidia-nim" => "nvidia".to_string(),
-        _ => normalized,
-    }
-}
-
-fn runtime_provider_aliases(provider: &str) -> Vec<String> {
-    let normalized = normalize_runtime_provider_id(provider);
-    match normalized.as_str() {
-        "nvidia" => vec!["nvidia".to_string(), "nvidia-nim".to_string()],
-        _ if !normalized.is_empty() => vec![normalized],
-        _ => Vec::new(),
-    }
-}
-
-fn runtime_provider_ids_match(left: &str, right: &str) -> bool {
-    let left = normalize_runtime_provider_id(left);
-    let right = normalize_runtime_provider_id(right);
-    !left.is_empty() && left == right
-}
-
-fn strip_provider_prefixes(model: &str, provider: &str) -> String {
-    let mut current = model.trim().to_string();
-    if current.is_empty() {
-        return current;
-    }
-    let aliases = runtime_provider_aliases(provider);
-    if aliases.is_empty() {
-        return current;
-    }
-    loop {
-        let Some((prefix, suffix)) = current.split_once('/') else {
-            break;
-        };
-        if suffix.is_empty() {
-            break;
-        }
-        if aliases
-            .iter()
-            .any(|candidate| prefix.trim().eq_ignore_ascii_case(candidate))
-        {
-            current = suffix.to_string();
-            continue;
-        }
-        break;
-    }
-    current
-}
-
-fn find_namespaced_local_provider_alias(
-    model: &str,
-    provider_configs: &HashMap<String, assignment_store::ProviderConfigRecord>,
-) -> Option<(String, String)> {
-    let trimmed = model.trim();
-    let (prefix, suffix) = trimmed.split_once('/')?;
-    let provider_id = assignment_store::normalize_provider_id(prefix);
-    let model_name = suffix.trim();
-    if provider_id.is_empty() || model_name.is_empty() {
-        return None;
-    }
-    let cfg = provider_configs.get(&provider_id)?;
-    let matched = cfg.models.iter().any(|item| {
-        let normalized = strip_provider_prefixes(item, &provider_id);
-        normalized.eq_ignore_ascii_case(model_name)
-    });
-    if matched {
-        return Some((provider_id, model_name.to_string()));
-    }
-    None
-}
-
-fn normalize_display_model_ref(
-    provider: &str,
-    raw_model: &str,
-    provider_configs: &HashMap<String, assignment_store::ProviderConfigRecord>,
-) -> (String, String) {
-    let normalized_provider = normalize_runtime_provider_id(provider);
-    let normalized_model = strip_provider_prefixes(raw_model, &normalized_provider);
-    if normalized_model.is_empty() {
-        return (normalized_provider, normalized_model);
-    }
-    if let Some((provider_id, model_name)) =
-        find_namespaced_local_provider_alias(&normalized_model, provider_configs)
-    {
-        return (provider_id, model_name);
-    }
-    (normalized_provider, normalized_model)
-}
-
-fn normalize_runtime_applied_model(
-    target_provider: &str,
-    applied_provider: &str,
-    applied_model_raw: &str,
-) -> (String, String) {
-    let target_provider = normalize_runtime_provider_id(target_provider);
-    let applied_provider_trimmed = normalize_runtime_provider_id(applied_provider);
-
-    let compare_provider = if applied_provider_trimmed.is_empty() {
-        target_provider.as_str()
-    } else {
-        applied_provider_trimmed.as_str()
-    };
-
-    // Some backends (e.g. NIM) may report provider as a wrapper (nvidia-nim),
-    // but keep the user-facing namespace in the model id (xianyu/glm-4.7).
-    // We accept the target provider/model if it can be derived from the applied model selector.
-    let stripped_once = strip_provider_prefixes(applied_model_raw, compare_provider);
-    let mut normalized_provider = if applied_provider_trimmed.is_empty() {
-        target_provider.clone()
-    } else {
-        applied_provider_trimmed.clone()
-    };
-    let mut normalized_model = stripped_once.clone();
-
-    let candidate = stripped_once;
-    if let Some((prefix, _)) = candidate.split_once('/') {
-        if runtime_provider_ids_match(prefix.trim(), target_provider.as_str()) {
-            normalized_provider = target_provider.clone();
-            normalized_model = strip_provider_prefixes(&candidate, target_provider.as_str());
-        }
-    } else if let Some((prefix, _)) = applied_model_raw.split_once('/') {
-        if runtime_provider_ids_match(prefix.trim(), target_provider.as_str()) {
-            normalized_provider = target_provider.clone();
-            normalized_model = strip_provider_prefixes(applied_model_raw, target_provider.as_str());
-        }
-    }
-
-    (normalized_provider, normalized_model)
-}
-
 fn is_probably_chat_model(provider: &str, model: &str) -> bool {
     if provider.trim().eq_ignore_ascii_case("nvidia-nim")
         || provider.trim().eq_ignore_ascii_case("nvidia")
@@ -3127,92 +2968,6 @@ fn is_probably_chat_model(provider: &str, model: &str) -> bool {
     true
 }
 
-fn build_upstream_model_selector(provider: Option<&str>, raw_model: &str) -> Option<String> {
-    let requested_provider = provider
-        .map(normalize_runtime_provider_id)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase());
-    let mut model = raw_model.trim().to_string();
-    if model.is_empty() {
-        return None;
-    }
-
-    if let Some((left, right)) = model.split_once("::") {
-        let prefix = left.trim();
-        let suffix = right.trim();
-        if !suffix.is_empty()
-            && requested_provider
-                .as_deref()
-                .map(|name| name.eq_ignore_ascii_case(prefix))
-                .unwrap_or(true)
-        {
-            model = suffix.to_string();
-        }
-    }
-
-    if let Some(requested_provider) = requested_provider.as_deref() {
-        model = strip_provider_prefixes(&model, requested_provider);
-    }
-
-    if let Some((prefix, suffix)) = model.split_once('/') {
-        let prefix = prefix.trim();
-        let suffix = suffix.trim();
-        if !suffix.is_empty() {
-            let provider_matches = requested_provider
-                .as_deref()
-                .map(|name| name.eq_ignore_ascii_case(prefix))
-                .unwrap_or(false);
-            // 仅在未指定 provider 或 provider 前缀匹配时，才把前缀当成 provider。
-            // 这样避免像 nvidia-nim 的模型名包含 "qwen/..." 时被误判成 qwen provider。
-            if requested_provider.is_none() || provider_matches {
-                if is_supported_openfang_provider(prefix) {
-                    return Some(format!("{}/{}", prefix.to_ascii_lowercase(), suffix));
-                }
-            }
-            if provider_matches {
-                model = suffix.to_string();
-            }
-        }
-    }
-
-    if let Some(provider_name) = requested_provider {
-        return Some(format!("{provider_name}/{model}"));
-    }
-
-    Some(model)
-}
-
-fn resolve_provider_model_pair(
-    preferred_provider: Option<&str>,
-    raw_model: &str,
-) -> Option<(String, String)> {
-    let selector = build_upstream_model_selector(preferred_provider, raw_model)?;
-    if let Some((prefix, suffix)) = selector.split_once('/') {
-        let normalized_prefix = normalize_runtime_provider_id(prefix);
-        let normalized_suffix = suffix.trim();
-        if !normalized_suffix.is_empty() {
-            if is_supported_openfang_provider(&normalized_prefix) {
-                return Some((normalized_prefix, normalized_suffix.to_string()));
-            }
-            // 允许自定义 provider：当用户明确选择了 provider 时，也允许按前缀拆分
-            if preferred_provider
-                .map(normalize_runtime_provider_id)
-                .filter(|value| !value.is_empty())
-                .map(|value| runtime_provider_ids_match(&value, &normalized_prefix))
-                .unwrap_or(false)
-            {
-                return Some((normalized_prefix, normalized_suffix.to_string()));
-            }
-        }
-    }
-    let fallback_provider = preferred_provider
-        .map(normalize_runtime_provider_id)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "openai".to_string())
-        .to_ascii_lowercase();
-    Some((fallback_provider, selector))
-}
-
 fn payload_models_array<'a>(payload: &'a Value) -> Vec<&'a Value> {
     if let Some(items) = payload.as_array() {
         return items.iter().collect();
@@ -3229,35 +2984,33 @@ async fn ensure_runtime_model_available(
     provider: &str,
     model: &str,
 ) -> Result<(), ApiError> {
-    let normalized_model = strip_provider_prefixes(model, provider);
+    let model = model.trim();
     let payload = state.openfang.get_json("/api/models").await?;
     let exists = payload_models_array(&payload).into_iter().any(|item| {
         let item_provider = item
             .get("provider")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let item_model = strip_provider_prefixes(
-            item.get("model")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            provider,
-        );
-        item_provider.eq_ignore_ascii_case(provider)
-            && item_model.eq_ignore_ascii_case(&normalized_model)
+        let item_model = item
+            .get("model")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        item_provider.eq_ignore_ascii_case(provider) && item_model.eq_ignore_ascii_case(model)
     });
 
     if exists {
         return Ok(());
     }
 
-    let display_name = format!("{provider}/{normalized_model}");
+    let display_name = format!("{provider}/{model}");
     let _ = state
         .openfang
         .post_json(
             "/api/models/custom",
             json!({
-                "id": normalized_model,
+                "id": model,
                 "provider": provider,
                 "display_name": display_name
             }),
@@ -3274,62 +3027,34 @@ async fn apply_runtime_agent_model(
 ) -> Result<Value, ApiError> {
     ensure_runtime_model_available(state, provider, model).await?;
 
-    let selector = build_upstream_model_selector(Some(provider), model)
-        .unwrap_or_else(|| format!("{provider}/{model}"));
-    let path = format!("/api/agents/{agent_id}/model");
+    let path = format!("/api/agents/{agent_id}/config");
     state
         .openfang
-        .put_json(&path, json!({ "model": selector }))
+        .patch_json(
+            &path,
+            json!({
+                "provider": provider,
+                "model": model
+            }),
+        )
         .await?;
 
     let detail_path = format!("/api/agents/{agent_id}");
-    let mut detail = state.openfang.get_json(&detail_path).await?;
+    let detail = state.openfang.get_json(&detail_path).await?;
     let applied_provider = detail
         .pointer("/model/provider")
         .and_then(Value::as_str)
         .unwrap_or_default()
+        .trim()
         .to_string();
     let applied_model_raw = detail
         .pointer("/model/model")
         .and_then(Value::as_str)
         .unwrap_or_default()
+        .trim()
         .to_string();
-    let (normalized_provider, normalized_model) =
-        normalize_runtime_applied_model(provider, &applied_provider, &applied_model_raw);
-    let normalized_target_model = strip_provider_prefixes(model, provider);
 
-    if let Some(model_obj) = detail.get_mut("model").and_then(Value::as_object_mut) {
-        if !normalized_provider.eq_ignore_ascii_case(&applied_provider) {
-            model_obj.insert(
-                "provider".to_string(),
-                Value::String(normalized_provider.clone()),
-            );
-        }
-        if !normalized_model.eq_ignore_ascii_case(&applied_model_raw) {
-            model_obj.insert("model".to_string(), Value::String(normalized_model.clone()));
-        }
-        let provider_config_map: HashMap<String, assignment_store::ProviderConfigRecord> =
-            assignment_store::list_provider_configs()
-                .map_err(storage_error)?
-                .into_iter()
-                .map(|item| (item.provider_id.clone(), item))
-                .collect();
-        let (display_provider, display_model) = normalize_display_model_ref(
-            &normalized_provider,
-            &normalized_model,
-            &provider_config_map,
-        );
-        if !display_provider.is_empty() && display_provider != normalized_provider {
-            model_obj.insert("provider".to_string(), Value::String(display_provider));
-        }
-        if !display_model.is_empty() && display_model != normalized_model {
-            model_obj.insert("model".to_string(), Value::String(display_model));
-        }
-    }
-
-    if !normalized_provider.eq_ignore_ascii_case(provider)
-        || !normalized_model.eq_ignore_ascii_case(&normalized_target_model)
-    {
+    if !applied_provider.eq_ignore_ascii_case(provider) || applied_model_raw != model {
         return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             format!(
@@ -4151,12 +3876,6 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
                 .unwrap_or_default();
             !agent_id.is_empty() && !hidden.contains(&agent_id)
         });
-        let provider_configs = assignment_store::list_provider_configs().map_err(storage_error)?;
-        let provider_config_map: HashMap<String, assignment_store::ProviderConfigRecord> =
-            provider_configs
-                .into_iter()
-                .map(|item| (item.provider_id.clone(), item))
-                .collect();
         for row in rows {
             let is_nuwa = is_nuwa_agent_row(row);
             let agent_id = row
@@ -4175,29 +3894,6 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             }
             if let Some(profile) = profiles.get(&agent_id) {
                 merge_agent_profile_override(row, profile);
-            }
-            if let Some(model_obj) = row.get_mut("model").and_then(Value::as_object_mut) {
-                let provider = model_obj
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let model = model_obj
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let (display_provider, display_model) =
-                    normalize_display_model_ref(&provider, &model, &provider_config_map);
-                if !display_provider.is_empty() && display_provider != provider {
-                    model_obj.insert(
-                        "provider".to_string(),
-                        Value::String(display_provider.clone()),
-                    );
-                }
-                if !display_model.is_empty() && display_model != model {
-                    model_obj.insert("model".to_string(), Value::String(display_model));
-                }
             }
             if is_nuwa {
                 if let Some(object) = row.as_object_mut() {
@@ -4365,57 +4061,15 @@ pub async fn create_agent(
     Json(payload): Json<CreateAgentRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
-    let mut manifest_toml = payload.manifest_toml.clone();
+    let manifest_toml = payload.manifest_toml.clone();
     let mut preferred_workspace_segment: Option<String> = None;
-    if let Ok(mut parsed) = manifest_toml.parse::<toml::Value>() {
+    if let Ok(parsed) = manifest_toml.parse::<toml::Value>() {
         preferred_workspace_segment = parsed
             .get("name")
             .and_then(toml::Value::as_str)
             .map(str::trim)
             .filter(|value| is_valid_english_name(value))
             .and_then(normalize_workspace_segment);
-        if let Some(model_table) = parsed
-            .as_table_mut()
-            .and_then(|root| root.get_mut("model"))
-            .and_then(toml::Value::as_table_mut)
-        {
-            let provider = model_table
-                .get("provider")
-                .and_then(toml::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let model = model_table
-                .get("model")
-                .and_then(toml::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            if let Some(raw_model) = model {
-                if let Some(selector) = build_upstream_model_selector(provider, raw_model) {
-                    if let Some((prefix, suffix)) = selector.split_once('/') {
-                        let provider_name = prefix.trim();
-                        let model_name = suffix.trim();
-                        if !model_name.is_empty() && is_supported_openfang_provider(provider_name) {
-                            model_table.insert(
-                                "provider".to_string(),
-                                toml::Value::String(provider_name.to_ascii_lowercase()),
-                            );
-                            model_table.insert(
-                                "model".to_string(),
-                                toml::Value::String(model_name.to_string()),
-                            );
-                        } else {
-                            model_table
-                                .insert("model".to_string(), toml::Value::String(selector.clone()));
-                        }
-                    } else {
-                        model_table.insert("model".to_string(), toml::Value::String(selector));
-                    }
-                }
-            }
-        }
-        if let Ok(serialized) = toml::to_string(&parsed) {
-            manifest_toml = serialized;
-        }
     }
     let body = json!({
         "manifest_toml": manifest_toml
@@ -4491,41 +4145,8 @@ pub async fn get_agent(
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
     let resolved = resolve_agent_id_alias(&state, &id).await?;
-    let provider_config_map: HashMap<String, assignment_store::ProviderConfigRecord> =
-        assignment_store::list_provider_configs()
-            .map_err(storage_error)?
-            .into_iter()
-            .map(|item| (item.provider_id.clone(), item))
-            .collect();
     let path = format!("/api/agents/{}", resolved.resolved);
     let mut data = state.openfang.get_json(&path).await?;
-    if let Some(model_obj) = data.get_mut("model").and_then(Value::as_object_mut) {
-        let raw_provider = model_obj
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let raw_model = model_obj
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let (display_provider, display_model) =
-            normalize_display_model_ref(&raw_provider, &raw_model, &provider_config_map);
-        let provider_id = if display_provider.is_empty() {
-            raw_provider.clone()
-        } else {
-            display_provider.clone()
-        };
-        if !provider_id.is_empty() && provider_id != raw_provider {
-            model_obj.insert("provider".to_string(), Value::String(provider_id.clone()));
-        }
-        if !provider_id.is_empty() && !display_model.is_empty() && display_model != raw_model {
-            model_obj.insert("model".to_string(), Value::String(display_model));
-        }
-    }
     if let Some(profile) =
         assignment_store::get_agent_profile_override(&resolved.resolved).map_err(storage_error)?
     {
@@ -4788,27 +4409,30 @@ pub async fn update_agent_model(
     let provider = object
         .get("provider")
         .and_then(Value::as_str)
-        .map(normalize_runtime_provider_id)
+        .map(str::trim)
         .filter(|value| !value.is_empty());
+    let Some(provider) = provider else {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "provider 不能为空",
+        ));
+    };
     let raw_model = object
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let Some(raw_model) = raw_model else {
+        .map(ToString::to_string);
+    let Some(target_model) = raw_model else {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "model 不能为空",
         ));
     };
-    let (target_provider, target_model) =
-        resolve_provider_model_pair(provider.as_deref(), &raw_model)
-            .ok_or_else(|| ApiError::new(axum::http::StatusCode::BAD_REQUEST, "model 不能为空"))?;
     let runtime_provider_ids = get_upstream_provider_ids_quick(&state).await;
     if !runtime_provider_ids.is_empty()
-        && !runtime_provider_ids.contains(target_provider.as_str())
-        && !is_local_provider_configured(&target_provider)?
+        && !runtime_provider_ids.contains(provider)
+        && !is_local_provider_configured(provider)?
     {
         let mut providers: Vec<String> = runtime_provider_ids.into_iter().collect();
         providers.sort();
@@ -4816,15 +4440,14 @@ pub async fn update_agent_model(
             axum::http::StatusCode::BAD_REQUEST,
             format!(
                 "provider `{}` 当前运行时不支持。支持列表: {}",
-                target_provider,
+                provider,
                 providers.join(", ")
             ),
         ));
     }
 
     let mut data =
-        apply_runtime_agent_model(&state, &resolved.resolved, &target_provider, &target_model)
-            .await?;
+        apply_runtime_agent_model(&state, &resolved.resolved, provider, &target_model).await?;
     if resolved.alias_used {
         rewrite_agent_id_fields(&mut data, DEFAULT_NUWA_AGENT_ID);
     }
@@ -4860,11 +4483,35 @@ async fn normalize_agent_model_selector_if_needed(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let provider_config_map: HashMap<String, assignment_store::ProviderConfigRecord> =
+        assignment_store::list_provider_configs()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|item| (item.provider_id.clone(), item))
+            .collect();
 
     let target_pair = if let Some(current_model) = raw_model.as_deref() {
-        resolve_provider_model_pair(provider.as_deref(), current_model)
-    } else if let Ok((default_provider, default_model)) = resolve_default_model_tuple().await {
-        resolve_provider_model_pair(Some(default_provider.as_str()), default_model.as_str())
+        if let Some((candidate_provider, candidate_model)) = current_model.split_once('/') {
+            let candidate_provider = assignment_store::normalize_provider_id(candidate_provider);
+            let candidate_model = candidate_model.trim();
+            let matches_local_config = provider_config_map
+                .get(&candidate_provider)
+                .map(|cfg| {
+                    cfg.models
+                        .iter()
+                        .any(|item| item.trim().eq_ignore_ascii_case(candidate_model))
+                })
+                .unwrap_or(false);
+            if !candidate_provider.is_empty() && !candidate_model.is_empty() && matches_local_config {
+                Some((candidate_provider, candidate_model.to_string()))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else if current_provider.is_none() {
+        resolve_default_model_tuple().await.ok()
     } else {
         None
     };
@@ -5454,6 +5101,8 @@ fn is_semantic_memory_endpoint_unavailable(error: &ApiError) -> bool {
         return false;
     }
     if !(error.message.contains("/search")
+        || error.message.contains("/unified-search")
+        || error.message.contains("/unified-debug")
         || error.message.contains("/feedback")
         || error.message.contains("/items/"))
     {
@@ -5472,6 +5121,43 @@ fn is_semantic_memory_endpoint_unavailable(error: &ApiError) -> bool {
         }
         None => false,
     }
+}
+
+fn normalize_legacy_semantic_rows(
+    rows: Vec<Value>,
+    min_confidence: f32,
+    apply_threshold: bool,
+) -> Vec<Value> {
+    let mut normalized = rows
+        .into_iter()
+        .map(|mut row| {
+            let confidence = row
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+            if row.get("kind").is_none() {
+                row["kind"] = Value::String("semantic_memory".to_string());
+            }
+            if row.get("score").is_none() {
+                row["score"] = Value::from(confidence);
+            }
+            if row.get("explain").is_none() {
+                row["explain"] = json!({
+                    "channel": "legacy_semantic_search",
+                    "reason": "旧版 /search 兼容回退"
+                });
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+
+    if apply_threshold {
+        normalized.retain(|row| {
+            row.get("score").and_then(Value::as_f64).unwrap_or(0.0) >= min_confidence as f64
+        });
+    }
+
+    normalized
 }
 
 fn semantic_memory_unavailable_error() -> ApiError {
@@ -7206,25 +6892,18 @@ pub async fn get_agent_skills(
     let resolved = resolve_agent_id_alias(&state, &id).await?;
     let agent_id = resolved.resolved;
     let runtime_available = openfang_known_skill_names(&state, &agent_id).await?;
-    let runtime_bundled_set: HashSet<String> = openfang_bundled_skill_names(&state)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
     let mut custom_available = global_custom_skill_names()?;
-    custom_available.extend(
-        runtime_available
-            .iter()
-            .filter(|name| !runtime_bundled_set.contains(*name))
-            .cloned(),
-    );
+    let custom_available_set = custom_available
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     custom_available.sort();
     custom_available.dedup();
 
     let mut builtin_available: Vec<String> = runtime_available
         .iter()
-        .filter(|name| runtime_bundled_set.contains(*name))
+        .filter(|name| !name.eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME))
+        .filter(|name| !custom_available_set.contains(&name.to_ascii_lowercase()))
         .cloned()
         .collect();
     builtin_available.sort();
@@ -7698,45 +7377,24 @@ pub async fn list_global_skills(
     let imported = assignment_store::list_imported_skills().map_err(storage_error)?;
     let local_dirs = list_child_dirs(&skills_root)
         .map_err(|e| storage_error(format!("读取技能目录失败: {e}")))?;
-
-    let mut description_map = serde_json::Map::new();
-    for folder_name in &local_dirs {
-        if let Some(description) = read_skill_description_from_dir(&skills_root.join(folder_name)) {
-            description_map.insert(folder_name.clone(), Value::String(description));
-        }
-    }
-
-    let imported_payload = imported
+    let local_entries = local_dirs
         .iter()
-        .map(|record| {
-            let mut description = description_map
-                .get(&record.name)
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            if description.is_none() {
-                let mut candidates = Vec::new();
-                if !record.installed_path.trim().is_empty() {
-                    candidates.push(PathBuf::from(record.installed_path.trim()));
-                }
-                if !record.source_path.trim().is_empty() {
-                    candidates.push(PathBuf::from(record.source_path.trim()));
-                }
-                description = read_skill_description_from_candidates(&candidates);
+        .map(|folder_name| {
+            let path = skills_root.join(folder_name);
+            LocalSkillListEntry {
+                folder_name: folder_name.clone(),
+                display_name: read_skill_name_from_dir(&path)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| folder_name.clone()),
+                description: read_skill_description_from_dir(&path),
+                path,
             }
-            if let Some(value) = description.as_ref() {
-                description_map
-                    .entry(record.name.clone())
-                    .or_insert_with(|| Value::String(value.clone()));
-            }
-            json!({
-                "name": record.name,
-                "source_path": record.source_path,
-                "installed_path": record.installed_path,
-                "updated_at": record.updated_at,
-                "description": description
-            })
         })
         .collect::<Vec<_>>();
+    let local_folder_set = local_entries
+        .iter()
+        .map(|entry| entry.folder_name.clone())
+        .collect::<HashSet<_>>();
 
     let runtime = if is_service_online(&state).await {
         match state.openfang.get_json("/api/skills").await {
@@ -7746,6 +7404,200 @@ pub async fn list_global_skills(
     } else {
         json!({ "skills": [], "total": 0 })
     };
+    let runtime_entries = extract_runtime_skill_entries(&runtime);
+
+    let mut stale_imported_names = Vec::new();
+    let imported_entries = imported
+        .iter()
+        .filter_map(|record| {
+            let mut candidates = Vec::new();
+            if !record.installed_path.trim().is_empty() {
+                candidates.push(PathBuf::from(record.installed_path.trim()));
+            }
+            if !record.source_path.trim().is_empty() {
+                candidates.push(PathBuf::from(record.source_path.trim()));
+            }
+            let installed_path = PathBuf::from(record.installed_path.trim());
+            let folder_name = skill_folder_name_from_record(record);
+            let path_exists = installed_path.is_dir();
+            let folder_exists = folder_name
+                .as_ref()
+                .map(|name| local_folder_set.contains(name))
+                .unwrap_or(false);
+            if !path_exists && !folder_exists {
+                stale_imported_names.push(record.name.clone());
+                return None;
+            }
+            Some(ImportedSkillListEntry {
+                record: record.clone(),
+                folder_name,
+                description: read_skill_description_from_candidates(&candidates),
+            })
+        })
+        .collect::<Vec<_>>();
+    for stale_name in stale_imported_names {
+        if let Err(err) = assignment_store::delete_imported_skill(&stale_name) {
+            tracing::warn!(skill = %stale_name, error = %err, "failed to prune stale imported skill record");
+        }
+    }
+
+    let mut description_map = serde_json::Map::new();
+    for local in &local_entries {
+        if let Some(description) = local.description.as_ref() {
+            description_map.insert(
+                local.folder_name.clone(),
+                Value::String(description.clone()),
+            );
+            if !local.display_name.eq_ignore_ascii_case(&local.folder_name) {
+                description_map
+                    .entry(local.display_name.clone())
+                    .or_insert_with(|| Value::String(description.clone()));
+            }
+        }
+    }
+
+    let mut runtime_by_name = runtime_entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.name.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut imported_by_folder = imported_entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .folder_name
+                .as_ref()
+                .map(|folder_name| (folder_name.clone(), entry.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut imported_by_name = imported_entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.record.name.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut normalized_items = Vec::new();
+    let mut seen_display_names = HashSet::new();
+
+    for local in &local_entries {
+        let runtime_entry = runtime_by_name
+            .remove(&local.display_name)
+            .or_else(|| runtime_by_name.remove(&local.folder_name));
+        let imported_entry = imported_by_folder
+            .remove(&local.folder_name)
+            .or_else(|| imported_by_name.remove(&local.folder_name))
+            .or_else(|| imported_by_name.remove(&local.display_name));
+        let is_ui_skill = local
+            .folder_name
+            .eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME)
+            || local
+                .display_name
+                .eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME);
+        let source_type = runtime_entry
+            .as_ref()
+            .map(|entry| entry.source_type.clone())
+            .unwrap_or_else(|| "local".to_string());
+        let description = runtime_entry
+            .as_ref()
+            .and_then(|entry| entry.description.clone())
+            .or_else(|| local.description.clone())
+            .or_else(|| {
+                imported_entry
+                    .as_ref()
+                    .and_then(|entry| entry.description.clone())
+            })
+            .unwrap_or_else(|| "未提供功能描述".to_string());
+        description_map
+            .entry(local.display_name.clone())
+            .or_insert_with(|| Value::String(description.clone()));
+        description_map
+            .entry(local.folder_name.clone())
+            .or_insert_with(|| Value::String(description.clone()));
+        seen_display_names.insert(local.display_name.to_ascii_lowercase());
+        let item_id = local.folder_name.clone();
+        let item_name = local.display_name.clone();
+        let folder_name = local.folder_name.clone();
+        let item_path = local.path.to_string_lossy().to_string();
+        let item_source_type = if is_ui_skill {
+            "ui".to_string()
+        } else {
+            source_type.clone()
+        };
+        normalized_items.push(json!({
+            "id": item_id,
+            "name": item_name,
+            "folderName": folder_name,
+            "description": description,
+            "path": item_path,
+            "sourceType": item_source_type,
+            "category": if is_ui_skill { "system_ui" } else { "custom" },
+            "isSystem": is_ui_skill,
+            "isImported": imported_entry.is_some(),
+            "canDelete": !is_ui_skill
+        }));
+    }
+
+    for entry in runtime_entries {
+        let lowered = entry.name.to_ascii_lowercase();
+        if seen_display_names.contains(&lowered) {
+            continue;
+        }
+        seen_display_names.insert(lowered);
+        let is_ui_skill = entry.name.eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME);
+        let is_bundled = entry.source_type.eq_ignore_ascii_case("bundled");
+        let is_system = is_ui_skill || is_bundled;
+        let category = if is_ui_skill {
+            "system_ui"
+        } else if is_bundled {
+            "builtin"
+        } else {
+            "custom"
+        };
+        let description = entry
+            .description
+            .clone()
+            .unwrap_or_else(|| "未提供功能描述".to_string());
+        description_map
+            .entry(entry.name.clone())
+            .or_insert_with(|| Value::String(description.clone()));
+        let item_id = entry.name.clone();
+        let item_name = entry.name.clone();
+        let runtime_source_type = if is_ui_skill {
+            "ui".to_string()
+        } else {
+            entry.source_type.clone()
+        };
+        normalized_items.push(json!({
+            "id": item_id,
+            "name": item_name.clone(),
+            "folderName": Value::Null,
+            "description": description,
+            "path": format!("runtime://{}/{}", runtime_source_type, item_name),
+            "sourceType": runtime_source_type,
+            "category": category,
+            "isSystem": is_system,
+            "isImported": false,
+            "canDelete": false
+        }));
+    }
+
+    let imported_payload = imported_entries
+        .iter()
+        .map(|entry| {
+            let description = entry.description.clone();
+            if let Some(value) = description.as_ref() {
+                description_map
+                    .entry(entry.record.name.clone())
+                    .or_insert_with(|| Value::String(value.clone()));
+            }
+            json!({
+                "name": entry.record.name,
+                "source_path": entry.record.source_path,
+                "installed_path": entry.record.installed_path,
+                "updated_at": entry.record.updated_at,
+                "description": description
+            })
+        })
+        .collect::<Vec<_>>();
 
     Ok(Json(json!({
         "storage": {
@@ -7753,6 +7605,7 @@ pub async fn list_global_skills(
             "skillsRoot": skills_root.to_string_lossy().to_string()
         },
         "descriptions": Value::Object(description_map),
+        "items": normalized_items,
         "imported": imported_payload,
         "localFolders": local_dirs,
         "runtime": runtime
@@ -8169,15 +8022,45 @@ async fn fetch_semantic_memory_rows(
         ("limit".to_string(), limit.to_string()),
         ("min_confidence".to_string(), min_confidence.to_string()),
     ];
-    let path = format!("/api/memory/agents/{agent_id}/unified-search");
-    let payload = match state.openfang.get_json_with_query(&path, &params).await {
+    let unified_path = format!("/api/memory/agents/{agent_id}/unified-search");
+    let payload = match state
+        .openfang
+        .get_json_with_query(&unified_path, &params)
+        .await
+    {
         Ok(data) => data,
         Err(error) if is_semantic_memory_endpoint_unavailable(&error) => {
+            let legacy_path = format!("/api/memory/agents/{agent_id}/search");
             tracing::warn!(
                 agent_id = %agent_id,
-                "semantic memory auto recall skipped because upstream endpoint is unavailable"
+                "unified memory endpoint unavailable, fallback to legacy semantic search"
             );
-            return Ok(None);
+            match state
+                .openfang
+                .get_json_with_query(&legacy_path, &params)
+                .await
+            {
+                Ok(data) => {
+                    let rows = data
+                        .get("memories")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    return Ok(Some(normalize_legacy_semantic_rows(
+                        rows,
+                        min_confidence,
+                        !query.trim().is_empty(),
+                    )));
+                }
+                Err(legacy_error) if is_semantic_memory_endpoint_unavailable(&legacy_error) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        "semantic memory auto recall skipped because upstream memory endpoints are unavailable"
+                    );
+                    return Ok(None);
+                }
+                Err(legacy_error) => return Err(legacy_error),
+            }
         }
         Err(error) => return Err(error),
     };
@@ -8191,10 +8074,7 @@ async fn fetch_semantic_memory_rows(
     // 注意：recent window (query="") 不应被阈值过滤，否则会导致完全无候选。
     if !query.trim().is_empty() {
         rows.retain(|row| {
-            row.get("score")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                >= min_confidence as f64
+            row.get("score").and_then(Value::as_f64).unwrap_or(0.0) >= min_confidence as f64
         });
     }
     Ok(Some(rows))
@@ -8246,7 +8126,10 @@ async fn fetch_unified_memory_debug_plan_lines(
     if !subject_plan.is_empty() {
         lines.push(format!("subject_plan: {} subjects", subject_plan.len()));
         for row in subject_plan.into_iter().take(10) {
-            let st = row.get("subject_type").and_then(Value::as_str).unwrap_or("");
+            let st = row
+                .get("subject_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let sid = row.get("subject_id").and_then(Value::as_str).unwrap_or("");
             let depth = row.get("depth").and_then(Value::as_u64).unwrap_or(0);
             let w = row.get("weight").and_then(Value::as_f64).unwrap_or(0.0);
@@ -8254,7 +8137,10 @@ async fn fetch_unified_memory_debug_plan_lines(
                 .get("relation_strength")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
-            lines.push(format!("- {}:{} depth={} w={:.2} rel={:.2}", st, sid, depth, w, rel));
+            lines.push(format!(
+                "- {}:{} depth={} w={:.2} rel={:.2}",
+                st, sid, depth, w, rel
+            ));
         }
     }
 
@@ -8445,6 +8331,7 @@ pub struct ChatMessageRequest {
     pub message: String,
     pub session_id: Option<String>,
     pub session_label: Option<String>,
+    pub request_origin: Option<String>,
     #[serde(default)]
     pub attachments: Vec<ChatMessageAttachmentRequest>,
 }
@@ -8467,6 +8354,20 @@ fn normalize_session_label(raw: &str) -> String {
         out.push(normalized);
     }
     out.trim_matches('_').to_string()
+}
+
+fn resolve_upstream_request_origin(
+    request_origin: Option<&str>,
+    session_label: Option<&str>,
+) -> Option<&'static str> {
+    let normalized_origin = request_origin.map(str::trim).filter(|value| !value.is_empty());
+    let normalized_label = session_label
+        .map(normalize_session_label)
+        .filter(|value| !value.is_empty());
+    match (normalized_origin, normalized_label.as_deref()) {
+        (Some("group_auto"), Some(label)) if label.starts_with("groupmem_") => Some("group_auto"),
+        _ => None,
+    }
 }
 
 async fn get_openfang_agent_session_id(
@@ -9823,24 +9724,20 @@ async fn resolve_semantic_memory_prompt(
         return Ok(None);
     }
 
-    let debug_plan_lines = match fetch_unified_memory_debug_plan_lines(
-        state,
-        agent_id,
-        &query,
-        config.recall_limit,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(
-                agent_id = %agent_id,
-                error = %error.message,
-                "semantic memory debug plan skipped due to error"
-            );
-            None
-        }
-    };
+    let debug_plan_lines =
+        match fetch_unified_memory_debug_plan_lines(state, agent_id, &query, config.recall_limit)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %error.message,
+                    "semantic memory debug plan skipped due to error"
+                );
+                None
+            }
+        };
 
     let mut lines = Vec::new();
     for (index, row) in rows.into_iter().enumerate() {
@@ -9872,10 +9769,7 @@ async fn resolve_semantic_memory_prompt(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("semantic_memory");
-        let score = row
-            .get("score")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
+        let score = row.get("score").and_then(Value::as_f64).unwrap_or_default();
         let event_type = row
             .get("event_type")
             .and_then(Value::as_str)
@@ -9932,7 +9826,9 @@ async fn resolve_semantic_memory_prompt(
         if let Some(w) = query_subject_weight {
             prefix.push_str(&format!(" [w={w:.2}]"));
         }
-        if let (Some(from_type), Some(from_id)) = (related_from_subject_type, related_from_subject_id) {
+        if let (Some(from_type), Some(from_id)) =
+            (related_from_subject_type, related_from_subject_id)
+        {
             prefix.push_str(&format!(" [from={from_type}:{from_id}]"));
         }
         lines.push(format!("{prefix} {summary} ({reason})"));
@@ -10053,6 +9949,22 @@ fn extract_text_from_json(value: &Value) -> Option<String> {
             None
         }
         _ => None,
+    }
+}
+
+fn append_renderable_stream_text(buffer: &mut String, data: &str) {
+    if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+        if let Some(text) = extract_text_from_json(&parsed) {
+            if !text.is_empty() {
+                buffer.push_str(&text);
+            }
+        }
+        return;
+    }
+
+    let trimmed = data.trim();
+    if !trimmed.is_empty() {
+        buffer.push_str(trimmed);
     }
 }
 
@@ -10231,6 +10143,10 @@ pub async fn chat_message(
         include_prompt_blocks,
     );
     let attachments = build_openfang_attachment_payload(&payload.attachments);
+    let request_origin = resolve_upstream_request_origin(
+        payload.request_origin.as_deref(),
+        payload.session_label.as_deref(),
+    );
     let path = format!("/api/agents/{agent_id}/message");
     let data = match state
         .openfang
@@ -10238,7 +10154,8 @@ pub async fn chat_message(
             &path,
             json!({
                 "message": outgoing_message,
-                "attachments": attachments
+                "attachments": attachments,
+                "request_origin": request_origin,
             }),
         )
         .await
@@ -10333,6 +10250,10 @@ pub async fn chat_message_stream(
         include_prompt_blocks,
     );
     let attachments = build_openfang_attachment_payload(&payload.attachments);
+    let request_origin = resolve_upstream_request_origin(
+        payload.request_origin.as_deref(),
+        payload.session_label.as_deref(),
+    );
     let baseline_assistant_count = current_session
         .as_ref()
         .map(|session| extract_assistant_texts(session).len())
@@ -10345,7 +10266,8 @@ pub async fn chat_message_stream(
             &path,
             json!({
                 "message": outgoing_message,
-                "attachments": attachments
+                "attachments": attachments,
+                "request_origin": request_origin,
             }),
         )
         .await
@@ -10399,6 +10321,7 @@ pub async fn chat_message_stream(
         let mut streamed_text = String::new();
         let mut saw_tool_result = false;
         let mut saw_upstream_done = false;
+        let mut saw_upstream_error = false;
         let baseline_assistant_count = baseline_assistant_count;
 
         while let Some(chunk) = upstream_stream.next().await {
@@ -10417,28 +10340,17 @@ pub async fn chat_message_stream(
 
                         if let Some((event_name, data)) = parse_sse_event_frame(&frame) {
                             if event_name == "chunk" || event_name == "message" {
-                                if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-                                    if let Some(text) =
-                                        parsed.get("content").and_then(Value::as_str)
-                                    {
-                                        streamed_text.push_str(text);
-                                    }
-                                } else {
-                                    streamed_text.push_str(&data);
-                                }
+                                append_renderable_stream_text(&mut streamed_text, &data);
                             }
                             if event_name == "tool_result" {
                                 saw_tool_result = true;
                             }
+                            if event_name == "error" {
+                                saw_upstream_error = true;
+                            }
                             if event_name == "done" {
                                 saw_upstream_done = true;
-                                if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-                                    if let Some(content) =
-                                        parsed.get("content").and_then(Value::as_str)
-                                    {
-                                        streamed_text.push_str(content);
-                                    }
-                                }
+                                append_renderable_stream_text(&mut streamed_text, &data);
                             }
                         }
                     }
@@ -10453,7 +10365,10 @@ pub async fn chat_message_stream(
             }
         }
 
-        if saw_upstream_done {
+        if saw_upstream_done
+            && !streamed_text.trim().is_empty()
+            && !looks_like_protocol_only_text(streamed_text.trim())
+        {
             restore_original_session().await;
             return;
         }
@@ -10507,6 +10422,15 @@ pub async fn chat_message_stream(
             tracing::info!(
                 agent_id = %agent_id,
                 "chat stream finished with tool_result only; skipping empty-stream error"
+            );
+            restore_original_session().await;
+            return;
+        }
+
+        if saw_upstream_error {
+            tracing::info!(
+                agent_id = %agent_id,
+                "chat stream finished with upstream error event; skipping empty-stream error"
             );
             restore_original_session().await;
             return;
@@ -10894,7 +10818,7 @@ fn extract_provider_ids_from_payload(payload: &Value) -> HashSet<String> {
         .map(|rows| {
             rows.iter()
                 .filter_map(|row| row.get("id").and_then(Value::as_str))
-                .map(normalize_runtime_provider_id)
+                .map(assignment_store::normalize_provider_id)
                 .filter(|value| !value.is_empty())
                 .collect::<HashSet<String>>()
         })
@@ -10934,17 +10858,14 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> Result<Json<V
         let Some(obj) = row.as_object_mut() else {
             continue;
         };
-        let raw_provider_id = obj
+        let provider_id = obj
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
+            .trim()
             .to_string();
-        let provider_id = normalize_runtime_provider_id(&raw_provider_id);
         if provider_id.is_empty() {
             continue;
-        }
-        if provider_id != raw_provider_id {
-            obj.insert("id".to_string(), json!(provider_id.clone()));
         }
         seen.insert(provider_id.clone());
         if let Some(cfg) = config_map.get(&provider_id) {
@@ -11153,16 +11074,14 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             continue;
         }
         for model_name in &cfg.models {
-            let model_name = strip_provider_prefixes(model_name, &cfg.provider_id)
-                .trim()
-                .to_string();
+            let model_name = model_name.trim().to_string();
             if model_name.is_empty() {
                 continue;
             }
             if !is_probably_chat_model(&cfg.provider_id, &model_name) {
                 continue;
             }
-            let model_id = format!("{}::{}", cfg.provider_id, model_name);
+            let model_id = assignment_store::make_model_id(&cfg.provider_id, &model_name);
             if synthetic_seen.contains(&model_id) {
                 continue;
             }
@@ -11194,23 +11113,24 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             .get("model")
             .and_then(Value::as_str)
             .or_else(|| obj.get("id").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .unwrap_or_default()
             .to_string();
-        let (provider_id, normalized_model) =
-            normalize_display_model_ref(raw_provider_id, &raw_model, &config_map);
-        if provider_id.is_empty() || normalized_model.is_empty() {
+        let provider_id = raw_provider_id.trim().to_string();
+        if provider_id.is_empty() || raw_model.is_empty() {
             continue;
         }
-        obj.insert("provider".to_string(), json!(provider_id.clone()));
         if !provider_linked(&provider_id) {
             continue;
         }
-        let model_id = assignment_store::make_model_id(&provider_id, &normalized_model);
+        let model_id = assignment_store::make_model_id(&provider_id, &raw_model);
         if !seen_model_ids.insert(model_id.clone()) {
             continue;
         }
         obj.insert("id".to_string(), json!(model_id.clone()));
-        obj.insert("model".to_string(), json!(normalized_model.clone()));
+        obj.insert("provider".to_string(), json!(provider_id.clone()));
+        obj.insert("model".to_string(), json!(raw_model.clone()));
         let display_name = obj
             .get("display_name")
             .and_then(Value::as_str)
@@ -11226,7 +11146,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Result<Json<Valu
         {
             obj.insert(
                 "display_name".to_string(),
-                json!(format!("{}/{}", provider_id, normalized_model)),
+                json!(format!("{}/{}", provider_id, raw_model)),
             );
         }
         if !obj.contains_key("available") {
@@ -11297,13 +11217,6 @@ pub async fn test_model_connection(
             "model 不能为空",
         ));
     }
-    let normalized_model = strip_provider_prefixes(&raw_model, &provider_id);
-    if normalized_model.trim().is_empty() {
-        return Err(ApiError::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            "model 无效",
-        ));
-    }
 
     let local_provider_config =
         assignment_store::get_provider_config(&provider_id).map_err(storage_error)?;
@@ -11337,10 +11250,9 @@ pub async fn test_model_connection(
         return match discover_models_from_provider(&provider_id, protocol, base_url, api_key).await
         {
             Ok(found_models) => {
-                let matched = found_models.iter().any(|item| {
-                    let normalized = strip_provider_prefixes(item, &provider_id);
-                    normalized.eq_ignore_ascii_case(normalized_model.as_str())
-                });
+                let matched = found_models
+                    .iter()
+                    .any(|item| item.trim().eq_ignore_ascii_case(raw_model.as_str()));
                 if matched {
                     Ok(Json(json!({
                         "ok": true,
@@ -11351,7 +11263,7 @@ pub async fn test_model_connection(
                     Ok(Json(json!({
                         "ok": false,
                         "status": "model_not_found",
-                        "message": format!("连接成功，但提供商返回的模型列表中未找到 `{}`", normalized_model)
+                        "message": format!("连接成功，但提供商返回的模型列表中未找到 `{}`", raw_model)
                     })))
                 }
             }
@@ -11400,8 +11312,7 @@ pub async fn test_model_connection(
             .and_then(Value::as_str)
             .or_else(|| row.get("id").and_then(Value::as_str))
             .unwrap_or_default();
-        let normalized = strip_provider_prefixes(row_model, row_provider);
-        normalized.eq_ignore_ascii_case(normalized_model.as_str())
+        row_model.trim().eq_ignore_ascii_case(raw_model.as_str())
     });
 
     if matched {
@@ -11416,7 +11327,7 @@ pub async fn test_model_connection(
             "status": "model_not_found",
             "message": format!(
                 "运行时未发现模型 `{}`（provider: `{}`）",
-                normalized_model,
+                raw_model,
                 provider_id
             ),
             "model_id": payload.model_id
@@ -11488,7 +11399,7 @@ pub async fn test_provider_connection(
             rows.iter().find(|row| {
                 row.get("id")
                     .and_then(Value::as_str)
-                    .map(normalize_runtime_provider_id)
+                    .map(assignment_store::normalize_provider_id)
                     .map(|value| value == provider_id)
                     .unwrap_or(false)
             })
@@ -11502,10 +11413,7 @@ pub async fn test_provider_connection(
             .to_ascii_lowercase();
         let configured = !auth_status.contains("missing") && !auth_status.contains("none");
         if configured {
-            let model_count = row
-                .get("model_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            let model_count = row.get("model_count").and_then(Value::as_u64).unwrap_or(0);
             return Ok(Json(json!({
                 "ok": true,
                 "status": "ok",
@@ -11614,7 +11522,6 @@ pub async fn create_custom_provider(
     let mut models = payload
         .models
         .into_iter()
-        .map(|item| strip_provider_prefixes(&item, &provider_id))
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect::<Vec<_>>();
@@ -11725,7 +11632,6 @@ pub async fn update_provider_config(
     if let Some(models) = payload.models {
         record.models = models
             .into_iter()
-            .map(|item| strip_provider_prefixes(&item, &provider_id))
             .map(|item| item.trim().to_string())
             .filter(|item| !item.is_empty())
             .collect();
@@ -12113,35 +12019,6 @@ async fn openfang_known_skill_names(
     Ok(names)
 }
 
-async fn openfang_bundled_skill_names(state: &Arc<AppState>) -> Result<Vec<String>, ApiError> {
-    let payload = state.openfang.get_json("/api/skills").await?;
-    let mut names = Vec::new();
-    let Some(skills) = payload.get("skills").and_then(Value::as_array) else {
-        return Ok(names);
-    };
-    for skill in skills {
-        let Some(name_raw) = skill.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let name = name_raw.trim();
-        if name.is_empty() {
-            continue;
-        }
-        let source_type = skill
-            .get("source")
-            .and_then(Value::as_object)
-            .and_then(|source| source.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if source_type.eq_ignore_ascii_case("bundled") {
-            names.push(name.to_string());
-        }
-    }
-    names.sort();
-    names.dedup();
-    Ok(names)
-}
-
 async fn sync_agent_mcp_assignments(
     state: &Arc<AppState>,
     agent_id: &str,
@@ -12277,18 +12154,25 @@ async fn openfang_known_mcp_server_names(
 }
 
 fn global_custom_skill_names() -> Result<Vec<String>, ApiError> {
-    let mut names = assignment_store::list_imported_skills()
-        .map_err(storage_error)?
-        .into_iter()
-        .map(|record| record.name.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
-
+    let mut names = Vec::new();
     let skills_root = assignment_store::skills_root().map_err(storage_error)?;
     if skills_root.exists() {
         let dirs = list_child_dirs(&skills_root)
             .map_err(|e| storage_error(format!("读取技能目录失败: {e}")))?;
-        names.extend(dirs.into_iter().filter(|name| !name.trim().is_empty()));
+        for folder_name in dirs {
+            let trimmed = folder_name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let skill_dir = skills_root.join(trimmed);
+            let display_name = read_skill_name_from_dir(&skill_dir)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| trimmed.to_string());
+            if display_name.eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME) {
+                continue;
+            }
+            names.push(display_name);
+        }
     }
 
     names.sort();
@@ -13671,6 +13555,40 @@ fn parse_skill_description_from_markdown(content: &str) -> Option<String> {
     None
 }
 
+fn read_skill_frontmatter_field(markdown: &str, field_name: &str) -> Option<String> {
+    let mut lines = markdown.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case(field_name) {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+        if value.is_empty() || value == "|" || value == ">" {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn read_skill_name_from_dir(skill_dir: &StdPath) -> Option<String> {
+    let skill_md = skill_dir.join("SKILL.md");
+    if !skill_md.is_file() {
+        return None;
+    }
+    let content = fs::read_to_string(skill_md).ok()?;
+    read_skill_frontmatter_field(&content, "name")
+}
+
 fn read_skill_description_from_dir(skill_dir: &StdPath) -> Option<String> {
     let skill_md = skill_dir.join("SKILL.md");
     if !skill_md.is_file() {
@@ -13720,6 +13638,65 @@ fn list_child_dirs(root: &StdPath) -> Result<Vec<String>, std::io::Error> {
     }
     names.sort();
     Ok(names)
+}
+
+fn skill_folder_name_from_record(record: &assignment_store::ImportedSkillRecord) -> Option<String> {
+    let installed = record.installed_path.trim();
+    if !installed.is_empty() {
+        if let Some(folder_name) = PathBuf::from(installed)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+        {
+            return Some(folder_name);
+        }
+    }
+
+    let name = record.name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn extract_runtime_skill_entries(payload: &Value) -> Vec<RuntimeSkillListEntry> {
+    let Some(skills) = payload.get("skills").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut entries = Vec::new();
+    for skill in skills {
+        let Some(name_raw) = skill.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name_raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let description = skill
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let source_type = skill
+            .get("source")
+            .and_then(Value::as_object)
+            .and_then(|source| source.get("type"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("local")
+            .to_string();
+        entries.push(RuntimeSkillListEntry {
+            name: name.to_string(),
+            description,
+            source_type,
+        });
+    }
+    entries
 }
 
 fn normalize_zip_entry_path(raw: &str) -> String {
@@ -13855,6 +13832,9 @@ fn validate_skill_dir(source: &StdPath) -> Result<(), ApiError> {
 }
 
 fn infer_skill_name(source: &StdPath) -> Result<String, ApiError> {
+    if let Some(name) = read_skill_name_from_dir(source).filter(|name| !name.trim().is_empty()) {
+        return Ok(name);
+    }
     source
         .file_name()
         .and_then(|name| name.to_str())
@@ -14084,90 +14064,19 @@ fn resolve_assignment(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_upstream_model_selector, normalize_display_model_ref,
-        normalize_runtime_applied_model, normalize_runtime_provider_id,
-        resolve_provider_model_pair, strip_provider_prefixes,
-    };
-    use crate::assignment_store::ProviderConfigRecord;
-    use std::collections::HashMap;
+    use crate::assignment_store::{make_model_id, normalize_provider_id};
 
-    fn provider_record(provider_id: &str, models: &[&str]) -> ProviderConfigRecord {
-        ProviderConfigRecord {
-            provider_id: provider_id.to_string(),
-            display_name: Some(provider_id.to_string()),
-            protocol: "openai".to_string(),
-            base_url: Some("https://example.com/v1".to_string()),
-            api_key: Some("test-key".to_string()),
-            models: models.iter().map(|item| item.to_string()).collect(),
-            is_custom: false,
-            updated_at: "2026-03-16 00:00:00".to_string(),
-        }
+    #[test]
+    fn provider_id_keeps_original_config_value() {
+        assert_eq!(normalize_provider_id(" nvidia-nim "), "nvidia-nim");
+        assert_eq!(normalize_provider_id("NVIDIA"), "NVIDIA");
     }
 
     #[test]
-    fn nvidia_runtime_provider_alias_is_normalized() {
-        assert_eq!(normalize_runtime_provider_id("nvidia-nim"), "nvidia");
-        assert_eq!(normalize_runtime_provider_id("NVIDIA"), "nvidia");
-    }
-
-    #[test]
-    fn strip_provider_prefixes_accepts_nvidia_aliases() {
+    fn model_id_keeps_namespaced_model_value() {
         assert_eq!(
-            strip_provider_prefixes("nvidia-nim/xianyu/glm-4.7", "nvidia"),
-            "xianyu/glm-4.7"
-        );
-        assert_eq!(
-            strip_provider_prefixes("nvidia/xianyu/glm-4.7", "nvidia-nim"),
-            "xianyu/glm-4.7"
-        );
-    }
-
-    #[test]
-    fn build_upstream_selector_uses_runtime_provider_id_for_nim() {
-        assert_eq!(
-            build_upstream_model_selector(Some("nvidia-nim"), "xianyu/glm-4.7"),
-            Some("nvidia/xianyu/glm-4.7".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_provider_model_pair_preserves_namespaced_model_for_nim() {
-        assert_eq!(
-            resolve_provider_model_pair(Some("nvidia-nim"), "xianyu/glm-4.7"),
-            Some(("nvidia".to_string(), "xianyu/glm-4.7".to_string()))
-        );
-    }
-
-    #[test]
-    fn normalize_runtime_applied_model_strips_mismatched_nvidia_prefix() {
-        assert_eq!(
-            normalize_runtime_applied_model("nvidia", "nvidia", "nvidia-nim/xianyu/glm-4.7"),
-            ("nvidia".to_string(), "xianyu/glm-4.7".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_display_model_prefers_local_namespaced_provider() {
-        let mut provider_configs = HashMap::new();
-        provider_configs.insert(
-            "xianyu".to_string(),
-            provider_record("xianyu", &["glm-4.7", "minimax-m2.5"]),
-        );
-
-        assert_eq!(
-            normalize_display_model_ref("nvidia", "xianyu/minimax-m2.5", &provider_configs),
-            ("xianyu".to_string(), "minimax-m2.5".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_display_model_keeps_wrapper_provider_without_local_match() {
-        let provider_configs = HashMap::new();
-
-        assert_eq!(
-            normalize_display_model_ref("nvidia", "qwen/qwen3.5-397b-a17b", &provider_configs),
-            ("nvidia".to_string(), "qwen/qwen3.5-397b-a17b".to_string())
+            make_model_id("nvidia-nim", "xianyu/glm-4.7"),
+            "nvidia-nim::xianyu/glm-4.7"
         );
     }
 }

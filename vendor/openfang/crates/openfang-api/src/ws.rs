@@ -1088,6 +1088,10 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             "phase": phase,
             "detail": detail,
         })),
+        StreamEvent::Error { message } => Some(serde_json::json!({
+            "type": "error",
+            "error": message,
+        })),
         _ => None, // Skip ToolInputDelta, ContentComplete
     }
 }

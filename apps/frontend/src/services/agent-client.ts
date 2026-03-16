@@ -563,7 +563,18 @@ function buildRecoveredSessionLabel(baseLabel: string, agentId: string): string 
   return `${base}_recover_${stamp}_${suffix}`;
 }
 
-type ChatRecoveryReason = 'session_conflict' | 'context_overflow';
+type ChatRecoveryReason = 'session_conflict' | 'context_overflow' | 'quota_exceeded';
+
+function isQuotaExceededFailure(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes('resource quota exceeded')
+    || text.includes('quota exceeded')
+    || text.includes('rate limit exceeded')
+    || (text.includes('http 429') && text.includes('token limit exceeded'))
+  );
+}
 
 function isRecoverableStreamingFailure(message: string): boolean {
   const text = message.trim().toLowerCase();
@@ -592,6 +603,9 @@ function resolveChatRecoveryReason(result: AgentChatResult): ChatRecoveryReason 
   if (result.success) return null;
   const message = result.error || result.content || '';
   if ((result.content || '').trim()) return null;
+  if (isQuotaExceededFailure(message)) {
+    return 'quota_exceeded';
+  }
   if (isContextOverflowFailure(message)) {
     return 'context_overflow';
   }
@@ -1492,6 +1506,7 @@ async function sendAgentChatStreamOnce(input: AgentChatInput): Promise<AgentChat
 
     const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
     const sessionLabel = typeof input.sessionLabel === 'string' ? input.sessionLabel.trim() : '';
+    const requestOrigin = input.requestOrigin;
 
     // Tauri 下默认走 WS；但会话隔离需要 session_id/session_label 时，强制走 service-rs SSE 代理，确保命中目标会话。
     if (!isTauriRuntime() || sessionId || sessionLabel) {
@@ -1622,6 +1637,7 @@ async function sendAgentChatStreamOnce(input: AgentChatInput): Promise<AgentChat
             attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
             session_id: sessionId || undefined,
             session_label: sessionLabel || undefined,
+            request_origin: requestOrigin,
           },
           signal: controller.signal,
         },
@@ -1974,7 +1990,7 @@ async function sendAgentChatStream(input: AgentChatInput): Promise<AgentChatResu
   if (!recoveryReason) {
     return firstResult;
   }
-  if (recoveryReason === 'context_overflow') {
+  if (recoveryReason === 'context_overflow' || recoveryReason === 'quota_exceeded') {
     return {
       ...firstResult,
       recoveryReason,
@@ -2048,6 +2064,7 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
     const sendOnce = async (requestInput: AgentChatInput): Promise<AgentChatResult> => {
       const nextSessionId = typeof requestInput.sessionId === 'string' ? requestInput.sessionId.trim() : '';
       const nextSessionLabel = typeof requestInput.sessionLabel === 'string' ? requestInput.sessionLabel.trim() : '';
+      const requestOrigin = requestInput.requestOrigin;
       const result = await requestJson<unknown>(`/api/chat/${encodeURIComponent(requestInput.agentId)}/message`, {
         method: 'POST',
         body: {
@@ -2055,6 +2072,7 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
           attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
           session_id: nextSessionId || undefined,
           session_label: nextSessionLabel || undefined,
+          request_origin: requestOrigin,
         },
         signal: controller.signal,
       });
@@ -2090,7 +2108,7 @@ export async function sendAgentChat(input: AgentChatInput): Promise<AgentChatRes
       if (!recoveryReason) {
         return failed;
       }
-      if (recoveryReason === 'context_overflow') {
+      if (recoveryReason === 'context_overflow' || recoveryReason === 'quota_exceeded') {
         return {
           ...failed,
           recoveryReason,

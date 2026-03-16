@@ -781,7 +781,7 @@ function SkillsTab() {
     const globalWindow = window as unknown as { __TAURI_INTERNALS__?: unknown };
     return Boolean(globalWindow.__TAURI_INTERNALS__);
   }, []);
-  const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [skills, setSkills] = useState<Array<SkillItem & { canDelete: boolean }>>([]);
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
@@ -797,103 +797,19 @@ function SkillsTab() {
     setLoading(true);
     try {
       const payload = await getGlobalSkills();
-      const merged = new Map<string, SkillItem>();
-      const localFolderSet = new Set(payload.localFolders.map((item) => item.trim()).filter(Boolean));
-      const descriptionMap = payload.descriptions ?? {};
-
-      const pickDescription = (name: string, runtimeDescription?: string): string => {
-        const runtimeText = (runtimeDescription ?? '').trim();
-        if (runtimeText) {
-          return runtimeText;
-        }
-        const mapped = (descriptionMap[name] ?? '').trim();
-        if (mapped) {
-          return mapped;
-        }
-        return '未提供功能描述';
-      };
-
-      for (const runtimeSkill of payload.runtime.skills) {
-        const name = (runtimeSkill.name ?? '').trim();
-        if (!name) {
-          continue;
-        }
-        const sourceType = (runtimeSkill.source?.type ?? '').toLowerCase();
-        const isLocalFolder = localFolderSet.has(name);
-        const path = isLocalFolder
-          ? (payload.storage.skillsRoot
-              ? `${payload.storage.skillsRoot}\\${name}`
-              : `~/.webot/skills/${name}`)
-          : sourceType
-            ? `runtime://${sourceType}/${name}`
-            : `runtime://skill/${name}`;
-        merged.set(name, {
-          id: name,
-          metadata: {
-            name,
-            description: pickDescription(name, runtimeSkill.description),
-            location: '',
-          },
-          path,
-          isSystem: sourceType === 'system' || sourceType === 'openclaw',
-          isNew: false,
-        });
-      }
-
-      for (const folderName of payload.localFolders) {
-        const name = folderName.trim();
-        if (!name || merged.has(name)) {
-          continue;
-        }
-        const path = payload.storage.skillsRoot
-          ? `${payload.storage.skillsRoot}\\${name}`
-          : `~/.webot/skills/${name}`;
-        merged.set(name, {
-          id: name,
-          metadata: {
-            name,
-            description: pickDescription(name),
-            location: '',
-          },
-          path,
-          isSystem: false,
-          isNew: false,
-        });
-      }
-
-      for (const imported of payload.imported) {
-        const name = imported.name.trim();
-        if (!name) {
-          continue;
-        }
-        const existing = merged.get(name);
-        const description = pickDescription(name, imported.description || existing?.metadata.description);
-        if (existing) {
-          merged.set(name, {
-            ...existing,
-            metadata: {
-              ...existing.metadata,
-              description,
-              location: '',
-            },
-            isNew: existing.isNew || true,
-          });
-          continue;
-        }
-        merged.set(name, {
-          id: name,
-          metadata: {
-            name,
-            description,
-            location: '',
-          },
-          path: imported.installed_path || imported.source_path,
-          isSystem: false,
-          isNew: true,
-        });
-      }
-
-      setSkills(Array.from(merged.values()).sort((a, b) => a.metadata.name.localeCompare(b.metadata.name)));
+      const normalized = payload.items.map((item) => ({
+        id: item.id,
+        metadata: {
+          name: item.name,
+          description: item.description?.trim() || '未提供功能描述',
+          location: '',
+        },
+        path: item.path,
+        isSystem: item.isSystem,
+        isNew: item.isImported,
+        canDelete: item.canDelete,
+      }));
+      setSkills(normalized.sort((a, b) => a.metadata.name.localeCompare(b.metadata.name)));
     } catch (error) {
       console.error('[Skills] 加载失败:', error);
       alert(t('settings.skillsImportFailed'));
@@ -1162,7 +1078,7 @@ function SkillsTab() {
                   </p>
                 </div>
               </div>
-              {!skill.isSystem && (
+              {skill.canDelete && (
                 <Button
                   variant="ghost"
                   size="sm"

@@ -2,7 +2,7 @@ import type { ChatAttachment, Message, MessageToolCall, MessageTrace } from '@/d
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import type { ChatTaskLifecycleItem } from '@/types/chat-task';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
-import type { GroupMemoryDigest, GroupQueueItem, GroupSessionRuntime } from '@/types/group';
+import type { GroupAgentContextDigest, GroupMemoryDigest, GroupQueueItem, GroupSessionRuntime } from '@/types/group';
 
 const STORAGE_KEY = 'webot-chat-sessions-v1';
 const A2A_PLACEHOLDER_AGENT_ID = 'unknown-agent';
@@ -167,9 +167,35 @@ function normalizeGroupMemoryDigest(raw: unknown): GroupMemoryDigest | undefined
   }
   return {
     summary,
+    goal: typeof item.goal === 'string' && item.goal.trim() ? item.goal.trim() : undefined,
+    decisions: Array.isArray(item.decisions)
+      ? item.decisions.filter((row): row is string => typeof row === 'string' && row.trim().length > 0).map((row) => row.trim()).slice(0, 5)
+      : undefined,
+    openQuestions: Array.isArray(item.openQuestions)
+      ? item.openQuestions.filter((row): row is string => typeof row === 'string' && row.trim().length > 0).map((row) => row.trim()).slice(0, 4)
+      : undefined,
     speakerLine: typeof item.speakerLine === 'string' && item.speakerLine.trim() ? item.speakerLine.trim() : undefined,
     pendingLine: typeof item.pendingLine === 'string' && item.pendingLine.trim() ? item.pendingLine.trim() : undefined,
     lastUserIntent: typeof item.lastUserIntent === 'string' && item.lastUserIntent.trim() ? item.lastUserIntent.trim() : undefined,
+    updatedAt,
+  };
+}
+
+function normalizeGroupAgentContextDigest(raw: unknown): GroupAgentContextDigest | undefined {
+  const item = isRecord(raw) ? raw : null;
+  if (!item) return undefined;
+  const agentId = typeof item.agentId === 'string' ? item.agentId.trim() : '';
+  const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
+  const updatedAt = typeof item.updatedAt === 'string' ? item.updatedAt.trim() : '';
+  if (!agentId || !summary || !updatedAt) {
+    return undefined;
+  }
+  return {
+    agentId,
+    summary,
+    ownRecentLine: typeof item.ownRecentLine === 'string' && item.ownRecentLine.trim() ? item.ownRecentLine.trim() : undefined,
+    mentionLine: typeof item.mentionLine === 'string' && item.mentionLine.trim() ? item.mentionLine.trim() : undefined,
+    todoLine: typeof item.todoLine === 'string' && item.todoLine.trim() ? item.todoLine.trim() : undefined,
     updatedAt,
   };
 }
@@ -198,6 +224,13 @@ function normalizeGroupRuntime(raw: unknown): GroupSessionRuntime | undefined {
     lastCompactedAt: typeof item.lastCompactedAt === 'string' && item.lastCompactedAt.trim() ? item.lastCompactedAt.trim() : undefined,
     lastEventAt: typeof item.lastEventAt === 'string' && item.lastEventAt.trim() ? item.lastEventAt.trim() : undefined,
     memoryDigest: normalizeGroupMemoryDigest(item.memoryDigest),
+    agentContextDigests: isRecord(item.agentContextDigests)
+      ? Object.fromEntries(
+        Object.entries(item.agentContextDigests)
+          .map(([agentId, digest]) => [agentId.trim(), normalizeGroupAgentContextDigest(digest)] as const)
+          .filter((entry): entry is readonly [string, GroupAgentContextDigest] => Boolean(entry[0]) && entry[1] != null),
+      )
+      : undefined,
   };
 }
 
@@ -207,6 +240,11 @@ function cloneGroupRuntime(runtime?: GroupSessionRuntime): GroupSessionRuntime |
     ...runtime,
     queue: runtime.queue.map((item) => ({ ...item })),
     memoryDigest: runtime.memoryDigest ? { ...runtime.memoryDigest } : undefined,
+    agentContextDigests: runtime.agentContextDigests
+      ? Object.fromEntries(
+        Object.entries(runtime.agentContextDigests).map(([agentId, digest]) => [agentId, { ...digest }]),
+      )
+      : undefined,
   };
 }
 

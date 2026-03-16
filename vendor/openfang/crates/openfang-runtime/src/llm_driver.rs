@@ -123,6 +123,8 @@ pub enum StreamEvent {
         is_error: bool,
         input: Option<serde_json::Value>,
     },
+    /// Streaming pipeline failed before a final answer could be produced.
+    Error { message: String },
 }
 
 /// Trait for LLM drivers.

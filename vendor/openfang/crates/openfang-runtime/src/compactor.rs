@@ -59,7 +59,7 @@ impl Default for CompactionConfig {
             max_chunk_chars: 80_000,
             max_retries: 3,
             token_threshold_ratio: 0.7,
-            context_window_tokens: 200_000,
+            context_window_tokens: 1_000_000,
         }
     }
 }
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(config.keep_recent, 10);
         assert_eq!(config.max_summary_tokens, 1024);
         assert!((config.token_threshold_ratio - 0.7).abs() < f64::EPSILON);
-        assert_eq!(config.context_window_tokens, 200_000);
+        assert_eq!(config.context_window_tokens, 1_000_000);
     }
 
     #[tokio::test]
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(config.max_chunk_chars, 80_000);
         assert_eq!(config.max_retries, 3);
         assert!((config.token_threshold_ratio - 0.7).abs() < f64::EPSILON);
-        assert_eq!(config.context_window_tokens, 200_000);
+        assert_eq!(config.context_window_tokens, 1_000_000);
     }
 
     #[tokio::test]

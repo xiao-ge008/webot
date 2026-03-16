@@ -51,7 +51,7 @@ impl ContextBudget {
 
 impl Default for ContextBudget {
     fn default() -> Self {
-        Self::new(200_000)
+        Self::new(1_000_000)
     }
 }
 
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn test_budget_defaults() {
         let budget = ContextBudget::default();
-        assert_eq!(budget.context_window_tokens, 200_000);
+        assert_eq!(budget.context_window_tokens, 1_000_000);
         // 30% of 200K * 2.0 chars/token = 120K chars
         assert_eq!(budget.per_result_cap(), 120_000);
     }

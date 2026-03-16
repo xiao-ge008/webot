@@ -460,12 +460,10 @@ export function ChatConversationPane({
   const [copiedTraceKey, setCopiedTraceKey] = useState('');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
-  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const autoStickToBottomRef = useRef(true);
   const scrollRafRef = useRef<number | null>(null);
-  const taskHighlightTimerRef = useRef<number | null>(null);
   const mixedSegmentsCacheRef = useRef<Map<string, MixedRenderSegment[]>>(new Map());
   const imageInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1130,107 +1128,6 @@ export function ChatConversationPane({
     return date.toLocaleString();
   };
 
-  const a2aEventLabel = (kind?: A2AWorkCardData['latestEventKind']): string => {
-    if (kind === 'started') return '启动';
-    if (kind === 'final') return '总结';
-    if (kind === 'failed') return '失败';
-    return '进度';
-  };
-
-  const a2aEventClass = (card: A2AWorkCardData): string => {
-    if (card.status === 'failed' || card.latestEventKind === 'failed') return 'text-destructive';
-    if (card.status === 'completed' || card.latestEventKind === 'final') return 'text-success';
-    return 'text-primary';
-  };
-
-  type ConversationAsyncItem =
-    | {
-      id: string;
-      messageId: string;
-      kind: 'task';
-      sortAt: number;
-      active: boolean;
-      taskCard: ChatTaskCardData;
-    }
-    | {
-      id: string;
-      messageId: string;
-      kind: 'a2a';
-      sortAt: number;
-      active: boolean;
-      a2aCard: A2AWorkCardData;
-    };
-
-  const conversationAsyncItems = useMemo<ConversationAsyncItem[]>(() => {
-    const unique = new Map<string, ConversationAsyncItem>();
-    messages.forEach((message) => {
-      if (message.taskCard) {
-        const card = message.taskCard;
-        const key = `task:${card.taskId || message.id}`;
-        const sortAtRaw = Date.parse(card.latestReportAt || card.updatedAt || card.createdAt);
-        unique.set(key, {
-          id: key,
-          messageId: message.id,
-          kind: 'task',
-          sortAt: Number.isFinite(sortAtRaw) ? sortAtRaw : 0,
-          active: card.stage === 'running' || card.stage === 'scheduled',
-          taskCard: card,
-        });
-      }
-      if (message.a2aCards && message.a2aCards.length > 0) {
-        getVisibleA2aCards(message.a2aCards).forEach((card) => {
-          const key = `a2a:${card.id}`;
-          const sortAtRaw = Date.parse(card.latestEventAt || card.finishedAt || card.startedAt);
-          unique.set(key, {
-            id: key,
-            messageId: message.id,
-            kind: 'a2a',
-            sortAt: Number.isFinite(sortAtRaw) ? sortAtRaw : 0,
-            active: card.status === 'working',
-            a2aCard: card,
-          });
-        });
-      }
-    });
-    return [...unique.values()].sort((left, right) => {
-      const leftActive = left.active ? 1 : 0;
-      const rightActive = right.active ? 1 : 0;
-      if (leftActive !== rightActive) {
-        return rightActive - leftActive;
-      }
-      return right.sortAt - left.sortAt;
-    });
-  }, [messages]);
-
-  const scrollToTaskMessage = useCallback((messageId: string) => {
-    const container = contentRef.current;
-    if (!container || !messageId) {
-      return;
-    }
-    const escaped = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-      ? CSS.escape(messageId)
-      : messageId.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const target = container.querySelector(`[data-message-id="${escaped}"]`) as HTMLElement | null;
-    if (!target) {
-      return;
-    }
-    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    setHighlightedMessageId(messageId);
-    if (taskHighlightTimerRef.current != null) {
-      window.clearTimeout(taskHighlightTimerRef.current);
-    }
-    taskHighlightTimerRef.current = window.setTimeout(() => {
-      setHighlightedMessageId((current) => (current === messageId ? null : current));
-      taskHighlightTimerRef.current = null;
-    }, 2400);
-  }, []);
-
-  useEffect(() => () => {
-    if (taskHighlightTimerRef.current != null) {
-      window.clearTimeout(taskHighlightTimerRef.current);
-    }
-  }, []);
-
   const renderTaskCard = (msg: Message, taskCard: ChatTaskCardData) => {
     const stage = taskCard.stage;
     const logCount = taskCard.logCount ?? taskCard.runCount;
@@ -1424,143 +1321,6 @@ export function ChatConversationPane({
           </div>
         </CardContent>
       </Card>
-    );
-  };
-
-  const renderConversationTaskList = () => {
-    if (conversationAsyncItems.length === 0) {
-      return null;
-    }
-    const visibleTasks = conversationAsyncItems.slice(0, 10);
-    return (
-      <div className="mb-4 rounded-2xl border border-border/60 bg-gradient-to-br from-muted/30 via-background to-muted/10 p-3 shadow-sm">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/80">当前会话异步任务</p>
-            <p className="text-xs text-muted-foreground">定时任务、长任务和 A2A 协作都只在当前聊天里闭环管理</p>
-          </div>
-          <div className="rounded-full border border-border/70 bg-background/80 px-2.5 py-1 text-[11px] font-medium text-foreground/80">
-            {conversationAsyncItems.length} 项
-          </div>
-        </div>
-        <div className="space-y-2">
-          {visibleTasks.map((item) => {
-            if (item.kind === 'task') {
-              const { messageId, taskCard: card } = item;
-              const latestEntry = card.timeline?.[card.timeline.length - 1];
-              const canOpenDetails = Boolean(
-                card.taskId
-                || card.timeline?.length
-                || card.finalSummaryText
-                || card.errorSummary,
-              );
-              return (
-                <div
-                  key={item.id}
-                  className="flex items-start justify-between gap-3 rounded-xl border border-border/60 bg-background/85 px-3 py-2.5"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-semibold">{card.taskName}</span>
-                      <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-bold text-white', taskStageClass(card.stage))}>
-                        {taskStageLabel(card.stage)}
-                      </span>
-                    </div>
-                    <div className="mt-1 text-[11px] text-muted-foreground">
-                      {taskKindLabel(card.taskKind)} · {card.maxRuns > 0 ? `${card.runCount}/${card.maxRuns}` : `${card.runCount} 次`}
-                      {typeof card.progressPercent === 'number' ? ` · ${card.progressPercent}%` : ''}
-                    </div>
-                    {latestEntry ? (
-                      <div className="mt-1 text-[11px] leading-5 text-foreground/80">
-                        <span className={cn('font-semibold', taskTimelineClass(latestEntry))}>{taskTimelineLabel(latestEntry.kind)}</span>
-                        {' · '}
-                        {latestEntry.title}
-                        {latestEntry.detail ? `：${latestEntry.detail}` : ''}
-                      </div>
-                    ) : null}
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="h-7 rounded-md px-3 text-[11px] font-semibold"
-                      onClick={() => scrollToTaskMessage(messageId)}
-                    >
-                      定位
-                    </Button>
-                    {canOpenDetails ? (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 rounded-md px-3 text-[11px] font-semibold gap-1.5"
-                        onClick={() => onOpenTaskCardDetails({ taskId: card.taskId, messageId })}
-                      >
-                        <ListChecks className="w-3 h-3" />
-                        详情
-                      </Button>
-                    ) : null}
-                  </div>
-                </div>
-              );
-            }
-
-            const { messageId, a2aCard: card } = item;
-            const latestLabel = card.latestEventTitle || card.summary || a2aStatusText(card);
-            const latestDetail = card.finalReportText || card.logs[card.logs.length - 1]?.detail || card.objective || '';
-            return (
-              <div
-                key={item.id}
-                className="flex items-start justify-between gap-3 rounded-xl border border-border/60 bg-background/85 px-3 py-2.5"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-semibold">{getA2aCardDisplayName(card)}</span>
-                    <span className={cn(
-                      'rounded-full px-2 py-0.5 text-[10px] font-bold text-white',
-                      card.status === 'completed' ? 'bg-success' : card.status === 'failed' ? 'bg-destructive' : 'bg-primary',
-                    )}>
-                      {a2aStatusText(card)}
-                    </span>
-                  </div>
-                  <div className="mt-1 text-[11px] text-muted-foreground">
-                    A2A 协作任务 · {card.logs.length} 条调用日志
-                    {card.bindingSessionId ? ' · 已绑定当前会话' : ''}
-                  </div>
-                  <div className="mt-1 text-[11px] leading-5 text-foreground/80">
-                    <span className={cn('font-semibold', a2aEventClass(card))}>{a2aEventLabel(card.latestEventKind)}</span>
-                    {' · '}
-                    {latestLabel}
-                    {latestDetail ? `：${latestDetail.length > 120 ? `${latestDetail.slice(0, 120)}...` : latestDetail}` : ''}
-                  </div>
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-7 rounded-md px-3 text-[11px] font-semibold"
-                    onClick={() => scrollToTaskMessage(messageId)}
-                  >
-                    定位
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 rounded-md px-3 text-[11px] font-semibold gap-1.5"
-                    onClick={() => onOpenA2aCardDetails(messageId, card.id)}
-                  >
-                    <ListChecks className="w-3 h-3" />
-                    详情
-                  </Button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
     );
   };
 
@@ -2187,7 +1947,6 @@ export function ChatConversationPane({
                         className={cn(
                           'transition-colors',
                           itemIndex > 0 ? 'border-t border-border/40 pt-4' : '',
-                          highlightedMessageId === item.id ? 'rounded-xl bg-primary/5 ring-1 ring-primary/30 px-3 py-3' : '',
                         )}
                       >
                         {renderMessageBody(item, isUser, {
@@ -2293,7 +2052,6 @@ export function ChatConversationPane({
 
       <div ref={scrollRef} className="chat-messages" onScroll={handleScroll}>
         <div ref={contentRef} className="chat-messages-content">
-          {renderConversationTaskList()}
           {messageRows}
           {streamingRow}
         </div>

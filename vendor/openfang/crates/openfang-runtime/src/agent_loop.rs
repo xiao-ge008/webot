@@ -70,7 +70,7 @@ pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
 }
 
 /// Default context window size (tokens) for token-based trimming.
-const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
+const DEFAULT_CONTEXT_WINDOW: usize = 1_000_000;
 
 const MEMORY_RECALL_LIMIT: usize = 8;
 const TOPIC_SUMMARY_TRIGGER_MESSAGES: usize = 12;
@@ -2662,7 +2662,7 @@ mod tests {
     #[test]
     fn test_dynamic_truncate_short_unchanged() {
         use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
-        let budget = ContextBudget::new(200_000);
+        let budget = ContextBudget::new(1_000_000);
         let short = "Hello, world!";
         assert_eq!(truncate_tool_result_dynamic(short, &budget), short);
     }
@@ -2670,7 +2670,7 @@ mod tests {
     #[test]
     fn test_dynamic_truncate_over_limit() {
         use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
-        let budget = ContextBudget::new(200_000);
+        let budget = ContextBudget::new(1_000_000);
         let long = "x".repeat(budget.per_result_cap() + 10_000);
         let result = truncate_tool_result_dynamic(&long, &budget);
         assert!(result.len() <= budget.per_result_cap() + 200);

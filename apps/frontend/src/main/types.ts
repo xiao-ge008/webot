@@ -410,6 +410,7 @@ export interface AgentChatInput {
   renderMode?: (typeof CHAT_RENDER_MODES)[keyof typeof CHAT_RENDER_MODES] | string;
   sessionId?: string;
   sessionLabel?: string;
+  requestOrigin?: 'group_auto';
   systemPreamble?: string;
   homeDirOverride?: string;
 }
@@ -424,7 +425,7 @@ export interface AgentChatResult {
   usedFallback?: boolean;
   recoveredSessionLabel?: string;
   recoveredRemoteSessionId?: string;
-  recoveryReason?: 'session_conflict' | 'context_overflow';
+  recoveryReason?: 'session_conflict' | 'context_overflow' | 'quota_exceeded';
 }
 
 export interface AgentChatStreamChunk {
