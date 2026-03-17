@@ -4,10 +4,12 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tauri::AppHandle;
+use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 
@@ -32,6 +34,65 @@ pub struct AppMetadata {
 pub struct UpdateInstallResult {
     pub installer_path: String,
     pub launched: bool,
+}
+
+const UPDATE_INSTALL_PROGRESS_EVENT: &str = "update-install-progress";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInstallProgressPayload {
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installer_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launched: Option<bool>,
+}
+
+fn compute_progress_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> Option<f64> {
+    total_bytes.and_then(|total| {
+        if total == 0 {
+            None
+        } else {
+            Some(((downloaded_bytes as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+        }
+    })
+}
+
+fn emit_update_install_progress(
+    app: &AppHandle,
+    payload: UpdateInstallProgressPayload,
+) {
+    let _ = app.emit(UPDATE_INSTALL_PROGRESS_EVENT, payload);
+}
+
+fn emit_update_install_failed(
+    app: &AppHandle,
+    file_name: &str,
+    message: String,
+) {
+    emit_update_install_progress(
+        app,
+        UpdateInstallProgressPayload {
+            phase: "failed".to_string(),
+            downloaded_bytes: None,
+            total_bytes: None,
+            progress_percent: None,
+            message: Some(message),
+            file_name: Some(file_name.to_string()),
+            installer_path: None,
+            launched: None,
+        },
+    );
 }
 
 #[tauri::command]
@@ -691,12 +752,34 @@ pub async fn download_and_install_update(
     }
 
     let sanitized_name = sanitize_download_name(&file_name);
+    emit_update_install_progress(
+        &app,
+        UpdateInstallProgressPayload {
+            phase: "preparing".to_string(),
+            downloaded_bytes: Some(0),
+            total_bytes: None,
+            progress_percent: Some(0.0),
+            message: Some("正在准备下载安装包...".to_string()),
+            file_name: Some(sanitized_name.clone()),
+            installer_path: None,
+            launched: None,
+        },
+    );
+
     let temp_root = app
         .path()
         .temp_dir()
-        .map_err(|err| format!("读取临时目录失败: {err}"))?
+        .map_err(|err| {
+            let message = format!("读取临时目录失败: {err}");
+            emit_update_install_failed(&app, &sanitized_name, message.clone());
+            message
+        })?
         .join("webot-updates");
-    fs::create_dir_all(&temp_root).map_err(|err| format!("创建更新目录失败: {err}"))?;
+    fs::create_dir_all(&temp_root).map_err(|err| {
+        let message = format!("创建更新目录失败: {err}");
+        emit_update_install_failed(&app, &sanitized_name, message.clone());
+        message
+    })?;
 
     let installer_path = temp_root.join(sanitized_name);
 
@@ -707,28 +790,155 @@ pub async fn download_and_install_update(
     let client = reqwest::Client::builder()
         .default_headers(headers)
         .build()
-        .map_err(|err| format!("创建下载客户端失败: {err}"))?;
+        .map_err(|err| {
+            let message = format!("创建下载客户端失败: {err}");
+            emit_update_install_failed(&app, &file_name, message.clone());
+            message
+        })?;
 
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
-        .map_err(|err| format!("下载更新包失败: {err}"))?;
+        .map_err(|err| {
+            let message = format!("下载更新包失败: {err}");
+            emit_update_install_failed(&app, &file_name, message.clone());
+            message
+        })?;
     if !response.status().is_success() {
-        return Err(format!("下载更新包失败: HTTP {}", response.status()));
+        let message = format!("下载更新包失败: HTTP {}", response.status());
+        emit_update_install_failed(&app, &file_name, message.clone());
+        return Err(message);
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| format!("读取更新包失败: {err}"))?;
-    if bytes.is_empty() {
-        return Err("更新包为空".to_string());
+    let total_bytes = response.content_length();
+    emit_update_install_progress(
+        &app,
+        UpdateInstallProgressPayload {
+            phase: "downloading".to_string(),
+            downloaded_bytes: Some(0),
+            total_bytes,
+            progress_percent: Some(0.0),
+            message: Some("正在下载更新包...".to_string()),
+            file_name: Some(file_name.clone()),
+            installer_path: None,
+            launched: None,
+        },
+    );
+
+    let mut installer_file = fs::File::create(&installer_path).map_err(|err| {
+        let message = format!("创建更新包文件失败: {err}");
+        emit_update_install_failed(&app, &file_name, message.clone());
+        message
+    })?;
+
+    let mut downloaded_bytes = 0_u64;
+    let mut last_reported_bytes = 0_u64;
+    let mut last_reported_percent = -1_i64;
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        let message = format!("读取更新包失败: {err}");
+        emit_update_install_failed(&app, &file_name, message.clone());
+        message
+    })? {
+        if chunk.is_empty() {
+            continue;
+        }
+
+        installer_file.write_all(&chunk).map_err(|err| {
+            let message = format!("写入更新包失败: {err}");
+            emit_update_install_failed(&app, &file_name, message.clone());
+            message
+        })?;
+
+        downloaded_bytes += chunk.len() as u64;
+        let progress_percent = compute_progress_percent(downloaded_bytes, total_bytes);
+        let current_percent = progress_percent.map(|value| value.floor() as i64).unwrap_or(-1);
+        let percent_changed = current_percent != last_reported_percent;
+        let byte_threshold_reached =
+            downloaded_bytes.saturating_sub(last_reported_bytes) >= 512 * 1024;
+        let is_finished = total_bytes
+            .map(|total| downloaded_bytes >= total)
+            .unwrap_or(false);
+
+        if percent_changed || byte_threshold_reached || is_finished {
+            last_reported_percent = current_percent;
+            last_reported_bytes = downloaded_bytes;
+            emit_update_install_progress(
+                &app,
+                UpdateInstallProgressPayload {
+                    phase: "downloading".to_string(),
+                    downloaded_bytes: Some(downloaded_bytes),
+                    total_bytes,
+                    progress_percent,
+                    message: Some("正在下载更新包...".to_string()),
+                    file_name: Some(file_name.clone()),
+                    installer_path: None,
+                    launched: None,
+                },
+            );
+        }
     }
 
-    fs::write(&installer_path, &bytes).map_err(|err| format!("写入更新包失败: {err}"))?;
+    installer_file.flush().map_err(|err| {
+        let message = format!("刷新更新包失败: {err}");
+        emit_update_install_failed(&app, &file_name, message.clone());
+        message
+    })?;
+    if downloaded_bytes == 0 {
+        let message = "更新包为空".to_string();
+        emit_update_install_failed(&app, &file_name, message.clone());
+        return Err(message);
+    }
 
-    let launched = launch_installer(&installer_path)?;
+    emit_update_install_progress(
+        &app,
+        UpdateInstallProgressPayload {
+            phase: "downloaded".to_string(),
+            downloaded_bytes: Some(downloaded_bytes),
+            total_bytes: Some(total_bytes.unwrap_or(downloaded_bytes)),
+            progress_percent: Some(100.0),
+            message: Some("更新包下载完成，正在启动安装程序...".to_string()),
+            file_name: Some(file_name.clone()),
+            installer_path: Some(installer_path.to_string_lossy().to_string()),
+            launched: None,
+        },
+    );
+
+    emit_update_install_progress(
+        &app,
+        UpdateInstallProgressPayload {
+            phase: "launching_installer".to_string(),
+            downloaded_bytes: Some(downloaded_bytes),
+            total_bytes: Some(total_bytes.unwrap_or(downloaded_bytes)),
+            progress_percent: Some(100.0),
+            message: Some("正在启动安装程序...".to_string()),
+            file_name: Some(file_name.clone()),
+            installer_path: Some(installer_path.to_string_lossy().to_string()),
+            launched: None,
+        },
+    );
+
+    let launched = launch_installer(&installer_path).map_err(|err| {
+        emit_update_install_failed(&app, &file_name, err.clone());
+        err
+    })?;
+    emit_update_install_progress(
+        &app,
+        UpdateInstallProgressPayload {
+            phase: "installer_started".to_string(),
+            downloaded_bytes: Some(downloaded_bytes),
+            total_bytes: Some(total_bytes.unwrap_or(downloaded_bytes)),
+            progress_percent: Some(100.0),
+            message: Some(if launched {
+                "安装程序已启动，应用即将退出完成升级。".to_string()
+            } else {
+                "更新包已打开，请按系统提示继续完成安装。".to_string()
+            }),
+            file_name: Some(file_name.clone()),
+            installer_path: Some(installer_path.to_string_lossy().to_string()),
+            launched: Some(launched),
+        },
+    );
     if launched {
         let app_handle = app.clone();
         std::thread::spawn(move || {

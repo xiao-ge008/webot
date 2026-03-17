@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 const UPDATE_SETTINGS_KEY = 'webot-update-settings-v1';
+const UPDATE_INSTALL_PROGRESS_EVENT = 'update-install-progress';
 const DEFAULT_GITHUB_OWNER = (import.meta.env.VITE_WEBOT_UPDATE_OWNER as string | undefined)?.trim() || 'xiao-ge008';
 const DEFAULT_GITHUB_REPO = (import.meta.env.VITE_WEBOT_UPDATE_REPO as string | undefined)?.trim() || 'webot';
 
@@ -49,6 +51,25 @@ export interface UpdateInfo {
   publishedAt: string;
   releaseUrl: string;
   asset: UpdateAsset;
+}
+
+export type UpdateInstallPhase =
+  | 'preparing'
+  | 'downloading'
+  | 'downloaded'
+  | 'launching_installer'
+  | 'installer_started'
+  | 'failed';
+
+export interface UpdateInstallProgressEvent {
+  phase: UpdateInstallPhase;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  progressPercent?: number;
+  message?: string;
+  fileName?: string;
+  installerPath?: string;
+  launched?: boolean;
 }
 
 interface NormalizedVersion {
@@ -126,6 +147,18 @@ export async function installUpdate(asset: UpdateAsset): Promise<void> {
   await invoke('download_and_install_update', {
     downloadUrl: asset.downloadUrl,
     fileName: asset.name,
+  });
+}
+
+export async function listenUpdateInstallProgress(
+  handler: (event: UpdateInstallProgressEvent) => void,
+): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) {
+    return async () => {};
+  }
+
+  return listen<UpdateInstallProgressEvent>(UPDATE_INSTALL_PROGRESS_EVENT, (event) => {
+    handler(event.payload);
   });
 }
 
