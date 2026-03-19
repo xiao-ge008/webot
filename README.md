@@ -26,6 +26,24 @@ npm run dev:service-rs
 
 默认网关地址：`http://127.0.0.1:4310`
 
+## Windows 开发机初始化
+
+这个仓库在 Windows 下的桌面开发默认走 `GNU Rust + MinGW`，不再依赖本机预装的 Visual Studio `link.exe`。
+
+首次在新机器上接手时，先执行：
+
+```powershell
+npm run bootstrap:dev:windows
+```
+
+只想检查当前机器是否齐备，可以执行：
+
+```powershell
+npm run bootstrap:dev:check
+```
+
+更完整的迁移说明见 [docs/windows-dev-bootstrap.md](./docs/windows-dev-bootstrap.md)。
+
 ## OpenFang 启动逻辑
 
 `service-rs` 启动时会尝试拉起 OpenFang：
@@ -48,12 +66,15 @@ npm run dev:service-rs
 # Web 模式：启动 frontend + service-rs
 npm run dev:start:web
 
-# App 模式：启动 Tauri 桌面调试
+# App 模式：启动 Tauri 桌面调试（默认不挂 QQ 桥）
 npm run dev:start:app
 
 # 或使用统一入口（可带 --dry-run）
 npm run dev:start -- web
 npm run dev:start -- app
+
+# 如需在 Web 模式下额外挂 QQ 桥
+npm run dev:start -- web --qqbot
 ```
 
 端口检查：
@@ -70,6 +91,9 @@ npm run build
 # 全部 workspace
 npm run typecheck:all
 npm run build:all
+
+# 桌面端构建
+npm run build:desktop
 ```
 
 ## 说明

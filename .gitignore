@@ -6,4 +6,5 @@
 **/target/
 **/target-temp*/
 *.log
+log/
 .DS_Store

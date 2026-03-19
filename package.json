@@ -8,13 +8,15 @@
     "packages/*"
   ],
   "scripts": {
+    "bootstrap:dev:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap-dev.ps1 -CheckOnly",
+    "bootstrap:dev:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap-dev.ps1",
     "build": "npm run build:shared",
     "build:all": "npm run build --workspaces",
     "build:shared": "npm run build --workspace @webot/shared-types",
     "build:desktop": "node scripts/build-desktop.mjs",
     "dev:start": "node scripts/start-dev.mjs",
     "dev:start:web": "node scripts/start-dev.mjs web",
-    "dev:start:app": "node scripts/start-dev.mjs app --qqbot",
+    "dev:start:app": "node scripts/start-dev.mjs app",
     "check:service-rs": "cargo check --manifest-path apps/service-rs/Cargo.toml",
     "dev:frontend": "npm run dev --workspace @webot/frontend",
     "dev:service-rs": "cargo run --manifest-path apps/service-rs/Cargo.toml",

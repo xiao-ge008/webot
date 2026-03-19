@@ -5,9 +5,11 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { execSync } from 'node:child_process';
+import { buildWindowsGnuRustEnv, resolveRepoRoot } from './windows-rust-env.mjs';
 
 const mode = process.argv[2];
 const dryRun = process.argv.includes('--dry-run');
+const repoRoot = resolveRepoRoot(import.meta.url);
 const withQqbot =
   process.env.QQBOT_BRIDGE === '1'
   || process.argv.includes('--qqbot')
@@ -16,6 +18,7 @@ const withQqbot =
 const MODES = {
   web: {
     description: '启动 Web 调试模式（frontend + service-rs）',
+    allowQqbot: true,
     ports: [5173, 4310],
     commands: [
       {
@@ -32,12 +35,14 @@ const MODES = {
   },
   app: {
     description: '启动桌面 App 调试模式（Tauri）',
+    allowQqbot: false,
     ports: [5173],
     commands: [
       {
         label: 'tauri',
         command: 'npm',
         args: ['run', 'dev:tauri', '--workspace', '@webot/frontend'],
+        env: buildWindowsGnuRustEnv({ repoRoot }),
       },
     ],
   },
@@ -156,12 +161,15 @@ async function ensurePortsFree(ports) {
   }
 }
 
-function spawnCommand({ label, command, args }) {
+function spawnCommand({ label, command, args, env }) {
   const child = spawn(command, args, {
     cwd: process.cwd(),
     shell: true,
     stdio: 'inherit',
-    env: process.env,
+    env: {
+      ...process.env,
+      ...env,
+    },
   });
 
   child.on('error', (error) => {
@@ -203,11 +211,14 @@ async function main() {
   console.log(`模式: ${mode}`);
   console.log(`说明: ${config.description}`);
   console.log(`端口检查通过: ${config.ports.join(', ')}`);
+  if (withQqbot && config.allowQqbot === false) {
+    console.log('提示: app 模式暂时忽略 QQ 桥接，仅启动桌面端。');
+  }
 
   if (dryRun) {
     console.log('dry-run: 仅校验端口与命令，不执行启动');
     const commands = [...config.commands];
-    if (withQqbot) {
+    if (withQqbot && config.allowQqbot !== false) {
       commands.push(resolveQqbotBridgeCommand());
     }
     commands.forEach((item) => {
@@ -217,7 +228,7 @@ async function main() {
   }
 
   const commands = [...config.commands];
-  if (withQqbot) {
+  if (withQqbot && config.allowQqbot !== false) {
     commands.push(resolveQqbotBridgeCommand());
   }
   const children = commands.map(spawnCommand);

@@ -418,11 +418,10 @@ pub async fn execute_tool(
                         .iter()
                         .map(|conn| conn.name().to_string())
                         .collect::<Vec<_>>();
-                    if let Some(server_name) =
-                        mcp::resolve_mcp_server_from_known(
-                            other,
-                            known_servers.iter().map(String::as_str),
-                        )
+                    if let Some(server_name) = mcp::resolve_mcp_server_from_known(
+                        other,
+                        known_servers.iter().map(String::as_str),
+                    )
                     {
                         if let Some(conn_index) =
                             conns.iter().position(|conn| conn.name() == server_name)
