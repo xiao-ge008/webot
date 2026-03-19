@@ -23,6 +23,50 @@ export function resolveVendorOpenfangBinary(repoRoot) {
   return path.join(repoRoot, 'vendor', 'openfang', 'target', 'release', binaryName);
 }
 
+function resolveWingetWinLibsBin(baseEnv = process.env) {
+  const localAppData = baseEnv.LOCALAPPDATA;
+  if (!localAppData) {
+    return null;
+  }
+
+  const packagesRoot = path.join(localAppData, 'Microsoft', 'WinGet', 'Packages');
+  if (!fs.existsSync(packagesRoot)) {
+    return null;
+  }
+
+  const packageNames = fs.readdirSync(packagesRoot);
+  const winlibsPackage = packageNames.find((name) => name.startsWith('BrechtSanders.WinLibs.'));
+  if (!winlibsPackage) {
+    return null;
+  }
+
+  const mingwBin = path.join(packagesRoot, winlibsPackage, 'mingw64', 'bin');
+  return fs.existsSync(mingwBin) ? mingwBin : null;
+}
+
+function resolveWixBin() {
+  const candidates = [
+    path.join('C:', 'Program Files', 'WiX Toolset v6.0', 'bin'),
+    path.join('C:', 'Program Files (x86)', 'WiX Toolset v6.0', 'bin'),
+    path.join('C:', 'Program Files', 'WiX Toolset v3.14', 'bin'),
+    path.join('C:', 'Program Files (x86)', 'WiX Toolset v3.14', 'bin'),
+  ];
+
+  return candidates.find((entry) => fs.existsSync(entry)) ?? null;
+}
+
+export function resolveWindowsMingwBin(baseEnv = process.env) {
+  const userProfile = baseEnv.USERPROFILE ?? '';
+  const configured = baseEnv.WEBOT_MINGW_BIN;
+  const defaults = [
+    configured,
+    path.join(userProfile, 'tools', 'winlibs-x64', 'mingw64', 'bin'),
+    resolveWingetWinLibsBin(baseEnv),
+  ];
+
+  return defaults.find((entry) => entry && fs.existsSync(entry)) ?? defaults[0] ?? null;
+}
+
 export function buildWindowsGnuRustEnv({ repoRoot, baseEnv = process.env } = {}) {
   if (process.platform !== 'win32') {
     return {};
@@ -30,10 +74,11 @@ export function buildWindowsGnuRustEnv({ repoRoot, baseEnv = process.env } = {})
 
   const userProfile = baseEnv.USERPROFILE ?? '';
   const cargoHome = baseEnv.CARGO_HOME ?? path.join(userProfile, '.cargo');
-  const mingwBin = baseEnv.WEBOT_MINGW_BIN ?? path.join(userProfile, 'tools', 'winlibs-x64', 'mingw64', 'bin');
+  const mingwBin = resolveWindowsMingwBin(baseEnv);
   const cargoBin = path.join(cargoHome, 'bin');
-  const openfangBinary = baseEnv.OPENFANG_BINARY ?? resolveVendorOpenfangBinary(repoRoot);
-  const pathEntries = [mingwBin, cargoBin].filter((entry) => entry && fs.existsSync(entry));
+  const wixBin = resolveWixBin();
+  const openfangBinary = resolveVendorOpenfangBinary(repoRoot);
+  const pathEntries = [mingwBin, cargoBin, wixBin].filter((entry) => entry && fs.existsSync(entry));
   const nextPath = [...pathEntries, baseEnv.PATH ?? ''].filter(Boolean).join(path.delimiter);
   const env = {
     PATH: nextPath,

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$CheckOnly,
     [switch]$SkipNpmInstall,
@@ -130,16 +130,57 @@ function Sync-OpenFangBinary {
     Copy-Item -Path $SourceBinary -Destination (Join-Path $resourceRoot 'openfang.exe') -Force
 }
 
+function Resolve-MingwBin {
+    param([string]$UserProfileDir)
+
+    if (-not [string]::IsNullOrWhiteSpace($env:WEBOT_MINGW_BIN) -and (Test-Path $env:WEBOT_MINGW_BIN)) {
+        return $env:WEBOT_MINGW_BIN
+    }
+
+    $defaultPath = Join-Path $UserProfileDir 'tools\winlibs-x64\mingw64\bin'
+    if (Test-Path $defaultPath) {
+        return $defaultPath
+    }
+
+    $wingetPackagesRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    if (Test-Path $wingetPackagesRoot) {
+        $wingetPackage = Get-ChildItem -Path $wingetPackagesRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'BrechtSanders.WinLibs.*' } |
+            Select-Object -First 1
+
+        if ($null -ne $wingetPackage) {
+            $wingetBin = Join-Path $wingetPackage.FullName 'mingw64\bin'
+            if (Test-Path $wingetBin) {
+                return $wingetBin
+            }
+        }
+    }
+
+    return $defaultPath
+}
+
+function Resolve-WixBin {
+    $candidates = @(
+        'C:\Program Files\WiX Toolset v6.0\bin',
+        'C:\Program Files (x86)\WiX Toolset v6.0\bin',
+        'C:\Program Files\WiX Toolset v3.14\bin',
+        'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path (Join-Path $candidate 'wix.exe')) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $UserProfileDir = $env:USERPROFILE
 $CargoHome = if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) { Join-Path $UserProfileDir '.cargo' } else { $env:CARGO_HOME }
 $CargoBin = Join-Path $CargoHome 'bin'
-$MingwBin = if ([string]::IsNullOrWhiteSpace($env:WEBOT_MINGW_BIN)) {
-    Join-Path $UserProfileDir 'tools\winlibs-x64\mingw64\bin'
-}
-else {
-    $env:WEBOT_MINGW_BIN
-}
+$MingwBin = Resolve-MingwBin -UserProfileDir $UserProfileDir
 $OpenFangVendorBinary = Join-Path $RepoRoot 'vendor\openfang\target\x86_64-pc-windows-gnu\release\openfang.exe'
 $NodeModulesDir = Join-Path $RepoRoot 'node_modules'
 $GnuEnv = @{
@@ -223,7 +264,8 @@ else {
     Write-Host '[OK] dotnet 已检测到'
 }
 
-if (($null -eq (Get-CommandPath -Name 'wix')) -and ($null -eq (Get-CommandPath -Name 'candle'))) {
+$WixBin = Resolve-WixBin
+if (($null -eq (Get-CommandPath -Name 'wix')) -and ($null -eq (Get-CommandPath -Name 'candle')) -and ($null -eq $WixBin)) {
     Write-Warning '未检测到 WiX。开发启动不受影响，但 build:desktop 的 MSI 打包通常需要 WiX。'
 }
 else {

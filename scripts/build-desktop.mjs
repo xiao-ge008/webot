@@ -9,6 +9,11 @@ import {
 
 const webotRoot = resolveRepoRoot(import.meta.url);
 const dryRun = process.argv.includes('--dry-run');
+const vendorOpenfangRoot = path.join(webotRoot, 'vendor', 'openfang');
+const commandEnv = {
+  ...process.env,
+  ...buildWindowsGnuRustEnv({ repoRoot: webotRoot }),
+};
 
 function run(command, args, options = {}) {
   if (dryRun) {
@@ -21,46 +26,27 @@ function run(command, args, options = {}) {
   }
 }
 
+function buildVendorOpenfangBinary() {
+  const args = process.platform === 'win32'
+    ? ['build', '--release', '--target', 'x86_64-pc-windows-gnu', '-p', 'openfang-cli', '--bin', 'openfang']
+    : ['build', '--release', '-p', 'openfang-cli', '--bin', 'openfang'];
+
+  run('cargo', args, {
+    cwd: vendorOpenfangRoot,
+    env: commandEnv,
+  });
+}
+
 function resolveOpenfangBinary() {
-  const envBinary = process.env.OPENFANG_BINARY;
-  if (envBinary && existsSync(envBinary)) {
-    return envBinary;
-  }
-
-  const resourceRoot = path.join(
-    webotRoot,
-    'apps',
-    'frontend',
-    'src-tauri',
-    'resources',
-    'openfang'
-  );
-  const platformRoot = path.join(resourceRoot, platformFolder());
-  const binaryName = process.platform === 'win32' ? 'openfang.exe' : 'openfang';
-  const platformBinary = path.join(platformRoot, binaryName);
-  const rootBinary = path.join(resourceRoot, binaryName);
   const vendorBinary = resolveVendorOpenfangBinary(webotRoot);
-
-  if (existsSync(platformBinary)) {
-    return platformBinary;
-  }
-  if (existsSync(rootBinary)) {
-    return rootBinary;
-  }
   if (existsSync(vendorBinary)) {
     return vendorBinary;
   }
 
   console.error(
-    '未找到 openfang 可执行文件。请先将 release 版 openfang 放到 resources/openfang 或设置 OPENFANG_BINARY。'
+    '未找到 webot-app/vendor/openfang 的可执行文件。打包前会强制使用 vendor/openfang 源码产物，请先确认该源码可编译。'
   );
   process.exit(1);
-}
-
-function platformFolder() {
-  if (process.platform === 'win32') return 'win';
-  if (process.platform === 'darwin') return 'macos';
-  return 'linux';
 }
 
 function platformFolders() {
@@ -72,6 +58,8 @@ function platformFolders() {
   }
   return ['linux'];
 }
+
+buildVendorOpenfangBinary();
 
 const binaryName = process.platform === 'win32' ? 'openfang.exe' : 'openfang';
 const builtBinary = resolveOpenfangBinary();
@@ -105,11 +93,6 @@ if (!dryRun && process.platform !== 'win32') {
   }
   chmodSync(path.join(resourceRoot, binaryName), 0o755);
 }
-
-const commandEnv = {
-  ...process.env,
-  ...buildWindowsGnuRustEnv({ repoRoot: webotRoot }),
-};
 
 if (process.platform === 'win32') {
   run(
