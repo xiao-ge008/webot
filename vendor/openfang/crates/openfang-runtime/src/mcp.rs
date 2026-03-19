@@ -419,9 +419,7 @@ impl McpConnection {
                 let has_cmd = std::env::var("PATH")
                     .unwrap_or_default()
                     .split(';')
-                    .any(|dir| {
-                        std::path::Path::new(dir).join(&cmd_variant).exists()
-                    });
+                    .any(|dir| std::path::Path::new(dir).join(&cmd_variant).exists());
                 if has_cmd {
                     cmd_variant
                 } else {
@@ -646,7 +644,10 @@ mod tests {
     fn test_resolve_mcp_server_from_known_with_hyphenated_server_name() {
         let known = ["stock-agent", "github"];
         assert_eq!(
-            resolve_mcp_server_from_known("mcp_stock_agent_qmt_service_status", known.iter().copied()),
+            resolve_mcp_server_from_known(
+                "mcp_stock_agent_qmt_service_status",
+                known.iter().copied()
+            ),
             Some("stock-agent")
         );
     }

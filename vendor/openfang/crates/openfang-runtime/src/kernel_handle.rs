@@ -234,6 +234,18 @@ pub trait KernelHandle: Send + Sync {
         Err("Channel media send not available".to_string())
     }
 
+    /// Analyze an image with the caller agent's current model when that model supports vision.
+    async fn describe_image_with_agent_model(
+        &self,
+        agent_id: &str,
+        prompt: &str,
+        media_type: &str,
+        base64_data: &str,
+    ) -> Result<openfang_types::media::MediaUnderstanding, String> {
+        let _ = (agent_id, prompt, media_type, base64_data);
+        Err("Current agent model vision is not available".to_string())
+    }
+
     /// Spawn an agent with capability inheritance enforcement.
     /// `parent_caps` are the parent's granted capabilities. The kernel MUST verify
     /// that every capability in the child manifest is covered by `parent_caps`.

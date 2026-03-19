@@ -105,7 +105,11 @@ fn build_group_session_label(context: &ChannelConversationContext) -> Option<Str
     let conversation = normalize_label_component(base_conversation, 56);
     let mut label = format!("{GROUP_SESSION_LABEL_PREFIX}_{channel}_{conversation}");
 
-    if let Some(thread_id) = context.thread_id.as_deref().filter(|v| !v.trim().is_empty()) {
+    if let Some(thread_id) = context
+        .thread_id
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    {
         let thread = normalize_label_component(thread_id, 28);
         label.push_str("_th_");
         label.push_str(&thread);
@@ -1247,7 +1251,9 @@ pub async fn start_channel_bridge_with_config(
     // WhatsApp — supports Cloud API mode (access token) or Web/QR mode (gateway URL)
     if let Some(ref wa_config) = config.whatsapp {
         let cloud_token = read_token(&wa_config.access_token_env, "WhatsApp");
-        let gateway_url = std::env::var(&wa_config.gateway_url_env).ok().filter(|u| !u.is_empty());
+        let gateway_url = std::env::var(&wa_config.gateway_url_env)
+            .ok()
+            .filter(|u| !u.is_empty());
 
         if cloud_token.is_some() || gateway_url.is_some() {
             let token = cloud_token.unwrap_or_default();

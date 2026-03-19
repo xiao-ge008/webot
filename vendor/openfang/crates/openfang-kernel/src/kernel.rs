@@ -59,6 +59,44 @@ impl LlmDriver for StubDriver {
     }
 }
 
+fn detect_known_vision_support(
+    catalog: &openfang_runtime::model_catalog::ModelCatalog,
+    raw_model: &str,
+    provider: &str,
+) -> Option<bool> {
+    let stripped_model = strip_provider_prefix(raw_model, provider);
+    let mut candidates = vec![raw_model.to_string()];
+    if stripped_model != raw_model {
+        candidates.push(stripped_model.clone());
+    }
+    if let Some((_, tail)) = raw_model.rsplit_once('/') {
+        if !tail.is_empty() {
+            candidates.push(tail.to_string());
+        }
+    }
+    if let Some((_, tail)) = stripped_model.rsplit_once('/') {
+        if !tail.is_empty() {
+            candidates.push(tail.to_string());
+        }
+    }
+
+    let mut saw_explicit_false = false;
+    for candidate in candidates {
+        if let Some(model) = catalog.find_model(&candidate) {
+            if model.supports_vision {
+                return Some(true);
+            }
+            saw_explicit_false = true;
+        }
+    }
+
+    if saw_explicit_false {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 pub struct OpenFangKernel {
     /// Kernel configuration.
     pub config: KernelConfig,
@@ -1571,9 +1609,11 @@ impl OpenFangKernel {
                                 usage: result.total_usage,
                             })
                             .await;
-                        kernel_clone
-                            .scheduler
-                            .record_usage(agent_id, &result.total_usage, quota_scope);
+                        kernel_clone.scheduler.record_usage(
+                            agent_id,
+                            &result.total_usage,
+                            quota_scope,
+                        );
                         let _ = kernel_clone
                             .registry
                             .set_state(agent_id, AgentState::Running);
@@ -2687,11 +2727,7 @@ impl OpenFangKernel {
 
         if let Some(provider) = normalized_provider.as_ref() {
             self.registry
-                .update_model_and_provider(
-                    agent_id,
-                    normalized_model.to_string(),
-                    provider.clone(),
-                )
+                .update_model_and_provider(agent_id, normalized_model.to_string(), provider.clone())
                 .map_err(KernelError::OpenFang)?;
             info!(agent_id = %agent_id, model = %normalized_model, provider = %provider, "Agent model+provider updated");
         } else {
@@ -7046,6 +7082,80 @@ impl KernelHandle for OpenFangKernel {
         ))
     }
 
+    async fn describe_image_with_agent_model(
+        &self,
+        agent_id: &str,
+        prompt: &str,
+        media_type: &str,
+        base64_data: &str,
+    ) -> Result<openfang_types::media::MediaUnderstanding, String> {
+        let agent_id: AgentId = agent_id
+            .parse()
+            .map_err(|_| format!("Invalid agent id: {agent_id}"))?;
+        let entry = self
+            .registry
+            .get(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+
+        let known_vision_support = self.model_catalog.read().ok().and_then(|cat| {
+            detect_known_vision_support(
+                &cat,
+                entry.manifest.model.model.as_str(),
+                &entry.manifest.model.provider,
+            )
+        });
+        if matches!(known_vision_support, Some(false)) {
+            return Err(format!(
+                "Current model '{}' (provider: {}) does not support vision",
+                entry.manifest.model.model, entry.manifest.model.provider
+            ));
+        }
+
+        let driver = self
+            .resolve_driver(&entry.manifest)
+            .map_err(|e| format!("Failed to resolve driver for current agent model: {e}"))?;
+
+        let request = CompletionRequest {
+            model: entry.manifest.model.model.clone(),
+            messages: vec![openfang_types::message::Message {
+                role: openfang_types::message::Role::User,
+                content: openfang_types::message::MessageContent::Blocks(vec![
+                    openfang_types::message::ContentBlock::Text {
+                        text: prompt.to_string(),
+                    },
+                    openfang_types::message::ContentBlock::Image {
+                        media_type: media_type.to_string(),
+                        data: base64_data.to_string(),
+                    },
+                ]),
+            }],
+            tools: Vec::new(),
+            max_tokens: 1200,
+            temperature: 0.1,
+            system: Some(
+                "You analyze images and answer the user's prompt directly and concretely."
+                    .to_string(),
+            ),
+            thinking: None,
+        };
+
+        let response = driver
+            .complete(request)
+            .await
+            .map_err(|e| format!("Current model vision request failed: {e}"))?;
+        let description = response.text().trim().to_string();
+        if description.is_empty() {
+            return Err("Current model returned empty text for image analysis".to_string());
+        }
+
+        Ok(openfang_types::media::MediaUnderstanding {
+            media_type: openfang_types::media::MediaType::Image,
+            description,
+            provider: entry.manifest.model.provider.clone(),
+            model: entry.manifest.model.model.clone(),
+        })
+    }
+
     async fn spawn_agent_checked(
         &self,
         manifest_toml: &str,
@@ -7254,6 +7364,17 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_known_vision_support_prefers_true_alias_over_false_raw_match() {
+        let mut catalog = openfang_runtime::model_catalog::ModelCatalog::new();
+        catalog.merge_discovered_models("modelscope", &["ZhipuAI/GLM-5".to_string()]);
+
+        assert_eq!(
+            detect_known_vision_support(&catalog, "ZhipuAI/GLM-5", "modelscope"),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn test_find_agents_by_tag() {
         let registry = AgentRegistry::new();
 
@@ -7391,5 +7512,4 @@ mod tests {
             .any(|c| matches!(c, Capability::NetConnect(host) if host == "example.com:443")));
         assert!(!caps.iter().any(|c| matches!(c, Capability::ToolInvoke(_))));
     }
-
 }

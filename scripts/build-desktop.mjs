@@ -63,6 +63,16 @@ function platformFolder() {
   return 'linux';
 }
 
+function platformFolders() {
+  if (process.platform === 'win32') {
+    return ['win-x86_64', 'win', 'windows'];
+  }
+  if (process.platform === 'darwin') {
+    return ['macos'];
+  }
+  return ['linux'];
+}
+
 const binaryName = process.platform === 'win32' ? 'openfang.exe' : 'openfang';
 const builtBinary = resolveOpenfangBinary();
 
@@ -74,19 +84,25 @@ const resourceRoot = path.join(
   'resources',
   'openfang'
 );
-const platformRoot = path.join(resourceRoot, platformFolder());
+const platformRoots = platformFolders().map((folder) => path.join(resourceRoot, folder));
 
 if (dryRun) {
-  console.log(`[dry-run] sync ${builtBinary} -> ${path.join(platformRoot, binaryName)}`);
+  for (const platformRoot of platformRoots) {
+    console.log(`[dry-run] sync ${builtBinary} -> ${path.join(platformRoot, binaryName)}`);
+  }
   console.log(`[dry-run] sync ${builtBinary} -> ${path.join(resourceRoot, binaryName)}`);
 } else {
-  mkdirSync(platformRoot, { recursive: true });
-  copyFileSync(builtBinary, path.join(platformRoot, binaryName));
+  for (const platformRoot of platformRoots) {
+    mkdirSync(platformRoot, { recursive: true });
+    copyFileSync(builtBinary, path.join(platformRoot, binaryName));
+  }
   copyFileSync(builtBinary, path.join(resourceRoot, binaryName));
 }
 
 if (!dryRun && process.platform !== 'win32') {
-  chmodSync(path.join(platformRoot, binaryName), 0o755);
+  for (const platformRoot of platformRoots) {
+    chmodSync(path.join(platformRoot, binaryName), 0o755);
+  }
   chmodSync(path.join(resourceRoot, binaryName), 0o755);
 }
 

@@ -3,17 +3,17 @@
 //! Provides a comprehensive catalog of 130+ builtin models across 27 providers,
 //! with alias resolution, auth status detection, and pricing lookups.
 
+use openfang_types::config::ProviderConfigEntry;
 use openfang_types::model_catalog::{
     AuthStatus, ModelCatalogEntry, ModelTier, ProviderInfo, AI21_BASE_URL, ANTHROPIC_BASE_URL,
     BEDROCK_BASE_URL, CEREBRAS_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL,
     GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL,
-    LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, NVIDIA_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
+    LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_BASE_URL,
+    OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL,
+    QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
     ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
-use openfang_types::config::ProviderConfigEntry;
 use std::collections::HashMap;
 
 /// The model catalog  ?registry of all known models and providers.
@@ -68,8 +68,7 @@ impl ModelCatalog {
             let has_fallback = match provider.id.as_str() {
                 "gemini" => std::env::var("GOOGLE_API_KEY").is_ok(),
                 "codex" => {
-                    std::env::var("OPENAI_API_KEY").is_ok()
-                        || read_codex_credential().is_some()
+                    std::env::var("OPENAI_API_KEY").is_ok() || read_codex_credential().is_some()
                 }
                 "claude-code" => crate::drivers::claude_code::claude_code_available(),
                 _ => false,
@@ -489,7 +488,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
-                ProviderInfo {
+        ProviderInfo {
             id: "nvidia".into(),
             display_name: "NVIDIA NIM".into(),
             api_key_env: "NVIDIA_API_KEY".into(),
@@ -525,7 +524,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::NotRequired,
             model_count: 0,
         },
-        //   New providers (8)  
+        //   New providers (8)
         ProviderInfo {
             id: "perplexity".into(),
             display_name: "Perplexity AI".into(),
@@ -598,7 +597,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
-        //   GitHub Copilot  
+        //   GitHub Copilot
         ProviderInfo {
             id: "github-copilot".into(),
             display_name: "GitHub Copilot".into(),
@@ -608,7 +607,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
-        //   Chinese providers (5)  
+        //   Chinese providers (5)
         ProviderInfo {
             id: "qwen".into(),
             display_name: "Qwen (Alibaba)".into(),
@@ -681,7 +680,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
-        //   Volcano Engine (Doubao)  
+        //   Volcano Engine (Doubao)
         ProviderInfo {
             id: "volcengine".into(),
             display_name: "Volcano Engine (Doubao)".into(),
@@ -700,7 +699,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
-        //   AWS Bedrock  
+        //   AWS Bedrock
         ProviderInfo {
             id: "bedrock".into(),
             display_name: "AWS Bedrock".into(),
@@ -710,7 +709,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
-        //   OpenAI Codex  
+        //   OpenAI Codex
         ProviderInfo {
             id: "codex".into(),
             display_name: "OpenAI Codex".into(),
@@ -720,7 +719,7 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
-        //   Claude Code CLI  
+        //   Claude Code CLI
         ProviderInfo {
             id: "claude-code".into(),
             display_name: "Claude Code".into(),
@@ -807,9 +806,9 @@ fn builtin_aliases() -> HashMap<String, String> {
 
 fn builtin_models() -> Vec<ModelCatalogEntry> {
     vec![
-        //  
+        //
         // Anthropic (7)
-        //  
+        //
         ModelCatalogEntry {
             id: "claude-opus-4-6".into(),
             display_name: "Claude Opus 4.6".into(),
@@ -908,9 +907,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // OpenAI (16)
-        //  
+        //
         ModelCatalogEntry {
             id: "gpt-4o".into(),
             display_name: "GPT-4o".into(),
@@ -1135,9 +1134,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Google Gemini (10)
-        //  
+        //
         ModelCatalogEntry {
             id: "gemini-3.1-pro-preview".into(),
             display_name: "Gemini 3.1 Pro Preview".into(),
@@ -1278,9 +1277,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // DeepSeek (4)
-        //  
+        //
         ModelCatalogEntry {
             id: "deepseek-chat".into(),
             display_name: "DeepSeek V3".into(),
@@ -1337,9 +1336,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Groq (11)
-        //  
+        //
         ModelCatalogEntry {
             id: "llama-3.3-70b-versatile".into(),
             display_name: "Llama 3.3 70B".into(),
@@ -1480,9 +1479,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // OpenRouter (11)
-        //  
+        //
         ModelCatalogEntry {
             id: "openrouter/auto".into(),
             display_name: "OpenRouter Auto".into(),
@@ -1623,9 +1622,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Mistral (6)
-        //  
+        //
         ModelCatalogEntry {
             id: "mistral-large-latest".into(),
             display_name: "Mistral Large".into(),
@@ -1710,9 +1709,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec!["pixtral".into()],
         },
-        //  
+        //
         // Together (8)
-        //  
+        //
         ModelCatalogEntry {
             id: "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo".into(),
             display_name: "Llama 3.1 405B (Together)".into(),
@@ -1825,9 +1824,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Fireworks (5)
-        //  
+        //
         ModelCatalogEntry {
             id: "accounts/fireworks/models/llama-v3p1-405b-instruct".into(),
             display_name: "Llama 3.1 405B (Fireworks)".into(),
@@ -1898,9 +1897,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Ollama (6)  ?local, no key required + dynamic discovery
-        //  
+        //
         ModelCatalogEntry {
             id: "llama3.2".into(),
             display_name: "Llama 3.2 (Ollama)".into(),
@@ -1985,9 +1984,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // vLLM (1)  ?generic local entry + dynamic discovery
-        //  
+        //
         ModelCatalogEntry {
             id: "vllm-local".into(),
             display_name: "vLLM Local Model".into(),
@@ -2002,9 +2001,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // LM Studio (1)  ?generic local entry + dynamic discovery
-        //  
+        //
         ModelCatalogEntry {
             id: "lmstudio-local".into(),
             display_name: "LM Studio Local Model".into(),
@@ -2019,9 +2018,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Perplexity (4)
-        //  
+        //
         ModelCatalogEntry {
             id: "sonar-pro".into(),
             display_name: "Sonar Pro".into(),
@@ -2078,9 +2077,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Cohere (4)
-        //  
+        //
         ModelCatalogEntry {
             id: "command-r-plus".into(),
             display_name: "Command R+".into(),
@@ -2137,9 +2136,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // AI21 (3)
-        //  
+        //
         ModelCatalogEntry {
             id: "jamba-1.5-large".into(),
             display_name: "Jamba 1.5 Large".into(),
@@ -2182,9 +2181,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Cerebras (4)
-        //  
+        //
         ModelCatalogEntry {
             id: "cerebras/llama3.3-70b".into(),
             display_name: "Llama 3.3 70B (Cerebras)".into(),
@@ -2241,9 +2240,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // SambaNova (3)
-        //  
+        //
         ModelCatalogEntry {
             id: "sambanova/llama-3.3-70b".into(),
             display_name: "Llama 3.3 70B (SambaNova)".into(),
@@ -2286,9 +2285,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // xAI (9)
-        //  
+        //
         ModelCatalogEntry {
             id: "grok-4-0709".into(),
             display_name: "Grok 4".into(),
@@ -2415,9 +2414,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec!["grok-mini".into()],
         },
-        //  
+        //
         // Hugging Face (3) + dynamic discovery
-        //  
+        //
         ModelCatalogEntry {
             id: "hf/meta-llama/Llama-3.3-70B-Instruct".into(),
             display_name: "Llama 3.3 70B (HF)".into(),
@@ -2460,9 +2459,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Replicate (3)
-        //  
+        //
         ModelCatalogEntry {
             id: "replicate/meta-llama-3.3-70b-instruct".into(),
             display_name: "Llama 3.3 70B (Replicate)".into(),
@@ -2505,9 +2504,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // GitHub Copilot (2)  ?free for subscribers
-        //  
+        //
         ModelCatalogEntry {
             id: "copilot/gpt-4o".into(),
             display_name: "GPT-4o (Copilot)".into(),
@@ -2536,9 +2535,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec!["copilot-gpt4".into()],
         },
-        //  
+        //
         // Qwen / Alibaba (6)
-        //  
+        //
         ModelCatalogEntry {
             id: "qwen-max".into(),
             display_name: "Qwen Max".into(),
@@ -2693,9 +2692,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // MiniMax (4)
-        //  
+        //
         ModelCatalogEntry {
             id: "minimax-text-01".into(),
             display_name: "MiniMax Text 01".into(),
@@ -2752,9 +2751,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Zhipu AI / GLM (6)
-        //  
+        //
         ModelCatalogEntry {
             id: "glm-4-plus".into(),
             display_name: "GLM-4 Plus".into(),
@@ -2823,7 +2822,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["glm-5".into()],
+            aliases: vec!["glm-5".into(), "zhipuai/glm-5".into()],
         },
         ModelCatalogEntry {
             id: "glm-4.7".into(),
@@ -2839,9 +2838,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Zhipu Coding / CodeGeeX (1)
-        //  
+        //
         ModelCatalogEntry {
             id: "codegeex-4".into(),
             display_name: "CodeGeeX 4".into(),
@@ -2856,9 +2855,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec!["codegeex".into()],
         },
-        //  
+        //
         // Moonshot / Kimi (3)
-        //  
+        //
         ModelCatalogEntry {
             id: "moonshot-v1-128k".into(),
             display_name: "Moonshot V1 128K".into(),
@@ -2901,9 +2900,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Baidu Qianfan / ERNIE (3)
-        //  
+        //
         ModelCatalogEntry {
             id: "ernie-4.5-8k".into(),
             display_name: "ERNIE 4.5 8K".into(),
@@ -2946,9 +2945,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // Volcano Engine / Doubao (4)
-        //  
+        //
         ModelCatalogEntry {
             id: "doubao-seed-1-6-251015".into(),
             display_name: "Doubao Seed 1.6 Pro".into(),
@@ -3005,9 +3004,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec!["doubao-code".into()],
         },
-        //  
+        //
         // AWS Bedrock (8)
-        //  
+        //
         ModelCatalogEntry {
             id: "bedrock/anthropic.claude-opus-4-6".into(),
             display_name: "Claude Opus 4.6 (Bedrock)".into(),
@@ -3120,9 +3119,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
-        //  
+        //
         // OpenAI Codex (2)  ?reuses OpenAI driver
-        //  
+        //
         ModelCatalogEntry {
             id: "codex/gpt-4.1".into(),
             display_name: "GPT-4.1 (Codex)".into(),
@@ -3151,9 +3150,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec!["codex-o4".into()],
         },
-        //  
+        //
         // Claude Code CLI (3)  ?subprocess-based
-        //  
+        //
         ModelCatalogEntry {
             id: "claude-code/opus".into(),
             display_name: "Claude Opus (CLI)".into(),
@@ -3239,6 +3238,14 @@ mod tests {
     }
 
     #[test]
+    fn test_find_glm_5_prefixed_alias() {
+        let catalog = ModelCatalog::new();
+        let entry = catalog.find_model("zhipuai/glm-5").unwrap();
+        assert_eq!(entry.id, "glm-5-20250605");
+        assert!(entry.supports_vision);
+    }
+
+    #[test]
     fn test_find_model_not_found() {
         let catalog = ModelCatalog::new();
         assert!(catalog.find_model("nonexistent-model").is_none());
@@ -3247,10 +3254,7 @@ mod tests {
     #[test]
     fn test_resolve_alias() {
         let catalog = ModelCatalog::new();
-        assert_eq!(
-            catalog.resolve_alias("sonnet"),
-            Some("claude-sonnet-4-6")
-        );
+        assert_eq!(catalog.resolve_alias("sonnet"), Some("claude-sonnet-4-6"));
         assert_eq!(
             catalog.resolve_alias("haiku"),
             Some("claude-haiku-4-5-20251001")
@@ -3569,8 +3573,3 @@ mod tests {
         assert_eq!(entry.id, "claude-code/sonnet");
     }
 }
-
-
-
-
-

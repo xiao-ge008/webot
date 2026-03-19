@@ -469,9 +469,16 @@ impl LlmDriver for OpenAIDriver {
 
                 // Auto-cap max_tokens when model rejects our value (e.g. Groq Maverick limit 8192)
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let current = oai_request
+                        .max_tokens
+                        .or(oai_request.max_completion_tokens)
+                        .unwrap_or(4096);
                     let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
-                    warn!(old = current, new = cap, "Auto-capping max_tokens to model limit");
+                    warn!(
+                        old = current,
+                        new = cap,
+                        "Auto-capping max_tokens to model limit"
+                    );
                     if oai_request.max_completion_tokens.is_some() {
                         oai_request.max_completion_tokens = Some(cap);
                     } else {
@@ -526,7 +533,10 @@ impl LlmDriver for OpenAIDriver {
 
             if let Some(ref reasoning) = choice.message.reasoning_content {
                 if !reasoning.is_empty() {
-                    debug!(len = reasoning.len(), "Captured reasoning_content from response");
+                    debug!(
+                        len = reasoning.len(),
+                        "Captured reasoning_content from response"
+                    );
                     content.push(ContentBlock::Thinking {
                         thinking: reasoning.clone(),
                     });
@@ -549,7 +559,9 @@ impl LlmDriver for OpenAIDriver {
                 }
             }
 
-            let has_text = content.iter().any(|block| matches!(block, ContentBlock::Text { .. }));
+            let has_text = content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { .. }));
             let has_thinking = content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::Thinking { .. }));
@@ -604,14 +616,14 @@ impl LlmDriver for OpenAIDriver {
                 })
                 .unwrap_or_default();
 
-            let usage = if !content.is_empty() && usage.input_tokens == 0 && usage.output_tokens == 0
-            {
-                let mut synthetic = usage;
-                synthetic.output_tokens = 1;
-                synthetic
-            } else {
-                usage
-            };
+            let usage =
+                if !content.is_empty() && usage.input_tokens == 0 && usage.output_tokens == 0 {
+                    let mut synthetic = usage;
+                    synthetic.output_tokens = 1;
+                    synthetic
+                } else {
+                    usage
+                };
 
             return Ok(CompletionResponse {
                 content,
@@ -890,7 +902,10 @@ impl LlmDriver for OpenAIDriver {
 
                 // Auto-cap max_tokens when model rejects our value
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let current = oai_request
+                        .max_tokens
+                        .or(oai_request.max_completion_tokens)
+                        .unwrap_or(4096);
                     let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
                     warn!(old = current, new = cap, "Auto-capping max_tokens (stream)");
                     if oai_request.max_completion_tokens.is_some() {
@@ -1001,7 +1016,9 @@ impl LlmDriver for OpenAIDriver {
                                             if !thinking.is_empty() {
                                                 reasoning_content.push_str(&thinking);
                                                 let _ = tx
-                                                    .send(StreamEvent::ThinkingDelta { text: thinking })
+                                                    .send(StreamEvent::ThinkingDelta {
+                                                        text: thinking,
+                                                    })
                                                     .await;
                                             }
                                         }
@@ -1135,7 +1152,9 @@ impl LlmDriver for OpenAIDriver {
                 }
             };
 
-            let has_text = content.iter().any(|block| matches!(block, ContentBlock::Text { .. }));
+            let has_text = content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { .. }));
             let has_thinking = content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::Thinking { .. }));

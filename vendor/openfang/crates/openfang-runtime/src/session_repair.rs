@@ -590,12 +590,12 @@ fn strip_injection_markers(content: &str) -> String {
 
     for marker in INJECTION_MARKERS {
         let pattern = regex_lite::escape(marker);
-        let regex = RegexBuilder::new(&pattern)
-            .case_insensitive(true)
-            .build();
+        let regex = RegexBuilder::new(&pattern).case_insensitive(true).build();
         if let Ok(re) = regex {
             if re.is_match(&result) {
-                result = re.replace_all(&result, "[injection marker removed]").to_string();
+                result = re
+                    .replace_all(&result, "[injection marker removed]")
+                    .to_string();
             }
         }
     }

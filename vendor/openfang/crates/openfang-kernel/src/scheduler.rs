@@ -118,8 +118,7 @@ impl AgentScheduler {
         // Reset the window if an hour has passed
         tracker.reset_if_expired();
 
-        if quota.max_llm_tokens_per_hour > 0
-            && tracker.total_tokens > quota.max_llm_tokens_per_hour
+        if quota.max_llm_tokens_per_hour > 0 && tracker.total_tokens > quota.max_llm_tokens_per_hour
         {
             return Err(OpenFangError::QuotaExceeded(format!(
                 "Token limit exceeded: {} / {}",
@@ -219,7 +218,9 @@ mod tests {
             },
             SchedulerQuotaScope::Ignore,
         );
-        assert!(scheduler.check_quota(id, SchedulerQuotaScope::Ignore).is_ok());
+        assert!(scheduler
+            .check_quota(id, SchedulerQuotaScope::Ignore)
+            .is_ok());
         let (tokens, _) = scheduler.get_usage(id).unwrap();
         assert_eq!(tokens, 0);
     }

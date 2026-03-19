@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { ClipboardEvent, ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -43,9 +43,71 @@ const WEB_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
 const APP_FILE_MAX_BYTES = 32 * 1024 * 1024;
 const A2A_PLACEHOLDER_AGENT_ID = 'unknown-agent';
 const A2A_PLACEHOLDER_AGENT_NAME = '子智能体';
+const CLIPBOARD_IMAGE_EXTENSION_BY_MIME: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/svg+xml': 'svg',
+  'image/bmp': 'bmp',
+};
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
+}
+
+function buildClipboardFileName(file: File, index: number): string {
+  const rawName = file.name.trim();
+  if (rawName) {
+    return rawName;
+  }
+  const mimeType = file.type.trim().toLowerCase();
+  const extension = CLIPBOARD_IMAGE_EXTENSION_BY_MIME[mimeType] || 'bin';
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `clipboard-${stamp}-${index + 1}.${extension}`;
+}
+
+function collectClipboardFiles(clipboardData: DataTransfer | null): File[] {
+  if (!clipboardData) {
+    return [];
+  }
+  const collected: File[] = [];
+  const seenKeys = new Set<string>();
+  const pushFile = (candidate: File | null | undefined, index: number) => {
+    if (!candidate) {
+      return;
+    }
+    const normalizedName = buildClipboardFileName(candidate, index);
+    const normalized = candidate.name.trim()
+      ? candidate
+      : new File([candidate], normalizedName, {
+        type: candidate.type || 'application/octet-stream',
+        lastModified: candidate.lastModified || Date.now(),
+      });
+    const key = [normalized.name, normalized.size, normalized.type, normalized.lastModified].join('::');
+    if (seenKeys.has(key)) {
+      return;
+    }
+    seenKeys.add(key);
+    collected.push(normalized);
+  };
+
+  Array.from(clipboardData.items ?? []).forEach((item, index) => {
+    if (item.kind !== 'file') {
+      return;
+    }
+    pushFile(item.getAsFile(), index);
+  });
+
+  if (collected.length > 0) {
+    return collected;
+  }
+
+  Array.from(clipboardData.files ?? []).forEach((file, index) => {
+    pushFile(file, index);
+  });
+
+  return collected;
 }
 
 export interface ChatSendPayload {
@@ -190,13 +252,10 @@ function hasRuntimeLogData(msg: Message): boolean {
     || (msg.debugNormalizedUiRawText || '').trim()
     || (msg.debugRepairedUiRawText || '').trim()
     || (msg.debugUiContractWarnings || '').trim()
-    || (msg.text || '').trim()
-    || msg.spec != null
     || (msg.debugNormalizedSpecText || '').trim()
-    || typeof msg.debugProfileIntroDetected === 'boolean'
+    || msg.debugProfileIntroDetected === true
     || (msg.debugLegacySanitizer || '').trim()
-    || (msg.debugSchemaSanitizer || '').trim()
-    || typeof msg.debugMixedSegmentCount === 'number'
+    || ((msg.debugMixedSegmentCount ?? 0) > 0)
     || (msg.debugDonePayload || '').trim()
   );
 }
@@ -841,10 +900,10 @@ export function ChatConversationPane({
   }, []);
 
   const handlePickedFiles = useCallback(async (
-    fileList: FileList | null,
+    fileList: FileList | readonly File[] | null,
     requestedKind: 'image' | 'file',
   ) => {
-    const files = Array.from(fileList ?? []);
+    const files = Array.isArray(fileList) ? [...fileList] : Array.from(fileList ?? []);
     if (files.length === 0 || inputLocked) {
       return;
     }
@@ -940,6 +999,18 @@ export function ChatConversationPane({
       handleSend();
     }
   };
+
+  const handleComposerPaste = useCallback((event: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (typeof onUserActivity === 'function') {
+      onUserActivity('input');
+    }
+    const clipboardFiles = collectClipboardFiles(event.clipboardData);
+    if (clipboardFiles.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    void handlePickedFiles(clipboardFiles, 'file');
+  }, [handlePickedFiles, onUserActivity]);
 
   const handleScroll = useCallback(() => {
     autoStickToBottomRef.current = isNearBottom(scrollRef.current);
@@ -1423,14 +1494,24 @@ export function ChatConversationPane({
   };
 
   const renderTraceItems = (rows: MessageTrace[]) => (
-    <div className="space-y-2 min-w-0">
+    <div className="space-y-3 min-w-0">
       {rows.map((trace) => (
-        <div key={trace.id} className="border-l border-border/60 pl-3 py-1 min-w-0 [contain:layout]">
-          <div className="text-[11px] font-medium text-foreground/85 leading-5">{trace.title}</div>
-          {trace.detail ? <div className="mt-1 rounded-sm bg-muted/20 px-2 py-1.5 text-[12px] leading-5 text-muted-foreground whitespace-pre-wrap break-all overflow-x-auto">{trace.detail}</div> : null}
-          <div className="mt-1 text-[10px] text-muted-foreground/70">
-            {new Date(trace.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        <div
+          key={trace.id}
+          className="min-w-0 [contain:layout] border-t border-zinc-200/70 pt-3 first:border-t-0 first:pt-0 dark:border-white/6"
+        >
+          <div className="flex items-center gap-2 text-[10px] leading-4 text-zinc-500 dark:text-zinc-500/80">
+            <span className="font-semibold tracking-[0.02em] text-zinc-700 dark:text-zinc-100/90">{trace.title}</span>
+            <span className="inline-flex h-1 w-1 rounded-full bg-zinc-300 dark:bg-zinc-500/80" />
+            <span className="tabular-nums">
+              {new Date(trace.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            </span>
           </div>
+          {trace.detail ? (
+            <div className="mt-1.5 px-0.5 text-[12px] leading-6 text-zinc-800 whitespace-pre-wrap break-all overflow-x-auto dark:text-zinc-200/90">
+              {trace.detail}
+            </div>
+          ) : null}
         </div>
       ))}
     </div>
@@ -1460,42 +1541,51 @@ export function ChatConversationPane({
     const count = rows?.length ?? 0;
     if (count <= 0) return null;
     const opened = Boolean(traceOpen[key]);
+    const latestAt = rows?.[count - 1]?.at;
+    const timeLabel = latestAt
+      ? new Date(latestAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '';
     return (
-      <div className="mt-2 w-full rounded-md border border-border/50 bg-muted/10">
-        <div className="flex items-center gap-2 px-2 py-1.5">
+      <div className="mt-2 w-full">
+        <div className="group/trace-trigger flex items-center gap-2">
           <button
             type="button"
             onClick={() => toggleTracePanel(key)}
-            className="min-w-0 flex-1 inline-flex items-center justify-start gap-2 text-muted-foreground"
+            className="min-w-0 flex-1 inline-flex items-center justify-start gap-2 rounded-lg px-1 py-1 text-muted-foreground transition-colors hover:text-foreground dark:text-zinc-400/85 dark:hover:text-zinc-100"
           >
-            <span className="inline-flex items-center gap-2 text-[11px] leading-5 min-w-0">
-              <span className="font-medium truncate">{label}</span>
-              <span className="inline-flex items-center gap-0.5 text-muted-foreground/90 shrink-0">
-                <span className="inline-flex w-8 justify-end tabular-nums font-mono">{count}</span>
-                <span>?</span>
-              </span>
-              <ChevronDown className={cn('w-3.5 h-3.5 shrink-0 transition-transform duration-150', opened ? 'rotate-180' : 'rotate-0')} />
+            <span className="inline-flex min-w-0 items-center gap-2 text-[11px] leading-5">
+              <span className="truncate font-medium tracking-[0.01em]">{label}</span>
+              {timeLabel ? (
+                <span className="inline-flex shrink-0 items-center gap-1 text-[10px] tabular-nums text-muted-foreground/80 dark:text-zinc-500/80">
+                  <Clock3 className="h-3 w-3" />
+                  {timeLabel}
+                </span>
+              ) : null}
+              <ChevronDown className={cn(
+                'h-3.5 w-3.5 shrink-0 transition-all duration-150',
+                opened ? 'rotate-180 opacity-100' : 'rotate-0 opacity-0 group-hover/trace-trigger:opacity-100',
+              )} />
             </span>
           </button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-            onClick={() => copyTraceBlock(key, label, rows)}
-            title={`??${label}`}
-          >
-            {copiedTraceKey === key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-          </Button>
         </div>
         <div
           className={cn(
-            'grid transition-[grid-template-rows,opacity] duration-200 ease-out',
-            opened ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-90',
+            'grid transition-[grid-template-rows,opacity,transform] duration-200 ease-out',
+            opened ? 'mt-1 grid-rows-[1fr] opacity-100 translate-y-0' : 'grid-rows-[0fr] opacity-0 -translate-y-1 pointer-events-none',
           )}
         >
           <div className="min-h-0 overflow-hidden">
-            <div className="max-h-80 overflow-y-auto overflow-x-hidden px-2 pb-2 pt-0 min-w-0 overscroll-contain [scrollbar-gutter:stable]">
+            <div className="group/trace-panel relative max-h-80 overflow-y-auto overflow-x-hidden rounded-2xl border border-zinc-200/80 bg-zinc-50/92 px-3 pb-3 pt-3 min-w-0 shadow-[0_14px_30px_rgba(15,23,42,0.08)] overscroll-contain [scrollbar-gutter:stable] dark:border-white/6 dark:bg-zinc-950/62 dark:shadow-[0_16px_30px_rgba(0,0,0,0.26)]">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="absolute right-2 top-2 h-7 w-7 shrink-0 rounded-lg text-zinc-500 opacity-0 transition-all hover:bg-white/80 hover:text-zinc-900 group-hover/trace-panel:opacity-100 focus-visible:opacity-100 dark:text-zinc-500/90 dark:hover:bg-white/8 dark:hover:text-zinc-50"
+                onClick={() => copyTraceBlock(key, label, rows)}
+                title={`复制${label}`}
+              >
+                {copiedTraceKey === key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              </Button>
               {renderTraceItems(rows ?? [])}
             </div>
           </div>
@@ -1566,9 +1656,6 @@ export function ChatConversationPane({
     if (msg.debugUiContractWarnings?.trim()) {
       pushAutoRow('UI_JSON Contract 警告', msg.debugUiContractWarnings);
     }
-    if (msg.text?.trim()) {
-      pushAutoRow('最终正文', msg.text);
-    }
     if (msg.spec != null) {
       try {
         const specText = typeof msg.spec === 'string' ? msg.spec : JSON.stringify(msg.spec, null, 2);
@@ -1589,7 +1676,7 @@ export function ChatConversationPane({
     if (msg.debugSchemaSanitizer?.trim()) {
       pushAutoRow('Schema Sanitizer', msg.debugSchemaSanitizer);
     }
-    if (typeof msg.debugMixedSegmentCount === 'number') {
+    if (typeof msg.debugMixedSegmentCount === 'number' && msg.debugMixedSegmentCount > 0) {
       pushAutoRow('MixedSegments 数量', String(msg.debugMixedSegmentCount));
     }
     if (msg.debugDonePayload?.trim()) {
@@ -1627,6 +1714,18 @@ export function ChatConversationPane({
       return false;
     }
     return !looksLikeProtocolOnlyText(text);
+  };
+
+  const hasRenderableMessageContent = (msg: Message): boolean => {
+    if ((msg.attachments?.length ?? 0) > 0) return true;
+    if (msg.taskCard) return true;
+    if ((msg.a2aCards?.length ?? 0) > 0) return true;
+    if (msg.spec != null) return true;
+    if (msg.role === 'user') return Boolean((msg.text || '').trim());
+    if (hasMeaningfulMarkdownText(msg)) return true;
+    const meta = (msg.meta || '').trim();
+    if (meta && !meta.startsWith('auto_dispatch:')) return true;
+    return false;
   };
 
   const shouldRenderCardForMessage = (msg: Message, isUser: boolean): boolean => {
@@ -1850,7 +1949,10 @@ export function ChatConversationPane({
     </>
   );
 
-  const stableMessages = useMemo(() => messages.filter((msg) => !msg.streaming), [messages]);
+  const stableMessages = useMemo(
+    () => messages.filter((msg) => !msg.streaming && hasRenderableMessageContent(msg)),
+    [messages],
+  );
   const messageIndexMap = useMemo(() => {
     const map = new Map<string, number>();
     messages.forEach((msg, index) => {
@@ -2104,6 +2206,7 @@ export function ChatConversationPane({
                 setInputValue(e.target.value);
               }}
               onKeyDown={handleKeyDown}
+              onPaste={handleComposerPaste}
               onFocus={() => {
                 if (typeof onUserActivity === 'function') {
                   onUserActivity('focus');
@@ -2175,7 +2278,7 @@ export function ChatConversationPane({
                   size="icon"
                   className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
                   disabled={inputLocked}
-                  title={isDesktopRuntime ? '上传图片' : 'Web 端支持上传小图片'}
+                  title={isDesktopRuntime ? '上传图片或 Ctrl+V 粘贴图片' : 'Web 端支持上传或粘贴小图片'}
                   onClick={() => imageInputRef.current?.click()}
                 >
                   <ImageIcon className="w-4 h-4" />
@@ -2186,7 +2289,7 @@ export function ChatConversationPane({
                   size="icon"
                   className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
                   disabled={inputLocked || !isDesktopRuntime}
-                  title={isDesktopRuntime ? '上传附件' : 'Web 端暂不支持通用附件'}
+                  title={isDesktopRuntime ? '上传附件或 Ctrl+V 粘贴文件' : 'Web 端暂不支持粘贴通用附件'}
                   onClick={() => fileInputRef.current?.click()}
                 >
                   <Paperclip className="w-4 h-4" />

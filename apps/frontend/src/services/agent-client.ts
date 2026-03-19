@@ -116,6 +116,19 @@ export interface AgentSessionResult {
   message?: string;
 }
 
+export interface DeleteAgentSessionInput {
+  agentId: string;
+  sessionId?: string;
+  sessionLabel?: string;
+}
+
+export interface DeleteAgentSessionResult {
+  success: boolean;
+  deleted: boolean;
+  sessionId?: string;
+  message?: string;
+}
+
 export interface CompactAgentSessionInput {
   agentId: string;
   sessionId?: string;
@@ -2238,6 +2251,53 @@ export async function getAgentSession(agentId: string): Promise<AgentSessionResu
       success: false,
       messages: [],
       message: error instanceof Error ? error.message : '会话读取失败',
+    };
+  }
+}
+
+export async function deleteAgentSession(input: DeleteAgentSessionInput): Promise<DeleteAgentSessionResult> {
+  const agentId = input.agentId.trim();
+  const sessionId = input.sessionId?.trim() || '';
+  const sessionLabel = input.sessionLabel?.trim() || '';
+  if (!agentId) {
+    return {
+      success: false,
+      deleted: false,
+      message: 'agentId 不能为空',
+    };
+  }
+  if (!sessionId && !sessionLabel) {
+    return {
+      success: false,
+      deleted: false,
+      message: 'sessionId 或 sessionLabel 至少需要一个',
+    };
+  }
+
+  const query = new URLSearchParams();
+  if (sessionId) {
+    query.set('session_id', sessionId);
+  }
+  if (sessionLabel) {
+    query.set('session_label', sessionLabel);
+  }
+
+  try {
+    const data = await requestJson<Record<string, unknown>>(
+      `/api/chat/${encodeURIComponent(agentId)}/session?${query.toString()}`,
+      { method: 'DELETE' },
+    );
+    return {
+      success: true,
+      deleted: data.deleted !== false,
+      sessionId: typeof data.session_id === 'string' ? data.session_id : sessionId || undefined,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      deleted: false,
+      sessionId: sessionId || undefined,
+      message: error instanceof Error ? error.message : '会话删除失败',
     };
   }
 }

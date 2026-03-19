@@ -1053,26 +1053,22 @@ pub async fn send_message_stream(
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     let quota_scope = resolve_scheduler_quota_scope(req.request_origin.as_deref());
-    let (rx, _handle) =
-        match state
-            .kernel
-            .send_message_streaming_with_quota_scope(
-                agent_id,
-                &req.message,
-                Some(kernel_handle),
-                quota_scope,
+    let (rx, _handle) = match state.kernel.send_message_streaming_with_quota_scope(
+        agent_id,
+        &req.message,
+        Some(kernel_handle),
+        quota_scope,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("Streaming message failed for agent {id}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Streaming message failed"})),
             )
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!("Streaming message failed for agent {id}: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Streaming message failed"})),
-                )
-                    .into_response();
-            }
-        };
+                .into_response();
+        }
+    };
 
     let sse_stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
@@ -6731,7 +6727,11 @@ pub async fn set_model(
             Json(serde_json::json!({"error": "Missing 'model' field"})),
         );
     }
-    let provider = body.provider.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let provider = body
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     match state
         .kernel
         .set_agent_model_with_provider(agent_id, model, provider)
@@ -6746,7 +6746,10 @@ pub async fn set_model(
         ),
         Err(openfang_kernel::error::KernelError::OpenFang(
             openfang_types::error::OpenFangError::InvalidInput(message),
-        )) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": message}))),
+        )) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": message})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("{e}")})),

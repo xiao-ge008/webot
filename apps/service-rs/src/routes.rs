@@ -950,7 +950,7 @@ pub async fn optimize_prompt_with_default_model(
 pub fn chat_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{id}/sessions", get(chat_sessions))
-        .route("/{id}/session", get(chat_session))
+        .route("/{id}/session", get(chat_session).delete(delete_chat_session))
         .route("/{id}/session/compact", post(chat_session_compact))
         .route("/{id}/message", post(chat_message))
         .route("/{id}/message/stream", post(chat_message_stream))
@@ -1336,6 +1336,71 @@ pub async fn chat_session(
     }
 
     Ok(Json(data))
+}
+
+pub async fn delete_chat_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ChatSessionQuery>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let session_id = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let session_label = query
+        .session_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let resolved_session_id = if let Some(sid) = session_id {
+        sid
+    } else if let Some(label) = session_label {
+        let safe_label = normalize_session_label(label);
+        if safe_label.is_empty() {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "session_label 无效"));
+        }
+        match find_openfang_session_by_label(&state, &resolved.resolved, &safe_label).await? {
+            Some(found) => found,
+            None => {
+                return Ok(Json(json!({
+                    "ok": true,
+                    "agent_id": resolved.resolved,
+                    "deleted": false,
+                    "session_id": Value::Null,
+                })));
+            }
+        }
+    } else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "缺少 session_id 或 session_label",
+        ));
+    };
+
+    let path = format!("/api/sessions/{resolved_session_id}");
+    let data = match state.openfang.delete_json(&path).await {
+        Ok(value) => value,
+        Err(error) if error.status == StatusCode::NOT_FOUND => {
+            json!({
+                "status": "missing",
+                "session_id": resolved_session_id,
+            })
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "agent_id": resolved.resolved,
+        "deleted": true,
+        "session_id": resolved_session_id,
+        "result": data,
+    })))
 }
 
 pub async fn chat_session_compact(
@@ -6891,8 +6956,13 @@ pub async fn get_agent_skills(
     ensure_online(&state).await?;
     let resolved = resolve_agent_id_alias(&state, &id).await?;
     let agent_id = resolved.resolved;
-    let runtime_available = openfang_known_skill_names(&state, &agent_id).await?;
-    let mut custom_available = global_custom_skill_names()?;
+    let skill_aliases = skill_name_alias_map()?;
+    let runtime_available = canonicalize_skill_names(
+        openfang_known_skill_names(&state, &agent_id).await?,
+        &skill_aliases,
+    );
+    let mut custom_available =
+        canonicalize_skill_names(global_custom_skill_names()?, &skill_aliases);
     let custom_available_set = custom_available
         .iter()
         .map(|name| name.to_ascii_lowercase())
@@ -6912,8 +6982,10 @@ pub async fn get_agent_skills(
     let mut available = custom_available.clone();
     available.extend(builtin_available.iter().cloned());
     available.extend(runtime_available.iter().cloned());
-    let mut assigned =
-        assignment_store::list_agent_enabled_skills(&agent_id).map_err(storage_error)?;
+    let mut assigned = canonicalize_skill_names(
+        assignment_store::list_agent_enabled_skills(&agent_id).map_err(storage_error)?,
+        &skill_aliases,
+    );
     available.extend(assigned.iter().cloned());
     available.sort();
     available.dedup();
@@ -6954,11 +7026,17 @@ pub async fn set_agent_skills(
         payload.assigned,
         "skills",
     )?;
+    let skill_aliases = skill_name_alias_map()?;
+    desired = canonicalize_skill_names(desired, &skill_aliases);
 
-    let mut available = global_custom_skill_names()?;
-    available.extend(openfang_known_skill_names(&state, &agent_id).await?);
-    let mut previous =
+    let mut available = canonicalize_skill_names(global_custom_skill_names()?, &skill_aliases);
+    available.extend(canonicalize_skill_names(
+        openfang_known_skill_names(&state, &agent_id).await?,
+        &skill_aliases,
+    ));
+    let previous_raw =
         assignment_store::list_agent_enabled_skills(&agent_id).map_err(storage_error)?;
+    let mut previous = canonicalize_skill_names(previous_raw.clone(), &skill_aliases);
     available.extend(previous.iter().cloned());
     available.sort();
     available.dedup();
@@ -6985,8 +7063,9 @@ pub async fn set_agent_skills(
     desired.dedup();
     previous.sort();
     previous.dedup();
+    let previous_raw = unique_trimmed_names(previous_raw);
 
-    for skill in &previous {
+    for skill in &previous_raw {
         assignment_store::set_agent_skill_enabled(&agent_id, skill, false)
             .map_err(storage_error)?;
     }
@@ -7005,7 +7084,7 @@ pub async fn set_agent_skills(
             for skill in &desired {
                 let _ = assignment_store::set_agent_skill_enabled(&agent_id, skill, false);
             }
-            for skill in &previous {
+            for skill in &previous_raw {
                 let _ = assignment_store::set_agent_skill_enabled(&agent_id, skill, true);
             }
             Err(err)
@@ -7259,13 +7338,23 @@ pub async fn set_agent_skill_toggle(
             "skill 不能为空",
         ));
     }
+    let skill_aliases = skill_name_alias_map()?;
+    let Some(skill) = canonicalize_skill_name(skill, &skill_aliases) else {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "skill 不能为空",
+        ));
+    };
 
     if payload.enabled {
-        let mut available = global_custom_skill_names()?;
-        available.extend(openfang_known_skill_names(&state, &agent_id).await?);
+        let mut available = canonicalize_skill_names(global_custom_skill_names()?, &skill_aliases);
+        available.extend(canonicalize_skill_names(
+            openfang_known_skill_names(&state, &agent_id).await?,
+            &skill_aliases,
+        ));
         available.sort();
         available.dedup();
-        if !available.iter().any(|name| name == skill) {
+        if !available.iter().any(|name| name == &skill) {
             return Err(ApiError::new(
                 axum::http::StatusCode::BAD_REQUEST,
                 format!("未知 skill: {skill}"),
@@ -7273,12 +7362,27 @@ pub async fn set_agent_skill_toggle(
         }
     }
 
-    let prev_enabled = assignment_store::list_agent_enabled_skills(&agent_id)
-        .map_err(storage_error)?
-        .iter()
-        .any(|name| name == skill);
-    assignment_store::set_agent_skill_enabled(&agent_id, skill, payload.enabled)
-        .map_err(storage_error)?;
+    let previous_raw =
+        assignment_store::list_agent_enabled_skills(&agent_id).map_err(storage_error)?;
+    let previous_canonical = canonicalize_skill_names(previous_raw.clone(), &skill_aliases);
+    let prev_enabled = previous_canonical.iter().any(|name| name == &skill);
+    let mut desired = previous_canonical.clone();
+    if payload.enabled {
+        desired.push(skill.clone());
+    } else {
+        desired.retain(|name| name != &skill);
+    }
+    desired.sort();
+    desired.dedup();
+    let previous_raw = unique_trimmed_names(previous_raw);
+
+    for raw_name in &previous_raw {
+        assignment_store::set_agent_skill_enabled(&agent_id, raw_name, false)
+            .map_err(storage_error)?;
+    }
+    for name in &desired {
+        assignment_store::set_agent_skill_enabled(&agent_id, name, true).map_err(storage_error)?;
+    }
 
     match sync_agent_skill_assignments(&state, &agent_id).await {
         Ok(mut result) => {
@@ -7288,7 +7392,15 @@ pub async fn set_agent_skill_toggle(
             Ok(Json(result))
         }
         Err(err) => {
-            let _ = assignment_store::set_agent_skill_enabled(&agent_id, skill, prev_enabled);
+            for name in &desired {
+                let _ = assignment_store::set_agent_skill_enabled(&agent_id, name, false);
+            }
+            for raw_name in &previous_raw {
+                let _ = assignment_store::set_agent_skill_enabled(&agent_id, raw_name, true);
+            }
+            if !prev_enabled {
+                let _ = assignment_store::set_agent_skill_enabled(&agent_id, &skill, false);
+            }
             Err(err)
         }
     }
@@ -11874,8 +11986,13 @@ async fn sync_agent_skill_assignments(
     state: &Arc<AppState>,
     agent_id: &str,
 ) -> Result<Value, ApiError> {
-    let desired = assignment_store::list_agent_enabled_skills(agent_id).map_err(storage_error)?;
-    let known = openfang_known_skill_names(state, agent_id).await?;
+    let skill_aliases = skill_name_alias_map()?;
+    let desired = canonicalize_skill_names(
+        assignment_store::list_agent_enabled_skills(agent_id).map_err(storage_error)?,
+        &skill_aliases,
+    );
+    let known =
+        canonicalize_skill_names(openfang_known_skill_names(state, agent_id).await?, &skill_aliases);
     let known_set = known.iter().cloned().collect::<HashSet<_>>();
     let desired_runtime: Vec<String> = desired
         .iter()
@@ -12178,6 +12295,100 @@ fn global_custom_skill_names() -> Result<Vec<String>, ApiError> {
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+fn skill_name_alias_map() -> Result<HashMap<String, String>, ApiError> {
+    let skills_root = assignment_store::skills_root().map_err(storage_error)?;
+    let imported = assignment_store::list_imported_skills().map_err(storage_error)?;
+    let mut aliases = HashMap::new();
+    let mut folder_to_display = HashMap::new();
+
+    if skills_root.exists() {
+        let dirs = list_child_dirs(&skills_root)
+            .map_err(|e| storage_error(format!("读取技能目录失败: {e}")))?;
+        for folder_name in dirs {
+            let trimmed = folder_name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let skill_dir = skills_root.join(trimmed);
+            let display_name = read_skill_name_from_dir(&skill_dir)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| trimmed.to_string());
+            folder_to_display.insert(trimmed.to_ascii_lowercase(), display_name.clone());
+            aliases
+                .entry(trimmed.to_ascii_lowercase())
+                .or_insert_with(|| display_name.clone());
+            aliases
+                .entry(display_name.to_ascii_lowercase())
+                .or_insert(display_name);
+        }
+    }
+
+    for record in imported {
+        let record_name = record.name.trim();
+        if record_name.is_empty() {
+            continue;
+        }
+        let canonical = skill_folder_name_from_record(&record)
+            .and_then(|folder_name| folder_to_display.get(&folder_name.to_ascii_lowercase()).cloned())
+            .unwrap_or_else(|| record_name.to_string());
+        aliases
+            .entry(record_name.to_ascii_lowercase())
+            .or_insert_with(|| canonical.clone());
+        if let Some(folder_name) = skill_folder_name_from_record(&record) {
+            let trimmed = folder_name.trim();
+            if !trimmed.is_empty() {
+                aliases
+                    .entry(trimmed.to_ascii_lowercase())
+                    .or_insert(canonical);
+            }
+        }
+    }
+
+    Ok(aliases)
+}
+
+fn canonicalize_skill_name(name: &str, aliases: &HashMap<String, String>) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        aliases
+            .get(&trimmed.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| trimmed.to_string()),
+    )
+}
+
+fn canonicalize_skill_names(
+    names: impl IntoIterator<Item = String>,
+    aliases: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for name in names {
+        if let Some(canonical) = canonicalize_skill_name(&name, aliases) {
+            normalized.push(canonical);
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn unique_trimmed_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 async fn sync_active_mcp_servers_to_runtime(state: &Arc<AppState>) -> Result<Value, ApiError> {

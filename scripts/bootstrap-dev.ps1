@@ -116,10 +116,17 @@ function Sync-OpenFangBinary {
     )
 
     $resourceRoot = Join-Path $RepoRoot 'apps\frontend\src-tauri\resources\openfang'
-    $platformRoot = Join-Path $resourceRoot 'win'
+    $platformRoots = @(
+        (Join-Path $resourceRoot 'win-x86_64'),
+        (Join-Path $resourceRoot 'win'),
+        (Join-Path $resourceRoot 'windows')
+    )
 
-    New-Item -ItemType Directory -Path $platformRoot -Force | Out-Null
-    Copy-Item -Path $SourceBinary -Destination (Join-Path $platformRoot 'openfang.exe') -Force
+    foreach ($platformRoot in $platformRoots) {
+        New-Item -ItemType Directory -Path $platformRoot -Force | Out-Null
+        Copy-Item -Path $SourceBinary -Destination (Join-Path $platformRoot 'openfang.exe') -Force
+    }
+
     Copy-Item -Path $SourceBinary -Destination (Join-Path $resourceRoot 'openfang.exe') -Force
 }
 

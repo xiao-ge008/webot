@@ -832,9 +832,12 @@ impl MemorySubstrate {
         let subject_type = subject_type.to_string();
         let subject_id = subject_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
-            let mut stmt = db.prepare(
-                "SELECT
+            let db = conn
+                .lock()
+                .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let mut stmt = db
+                .prepare(
+                    "SELECT
                     p.projection_id,
                     p.subject_type,
                     p.subject_id,
@@ -857,47 +860,50 @@ impl MemorySubstrate {
                  JOIN memory_events e ON e.event_id = p.event_id
                  WHERE p.subject_type = ?1 AND p.subject_id = ?2
                  ORDER BY e.created_at DESC
-                 LIMIT ?3"
-            ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+                 LIMIT ?3",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-            let rows = stmt.query_map(
-                rusqlite::params![subject_type, subject_id, limit as i64],
-                |row| {
-                    let projection_metadata_raw = row.get::<_, String>(4)?;
-                    let event_metadata_raw = row.get::<_, String>(16)?;
-                    let participant_ids_raw = row.get::<_, String>(15)?;
-                    let projection_metadata: serde_json::Value =
-                        serde_json::from_str(&projection_metadata_raw)
-                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-                    let event_metadata: serde_json::Value =
-                        serde_json::from_str(&event_metadata_raw)
-                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-                    let participant_ids: serde_json::Value =
-                        serde_json::from_str(&participant_ids_raw)
-                            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-                    Ok(serde_json::json!({
-                        "kind": "projected_event",
-                        "projection_id": row.get::<_, String>(0)?,
-                        "subject_type": row.get::<_, String>(1)?,
-                        "subject_id": row.get::<_, String>(2)?,
-                        "projection_role": row.get::<_, String>(3)?,
-                        "projection_metadata": projection_metadata,
-                        "event_id": row.get::<_, String>(5)?,
-                        "event_type": row.get::<_, String>(6)?,
-                        "content": row.get::<_, String>(7)?,
-                        "conversation_id": row.get::<_, String>(8)?,
-                        "group_id": row.get::<_, String>(9)?,
-                        "task_id": row.get::<_, String>(10)?,
-                        "source_agent_id": row.get::<_, String>(11)?,
-                        "target_agent_id": row.get::<_, String>(12)?,
-                        "speaker_agent_id": row.get::<_, String>(13)?,
-                        "speaker_user_id": row.get::<_, String>(14)?,
-                        "participant_ids": participant_ids,
-                        "event_metadata": event_metadata,
-                        "created_at": row.get::<_, String>(17)?,
-                    }))
-                },
-            ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![subject_type, subject_id, limit as i64],
+                    |row| {
+                        let projection_metadata_raw = row.get::<_, String>(4)?;
+                        let event_metadata_raw = row.get::<_, String>(16)?;
+                        let participant_ids_raw = row.get::<_, String>(15)?;
+                        let projection_metadata: serde_json::Value =
+                            serde_json::from_str(&projection_metadata_raw)
+                                .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                        let event_metadata: serde_json::Value =
+                            serde_json::from_str(&event_metadata_raw)
+                                .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                        let participant_ids: serde_json::Value =
+                            serde_json::from_str(&participant_ids_raw)
+                                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+                        Ok(serde_json::json!({
+                            "kind": "projected_event",
+                            "projection_id": row.get::<_, String>(0)?,
+                            "subject_type": row.get::<_, String>(1)?,
+                            "subject_id": row.get::<_, String>(2)?,
+                            "projection_role": row.get::<_, String>(3)?,
+                            "projection_metadata": projection_metadata,
+                            "event_id": row.get::<_, String>(5)?,
+                            "event_type": row.get::<_, String>(6)?,
+                            "content": row.get::<_, String>(7)?,
+                            "conversation_id": row.get::<_, String>(8)?,
+                            "group_id": row.get::<_, String>(9)?,
+                            "task_id": row.get::<_, String>(10)?,
+                            "source_agent_id": row.get::<_, String>(11)?,
+                            "target_agent_id": row.get::<_, String>(12)?,
+                            "speaker_agent_id": row.get::<_, String>(13)?,
+                            "speaker_user_id": row.get::<_, String>(14)?,
+                            "participant_ids": participant_ids,
+                            "event_metadata": event_metadata,
+                            "created_at": row.get::<_, String>(17)?,
+                        }))
+                    },
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
             let mut items = Vec::new();
             for row in rows {

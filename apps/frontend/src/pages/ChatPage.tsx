@@ -26,7 +26,7 @@ import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task'
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import type { GroupQueueItem, GroupQueueReason, GroupQueueStatus, GroupSessionRuntime } from '@/types/group';
 import { CHAT_CHANNELS, CHAT_RENDER_MODES } from '@/main/types';
-import { cancelAgentChat, compactAgentSession, sendAgentChat, stopAgent, subscribeAgentChatStream, withChatRenderContext } from '@/services/agent-client';
+import { cancelAgentChat, compactAgentSession, deleteAgentSession, sendAgentChat, stopAgent, subscribeAgentChatStream, withChatRenderContext } from '@/services/agent-client';
 import type { StoredChatSession } from '@/services/chat-session-store';
 import { chatRuntimeStore, useChatRuntimeSelector } from '@/services/chat-runtime-store';
 import { ensureChatRuntimeStreamPump } from '@/services/chat-runtime-stream-pump';
@@ -2588,6 +2588,7 @@ export function ChatPage({
     const [isResizing, setIsResizing] = useState(false);
     const [sessionKeyword, setSessionKeyword] = useState('');
     const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null);
+    const [sessionDeleteBusy, setSessionDeleteBusy] = useState(false);
     const [pendingCreateTaskMessageId, setPendingCreateTaskMessageId] = useState<string | null>(null);
     const [taskActionBusy, setTaskActionBusy] = useState(false);
     const [taskDetailsOpen, setTaskDetailsOpen] = useState(false);
@@ -2721,7 +2722,7 @@ export function ChatPage({
         ? streamState
         : (sessionStreamState === 'streaming' || sessionStreamState === 'waiting' ? sessionStreamState : 'idle');
     const inputLocked = autoConversationEnabled || isSending || effectiveStreamState !== 'idle' || pendingSilentCount > 0 || silentDispatching || multiReplyDispatching;
-    const sessionActionLocked = isSending || effectiveStreamState !== 'idle';
+    const sessionActionLocked = sessionDeleteBusy || isSending || effectiveStreamState !== 'idle';
     const markUserActivity = useCallback((_source?: string) => {
         lastUserActivityAtRef.current = Date.now();
     }, []);
@@ -7170,11 +7171,46 @@ export function ChatPage({
         setPendingDeleteSessionId(sessionId);
     };
 
-    const handleConfirmDeleteSession = () => {
+    const dropRemoteSessionReferences = (remoteSessionId: string) => {
+        const normalizedRemoteSessionId = remoteSessionId.trim();
+        if (!normalizedRemoteSessionId) {
+            return;
+        }
+        remoteSyncTokenRef.current += 1;
+        remoteBatchLoadingRef.current = false;
+        remoteSessionSummaryMapRef.current.delete(normalizedRemoteSessionId);
+        remoteSessionQueueRef.current = remoteSessionQueueRef.current.filter((item) => item.sessionId !== normalizedRemoteSessionId);
+        syncRemoteQueueMeta(remoteSessionQueueRef.current.length);
+    };
+
+    const handleConfirmDeleteSession = async () => {
         if (!pendingDeleteSessionId || sessionActionLocked) {
             return;
         }
         const deletingSessionId = pendingDeleteSessionId;
+        const deletingSession = sessions.find((session) => session.id === deletingSessionId) ?? null;
+        const deletingRemoteSessionId = getRemoteSessionId(deletingSession);
+        const deletingRemoteOwnerAgentId = getRemoteSessionOwnerAgentId(deletingSession) || sessionOwnerAgentId;
+        setSessionDeleteBusy(true);
+        try {
+            if (deletingRemoteSessionId) {
+                const result = await deleteAgentSession({
+                    agentId: deletingRemoteOwnerAgentId,
+                    sessionId: deletingRemoteSessionId,
+                });
+                if (!result.success) {
+                    pushInAppNotice({
+                        title: '删除会话失败',
+                        message: result.message || '远端会话删除失败，请稍后重试。',
+                        level: 'error',
+                    });
+                    return;
+                }
+                dropRemoteSessionReferences(deletingRemoteSessionId);
+            }
+        } finally {
+            setSessionDeleteBusy(false);
+        }
         const deletingActive = deletingSessionId === activeSessionId;
         const remaining = sessions.filter((session) => session.id !== deletingSessionId);
         if (!remaining.length) {

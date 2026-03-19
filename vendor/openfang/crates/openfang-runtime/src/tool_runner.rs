@@ -5,11 +5,13 @@
 
 use crate::kernel_handle::KernelHandle;
 use crate::mcp;
+use crate::media_understanding::MediaEngine;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -81,6 +83,34 @@ tokio::task_local! {
     static AGENT_CALL_DEPTH: std::cell::Cell<u32>;
     /// Canvas max HTML size in bytes (set from kernel config at loop start).
     pub static CANVAS_MAX_BYTES: usize;
+}
+
+const CURRENT_MODEL_VISION_TIMEOUT_SECS: u64 = 75;
+const FALLBACK_VISION_TIMEOUT_SECS: u64 = 30;
+
+fn format_timeout_duration(timeout: std::time::Duration) -> String {
+    if timeout.as_millis() < 1000 {
+        format!("{}ms", timeout.as_millis())
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
+}
+
+async fn run_with_timeout<T, F>(
+    label: &str,
+    timeout: std::time::Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "{label} timed out after {}",
+            format_timeout_duration(timeout)
+        )),
+    }
 }
 
 /// Get the current inter-agent call depth from the task-local context.
@@ -191,7 +221,9 @@ pub async fn execute_tool(
             let headers = input.get("headers").and_then(|v| v.as_object());
             let body = input["body"].as_str();
             if let Some(ctx) = web_ctx {
-                ctx.fetch.fetch_with_options(url, method, headers, body).await
+                ctx.fetch
+                    .fetch_with_options(url, method, headers, body)
+                    .await
             } else {
                 tool_web_fetch_legacy(input).await
             }
@@ -275,10 +307,10 @@ pub async fn execute_tool(
         "knowledge_query" => tool_knowledge_query(input, kernel).await,
 
         // Image analysis tool
-        "image_analyze" => tool_image_analyze(input).await,
+        "image_analyze" => tool_image_analyze(input, media_engine, kernel, caller_agent_id).await,
 
         // Media understanding tools
-        "media_describe" => tool_media_describe(input, media_engine).await,
+        "media_describe" => tool_media_describe(input, media_engine, kernel, caller_agent_id).await,
         "media_transcribe" => tool_media_transcribe(input, media_engine).await,
 
         // Image generation tool
@@ -337,8 +369,7 @@ pub async fn execute_tool(
                     crate::browser::tool_browser_navigate(input, mgr, aid).await
                 }
                 None => Err(
-                    "Browser tools not available. Ensure Chrome/Chromium is installed."
-                        .to_string(),
+                    "Browser tools not available. Ensure Chrome/Chromium is installed.".to_string(),
                 ),
             }
         }
@@ -347,63 +378,81 @@ pub async fn execute_tool(
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_click(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_type" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_type(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_screenshot" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_screenshot(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_read_page" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_read_page(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_close" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_close(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_scroll" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_scroll(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_wait" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_wait(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_run_js" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_run_js(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
         "browser_back" => match browser_ctx {
             Some(mgr) => {
                 let aid = caller_agent_id.unwrap_or("default");
                 crate::browser::tool_browser_back(input, mgr, aid).await
             }
-            None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+            None => {
+                Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
+            }
         },
 
         // Canvas / A2UI tool
@@ -421,8 +470,7 @@ pub async fn execute_tool(
                     if let Some(server_name) = mcp::resolve_mcp_server_from_known(
                         other,
                         known_servers.iter().map(String::as_str),
-                    )
-                    {
+                    ) {
                         if let Some(conn_index) =
                             conns.iter().position(|conn| conn.name() == server_name)
                         {
@@ -802,7 +850,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Image analysis tool ---
         ToolDefinition {
             name: "image_analyze".to_string(),
-            description: "Analyze an image file — returns format, dimensions, file size, and a base64 preview. For vision-model analysis, include a prompt.".to_string(),
+            description: "Analyze an image file. Always returns file metadata; when a prompt is provided, also performs direct vision analysis with the current agent model when possible, otherwise falls back to configured vision providers.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -925,7 +973,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Media understanding tools ---
         ToolDefinition {
             name: "media_describe".to_string(),
-            description: "Describe an image using a vision-capable LLM. Auto-selects the best available provider (Anthropic, OpenAI, or Gemini). Returns a text description of the image content.".to_string(),
+            description: "Describe an image using the current agent model when it supports vision; otherwise fall back to configured vision providers (Anthropic, OpenAI, or Gemini). Returns a text description of the image content.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1651,13 +1699,11 @@ async fn tool_memory_recall(
                         "subject_id": subject_id,
                         "results": results,
                     });
-                    return Ok(
-                        serde_json::to_string_pretty(&payload)
-                            .unwrap_or_else(|_| payload.to_string()),
-                    );
+                    return Ok(serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| payload.to_string()));
                 }
             }
-            Ok(format!("No value found for key '{key}'."))        
+            Ok(format!("No value found for key '{key}'."))
         }
     }
 }
@@ -2135,7 +2181,8 @@ async fn tool_cron_create(
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let agent_id = caller_agent_id.ok_or("Agent ID required for cron_create")?;
-    kh.cron_create(agent_id, normalize_cron_create_input_for_tool(input)).await
+    kh.cron_create(agent_id, normalize_cron_create_input_for_tool(input))
+        .await
 }
 
 fn normalize_cron_create_input_for_tool(input: &serde_json::Value) -> serde_json::Value {
@@ -2459,9 +2506,14 @@ async fn tool_a2a_send(
 // Image analysis tool
 // ---------------------------------------------------------------------------
 
-async fn tool_image_analyze(input: &serde_json::Value) -> Result<String, String> {
+async fn tool_image_analyze(
+    input: &serde_json::Value,
+    media_engine: Option<&MediaEngine>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
     let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let prompt = input["prompt"].as_str().unwrap_or("");
+    let prompt = input["prompt"].as_str().map(str::trim).unwrap_or("");
 
     let data = tokio::fs::read(path)
         .await
@@ -2476,7 +2528,7 @@ async fn tool_image_analyze(input: &serde_json::Value) -> Result<String, String>
     let dimensions = extract_image_dimensions(&data, &format);
 
     // Base64-encode (truncate for very large images in the response)
-    let base64_preview = if file_size <= 512 * 1024 {
+    let full_base64_preview = if file_size <= 512 * 1024 {
         // Under 512KB — include full base64
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(&data)
@@ -2505,12 +2557,28 @@ async fn tool_image_analyze(input: &serde_json::Value) -> Result<String, String>
 
     if !prompt.is_empty() {
         result["prompt"] = serde_json::json!(prompt);
-        result["note"] = serde_json::json!(
-            "Vision analysis requires a vision-capable LLM. The base64 data is included for downstream processing."
-        );
+        match tool_media_describe(input, media_engine, kernel, caller_agent_id).await {
+            Ok(vision_json) => {
+                let vision_result = serde_json::from_str::<serde_json::Value>(&vision_json)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": vision_json }));
+                result["vision_analysis"] = vision_result;
+                result["note"] = serde_json::json!(
+                    "Direct vision analysis succeeded. Base64 preview omitted to reduce token usage."
+                );
+                result["base64_preview"] =
+                    serde_json::json!("[omitted because direct vision analysis succeeded]");
+            }
+            Err(err) => {
+                result["vision_error"] = serde_json::json!(err);
+                result["note"] = serde_json::json!(
+                    "Direct vision analysis was requested but failed. A base64 preview is kept for compatibility."
+                );
+                result["base64_preview"] = serde_json::json!(full_base64_preview);
+            }
+        }
+    } else {
+        result["base64_preview"] = serde_json::json!(full_base64_preview);
     }
-
-    result["base64_preview"] = serde_json::json!(base64_preview);
 
     serde_json::to_string_pretty(&result).map_err(|e| format!("Serialize error: {e}"))
 }
@@ -2669,10 +2737,37 @@ async fn tool_location_get() -> Result<String, String> {
 async fn tool_media_describe(
     input: &serde_json::Value,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    tool_media_describe_with_timeouts(
+        input,
+        media_engine,
+        kernel,
+        caller_agent_id,
+        std::time::Duration::from_secs(CURRENT_MODEL_VISION_TIMEOUT_SECS),
+        std::time::Duration::from_secs(FALLBACK_VISION_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn tool_media_describe_with_timeouts(
+    input: &serde_json::Value,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    current_model_timeout: std::time::Duration,
+    fallback_timeout: std::time::Duration,
 ) -> Result<String, String> {
     use base64::Engine;
-    let engine = media_engine.ok_or("Media engine not available. Check media configuration.")?;
     let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let prompt = input["prompt"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(
+            "Describe this image in detail. Extract visible text, numbers, tables, charts, UI elements, and any other relevant information.",
+        );
     let _ = validate_path(path)?;
 
     // Read image file
@@ -2696,18 +2791,60 @@ async fn tool_media_describe(
         _ => return Err(format!("Unsupported image format: .{ext}")),
     };
 
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    let mut current_model_error = None;
+    if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+        match run_with_timeout(
+            "Current agent model vision request",
+            current_model_timeout,
+            kernel.describe_image_with_agent_model(agent_id, prompt, mime, &base64_data),
+        )
+        .await
+        {
+            Ok(understanding) => {
+                return serde_json::to_string_pretty(&understanding)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            Err(err) => current_model_error = Some(err),
+        }
+    }
+
     let attachment = openfang_types::media::MediaAttachment {
         media_type: openfang_types::media::MediaType::Image,
         mime_type: mime.to_string(),
         source: openfang_types::media::MediaSource::Base64 {
-            data: base64::engine::general_purpose::STANDARD.encode(&data),
+            data: base64_data,
             mime_type: mime.to_string(),
         },
         size_bytes: data.len() as u64,
     };
 
-    let understanding = engine.describe_image(&attachment).await?;
-    serde_json::to_string_pretty(&understanding).map_err(|e| format!("Serialize error: {e}"))
+    let fallback_error = match media_engine {
+        Some(engine) => match run_with_timeout(
+            "Fallback vision provider request",
+            fallback_timeout,
+            engine.describe_image(&attachment),
+        )
+        .await
+        {
+            Ok(understanding) => {
+                return serde_json::to_string_pretty(&understanding)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            Err(err) => err,
+        },
+        None => "Media engine not available. Check media configuration.".to_string(),
+    };
+
+    let mut parts = Vec::new();
+    if let Some(err) = current_model_error {
+        parts.push(format!("Current agent model path failed: {err}"));
+    }
+    parts.push(format!(
+        "Fallback vision provider path failed: {fallback_error}"
+    ));
+    Err(parts.join(" | "))
 }
 
 /// Transcribe audio to text using speech-to-text.
@@ -3206,6 +3343,9 @@ async fn tool_canvas_present(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel_handle::{AgentInfo, KernelHandle};
+    use async_trait::async_trait;
+    use std::sync::Arc;
 
     #[test]
     fn test_builtin_tool_definitions() {
@@ -3704,6 +3844,53 @@ mod tests {
         assert!(result.content.contains("Failed to read"));
     }
 
+    #[tokio::test]
+    async fn test_image_analyze_with_prompt_uses_current_agent_vision_first() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "openfang_image_analyze_test_{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, b"fake-png-data").unwrap();
+
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = execute_tool(
+            "test-id",
+            "image_analyze",
+            &serde_json::json!({
+                "path": temp_path.to_string_lossy().to_string(),
+                "prompt": "extract every visible number"
+            }),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("\"vision_analysis\""));
+        assert!(result
+            .content
+            .contains("vision-ok: extract every visible number"));
+        assert!(result
+            .content
+            .contains("[omitted because direct vision analysis succeeded]"));
+    }
+
     #[test]
     fn test_depth_limit_constant() {
         assert_eq!(MAX_AGENT_CALL_DEPTH, 5);
@@ -3747,6 +3934,198 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(result.content.contains("Kernel handle not available"));
+    }
+
+    enum MediaDescribeTestKernelMode {
+        Immediate,
+        Sleep(std::time::Duration),
+    }
+
+    struct MediaDescribeTestKernel {
+        mode: MediaDescribeTestKernelMode,
+    }
+
+    #[async_trait]
+    impl KernelHandle for MediaDescribeTestKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        fn list_agents(&self) -> Vec<AgentInfo> {
+            Vec::new()
+        }
+
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        fn memory_store(&self, _key: &str, _value: serde_json::Value) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        fn memory_recall(&self, _key: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+
+        fn find_agents(&self, _query: &str) -> Vec<AgentInfo> {
+            Vec::new()
+        }
+
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+
+        async fn task_complete(&self, _task_id: &str, _result: &str) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn task_list(&self, _status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_add_entity(
+            &self,
+            _entity: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_add_relation(
+            &self,
+            _relation: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_query(
+            &self,
+            _pattern: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn describe_image_with_agent_model(
+            &self,
+            _agent_id: &str,
+            prompt: &str,
+            _media_type: &str,
+            _base64_data: &str,
+        ) -> Result<openfang_types::media::MediaUnderstanding, String> {
+            if let MediaDescribeTestKernelMode::Sleep(delay) = &self.mode {
+                tokio::time::sleep(*delay).await;
+            }
+            Ok(openfang_types::media::MediaUnderstanding {
+                media_type: openfang_types::media::MediaType::Image,
+                description: format!("vision-ok: {prompt}"),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_media_describe_uses_current_agent_vision_first() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "openfang_media_describe_test_{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, b"fake-png-data").unwrap();
+
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = execute_tool(
+            "test-id",
+            "media_describe",
+            &serde_json::json!({
+                "path": temp_path.to_string_lossy().to_string(),
+                "prompt": "extract every visible number"
+            }),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert!(!result.is_error);
+        assert!(result
+            .content
+            .contains("vision-ok: extract every visible number"));
+        assert!(result.content.contains("\"model\": \"test-model\""));
+    }
+
+    #[tokio::test]
+    async fn test_media_describe_times_out_current_model_request_before_tool_timeout() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "openfang_media_describe_timeout_test_{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, b"fake-png-data").unwrap();
+
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Sleep(std::time::Duration::from_millis(30)),
+        });
+        let result = tool_media_describe_with_timeouts(
+            &serde_json::json!({
+                "path": temp_path.to_string_lossy().to_string(),
+                "prompt": "extract every visible number"
+            }),
+            None,
+            Some(&kernel),
+            Some("agent-1"),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&temp_path);
+
+        let err = result.expect_err("expected timeout");
+        assert!(err.contains(
+            "Current agent model path failed: Current agent model vision request timed out after 10ms"
+        ));
+        assert!(err.contains(
+            "Fallback vision provider path failed: Media engine not available. Check media configuration."
+        ));
     }
 
     // ─── Canvas / A2UI tests ────────────────────────────────────────
