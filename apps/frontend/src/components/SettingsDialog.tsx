@@ -46,6 +46,7 @@ import { ProvidersTab } from '@/components/settings/ProvidersTab';
 import { ModelsTab } from '@/components/settings/ModelsTab';
 import { MemoryEnhancementTab } from '@/components/settings/MemoryEnhancementTab';
 import { Live2DTab } from '@/components/settings/Live2DTab';
+import { ComponentProvidersTab } from '@/components/settings/ComponentProvidersTab';
 import {
   clearGlobalMcpConfig,
   deleteGlobalSkill,
@@ -95,6 +96,7 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
       {
         title: t('settings.menu.extensions'),
         items: [
+          { id: 'componentProviders', label: t('settings.menu.componentProviders'), icon: Settings2 },
           { id: 'skills', label: t('settings.menu.skills'), icon: FileText },
           { id: 'mcp', label: t('settings.menu.mcp'), icon: Server },
         ],
@@ -185,6 +187,7 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
           {activeTab === 'providers' && <ProvidersTab />}
           {activeTab === 'models' && <ModelsTab />}
           {activeTab === 'memoryEnhancement' && <MemoryEnhancementTab />}
+          {activeTab === 'componentProviders' && <ComponentProvidersTab />}
           {activeTab === 'skills' && <SkillsTab />}
           {activeTab === 'mcp' && <McpTab />}
           {activeTab === 'live2d' && <Live2DTab />}
@@ -192,6 +195,7 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
             activeTab !== 'providers' &&
             activeTab !== 'models' &&
             activeTab !== 'memoryEnhancement' &&
+            activeTab !== 'componentProviders' &&
             activeTab !== 'skills' &&
             activeTab !== 'mcp' &&
             activeTab !== 'live2d' && (
@@ -797,7 +801,8 @@ function SkillsTab() {
     setLoading(true);
     try {
       const payload = await getGlobalSkills();
-      const normalized = payload.items.map((item) => ({
+      const customItems = payload.items.filter((item) => item.category === 'custom');
+      const normalized = customItems.map((item) => ({
         id: item.id,
         metadata: {
           name: item.name,
@@ -927,11 +932,11 @@ function SkillsTab() {
       <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
         <DialogContent className="max-w-lg">
           <DialogHeader>
-            <DialogTitle>导入技能</DialogTitle>
+            <DialogTitle>导入自定义SKILL</DialogTitle>
             <DialogDescription>
               {isDesktopRuntime
-                ? '选择本地技能文件夹后将直接复制到服务端技能目录。'
-                : '选择技能文件夹后上传，服务端会自动复制并安装。'}
+                ? '选择本地 skill 文件夹后将直接复制到服务端技能目录。'
+                : '选择 skill 文件夹后上传，服务端会自动复制并安装。'}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -1044,7 +1049,7 @@ function SkillsTab() {
           </div>
         ) : skills.length === 0 ? (
           <div className="p-8 text-center text-foreground-secondary">
-            {t('settings.noItems')}
+            暂无自定义 skill
           </div>
         ) : (
           skills.map((skill, index) => (
@@ -1062,14 +1067,12 @@ function SkillsTab() {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-1">
                     <h4 className="text-[15px] font-medium text-foreground truncate">{skill.metadata.name}</h4>
-                    {skill.isSystem && (
-                      <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-5">
-                        {t('settings.system')}
-                      </Badge>
-                    )}
-                    {skill.isNew && !skill.isSystem && (
+                    <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-5">
+                      自定义
+                    </Badge>
+                    {skill.isNew && (
                       <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-5">
-                        Imported
+                        已导入
                       </Badge>
                     )}
                   </div>

@@ -7,6 +7,19 @@ import { UpdateProvider } from '@/providers/UpdateProvider';
 import '@/i18n';
 import './index.css';
 import App from './App.tsx';
+import { requestJson } from '@/services/transport';
+
+declare global {
+  interface Window {
+    __WEBOT_API__?: {
+      requestJson: typeof requestJson;
+    };
+  }
+}
+
+window.__WEBOT_API__ = {
+  requestJson,
+};
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

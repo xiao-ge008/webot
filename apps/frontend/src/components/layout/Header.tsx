@@ -8,9 +8,9 @@ import { ThemeLangSwitcher } from '@/components/ThemeLangSwitcher';
 import { SettingsDialog } from '@/components/SettingsDialog';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { getServicePowerState, startServicePower, stopServicePower, type ServicePowerState } from '@/services/service-power-client';
-import { AlertTriangle, ChevronLeft, Loader2, Power, Sparkles, User, Users, Clock, Wand2 } from 'lucide-react';
+import { AlertTriangle, ChevronLeft, Loader2, Power, Sparkles, User, Users, Clock, Wand2, Boxes } from 'lucide-react';
 
-export type HomeTab = 'agents' | 'groups' | 'tasks' | 'superTools';
+export type HomeTab = 'agents' | 'groups' | 'tasks' | 'components' | 'superTools';
 
 interface HomeTabContextType {
   activeTab: HomeTab;
@@ -45,6 +45,7 @@ export function Header() {
   if (location.pathname === '/settings') return null;
   const isHome = location.pathname === '/' || location.pathname === '/home';
   const isTaskLanding = location.pathname.startsWith('/tasks');
+  const isComponentLanding = location.pathname.startsWith('/components');
   const [serviceState, setServiceState] = useState<ServicePowerState>({
     status: 'offline',
     online: false,
@@ -92,11 +93,13 @@ export function Header() {
     { id: 'agents' as HomeTab, icon: User, label: t('home.tabs.agents'), path: '/home' },
     { id: 'groups' as HomeTab, icon: Users, label: t('home.tabs.groups'), path: '/home' },
     { id: 'tasks' as HomeTab, icon: Clock, label: t('home.tabs.tasks'), path: '/tasks' },
+    { id: 'components' as HomeTab, icon: Boxes, label: t('home.tabs.components'), path: '/components' },
     { id: 'superTools' as HomeTab, icon: Wand2, label: t('home.tabs.superTools'), path: '/home' },
   ];
 
   const activeTopTab: HomeTab | null = (() => {
     if (isTaskLanding) return 'tasks';
+    if (isComponentLanding) return 'components';
     if (location.pathname.startsWith('/agents')) return 'agents';
     if (isHome) return activeTab;
     return null;
@@ -125,7 +128,7 @@ export function Header() {
         </div>
 
         {/* 中间：主功能导航 Tab */}
-        {(isHome || isTaskLanding || location.pathname.startsWith('/agents')) && (
+        {(isHome || isTaskLanding || isComponentLanding || location.pathname.startsWith('/agents')) && (
           <nav className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center gap-1">
             {navTabs.map((tab) => (
               <Button

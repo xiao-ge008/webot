@@ -2203,6 +2203,7 @@ export interface AgentAssignmentInfo {
   mode: 'all' | 'allowlist' | string;
   runtime_available?: string[];
   custom_available?: string[];
+  component_available?: string[];
   builtin_available?: string[];
 }
 
@@ -2219,6 +2220,7 @@ export async function getAgentSkillAssignments(agentId: string): Promise<AgentAs
     mode: asString(payload.mode, 'all'),
     runtime_available: asStringArray(payload.runtime_available),
     custom_available: asStringArray(payload.custom_available),
+    component_available: asStringArray(payload.component_available),
     builtin_available: asStringArray(payload.builtin_available),
   };
 }
@@ -2331,10 +2333,40 @@ export interface GlobalSkillListItem {
   description?: string;
   path: string;
   sourceType: string;
-  category: 'system_ui' | 'builtin' | 'custom' | string;
+  category: GlobalSkillCategory;
   isSystem: boolean;
   isImported: boolean;
   canDelete: boolean;
+}
+
+export type GlobalSkillCategory = 'system_ui' | 'builtin' | 'component' | 'custom';
+
+function normalizeGlobalSkillCategory(row: JsonRecord): GlobalSkillCategory {
+  const category = asString(row.category).trim().toLowerCase();
+  if (
+    category === 'system_ui' ||
+    category === 'builtin' ||
+    category === 'component' ||
+    category === 'custom'
+  ) {
+    return category;
+  }
+
+  const sourceType = asString(row.sourceType).trim().toLowerCase();
+  const isSystem = Boolean(row.isSystem) || sourceType === 'ui';
+  if (isSystem) {
+    return 'system_ui';
+  }
+  if (sourceType === 'bundled' || sourceType === 'builtin' || sourceType === 'system') {
+    return 'builtin';
+  }
+
+  const canDelete =
+    typeof row.canDelete === 'boolean' ? row.canDelete : !Boolean(row.isSystem);
+  if (!canDelete) {
+    return 'component';
+  }
+  return 'custom';
 }
 
 export interface GlobalSkillsPayload {
@@ -2396,7 +2428,7 @@ export async function getGlobalSkills(): Promise<GlobalSkillsPayload> {
         description: asString(row.description) || undefined,
         path: asString(row.path),
         sourceType: asString(row.sourceType),
-        category: asString(row.category) || 'custom',
+        category: normalizeGlobalSkillCategory(row),
         isSystem: Boolean(row.isSystem),
         isImported: Boolean(row.isImported),
         canDelete: typeof row.canDelete === 'boolean' ? row.canDelete : !Boolean(row.isSystem),

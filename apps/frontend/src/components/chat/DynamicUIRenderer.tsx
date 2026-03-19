@@ -1,5 +1,6 @@
 import React, { Suspense } from 'react';
 import * as ReactJsxRuntime from 'react/jsx-runtime';
+import * as ReactDOM from 'react-dom';
 import { ErrorBoundary } from 'react-error-boundary';
 import {
   Renderer,
@@ -15,8 +16,16 @@ import { shadcnComponentDefinitions } from '@json-render/shadcn/catalog';
 import { defineCatalog, nestedToFlat } from '@json-render/core';
 import type { ComponentRenderProps } from '@json-render/react';
 import { genUiComponents } from '@/lib/genui-registry';
-import { AlertTriangle } from 'lucide-react';
+import { AlertTriangle, Loader2 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import * as ButtonUi from '@/components/ui/button';
+import * as DialogUi from '@/components/ui/dialog';
+import * as InputUi from '@/components/ui/input';
+import * as LabelUi from '@/components/ui/label';
+import * as ScrollAreaUi from '@/components/ui/scroll-area';
+import * as SelectUi from '@/components/ui/select';
+import * as SwitchUi from '@/components/ui/switch';
+import * as TextareaUi from '@/components/ui/textarea';
 
 const catalog = defineCatalog(schema, {
   components: {
@@ -37,6 +46,7 @@ const registryComponents = (registry as any).components ?? {};
 const componentNameMap = new Map<string, string>(
   Object.keys(registryComponents).map((key) => [key.toLowerCase(), key]),
 );
+const SKILL_COMPONENT_CACHE_ENABLED = !import.meta.env.DEV;
 
 const componentsCache: Record<string, any> = {};
 const SKILL_IMPORT_TRANSIENT_RE = /Failed to fetch dynamically imported module|Importing a module script failed|skill:\/\//i;
@@ -67,6 +77,7 @@ interface DynamicUIRendererProps {
   schema: any;
   onAction?: (actionId: string, payload?: any) => void;
   agentId?: string;
+  messageId?: string;
 }
 
 interface SkillSourcePayload {
@@ -158,6 +169,15 @@ async function compileSkillSourceToModule(source: string, filename: string): Pro
   const requireFn = (id: string) => {
     if (id === 'react') return React;
     if (id === 'react/jsx-runtime') return ReactJsxRuntime;
+    if (id === 'react-dom') return ReactDOM;
+    if (id === '@/components/ui/button') return ButtonUi;
+    if (id === '@/components/ui/dialog') return DialogUi;
+    if (id === '@/components/ui/input') return InputUi;
+    if (id === '@/components/ui/label') return LabelUi;
+    if (id === '@/components/ui/scroll-area') return ScrollAreaUi;
+    if (id === '@/components/ui/select') return SelectUi;
+    if (id === '@/components/ui/switch') return SwitchUi;
+    if (id === '@/components/ui/textarea') return TextareaUi;
     throw new Error(`动态组件暂不支持导入依赖: ${id}`);
   };
 
@@ -229,13 +249,14 @@ function resolveComponentCacheKey(componentName: string, agentId?: string): stri
 }
 
 function getCachedComponent(componentName: string, agentId?: string): any | null {
+  if (!SKILL_COMPONENT_CACHE_ENABLED) return null;
   const cacheKey = resolveComponentCacheKey(componentName, agentId);
   return componentsCache[cacheKey] ?? null;
 }
 
 async function loadSkill(componentName: string, agentId?: string): Promise<any> {
   const cacheKey = resolveComponentCacheKey(componentName, agentId);
-  if (componentsCache[cacheKey]) return componentsCache[cacheKey];
+  if (SKILL_COMPONENT_CACHE_ENABLED && componentsCache[cacheKey]) return componentsCache[cacheKey];
 
   const baseUrl = `skill://${componentName}/main.js`;
   const queryUrl = agentId ? `${baseUrl}?agentId=${encodeURIComponent(agentId)}` : baseUrl;
@@ -270,7 +291,9 @@ async function loadSkill(componentName: string, agentId?: string): Promise<any> 
     throw new Error(`组件模块缺少可用导出: ${componentName}`);
   }
 
-  componentsCache[cacheKey] = picked;
+  if (SKILL_COMPONENT_CACHE_ENABLED) {
+    componentsCache[cacheKey] = picked;
+  }
   return picked;
 }
 
@@ -305,12 +328,17 @@ const RecursiveRenderer = ({
   output,
   agentId,
   onAction,
+  messageId,
 }: {
   output: any;
   agentId?: string;
   onAction?: (actionId: string, payload?: any) => void;
+  messageId?: string;
 }) => {
   if (!output) return null;
+  if (React.isValidElement(output)) {
+    return output;
+  }
 
   const isSchema = typeof output === 'object' && (output.root || output.type);
   if (!isSchema) {
@@ -333,9 +361,12 @@ const RecursiveRenderer = ({
   const patchedElements: Record<string, any> = {};
   for (const [key, el] of Object.entries(flat.elements)) {
     const rawProps = (el as any).props || {};
-    const safeProps = typeof onAction === 'function'
-      ? { ...rawProps, __onAction: onAction }
-      : rawProps;
+    const safeProps = {
+      ...rawProps,
+      ...(typeof onAction === 'function' ? { __onAction: onAction } : {}),
+      ...(agentId ? { __agentId: agentId } : {}),
+      ...(messageId ? { __messageId: messageId } : {}),
+    };
     patchedElements[key] = {
       ...(el as any),
       props: safeProps,
@@ -355,13 +386,29 @@ const RecursiveRenderer = ({
 };
 
 function DynamicComponent(
-  { componentName, agentId, element, emit, onAction }: ComponentRenderProps & {
+  { componentName, agentId, element, emit, onAction, messageId }: ComponentRenderProps & {
     componentName: string;
     agentId?: string;
     onAction?: (actionId: string, payload?: any) => void;
+    messageId?: string;
   },
 ) {
   const cacheKey = React.useMemo(() => resolveComponentCacheKey(componentName, agentId), [componentName, agentId]);
+  const forwardedAction = onAction
+    || (typeof (element as any)?.props?.__onAction === 'function'
+      ? (element as any).props.__onAction as (actionId: string, payload?: any) => void
+      : undefined);
+  const rawProps = (element as any)?.props;
+  const patchedElement = messageId && rawProps && typeof rawProps === 'object'
+      ? {
+        ...(element as any),
+        props: {
+          ...rawProps,
+          ...(agentId ? { __agentId: agentId } : {}),
+          __messageId: messageId,
+        },
+      }
+    : element;
   const [Component, setComponent] = React.useState<any>(() => getCachedComponent(componentName, agentId));
   const [error, setError] = React.useState<string | null>(null);
 
@@ -400,24 +447,31 @@ function DynamicComponent(
 
   if (error === '__skill_module_missing__') return renderMissingSkillFallback(componentName, element);
   if (error) return <div className="p-2 text-sm text-destructive">组件加载失败：{error}</div>;
-  if (!Component) return <div className="animate-pulse p-2 text-xs text-muted-foreground">组件加载中...</div>;
+  if (!Component) {
+    return (
+      <Card className="border-border/60 bg-muted/15 shadow-none">
+        <CardContent className="flex items-center gap-3 p-4">
+          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+          <div className="space-y-1">
+            <div className="text-sm font-medium text-foreground/85">正在加载组件模块…</div>
+            <div className="text-xs text-muted-foreground">首次打开组件时需要先装载本地 UI 模块。</div>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
 
   let output: any;
   try {
-    output = Component({ element, emit });
+    output = Component({ element: patchedElement, emit, agentId, onAction: forwardedAction });
   } catch (renderError: any) {
     return <div className="p-2 text-sm text-destructive">组件渲染异常：{renderError?.message || String(renderError)}</div>;
   }
 
-  const forwardedAction = onAction
-    || (typeof (element as any)?.props?.__onAction === 'function'
-      ? (element as any).props.__onAction as (actionId: string, payload?: any) => void
-      : undefined);
-
-  return <RecursiveRenderer output={output} agentId={agentId} onAction={forwardedAction} />;
+  return <RecursiveRenderer output={output} agentId={agentId} onAction={forwardedAction} messageId={messageId} />;
 }
 
-const GenUIFallback = (props: ComponentRenderProps & { agentId?: string; onAction?: (actionId: string, payload?: any) => void }) => {
+const GenUIFallback = (props: ComponentRenderProps & { agentId?: string; onAction?: (actionId: string, payload?: any) => void; messageId?: string }) => {
   const componentName = (props.element.type as string) || 'unknown';
   if (HTML_TAGS.has(componentName.toLowerCase()) && !genUiComponents[componentName]) {
     return null;
@@ -425,7 +479,7 @@ const GenUIFallback = (props: ComponentRenderProps & { agentId?: string; onActio
   return <DynamicComponent componentName={componentName} agentId={props.agentId} onAction={props.onAction} {...props} />;
 };
 
-const DynamicUIRendererBase: React.FC<DynamicUIRendererProps> = ({ schema: uiSchema, onAction, agentId }) => {
+const DynamicUIRendererBase: React.FC<DynamicUIRendererProps> = ({ schema: uiSchema, onAction, agentId, messageId }) => {
   const schemaObj = uiSchema as any;
   const isNested = schemaObj?.type && !schemaObj?.root;
   const flatSpec = isNested ? (nestedToFlat ? nestedToFlat(schemaObj) : schemaObj) : schemaObj;
@@ -452,9 +506,12 @@ const DynamicUIRendererBase: React.FC<DynamicUIRendererProps> = ({ schema: uiSch
   if ((rendererSpec as any).elements) {
     for (const [key, el] of Object.entries((rendererSpec as any).elements)) {
       const rawProps = (el as any).props || {};
-      const nextProps = typeof onAction === 'function'
-        ? { ...rawProps, __onAction: onAction }
-        : rawProps;
+      const nextProps = {
+        ...rawProps,
+        ...(typeof onAction === 'function' ? { __onAction: onAction } : {}),
+        ...(agentId ? { __agentId: agentId } : {}),
+        ...(messageId ? { __messageId: messageId } : {}),
+      };
       patchedElements[key] = {
         ...(el as any),
         props: nextProps,
@@ -478,7 +535,7 @@ const DynamicUIRendererBase: React.FC<DynamicUIRendererProps> = ({ schema: uiSch
                   <Renderer
                     spec={normalizedFlat}
                     registry={registry}
-                    fallback={(props) => <GenUIFallback {...props} agentId={agentId} onAction={onAction} />}
+                    fallback={(props) => <GenUIFallback {...props} agentId={agentId} onAction={onAction} messageId={messageId} />}
                   />
                 </ActionProvider>
               </VisibilityProvider>
@@ -492,5 +549,5 @@ const DynamicUIRendererBase: React.FC<DynamicUIRendererProps> = ({ schema: uiSch
 
 export const DynamicUIRenderer = React.memo(
   DynamicUIRendererBase,
-  (prev, next) => prev.schema === next.schema && prev.agentId === next.agentId,
+  (prev, next) => prev.schema === next.schema && prev.agentId === next.agentId && prev.messageId === next.messageId,
 );

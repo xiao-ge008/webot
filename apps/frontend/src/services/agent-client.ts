@@ -449,6 +449,19 @@ function normalizeGenUiSpec(spec: unknown): unknown | undefined {
     if (NON_UI_EVENT_TYPES.has(rawType.toLowerCase())) return undefined;
 
     if (
+      !Object.prototype.hasOwnProperty.call(obj, 'props')
+      && !Object.prototype.hasOwnProperty.call(obj, 'children')
+      && !Object.prototype.hasOwnProperty.call(obj, 'slots')
+      && !Object.prototype.hasOwnProperty.call(obj, 'elements')
+      && Object.keys(obj).length === 1
+    ) {
+      return {
+        type: rawType,
+        props: {},
+      };
+    }
+
+    if (
       (obj.props && typeof obj.props === 'object')
       || Object.prototype.hasOwnProperty.call(obj, 'children')
       || Object.prototype.hasOwnProperty.call(obj, 'slots')
@@ -459,7 +472,12 @@ function normalizeGenUiSpec(spec: unknown): unknown | undefined {
 
     const rest = { ...obj };
     delete rest.type;
-    if (Object.keys(rest).length === 0) return undefined;
+    if (Object.keys(rest).length === 0) {
+      return {
+        type: rawType,
+        props: {},
+      };
+    }
     return {
       type: rawType,
       props: rest,
@@ -965,9 +983,9 @@ async function buildUiEnvironmentSystemPrompt(input: AgentChatInput): Promise<st
     'When using UI, prefer a mixed response: short Markdown explanation plus a small focused UI block.',
     'Do not convert the whole answer into UI unless the user explicitly asks for a fully structured card.',
     'When user intent is ambiguous and multiple follow-up directions are possible, prefer using the built-in `OptionSelector` component to ask for intent instead of asking the user to type a free-form clarification.',
-    'Common built-in components you should actively consider when useful: `OptionSelector`, `LineChartCard`, `BarChartCard`, `AreaChartCard`, `PieChartCard`, `ImageCover`, `ImageAlbum`, `ImageCarousel`, `WebViewCard`, `MarkdownPreviewCard`, `OfficePreviewCard`, `AgentManagementConfirmCard`.',
+    'Common built-in components you should actively consider when useful: `OptionSelector`, `LineChartCard`, `BarChartCard`, `AreaChartCard`, `PieChartCard`, `ImageCover`, `ImageAlbum`, `ImageCarousel`, `ComfyUIImageCard`, `VideoCover`, `VideoGallery`, `VideoCarousel`, `ComfyUIVideoCard`, `WebViewCard`, `MarkdownPreviewCard`, `OfficePreviewCard`, `AgentManagementConfirmCard`.',
     'For disambiguation, intent routing, next-step choices, or asking what the user wants to do next, `OptionSelector` is preferred over plain text questions whenever the options are clear.',
-    'Component-first preference order for chat UI: 1) `OptionSelector` for intent clarification and next-step choice, 2) image answers should prefer `ImageCover` / `ImageAlbum` / `ImageCarousel` with visible cover in chat, 3) video answers should prefer `VideoCover` / `VideoGallery` / `VideoCarousel` with visible cover in chat, 4) trend/comparison/numeric answers should prefer chart components such as `LineChartCard` / `BarChartCard` / `AreaChartCard` / `PieChartCard`.',
+    'Component-first preference order for chat UI: 1) `OptionSelector` for intent clarification and next-step choice, 2) ordinary image answers should prefer `ImageCover` / `ImageAlbum` / `ImageCarousel` with visible cover in chat, 3) ordinary video answers should prefer `VideoCover` / `VideoGallery` / `VideoCarousel` with visible cover in chat, 4) component-generated image outputs must use `ComfyUIImageCard`, 5) component-generated video outputs must use `ComfyUIVideoCard`, 6) trend/comparison/numeric answers should prefer chart components such as `LineChartCard` / `BarChartCard` / `AreaChartCard` / `PieChartCard`.',
     'Prefer rich mixed layouts with text plus media/chart components when they make the answer clearer and more readable.',
     'When images or videos are relevant, prioritize cover-first presentation inside the chat message rather than only giving text links.',
     'When comparing data or describing trends, prefer chart visualization over plain prose when valid data is available.',

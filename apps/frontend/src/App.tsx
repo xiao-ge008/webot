@@ -8,6 +8,7 @@ import { EditAgentPage } from '@/pages/EditAgentPage';
 import { ImportPage } from '@/pages/ImportPage';
 import { GroupChatPage } from '@/pages/GroupChatPage';
 import { TaskCenterPage } from '@/pages/TaskCenterPage';
+import { ComponentCenterPage } from '@/pages/ComponentCenterPage';
 import { ChatPage } from '@/pages/ChatPage';
 import { AgentTaskManagerPage } from '@/pages/AgentTaskManagerPage';
 import { SettingsPage } from '@/pages/SettingsPage';
@@ -28,6 +29,7 @@ function App() {
           <Route path="/home" element={<HomePage />} />
           <Route path="/agents" element={<AgentListPage />} />
           <Route path="/tasks" element={<TaskCenterPage />} />
+          <Route path="/components" element={<ComponentCenterPage />} />
           <Route path="/create" element={<CreateAgentPage />} />
           <Route path="/groups/create" element={<CreateGroupPage />} />
           <Route path="/edit/:id" element={<EditAgentPage />} />

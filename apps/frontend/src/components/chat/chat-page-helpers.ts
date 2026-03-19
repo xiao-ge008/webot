@@ -218,6 +218,60 @@ function canonicalizeComponentType(type: string): string {
   return COMPONENT_TYPE_ALIASES[normalized] || raw;
 }
 
+function normalizeComponentTypeKey(type: string): string {
+  return type.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+}
+
+function readComponentOutputName(props: Record<string, unknown>): string {
+  const candidates = [props.componentName, props.englishName, props.skillName];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return '';
+}
+
+function coerceBuiltinMediaComponentType(
+  type: string,
+  props: Record<string, unknown>,
+): string {
+  const componentName = readComponentOutputName(props);
+  if (!componentName) {
+    return type;
+  }
+
+  const normalizedType = normalizeComponentTypeKey(type);
+  const imageLikeTypes = new Set([
+    'image',
+    'imagecover',
+    'imagealbum',
+    'imagecarousel',
+    'componentimagecard',
+    'comfyuiimagecard',
+    'componentimage',
+    'comfyuiimage',
+  ]);
+  const videoLikeTypes = new Set([
+    'video',
+    'videocover',
+    'videogallery',
+    'videocarousel',
+    'componentvideocard',
+    'comfyuivideocard',
+    'componentvideo',
+    'comfyuivideo',
+  ]);
+
+  if (imageLikeTypes.has(normalizedType)) {
+    return 'ComfyUIImageCard';
+  }
+  if (videoLikeTypes.has(normalizedType)) {
+    return 'ComfyUIVideoCard';
+  }
+  return type;
+}
+
 const PROFILE_INTRO_ALLOWED_PROPS = new Set([
   'name',
   'title',
@@ -461,10 +515,10 @@ export function sanitizeByManifestSchema(props: Record<string, unknown>, schema:
 
 function sanitizeComponentEntry(entry: Record<string, unknown>): Record<string, unknown> {
   const rawType = typeof entry.type === 'string' ? entry.type : '';
-  const type = canonicalizeComponentType(rawType);
   const rawProps = entry.props && typeof entry.props === 'object'
     ? entry.props as Record<string, unknown>
     : {};
+  const type = coerceBuiltinMediaComponentType(canonicalizeComponentType(rawType), rawProps);
   const manifestSchema = getManifestSchemaFromCache(type);
   if (manifestSchema) {
     const schemaSanitized = sanitizeByManifestSchema(rawProps, manifestSchema);
@@ -948,7 +1002,12 @@ function buildShorthandSpecFromTypeObject(value: Record<string, unknown>): unkno
   const rest = { ...value };
   delete rest.type;
   const restKeys = Object.keys(rest);
-  if (restKeys.length === 0) return undefined;
+  if (restKeys.length === 0) {
+    return {
+      type: rawType,
+      props: {},
+    };
+  }
   if (rawType === 'ProfileIntroCard') {
     return {
       type: rawType,
@@ -989,6 +1048,18 @@ function normalizeUiSpecCandidate(value: unknown): unknown | undefined {
     const baseProps = (obj.props && typeof obj.props === 'object')
       ? { ...(obj.props as Record<string, unknown>) }
       : {};
+    if (
+      !Object.prototype.hasOwnProperty.call(obj, 'props')
+      && !Object.prototype.hasOwnProperty.call(obj, 'children')
+      && !Object.prototype.hasOwnProperty.call(obj, 'slots')
+      && !Object.prototype.hasOwnProperty.call(obj, 'elements')
+      && Object.keys(obj).length === 1
+    ) {
+      return {
+        type: rawType,
+        props: {},
+      };
+    }
     const propsItems = Array.isArray(baseProps.items) ? baseProps.items : undefined;
     const itemCandidates = directItems ?? propsItems;
 

@@ -67,6 +67,7 @@ export interface ChatContextUsageMeter {
 
 export interface ChatConversationPaneProps {
   agent: Agent;
+  conversationKey?: string;
   sessionTitle?: string;
   messages: Message[];
   isSending: boolean;
@@ -423,6 +424,7 @@ function buildAttachmentPrompt(text: string, attachments: ChatAttachment[]): str
 
 export function ChatConversationPane({
   agent,
+  conversationKey,
   sessionTitle,
   messages,
   isSending,
@@ -950,6 +952,11 @@ export function ChatConversationPane({
     }
     autoStickToBottomRef.current = isNearBottom(node);
   }, [isNearBottom]);
+
+  useEffect(() => {
+    autoStickToBottomRef.current = true;
+    scheduleScrollToBottom('auto');
+  }, [conversationKey, scheduleScrollToBottom]);
 
   useEffect(() => {
     if (!autoStickToBottomRef.current) {
@@ -1790,6 +1797,7 @@ export function ChatConversationPane({
                           schema={segment.spec as any}
                           onAction={(actionId, payload) => handleUiAction(actionId, payload, { messageId: msg.id })}
                           agentId={agent.id}
+                          messageId={msg.id}
                         />
                       </DeferredUiCard>
                     )}
@@ -1822,6 +1830,7 @@ export function ChatConversationPane({
                       schema={msg.spec as any}
                       onAction={(actionId, payload) => handleUiAction(actionId, payload, { messageId: msg.id })}
                       agentId={agent.id}
+                      messageId={msg.id}
                     />
                   </DeferredUiCard>
                 )}

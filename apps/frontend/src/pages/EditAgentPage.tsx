@@ -794,9 +794,12 @@ interface SkillCatalog {
   all: string[];
   custom: string[];
   builtin: string[];
+  component: string[];
   systemUi: string[];
   descriptions: Record<string, string>;
 }
+
+type SkillViewTab = 'system' | 'component' | 'custom';
 
 let cachedGlobalSkillCatalog: SkillCatalog | null = null;
 let cachedGlobalSkillCatalogAt = 0;
@@ -819,6 +822,7 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
   if (payload.items.length > 0) {
     const builtin: string[] = [];
     const custom: string[] = [];
+    const component: string[] = [];
     const systemUi: string[] = [];
     const all: string[] = [];
     const descriptions: Record<string, string> = {};
@@ -840,6 +844,10 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
         builtin.push(name);
         continue;
       }
+      if (item.category === 'component') {
+        component.push(name);
+        continue;
+      }
       custom.push(name);
     }
 
@@ -847,6 +855,7 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
       all: uniqueSorted(all),
       custom: uniqueSorted(custom),
       builtin: uniqueSorted(builtin),
+      component: uniqueSorted(component),
       systemUi: uniqueSorted(systemUi),
       descriptions,
     };
@@ -855,6 +864,7 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
   const runtimeNames: string[] = [];
   const runtimeBuiltin: string[] = [];
   const runtimeCustom: string[] = [];
+  const runtimeComponent: string[] = [];
   const runtimeUi: string[] = [];
   const descriptions: Record<string, string> = { ...payload.descriptions };
 
@@ -890,12 +900,13 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
   const localNames = payload.localFolders;
   const custom = uniqueSorted([...runtimeCustom, ...importedNames, ...localNames]);
   const builtin = uniqueSorted(runtimeBuiltin);
+  const component = uniqueSorted(runtimeComponent);
   const systemUi = uniqueSorted(runtimeUi);
   const all = uniqueSorted([...runtimeNames, ...importedNames, ...localNames]);
   for (const imported of payload.imported) {
     pushDescription(imported.name, imported.description);
   }
-  return { all, custom, builtin, systemUi, descriptions };
+  return { all, custom, builtin, component, systemUi, descriptions };
 }
 
 function mergeSkillCatalog(
@@ -905,6 +916,7 @@ function mergeSkillCatalog(
   return {
     all: uniqueSorted([...globalCatalog.all, ...assignment.available, ...assignment.assigned]),
     custom: uniqueSorted([...globalCatalog.custom, ...(assignment.custom_available || [])]),
+    component: uniqueSorted([...globalCatalog.component, ...(assignment.component_available || [])]),
     builtin: uniqueSorted([...globalCatalog.builtin, ...(assignment.builtin_available || [])]),
     systemUi: uniqueSorted(globalCatalog.systemUi),
     descriptions: globalCatalog.descriptions,
@@ -1037,10 +1049,12 @@ export function EditAgentPage() {
   const [savingMcpName, setSavingMcpName] = useState<string | null>(null);
   const [availableSkills, setAvailableSkills] = useState<string[]>([]);
   const [builtinSkills, setBuiltinSkills] = useState<string[]>([]);
+  const [componentSkills, setComponentSkills] = useState<string[]>([]);
   const [customSkills, setCustomSkills] = useState<string[]>([]);
   const [systemUiSkills, setSystemUiSkills] = useState<string[]>([]);
   const [skillDescriptions, setSkillDescriptions] = useState<Record<string, string>>({});
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+  const [skillViewTab, setSkillViewTab] = useState<SkillViewTab>('system');
   const [availableMcpServers, setAvailableMcpServers] = useState<string[]>([]);
   const [connectedMcpServers, setConnectedMcpServers] = useState<string[]>([]);
   const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([]);
@@ -1171,21 +1185,49 @@ export function EditAgentPage() {
     }
   }, [currentModel?.providerId, selectedModel?.providerId, selectedProviderId]);
 
+  const systemSkillGroup = useMemo(
+    () => uniqueSorted([...systemUiSkills, ...builtinSkills]),
+    [builtinSkills, systemUiSkills],
+  );
+  const componentSkillGroup = useMemo(
+    () => uniqueSorted(componentSkills),
+    [componentSkills],
+  );
   const customSkillGroup = useMemo(() => {
-    const systemUiSet = new Set(systemUiSkills);
-    const builtinSet = new Set(builtinSkills);
-    return uniqueSorted(
-      customSkills.filter((item) => !systemUiSet.has(item) && !builtinSet.has(item)),
+    const systemSet = new Set(systemSkillGroup);
+    const componentSet = new Set(componentSkillGroup);
+    const customSet = new Set(customSkills);
+    const uncategorized = availableSkills.filter(
+      (item) => !systemSet.has(item) && !componentSet.has(item) && !customSet.has(item),
     );
-  }, [builtinSkills, customSkills, systemUiSkills]);
-  const builtinSkillGroup = useMemo(() => {
-    const customSet = new Set(customSkillGroup);
-    return uniqueSorted([
-      ...systemUiSkills,
-      ...builtinSkills,
-      ...availableSkills.filter((item) => !customSet.has(item)),
-    ]);
-  }, [availableSkills, builtinSkills, customSkillGroup, systemUiSkills]);
+    return uniqueSorted([...customSkills, ...uncategorized]);
+  }, [availableSkills, componentSkillGroup, customSkills, systemSkillGroup]);
+  const skillSections = [
+    {
+      key: 'system' as const,
+      label: `系统内置 (${systemSkillGroup.length})`,
+      title: '系统内置 Skill',
+      description: '包含系统默认能力与 ui-skill。这里只能给当前智能体启用或关闭，不能删除、不能修改。',
+      empty: '当前没有系统内置 skill。',
+      skills: systemSkillGroup,
+    },
+    {
+      key: 'component' as const,
+      label: `组件 Skill (${componentSkillGroup.length})`,
+      title: '组件 Skill',
+      description: '来自组件中心生成的 ComfyUI / RunningHub 等 skill。管理入口在组件中心，这里只负责启停。',
+      empty: '当前没有组件 skill，可先去组件中心配置。',
+      skills: componentSkillGroup,
+    },
+    {
+      key: 'custom' as const,
+      label: `自定义 Skill (${customSkillGroup.length})`,
+      title: '自定义 Skill',
+      description: '由设置页全局导入和删除。编辑页只负责当前智能体是否使用，不在这里改全局资产。',
+      empty: '当前没有自定义 skill，可在设置里的“自定义SKILL”中导入。',
+      skills: customSkillGroup,
+    },
+  ];
   const hideHeaderSaveButton = activeTab === 'memory' || activeTab === 'workspace';
   const isRealtimeToggleTab = activeTab === 'skills' || activeTab === 'mcp';
   const realtimeSaving = savingSkillName !== null || savingMcpName !== null;
@@ -1298,6 +1340,7 @@ export function EditAgentPage() {
       const mergedCatalog = mergeSkillCatalog(skillAssignment, globalCatalog);
       setAvailableSkills(mergedCatalog.all);
       setCustomSkills(mergedCatalog.custom);
+      setComponentSkills(mergedCatalog.component);
       setBuiltinSkills(mergedCatalog.builtin);
       setSystemUiSkills(mergedCatalog.systemUi);
       setSkillDescriptions(mergedCatalog.descriptions);
@@ -1727,6 +1770,7 @@ export function EditAgentPage() {
       setModelOptionsLoaded(false);
       setAvailableSkills([]);
       setCustomSkills([]);
+      setComponentSkills([]);
       setBuiltinSkills([]);
       setSystemUiSkills([]);
       setSelectedSkills([]);
@@ -2671,7 +2715,7 @@ export function EditAgentPage() {
                     <Hammer className="w-6 h-6 text-primary" /> Skill 分配
                   </CardTitle>
                   <CardDescription className="text-sm font-medium">
-                    已恢复真实数据加载：按内置与自定义两组整理，可直接为当前智能体启停。
+                    已按系统内置、组件、自定义三类整理。系统和组件 skill 仅支持启停，自定义 skill 的增删在设置页统一管理。
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="p-8 pt-4 space-y-6">
@@ -2685,87 +2729,67 @@ export function EditAgentPage() {
                     </div>
                   ) : (
                     <>
-                      <div className="rounded-2xl border overflow-hidden bg-background">
-                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">内置 Skills</div>
-                        {builtinSkillGroup.length === 0 ? (
-                          <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
-                        ) : (
-                          builtinSkillGroup.map((skill, index) => {
-                            const enabled = selectedSkills.includes(skill);
-                            const processing = savingSkillName === skill;
-                            return (
-                              <div
-                                key={`builtin-${skill}`}
-                                className={cn(
-                                  'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== builtinSkillGroup.length - 1 && 'border-b',
-                                )}
-                              >
-                                <div className="flex items-center gap-3 min-w-0">
-                                  <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
-                                    <FileText className="w-4 h-4 text-muted-foreground" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="text-sm font-semibold truncate">{skill}</div>
-                                    <div className="text-xs text-muted-foreground truncate">
-                                      {skillDescriptions[skill] || '未提供功能描述'}
-                                    </div>
-                                  </div>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  {processing && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
-                                  <Switch
-                                    checked={enabled}
-                                    disabled={processing}
-                                    onCheckedChange={(checked) => handleToggleSkill(skill, checked)}
-                                  />
-                                </div>
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
+                      <Tabs value={skillViewTab} onValueChange={(value) => setSkillViewTab(value as SkillViewTab)} className="space-y-4">
+                        <TabsList className="grid h-auto grid-cols-3 rounded-2xl bg-muted/30 p-1">
+                          {skillSections.map((section) => (
+                            <TabsTrigger
+                              key={section.key}
+                              value={section.key}
+                              className="rounded-xl px-3 py-2 text-xs font-black tracking-wide"
+                            >
+                              {section.label}
+                            </TabsTrigger>
+                          ))}
+                        </TabsList>
+                      </Tabs>
 
-                      <div className="rounded-2xl border overflow-hidden bg-background">
-                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">自定义 Skills</div>
-                        {customSkillGroup.length === 0 ? (
-                          <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
-                        ) : (
-                          customSkillGroup.map((skill, index) => {
-                            const enabled = selectedSkills.includes(skill);
-                            const processing = savingSkillName === skill;
-                            return (
-                              <div
-                                key={`custom-${skill}`}
-                                className={cn(
-                                  'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== customSkillGroup.length - 1 && 'border-b',
-                                )}
-                              >
-                                <div className="flex items-center gap-3 min-w-0">
-                                  <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
-                                    <FileText className="w-4 h-4 text-muted-foreground" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="text-sm font-semibold truncate">{skill}</div>
-                                    <div className="text-xs text-muted-foreground truncate">
-                                      {skillDescriptions[skill] || '未提供功能描述'}
+                      {skillSections.map((section) => (
+                        section.key === skillViewTab ? (
+                          <div key={section.key} className="rounded-2xl border overflow-hidden bg-background">
+                            <div className="border-b bg-muted/20 px-4 py-3">
+                              <div className="text-sm font-semibold text-foreground">{section.title}</div>
+                              <div className="mt-1 text-xs leading-5 text-muted-foreground">{section.description}</div>
+                            </div>
+                            {section.skills.length === 0 ? (
+                              <div className="px-4 py-8 text-sm text-muted-foreground">{section.empty}</div>
+                            ) : (
+                              section.skills.map((skill, index) => {
+                                const enabled = selectedSkills.includes(skill);
+                                const processing = savingSkillName === skill;
+                                return (
+                                  <div
+                                    key={`${section.key}-${skill}`}
+                                    className={cn(
+                                      'px-4 py-3 flex items-center justify-between gap-4',
+                                      index !== section.skills.length - 1 && 'border-b',
+                                    )}
+                                  >
+                                    <div className="flex items-center gap-3 min-w-0">
+                                      <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
+                                        <FileText className="w-4 h-4 text-muted-foreground" />
+                                      </div>
+                                      <div className="min-w-0">
+                                        <div className="text-sm font-semibold truncate">{skill}</div>
+                                        <div className="text-xs text-muted-foreground truncate">
+                                          {skillDescriptions[skill] || '未提供功能描述'}
+                                        </div>
+                                      </div>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      {processing && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
+                                      <Switch
+                                        checked={enabled}
+                                        disabled={processing}
+                                        onCheckedChange={(checked) => handleToggleSkill(skill, checked)}
+                                      />
                                     </div>
                                   </div>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  {processing && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
-                                  <Switch
-                                    checked={enabled}
-                                    disabled={processing}
-                                    onCheckedChange={(checked) => handleToggleSkill(skill, checked)}
-                                  />
-                                </div>
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
+                                );
+                              })
+                            )}
+                          </div>
+                        ) : null
+                      ))}
                     </>
                   )}
                 </CardContent>

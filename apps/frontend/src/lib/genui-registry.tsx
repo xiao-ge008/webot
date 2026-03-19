@@ -7,8 +7,8 @@ import { Separator } from '@/components/ui/separator';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
-import { GenUIImageAlbum, GenUIImageCarousel, GenUIImageCover } from '@/components/chat/BuiltinImageComponents';
-import { GenUIVideoCarousel, GenUIVideoCover, GenUIVideoGallery } from '@/components/chat/BuiltinVideoComponents';
+import { GenUIComponentImageCard, GenUIImageAlbum, GenUIImageCarousel, GenUIImageCover } from '@/components/chat/BuiltinImageComponents';
+import { GenUIComponentVideoCard, GenUIVideoCarousel, GenUIVideoCover, GenUIVideoGallery } from '@/components/chat/BuiltinVideoComponents';
 import { GenUIWebViewCard } from '@/components/chat/BuiltinWebViewComponents';
 import { GenUIAudioPlayer, GenUIAudioPlaylist } from '@/components/chat/BuiltinAudioComponents';
 import { GenUIMarkdownPreviewCard } from '@/components/chat/BuiltinMarkdownPreviewComponents';
@@ -184,15 +184,27 @@ export const genUiComponents: any = {
     ImageCover: GenUIImageCover,
     ImageAlbum: GenUIImageAlbum,
     ImageCarousel: GenUIImageCarousel,
+    ComponentImageCard: GenUIComponentImageCard,
+    ComfyUIImageCard: GenUIComponentImageCard,
+    component_image_card: GenUIComponentImageCard,
+    comfyui_image_card: GenUIComponentImageCard,
     image_cover: GenUIImageCover,
     image_album: GenUIImageAlbum,
     image_carousel: GenUIImageCarousel,
+    'component.image': GenUIComponentImageCard,
+    'comfyui.image': GenUIComponentImageCard,
     'image.cover': GenUIImageCover,
     'image.album': GenUIImageAlbum,
     'image.carousel': GenUIImageCarousel,
     VideoCover: GenUIVideoCover,
     VideoGallery: GenUIVideoGallery,
     VideoCarousel: GenUIVideoCarousel,
+    ComponentVideoCard: GenUIComponentVideoCard,
+    ComfyUIVideoCard: GenUIComponentVideoCard,
+    component_video_card: GenUIComponentVideoCard,
+    comfyui_video_card: GenUIComponentVideoCard,
+    'component.video': GenUIComponentVideoCard,
+    'comfyui.video': GenUIComponentVideoCard,
     video: GenUIVideoCover,
     videocover: GenUIVideoCover,
     videogallery: GenUIVideoGallery,

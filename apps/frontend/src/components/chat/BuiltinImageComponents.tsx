@@ -1,10 +1,29 @@
 ﻿import * as React from 'react';
-import { Check, ChevronLeft, ChevronRight, Copy, Maximize2, Minus, Plus, RotateCcw, Send } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Loader2, Maximize2, Send, Settings2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent } from '@/components/ui/dialog';
+import {
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
+import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
 import { getApiBaseUrl } from '@/services/transport';
+import { requestJson } from '@/services/transport';
 
 interface GalleryImageItem {
   src: string;
@@ -16,6 +35,7 @@ interface GalleryImageItem {
 
 const IMAGE_ACTION_DEFAULT = 'insert_image';
 const IMAGE_CLICK_ACTIONS = new Set(['preview', 'send', 'sendandpreview']);
+const IMAGE_CARD_STAGE_MIN_HEIGHT = 'min-h-[224px] md:min-h-[248px]';
 
 function toSafeText(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value.trim() : fallback;
@@ -29,35 +49,14 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  const value = text.trim();
-  if (!value) return false;
-
-  try {
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(value);
-      return true;
-    }
-  } catch {
-    // fallback below
+function formatDurationLabel(totalSeconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(safeSeconds / 60);
+  const seconds = safeSeconds % 60;
+  if (minutes <= 0) {
+    return `${seconds}s`;
   }
-
-  try {
-    if (typeof document === 'undefined') return false;
-    const textarea = document.createElement('textarea');
-    textarea.value = value;
-    textarea.setAttribute('readonly', 'true');
-    textarea.style.position = 'fixed';
-    textarea.style.opacity = '0';
-    textarea.style.pointerEvents = 'none';
-    document.body.appendChild(textarea);
-    textarea.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(textarea);
-    return ok;
-  } catch {
-    return false;
-  }
+  return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
 }
 
 function normalizeFileLikeUrl(raw: string): string {
@@ -76,7 +75,7 @@ function normalizeFileLikeUrl(raw: string): string {
     return encodeURI(`file:${normalized}`);
   }
   if (source.startsWith('/')) {
-    return encodeURI(`file://${source}`);
+    return source;
   }
   return source;
 }
@@ -85,8 +84,19 @@ function shouldProxyRemoteImage(url: string): boolean {
   return /^https?:\/\//i.test(url.trim());
 }
 
+function shouldResolveBackendRelativeImage(url: string): boolean {
+  const value = url.trim();
+  return value.startsWith('/') || value.startsWith('api/');
+}
+
 function buildImageProxyUrl(baseUrl: string, rawUrl: string): string {
   return `${baseUrl}/api/management/media/image-proxy?url=${encodeURIComponent(rawUrl)}`;
+}
+
+function buildBackendImageUrl(baseUrl: string, rawPath: string): string {
+  const normalizedBase = baseUrl.replace(/\/+$/, '');
+  const normalizedPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  return `${normalizedBase}${normalizedPath}`;
 }
 
 function useResolvedImageSrc(src: string): string {
@@ -95,7 +105,14 @@ function useResolvedImageSrc(src: string): string {
   React.useEffect(() => {
     let cancelled = false;
     const raw = src.trim();
-    if (!raw || !shouldProxyRemoteImage(raw)) {
+    if (!raw) {
+      setResolved(src);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!shouldProxyRemoteImage(raw) && !shouldResolveBackendRelativeImage(raw)) {
       setResolved(src);
       return () => {
         cancelled = true;
@@ -105,6 +122,10 @@ function useResolvedImageSrc(src: string): string {
     getApiBaseUrl()
       .then((baseUrl) => {
         if (cancelled) return;
+        if (shouldResolveBackendRelativeImage(raw)) {
+          setResolved(buildBackendImageUrl(baseUrl, raw));
+          return;
+        }
         setResolved(buildImageProxyUrl(baseUrl, raw));
       })
       .catch(() => {
@@ -183,6 +204,42 @@ function normalizeGalleryItems(props: Record<string, unknown>): GalleryImageItem
     description: toSafeText(props.description),
     alt: toSafeText(props.alt) || toSafeText(props.title) || 'image',
   }];
+}
+
+function extractGalleryItemsFromResult(result: unknown): GalleryImageItem[] {
+  if (!result) {
+    return [];
+  }
+
+  if (Array.isArray(result)) {
+    return normalizeGalleryItems({ items: result });
+  }
+
+  if (typeof result !== 'object') {
+    return [];
+  }
+
+  const record = result as Record<string, unknown>;
+  const direct = normalizeGalleryItems(record);
+  if (direct.length > 0) {
+    return direct;
+  }
+
+  if (record.raw && typeof record.raw === 'object' && !Array.isArray(record.raw)) {
+    const fromRaw = normalizeGalleryItems(record.raw as Record<string, unknown>);
+    if (fromRaw.length > 0) {
+      return fromRaw;
+    }
+  }
+
+  if (Array.isArray(record.raw)) {
+    const fromRawArray = normalizeGalleryItems({ items: record.raw });
+    if (fromRawArray.length > 0) {
+      return fromRawArray;
+    }
+  }
+
+  return [];
 }
 
 function parseClickAction(value: unknown): 'preview' | 'send' | 'sendAndPreview' {
@@ -282,32 +339,15 @@ function ImagePreviewDialog({
   images,
   index,
   onIndexChange,
-  onSendImage,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   images: GalleryImageItem[];
   index: number;
   onIndexChange: (next: number) => void;
-  onSendImage: (item: GalleryImageItem) => void;
 }) {
-  const [zoom, setZoom] = React.useState(1);
-  const [copied, setCopied] = React.useState(false);
-  const copyResetTimerRef = React.useRef<number | null>(null);
   const current = images[index];
   const hasMultiple = images.length > 1;
-
-  React.useEffect(() => {
-    setZoom(1);
-    setCopied(false);
-  }, [index, open]);
-
-  React.useEffect(() => () => {
-    if (copyResetTimerRef.current != null) {
-      window.clearTimeout(copyResetTimerRef.current);
-      copyResetTimerRef.current = null;
-    }
-  }, []);
 
   const goPrev = React.useCallback(() => {
     if (images.length <= 1) return;
@@ -319,111 +359,108 @@ function ImagePreviewDialog({
     onIndexChange((index + 1) % images.length);
   }, [images.length, index, onIndexChange]);
 
+  React.useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        goPrev();
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        goNext();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [goNext, goPrev, open]);
+
   if (!current) {
     return null;
   }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[96vw] w-[96vw] h-[92vh] p-0 border-border/50 bg-black/90 overflow-hidden">
-        <div className="absolute left-3 top-3 z-20 inline-flex items-center gap-2">
-          <Badge variant="secondary" className="bg-white/15 text-white border-white/20">
-            {index + 1} / {images.length}
-          </Badge>
-          {current.title ? <span className="text-xs text-white/90">{current.title}</span> : null}
-        </div>
-
-        <div className="absolute right-3 top-3 z-20 inline-flex items-center gap-2">
-          <Button
-            size="sm"
-            variant="secondary"
-            className="h-8 bg-white/15 text-white hover:bg-white/25 border-white/20"
-            onClick={async () => {
-              const ok = await copyTextToClipboard(current.rawSrc || current.src);
-              setCopied(ok);
-              if (copyResetTimerRef.current != null) {
-                window.clearTimeout(copyResetTimerRef.current);
-              }
-              copyResetTimerRef.current = window.setTimeout(() => {
-                setCopied(false);
-                copyResetTimerRef.current = null;
-              }, 1600);
-            }}
-          >
-            {copied ? <Check className="w-3.5 h-3.5 mr-1" /> : <Copy className="w-3.5 h-3.5 mr-1" />}
-            {copied ? '已复制' : '复制图片链接'}
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            className="h-8 bg-white/15 text-white hover:bg-white/25 border-white/20"
-            onClick={() => onSendImage(current)}
-          >
-            <Send className="w-3.5 h-3.5 mr-1" />
-            发送到输入框
-          </Button>
-          <Button
-            size="icon"
-            variant="secondary"
-            className="h-8 w-8 bg-white/15 text-white hover:bg-white/25 border-white/20"
-            onClick={() => setZoom((prev) => clamp(prev - 0.2, 0.4, 4))}
-          >
-            <Minus className="w-3.5 h-3.5" />
-          </Button>
-          <Button
-            size="icon"
-            variant="secondary"
-            className="h-8 w-8 bg-white/15 text-white hover:bg-white/25 border-white/20"
-            onClick={() => setZoom((prev) => clamp(prev + 0.2, 0.4, 4))}
-          >
-            <Plus className="w-3.5 h-3.5" />
-          </Button>
-          <Button
-            size="icon"
-            variant="secondary"
-            className="h-8 w-8 bg-white/15 text-white hover:bg-white/25 border-white/20"
-            onClick={() => setZoom(1)}
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-          </Button>
-        </div>
-
-        <div className="h-full w-full flex items-center justify-center overflow-hidden px-4 py-14">
-          <img
-            src={current.src}
-            alt={current.alt}
-            draggable={false}
-            style={{ transform: `scale(${zoom})` }}
-            className="max-h-full max-w-full object-contain select-none transition-transform duration-150"
-          />
-        </div>
-
-        {hasMultiple ? (
-          <>
-            <Button
-              size="icon"
-              variant="secondary"
-              className="absolute left-3 top-1/2 z-20 h-9 w-9 -translate-y-1/2 bg-white/15 text-white hover:bg-white/25 border-white/20"
-              onClick={goPrev}
-            >
-              <ChevronLeft className="w-4 h-4" />
-            </Button>
-            <Button
-              size="icon"
-              variant="secondary"
-              className="absolute right-3 top-1/2 z-20 h-9 w-9 -translate-y-1/2 bg-white/15 text-white hover:bg-white/25 border-white/20"
-              onClick={goNext}
-            >
-              <ChevronRight className="w-4 h-4" />
-            </Button>
-          </>
-        ) : null}
-
-        {current.description ? (
-          <div className="absolute bottom-3 left-3 right-3 z-20 rounded-md bg-black/45 text-white/90 text-xs px-3 py-2 border border-white/10">
-            {current.description}
+      <DialogContent className="h-[96vh] w-[96vw] max-w-none overflow-hidden border-0 bg-black/96 p-0 shadow-none [&>button:last-child]:hidden">
+        <DialogTitle className="sr-only">
+          {current.title || current.alt || `图片预览 ${index + 1}`}
+        </DialogTitle>
+        <div className="relative h-full w-full overflow-hidden">
+          <div className="absolute inset-0 flex items-center justify-center p-2 md:p-4">
+            <ProxyImage
+              src={current.src}
+              alt={current.alt}
+              draggable={false}
+              className="h-full w-full select-none object-contain"
+            />
           </div>
-        ) : null}
+
+          <div className="absolute left-3 top-3 z-20 flex items-center gap-2">
+            {hasMultiple ? (
+              <Badge variant="secondary" className="h-7 rounded-full border-0 bg-white/10 px-3 text-[11px] text-white backdrop-blur-sm">
+                {index + 1} / {images.length}
+              </Badge>
+            ) : null}
+          </div>
+
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="absolute right-3 top-3 z-20 h-9 w-9 rounded-full border-0 bg-white/10 text-white backdrop-blur-sm hover:bg-white/16 hover:text-white focus-visible:ring-0"
+            onClick={() => onOpenChange(false)}
+            aria-label="关闭预览"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+
+          {hasMultiple ? (
+            <>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="absolute left-3 top-1/2 z-20 h-11 w-11 -translate-y-1/2 rounded-full border-0 bg-white/10 text-white backdrop-blur-sm hover:bg-white/16 hover:text-white focus-visible:ring-0"
+                onClick={goPrev}
+                aria-label="上一张"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="absolute right-3 top-1/2 z-20 h-11 w-11 -translate-y-1/2 rounded-full border-0 bg-white/10 text-white backdrop-blur-sm hover:bg-white/16 hover:text-white focus-visible:ring-0"
+                onClick={goNext}
+                aria-label="下一张"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </>
+          ) : null}
+
+          {hasMultiple ? (
+            <div className="absolute inset-x-0 bottom-3 z-20 flex justify-center px-3">
+              <div className="flex max-w-full gap-2 overflow-x-auto rounded-full bg-white/8 px-2 py-2 backdrop-blur-md [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                {images.map((item, itemIndex) => (
+                  <button
+                    key={`${item.src}-${itemIndex}`}
+                    type="button"
+                    className={cn(
+                      'relative h-14 w-14 shrink-0 overflow-hidden rounded-2xl transition-all focus-visible:ring-0 md:h-16 md:w-16',
+                      itemIndex === index
+                        ? 'ring-2 ring-white/90'
+                        : 'opacity-55 hover:opacity-100',
+                    )}
+                    onClick={() => onIndexChange(itemIndex)}
+                    aria-label={`查看第 ${itemIndex + 1} 张图片`}
+                  >
+                    <ProxyImage src={item.src} alt={item.alt} className="h-full w-full object-cover" />
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
       </DialogContent>
     </Dialog>
   );
@@ -479,6 +516,783 @@ function EmptyImageState({ title }: { title: string }) {
   return (
     <div className="w-full rounded-xl border border-dashed border-border/70 bg-muted/20 text-muted-foreground px-4 py-6 text-sm">
       {title}
+    </div>
+  );
+}
+
+interface ComponentImageParameterMapping {
+  id: string;
+  parameterName: string;
+  label: string;
+  valueType: string;
+  description: string;
+  defaultValue: unknown;
+  required: boolean;
+  options: unknown[];
+}
+
+interface ComponentImageDefinition {
+  name: string;
+  englishName: string;
+  description: string;
+  workflow: {
+    parameterMappings: ComponentImageParameterMapping[];
+  };
+}
+
+interface ComponentImageRunSnapshot {
+  result?: unknown;
+  elapsedSeconds?: number;
+  values?: Record<string, unknown>;
+  error?: string;
+}
+
+interface ComponentImageInflightRun {
+  startedAt: number;
+  values: Record<string, unknown>;
+  promise: Promise<ComponentImageRunSnapshot>;
+}
+
+const componentImageRuntimeSnapshots = new Map<string, ComponentImageRunSnapshot>();
+const componentImageInflightRuns = new Map<string, ComponentImageInflightRun>();
+
+function safeStorageGet(key: string) {
+  if (typeof window === 'undefined' || !window.localStorage) return null;
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeStorageSet(key: string, value: string) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function safeStorageRemove(key: string) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+}
+
+function buildComponentImageCacheKey(
+  componentName: string,
+  messageId: string | undefined,
+  initialValues: Record<string, unknown>,
+) {
+  if (messageId && messageId.trim()) {
+    return `webot:component-image:${componentName}:message:${messageId.trim()}`;
+  }
+  return `webot:component-image:${componentName}:props:${stableStringify(initialValues)}`;
+}
+
+function buildComponentInitialValues(
+  mappings: ComponentImageParameterMapping[],
+  presetValues: Record<string, unknown>,
+) {
+  const output: Record<string, unknown> = {};
+  for (const mapping of mappings) {
+    const key = typeof mapping?.parameterName === 'string' ? mapping.parameterName : '';
+    if (!key) continue;
+    if (Object.prototype.hasOwnProperty.call(presetValues, key)) {
+      output[key] = presetValues[key];
+      continue;
+    }
+    if (mapping.defaultValue !== undefined && mapping.defaultValue !== null) {
+      output[key] = mapping.defaultValue;
+      continue;
+    }
+    output[key] = mapping.valueType === 'boolean' ? false : '';
+  }
+  return output;
+}
+
+function hasMissingRequiredValues(
+  mappings: ComponentImageParameterMapping[],
+  values: Record<string, unknown>,
+): boolean {
+  return mappings.some((mapping) => {
+    if (!mapping?.required) return false;
+    const value = values[mapping.parameterName];
+    return value === '' || value === null || value === undefined;
+  });
+}
+
+function buildInvokePayload(
+  mappings: ComponentImageParameterMapping[],
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(values).map(([key, raw]) => {
+      const mapping = mappings.find((item) => item.parameterName === key);
+      return [key, normalizeComponentParamValue(raw, mapping?.valueType || 'string')];
+    }),
+  );
+}
+
+function normalizeComponentParamValue(raw: unknown, valueType: string) {
+  if (valueType === 'number') {
+    if (raw === '' || raw === null || raw === undefined) return '';
+    const next = Number(raw);
+    return Number.isFinite(next) ? next : raw;
+  }
+  if (valueType === 'boolean') {
+    return Boolean(raw);
+  }
+  if (valueType === 'json') {
+    if (typeof raw === 'string') {
+      const text = raw.trim();
+      if (!text) return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return raw;
+      }
+    }
+    return raw;
+  }
+  return raw ?? '';
+}
+
+function ComponentImageSettingsDialog({
+  open,
+  title,
+  description,
+  mappings,
+  values,
+  submitting,
+  elapsedSeconds,
+  onOpenChange,
+  onChange,
+  onSubmit,
+}: {
+  open: boolean;
+  title: string;
+  description?: string;
+  mappings: ComponentImageParameterMapping[];
+  values: Record<string, unknown>;
+  submitting: boolean;
+  elapsedSeconds: number;
+  onOpenChange: (nextOpen: boolean) => void;
+  onChange: (key: string, value: unknown) => void;
+  onSubmit: () => void;
+}) {
+  const quietFieldClassName =
+    'focus:outline-none focus:ring-0 focus:ring-transparent focus-visible:ring-0 focus-visible:ring-transparent focus-visible:border-input';
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="gap-0 p-0 sm:max-w-none"
+        style={{
+          width: 'min(920px, calc(100vw - 24px))',
+          maxWidth: '920px',
+          maxHeight: 'min(820px, calc(100vh - 48px))',
+          display: 'grid',
+          gridTemplateRows: 'auto minmax(0, 1fr) auto',
+        }}
+      >
+        <DialogHeader className="border-b px-6 py-5 text-left">
+          <div className="inline-flex items-center gap-2">
+            <span className="inline-flex h-8 w-8 items-center justify-center rounded-full border bg-muted/60 text-foreground-secondary">
+              <Settings2 className="h-4 w-4" />
+            </span>
+            <DialogTitle>{title || '图片生成设置'}</DialogTitle>
+          </div>
+          <DialogDescription>{description || '调整参数后重新生成图片。'}</DialogDescription>
+        </DialogHeader>
+
+        <ScrollArea className="min-h-0 px-6 py-5">
+          {submitting ? (
+            <div className="mb-5 rounded-2xl border border-border/70 bg-muted/25 px-4 py-3 text-sm text-muted-foreground">
+              生成中，已等待 {formatDurationLabel(elapsedSeconds)}
+            </div>
+          ) : null}
+
+          <div className="grid gap-5 pb-2">
+            {mappings.map((mapping) => {
+              const key = mapping.parameterName;
+              const label = mapping.label?.trim() || key;
+              const options = Array.isArray(mapping.options) ? mapping.options : [];
+              const valueType = mapping.valueType || 'string';
+              const currentValue = values[key] ?? (valueType === 'boolean' ? false : '');
+              const fieldId = `component-image-setting-${String(mapping.id || key)}`;
+
+              return (
+                <div key={mapping.id || key} className="grid gap-2">
+                  <div className="grid gap-1">
+                    <Label htmlFor={fieldId} className="text-sm">
+                      {label}
+                      {mapping.required ? <span className="ml-1 text-destructive">*</span> : null}
+                    </Label>
+                    {mapping.description ? (
+                      <p className="text-xs text-muted-foreground">{mapping.description}</p>
+                    ) : null}
+                  </div>
+
+                  {options.length > 0 ? (
+                    <Select
+                      value={String(currentValue ?? '')}
+                      onValueChange={(value) => onChange(key, value)}
+                      disabled={submitting}
+                    >
+                      <SelectTrigger id={fieldId} className={`h-11 ${quietFieldClassName}`}>
+                        <SelectValue placeholder={`选择 ${label}`} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {options.map((option, index) => {
+                          const optionRecord = typeof option === 'object' && option !== null
+                            ? option as Record<string, unknown>
+                            : null;
+                          const optionValue = optionRecord
+                            ? (optionRecord.value ?? optionRecord.index ?? optionRecord.name ?? optionRecord.label ?? String(index))
+                            : option;
+                          const optionLabel = optionRecord
+                            ? (optionRecord.label ?? optionRecord.name ?? optionRecord.description ?? optionValue)
+                            : optionValue;
+                          return (
+                            <SelectItem key={String(optionValue)} value={String(optionValue)}>
+                              {String(optionLabel)}
+                            </SelectItem>
+                          );
+                        })}
+                      </SelectContent>
+                    </Select>
+                  ) : valueType === 'boolean' ? (
+                    <div className="flex min-h-11 items-center justify-between rounded-lg border px-3 py-2">
+                      <span className="text-sm text-muted-foreground">
+                        {Boolean(currentValue) ? '已启用' : '未启用'}
+                      </span>
+                      <Switch
+                        checked={Boolean(currentValue)}
+                        onCheckedChange={(checked) => onChange(key, checked)}
+                        disabled={submitting}
+                      />
+                    </div>
+                  ) : valueType === 'number' ? (
+                    <Input
+                      id={fieldId}
+                      type="number"
+                      value={currentValue as any}
+                      onChange={(event) => onChange(key, event.target.value)}
+                      disabled={submitting}
+                      className={`h-11 ${quietFieldClassName}`}
+                    />
+                  ) : valueType === 'json' ? (
+                    <Textarea
+                      id={fieldId}
+                      value={typeof currentValue === 'string' ? currentValue : JSON.stringify(currentValue ?? '', null, 2)}
+                      onChange={(event) => onChange(key, event.target.value)}
+                      disabled={submitting}
+                      rows={5}
+                      className={`min-h-28 resize-y ${quietFieldClassName}`}
+                    />
+                  ) : (
+                    <Textarea
+                      id={fieldId}
+                      value={String(currentValue ?? '')}
+                      onChange={(event) => onChange(key, event.target.value)}
+                      disabled={submitting}
+                      rows={key.toLowerCase().includes('prompt') ? 6 : 3}
+                      className={cn(
+                        quietFieldClassName,
+                        key.toLowerCase().includes('prompt') ? 'min-h-40 resize-y leading-7' : 'min-h-24 resize-y',
+                      )}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </ScrollArea>
+
+        <DialogFooter className="border-t px-6 py-4 sm:justify-stretch">
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
+            关闭
+          </Button>
+          <Button type="button" onClick={onSubmit} disabled={submitting} className="h-11 min-w-32">
+            {submitting ? '生成中...' : '重新生成'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ComponentImageGallery({
+  images,
+  onOpen,
+  overlay,
+}: {
+  images: GalleryImageItem[];
+  onOpen: (index: number) => void;
+  overlay?: React.ReactNode;
+}) {
+  if (images.length === 0) return null;
+
+  const renderTile = (
+    item: GalleryImageItem,
+    index: number,
+    className: string,
+    overlay?: React.ReactNode,
+  ) => (
+    <button
+      key={`${item.src}-${index}`}
+      type="button"
+      onClick={() => onOpen(index)}
+      className={cn(
+        'group relative block overflow-hidden rounded-[26px] bg-muted/25 text-left shadow-sm outline-none transition-transform duration-300 focus-visible:ring-0',
+        className,
+      )}
+    >
+      <ProxyImage
+        src={item.src}
+        alt={item.alt}
+        className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]"
+      />
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/18 via-transparent to-transparent opacity-80 transition-opacity duration-300 group-hover:opacity-100" />
+      {overlay}
+    </button>
+  );
+
+  if (images.length === 1) {
+    return (
+      <div className={cn('flex items-center', IMAGE_CARD_STAGE_MIN_HEIGHT)}>
+        <div className="relative mx-auto w-full max-w-[720px]">
+          {overlay}
+          {renderTile(images[0], 0, 'aspect-[4/5] rounded-[30px]')}
+        </div>
+      </div>
+    );
+  }
+
+  if (images.length === 2) {
+    return (
+      <div className={cn('flex items-center', IMAGE_CARD_STAGE_MIN_HEIGHT)}>
+        <div className="relative mx-auto w-full max-w-[860px]">
+          {overlay}
+          <div className="grid grid-cols-2 gap-3 md:gap-4">
+            {images.map((item, index) => renderTile(item, index, 'aspect-[4/5] rounded-[28px]'))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (images.length === 3) {
+    return (
+      <div className={cn('flex items-center', IMAGE_CARD_STAGE_MIN_HEIGHT)}>
+        <div className="relative mx-auto w-full max-w-[980px]">
+          {overlay}
+          <div className="grid gap-3 md:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)] md:grid-rows-2 md:gap-4">
+            {renderTile(images[0], 0, 'aspect-[4/5] md:row-span-2 md:h-full md:aspect-auto rounded-[30px]')}
+            {renderTile(images[1], 1, 'aspect-[4/3] md:h-full rounded-[24px]')}
+            {renderTile(images[2], 2, 'aspect-[4/3] md:h-full rounded-[24px]')}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (images.length === 4) {
+    return (
+      <div className={cn('flex items-center', IMAGE_CARD_STAGE_MIN_HEIGHT)}>
+        <div className="relative mx-auto w-full max-w-[1180px]">
+          {overlay}
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            {images.map((item, index) => renderTile(item, index, 'aspect-[4/5] rounded-[24px] md:rounded-[22px]'))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const visibleImages = images.slice(0, 5);
+  const hiddenCount = Math.max(0, images.length - visibleImages.length);
+
+  return (
+    <div className={cn('flex items-center', IMAGE_CARD_STAGE_MIN_HEIGHT)}>
+      <div className="relative mx-auto w-full max-w-[1180px]">
+        {overlay}
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4 md:grid-rows-2 md:gap-4">
+          {renderTile(visibleImages[0], 0, 'col-span-2 aspect-[16/10] md:row-span-2 md:h-full md:aspect-auto rounded-[30px]')}
+          {visibleImages[1] ? renderTile(visibleImages[1], 1, 'aspect-[4/3] rounded-[24px]') : null}
+          {visibleImages[2] ? renderTile(visibleImages[2], 2, 'aspect-[4/3] rounded-[24px]') : null}
+          {visibleImages[3] ? renderTile(visibleImages[3], 3, 'aspect-[4/3] rounded-[24px]') : null}
+          {visibleImages[4] ? renderTile(
+            visibleImages[4],
+            4,
+            'aspect-[4/3] rounded-[24px]',
+            hiddenCount > 0 ? (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/42">
+                <div className="rounded-full bg-background/90 px-3 py-1 text-sm font-medium text-foreground shadow-sm">
+                  +{hiddenCount}
+                </div>
+              </div>
+            ) : null,
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function GenUIComponentImageCard(ctx: any) {
+  const props = (ctx?.props && typeof ctx.props === 'object') ? ctx.props as Record<string, unknown> : {};
+  const componentName = toSafeText(props.componentName) || toSafeText(props.englishName) || toSafeText(props.skillName);
+  const initialValues = (props.initialValues && typeof props.initialValues === 'object' && !Array.isArray(props.initialValues))
+    ? props.initialValues as Record<string, unknown>
+    : {};
+  const title = toSafeText(props.title);
+  const description = toSafeText(props.description);
+  const autoRun = props.autoRun !== false;
+  const agentId = toSafeText(props.__agentId) || toSafeText(ctx?.agentId);
+  const messageId = toSafeText(props.__messageId);
+  const cacheKey = React.useMemo(
+    () => buildComponentImageCacheKey(componentName, messageId || undefined, initialValues),
+    [componentName, initialValues, messageId],
+  );
+  const [definition, setDefinition] = React.useState<ComponentImageDefinition | null>(null);
+  const [values, setValues] = React.useState<Record<string, unknown>>({});
+  const [loading, setLoading] = React.useState(true);
+  const [submitting, setSubmitting] = React.useState(false);
+  const [error, setError] = React.useState('');
+  const [result, setResult] = React.useState<unknown>(null);
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [viewerOpen, setViewerOpen] = React.useState(false);
+  const [viewerIndex, setViewerIndex] = React.useState(0);
+  const [runStartedAt, setRunStartedAt] = React.useState<number | null>(null);
+  const [finishedElapsedSeconds, setFinishedElapsedSeconds] = React.useState(0);
+  const [clockMs, setClockMs] = React.useState(() => Date.now());
+  const autoRanRef = React.useRef(false);
+
+  const invokeWith = React.useCallback(async (
+    definitionArg: ComponentImageDefinition,
+    nextValues: Record<string, unknown>,
+  ) => {
+    if (!componentName) return;
+    const startedAt = Date.now();
+    const mappings = Array.isArray(definitionArg.workflow?.parameterMappings) ? definitionArg.workflow.parameterMappings : [];
+    setSubmitting(true);
+    setError('');
+    setRunStartedAt(startedAt);
+    setFinishedElapsedSeconds(0);
+    setSettingsOpen(false);
+    const runTask = (async (): Promise<ComponentImageRunSnapshot> => {
+      const payload = buildInvokePayload(mappings, nextValues);
+      const response = await requestJson<unknown>(`/api/management/components/${encodeURIComponent(componentName)}/invoke`, {
+        method: 'POST',
+        body: {
+          params: payload,
+          ...(agentId ? { agentId } : {}),
+        },
+      });
+      const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      return {
+        result: response,
+        elapsedSeconds: elapsed,
+        values: nextValues,
+      };
+    })();
+    componentImageInflightRuns.set(cacheKey, {
+      startedAt,
+      values: nextValues,
+      promise: runTask,
+    });
+    try {
+      const snapshot = await runTask;
+      setFinishedElapsedSeconds(snapshot.elapsedSeconds ?? 0);
+      setResult(snapshot.result ?? null);
+      componentImageRuntimeSnapshots.set(cacheKey, snapshot);
+      safeStorageSet(cacheKey, JSON.stringify({
+        elapsedSeconds: snapshot.elapsedSeconds ?? 0,
+        result: snapshot.result,
+        values: nextValues,
+      }));
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err || '调用失败');
+      setError(errorMessage);
+      componentImageRuntimeSnapshots.set(cacheKey, {
+        error: errorMessage,
+        values: nextValues,
+      });
+      autoRanRef.current = false;
+    } finally {
+      const inflight = componentImageInflightRuns.get(cacheKey);
+      if (inflight?.promise === runTask) {
+        componentImageInflightRuns.delete(cacheKey);
+      }
+      setSubmitting(false);
+    }
+  }, [agentId, cacheKey, componentName]);
+
+  const invoke = React.useCallback(async (overrideValues?: Record<string, unknown>) => {
+    if (!definition) return;
+    await invokeWith(definition, overrideValues ?? values);
+  }, [definition, invokeWith, values]);
+
+  React.useEffect(() => {
+    if (!componentName) return;
+    const runtimeSnapshot = componentImageRuntimeSnapshots.get(cacheKey);
+    if (runtimeSnapshot?.result) {
+      setResult(runtimeSnapshot.result);
+      setFinishedElapsedSeconds(Math.max(0, Math.floor(runtimeSnapshot.elapsedSeconds ?? 0)));
+      if (runtimeSnapshot.values && typeof runtimeSnapshot.values === 'object') {
+        setValues((prev) => ({ ...prev, ...runtimeSnapshot.values }));
+      }
+      autoRanRef.current = true;
+    } else if (runtimeSnapshot?.error) {
+      setError(runtimeSnapshot.error);
+      if (runtimeSnapshot.values && typeof runtimeSnapshot.values === 'object') {
+        setValues((prev) => ({ ...prev, ...runtimeSnapshot.values }));
+      }
+    }
+
+    const inflight = componentImageInflightRuns.get(cacheKey);
+    if (!inflight) return;
+    let active = true;
+    setSubmitting(true);
+    setRunStartedAt(inflight.startedAt);
+    setFinishedElapsedSeconds(0);
+    setValues((prev) => ({ ...inflight.values, ...prev }));
+    inflight.promise
+      .then((snapshot) => {
+        if (!active) return;
+        if (snapshot.result !== undefined) {
+          setResult(snapshot.result);
+          setFinishedElapsedSeconds(Math.max(0, Math.floor(snapshot.elapsedSeconds ?? 0)));
+          autoRanRef.current = true;
+        }
+        if (snapshot.error) {
+          setError(snapshot.error);
+          autoRanRef.current = false;
+        }
+      })
+      .finally(() => {
+        if (!active) return;
+        setSubmitting(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [cacheKey, componentName]);
+
+  React.useEffect(() => {
+    if (!componentName) return;
+    const cached = safeStorageGet(cacheKey);
+    if (!cached) return;
+    try {
+      const parsed = JSON.parse(cached) as {
+        result?: unknown;
+        elapsedSeconds?: number;
+        values?: Record<string, unknown>;
+      };
+      if (parsed.result) {
+        const cachedImages = extractGalleryItemsFromResult(parsed.result);
+        if (cachedImages.length > 0) {
+          setResult(parsed.result);
+          autoRanRef.current = true;
+          componentImageRuntimeSnapshots.set(cacheKey, {
+            result: parsed.result,
+            elapsedSeconds: parsed.elapsedSeconds,
+            values: parsed.values,
+          });
+        } else {
+          safeStorageRemove(cacheKey);
+        }
+      }
+      if (typeof parsed.elapsedSeconds === 'number' && Number.isFinite(parsed.elapsedSeconds)) {
+        setFinishedElapsedSeconds(Math.max(0, Math.floor(parsed.elapsedSeconds)));
+      }
+      if (parsed.values && typeof parsed.values === 'object') {
+        setValues((prev) => ({ ...prev, ...parsed.values }));
+      }
+    } catch {
+      // ignore broken cache
+    }
+  }, [cacheKey, componentName]);
+
+  React.useEffect(() => {
+    if (!componentName) {
+      setLoading(false);
+      setError('缺少 componentName');
+      return;
+    }
+    let active = true;
+    setLoading(true);
+    setError('');
+    requestJson<{ item?: ComponentImageDefinition }>(`/api/management/components/${encodeURIComponent(componentName)}`)
+      .then((payload) => {
+        if (!active) return;
+        const item = payload?.item ?? null;
+        setDefinition(item);
+        const mappings = Array.isArray(item?.workflow?.parameterMappings) ? item.workflow.parameterMappings : [];
+        const nextValues = {
+          ...buildComponentInitialValues(mappings, initialValues),
+        };
+        setValues((prev) => {
+          const merged = {
+            ...nextValues,
+            ...prev,
+          };
+          if (
+            autoRun
+            && item
+            && !autoRanRef.current
+            && !hasMissingRequiredValues(mappings, merged)
+          ) {
+            autoRanRef.current = true;
+            void invokeWith(item, merged);
+          }
+          return merged;
+        });
+      })
+      .catch((err) => {
+        if (!active) return;
+        setError(err instanceof Error ? err.message : String(err || '加载组件失败'));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [autoRun, componentName, initialValues, invokeWith]);
+
+  React.useEffect(() => {
+    if (!loading && !submitting) return undefined;
+    const timer = window.setInterval(() => {
+      setClockMs(Date.now());
+    }, 500);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [loading, submitting]);
+
+  React.useEffect(() => {
+    if (!autoRun || !definition || autoRanRef.current) return;
+    const mappings = Array.isArray(definition.workflow?.parameterMappings) ? definition.workflow.parameterMappings : [];
+    if (hasMissingRequiredValues(mappings, values)) return;
+    autoRanRef.current = true;
+    void invoke();
+  }, [autoRun, definition, invoke, values]);
+
+  const images = React.useMemo(() => {
+    return extractGalleryItemsFromResult(result);
+  }, [result]);
+  const elapsedSeconds = submitting && runStartedAt != null
+    ? Math.max(0, Math.floor((clockMs - runStartedAt) / 1000))
+    : finishedElapsedSeconds;
+  const effectiveTitle = title || definition?.name || componentName;
+  const effectiveDescription = description || definition?.description || '';
+
+  if (!componentName) {
+    return <div className="p-2 text-sm text-destructive">组件配置缺少 `componentName`。</div>;
+  }
+
+  if (loading) {
+    return (
+      <div className={cn(IMAGE_CARD_STAGE_MIN_HEIGHT, 'animate-pulse rounded-[28px] bg-muted/40')} />
+    );
+  }
+
+  if (error && !definition) {
+    return <div className="p-2 text-sm text-destructive">{error}</div>;
+  }
+
+  const elapsedLabel = submitting
+    ? formatDurationLabel(elapsedSeconds)
+    : finishedElapsedSeconds > 0
+      ? formatDurationLabel(finishedElapsedSeconds)
+      : '';
+  const galleryOverlay = (
+    <div className="absolute right-3 top-3 z-20 flex items-center gap-2 opacity-90 transition-opacity duration-200 md:opacity-0 md:group-hover:opacity-100">
+      {elapsedLabel ? (
+        <div className="rounded-full border-0 bg-white/10 px-2.5 py-1 text-[11px] font-medium text-white shadow-sm backdrop-blur-sm">
+          {elapsedLabel}
+        </div>
+      ) : null}
+      <Button
+        type="button"
+        size="icon"
+        variant="ghost"
+        className="h-8 w-8 rounded-full border-0 bg-white/10 text-white shadow-sm backdrop-blur-sm hover:bg-white/16 hover:text-white focus-visible:ring-0"
+        onClick={() => setSettingsOpen(true)}
+      >
+        <Settings2 className="h-4 w-4" />
+      </Button>
+    </div>
+  );
+
+  return (
+    <div className="relative">
+      {images.length > 0 ? (
+        <div className={cn('group relative', IMAGE_CARD_STAGE_MIN_HEIGHT)}>
+          <ComponentImageGallery
+            images={images}
+            overlay={galleryOverlay}
+            onOpen={(index) => {
+              setViewerIndex(index);
+              setViewerOpen(true);
+            }}
+          />
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setSettingsOpen(true)}
+          className={cn(
+            IMAGE_CARD_STAGE_MIN_HEIGHT,
+            'flex w-full flex-col items-center justify-center gap-3 rounded-[28px] border border-dashed border-border/70 bg-muted/20 text-sm text-muted-foreground',
+          )}
+        >
+          {submitting ? <Loader2 className="h-7 w-7 animate-spin" /> : <Settings2 className="h-6 w-6" />}
+          <span>{submitting ? `生成中 ${formatDurationLabel(elapsedSeconds)}` : '点击设置开始生成'}</span>
+        </button>
+      )}
+
+      {error ? <div className="mt-3 text-sm text-destructive">{error}</div> : null}
+
+      <ComponentImageSettingsDialog
+        open={settingsOpen}
+        title={effectiveTitle}
+        description={effectiveDescription}
+        mappings={definition?.workflow?.parameterMappings ?? []}
+        values={values}
+        submitting={submitting}
+        elapsedSeconds={elapsedSeconds}
+        onOpenChange={setSettingsOpen}
+        onChange={(key, value) => setValues((prev) => ({ ...prev, [key]: value }))}
+        onSubmit={() => void invoke()}
+      />
+
+      <ImagePreviewDialog
+        open={viewerOpen}
+        onOpenChange={setViewerOpen}
+        images={images}
+        index={viewerIndex}
+        onIndexChange={setViewerIndex}
+      />
     </div>
   );
 }
@@ -584,7 +1398,6 @@ export function GenUIImageCover(ctx: any) {
           images={images}
           index={activeIndex}
           onIndexChange={setActiveIndex}
-          onSendImage={emitImage}
         />
       </div>
     );
@@ -650,7 +1463,6 @@ export function GenUIImageCover(ctx: any) {
         images={images}
         index={activeIndex}
         onIndexChange={setActiveIndex}
-        onSendImage={emitImage}
       />
     </div>
   );
@@ -749,7 +1561,6 @@ export function GenUIImageAlbum(ctx: any) {
           images={images}
           index={activeIndex}
           onIndexChange={setActiveIndex}
-          onSendImage={emitImage}
         />
       </div>
     );
@@ -809,7 +1620,6 @@ export function GenUIImageAlbum(ctx: any) {
         images={images}
         index={activeIndex}
         onIndexChange={setActiveIndex}
-        onSendImage={emitImage}
       />
     </div>
   );
@@ -939,7 +1749,6 @@ export function GenUIImageCarousel(ctx: any) {
         images={images}
         index={activeIndex}
         onIndexChange={setActiveIndex}
-        onSendImage={emitImage}
       />
     </div>
   );

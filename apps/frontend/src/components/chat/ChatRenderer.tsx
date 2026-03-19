@@ -7,6 +7,7 @@ import { ChatConversationPane } from '@/components/chat/ChatConversationPane';
 
 export interface ChatRendererProps {
   agent: Agent;
+  conversationKey?: string;
   sessionTitle?: string;
   messages: Message[];
   isSending: boolean;
@@ -41,6 +42,7 @@ export interface ChatRendererProps {
 
 export const ChatRenderer = memo(function ChatRenderer({
   agent,
+  conversationKey,
   sessionTitle,
   messages,
   isSending,
@@ -75,6 +77,7 @@ export const ChatRenderer = memo(function ChatRenderer({
   return (
     <ChatConversationPane
       agent={agent}
+      conversationKey={conversationKey}
       sessionTitle={sessionTitle}
       messages={messages}
       isSending={isSending}
@@ -109,6 +112,7 @@ export const ChatRenderer = memo(function ChatRenderer({
   );
 }, (prev, next) => (
   prev.agent === next.agent
+  && prev.conversationKey === next.conversationKey
   && prev.sessionTitle === next.sessionTitle
   && prev.messages === next.messages
   && prev.isSending === next.isSending

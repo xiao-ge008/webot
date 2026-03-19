@@ -755,6 +755,60 @@ function pickRicherText(left: string, right: string): string {
     return b.length >= a.length ? right : left;
 }
 
+function buildStableRemoteMessageFingerprint(raw: string): string {
+    const input = raw.trim();
+    if (!input) {
+        return 'empty';
+    }
+    let hash = 2166136261;
+    for (let index = 0; index < input.length; index += 1) {
+        hash ^= input.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function buildStableRemoteMessageId(
+    sessionId: string,
+    row: Record<string, unknown>,
+    index: number,
+    role: Message['role'],
+    rawText: string,
+): string {
+    const directIdCandidates = [
+        row.id,
+        row.message_id,
+        row.messageId,
+        row.msg_id,
+        row.msgId,
+    ];
+    for (const candidate of directIdCandidates) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+            return `remote_msg_${sessionId}_${candidate.trim()}`;
+        }
+        if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+            return `remote_msg_${sessionId}_${candidate}`;
+        }
+    }
+
+    const timestampCandidate = [
+        row.created_at,
+        row.createdAt,
+        row.updated_at,
+        row.updatedAt,
+        row.at,
+        row.timestamp,
+    ].find((candidate) => (
+        (typeof candidate === 'string' && candidate.trim())
+        || (typeof candidate === 'number' && Number.isFinite(candidate))
+    ));
+    const timestampPart = typeof timestampCandidate === 'string'
+        ? timestampCandidate.trim()
+        : (typeof timestampCandidate === 'number' ? String(timestampCandidate) : '');
+    const fingerprint = buildStableRemoteMessageFingerprint(`${role}::${timestampPart}::${rawText}`);
+    return `remote_msg_${sessionId}_${index}_${fingerprint}`;
+}
+
 function hydrateRecoveredMessage(base: Message | undefined, recovered: Message): Message {
     if (!base || base.role !== recovered.role) {
         return recovered;
@@ -763,6 +817,7 @@ function hydrateRecoveredMessage(base: Message | undefined, recovered: Message):
     return {
         ...base,
         ...recovered,
+        id: base.id || recovered.id,
         text: mergedText,
         agentId: recovered.agentId ?? base.agentId,
         agentName: recovered.agentName ?? base.agentName,
@@ -844,6 +899,12 @@ function buildSessionFromBackendPayload(
     ownerAgentId?: string,
 ): StoredChatSession | null {
     const source = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+    const rawSessionId = typeof source.session_id === 'string'
+        ? source.session_id.trim()
+        : (fallback?.sessionId ?? '').trim();
+    if (!rawSessionId) {
+        return null;
+    }
     const rows = Array.isArray(source.messages)
         ? source.messages.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
         : [];
@@ -862,7 +923,7 @@ function buildSessionFromBackendPayload(
                 return null;
             }
             return {
-                id: `remote_msg_${Date.now()}_${index}`,
+                id: buildStableRemoteMessageId(rawSessionId, row, index, role, rawText),
                 role,
                 agentId: role === 'agent' ? ownerAgentId?.trim() || undefined : undefined,
                 text,
@@ -872,13 +933,6 @@ function buildSessionFromBackendPayload(
             } as Message;
         })
         .filter((item): item is Message => item != null);
-
-    const rawSessionId = typeof source.session_id === 'string'
-        ? source.session_id.trim()
-        : (fallback?.sessionId ?? '').trim();
-    if (!rawSessionId) {
-        return null;
-    }
     const rawSessionLabel = typeof source.label === 'string'
         ? source.label.trim()
         : (typeof source.session_label === 'string'
@@ -4637,6 +4691,12 @@ export function ChatPage({
                         next.debugSpecSource = 'inline';
                     }
                 }
+                if (next.spec == null && next.uiRawText) {
+                    next.spec = tryParseInlineSpecFromText(next.uiRawText);
+                    if (next.spec != null) {
+                        next.debugSpecSource = 'inline';
+                    }
+                }
                 next.text = cleanupAssistantText(next.text || '', next.spec);
                 next.thinking = false;
                 next.streaming = false;
@@ -5090,6 +5150,9 @@ export function ChatPage({
             }
             if (finalDraft.spec == null && rawAssistantStreamRef.current) {
                 finalDraft.spec = tryParseInlineSpecFromText(rawAssistantStreamRef.current);
+            }
+            if (finalDraft.spec == null && finalDraft.uiRawText) {
+                finalDraft.spec = tryParseInlineSpecFromText(finalDraft.uiRawText);
             }
             const taskCardCandidateText = finalDraft.text || result.text || result.content || rawAssistantStreamRef.current || '';
             if (finalDraft.spec == null && isNuwaManagementAgent) {
@@ -7142,6 +7205,7 @@ export function ChatPage({
         const chatNode = (
             <ChatRenderer
                 agent={agent}
+                conversationKey={activeSessionId || id || agent.id}
                 sessionTitle={fixedSessionTitleProp ?? activeSession?.title}
                 messages={messages}
                 isSending={displayIsSending}

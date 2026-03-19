@@ -329,9 +329,12 @@ interface SkillCatalog {
   all: string[];
   custom: string[];
   builtin: string[];
+  component: string[];
   systemUi: string[];
   descriptions: Record<string, string>;
 }
+
+type SkillViewTab = 'system' | 'component' | 'custom';
 
 function uniqueSorted(values: string[]): string[] {
   return Array.from(new Set(values.map((item) => item.trim()).filter(Boolean))).sort((a, b) =>
@@ -343,6 +346,7 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
   if (payload.items.length > 0) {
     const builtin: string[] = [];
     const custom: string[] = [];
+    const component: string[] = [];
     const systemUi: string[] = [];
     const all: string[] = [];
     const descriptions: Record<string, string> = {};
@@ -364,6 +368,10 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
         builtin.push(name);
         continue;
       }
+      if (item.category === 'component') {
+        component.push(name);
+        continue;
+      }
       custom.push(name);
     }
 
@@ -371,6 +379,7 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
       all: uniqueSorted(all),
       custom: uniqueSorted(custom),
       builtin: uniqueSorted(builtin),
+      component: uniqueSorted(component),
       systemUi: uniqueSorted(systemUi),
       descriptions,
     };
@@ -379,6 +388,7 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
   const runtimeNames: string[] = [];
   const runtimeBuiltin: string[] = [];
   const runtimeCustom: string[] = [];
+  const runtimeComponent: string[] = [];
   const runtimeUi: string[] = [];
   const descriptions: Record<string, string> = { ...payload.descriptions };
 
@@ -414,12 +424,13 @@ function buildGlobalSkillCatalog(payload: Awaited<ReturnType<typeof getGlobalSki
   const localNames = payload.localFolders;
   const custom = uniqueSorted([...runtimeCustom, ...importedNames, ...localNames]);
   const builtin = uniqueSorted(runtimeBuiltin);
+  const component = uniqueSorted(runtimeComponent);
   const systemUi = uniqueSorted(runtimeUi);
   const all = uniqueSorted([...runtimeNames, ...importedNames, ...localNames]);
   for (const imported of payload.imported) {
     pushDescription(imported.name, imported.description);
   }
-  return { all, custom, builtin, systemUi, descriptions };
+  return { all, custom, builtin, component, systemUi, descriptions };
 }
 
 export function CreateAgentPage() {
@@ -450,10 +461,12 @@ export function CreateAgentPage() {
   const [mcpLoading, setMcpLoading] = useState(false);
   const [availableSkills, setAvailableSkills] = useState<string[]>([]);
   const [builtinSkills, setBuiltinSkills] = useState<string[]>([]);
+  const [componentSkills, setComponentSkills] = useState<string[]>([]);
   const [customSkills, setCustomSkills] = useState<string[]>([]);
   const [systemUiSkills, setSystemUiSkills] = useState<string[]>([]);
   const [skillDescriptions, setSkillDescriptions] = useState<Record<string, string>>({});
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+  const [skillViewTab, setSkillViewTab] = useState<SkillViewTab>('system');
   const [availableMcpServers, setAvailableMcpServers] = useState<string[]>([]);
   const [connectedMcpServers, setConnectedMcpServers] = useState<string[]>([]);
   const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([]);
@@ -492,6 +505,7 @@ export function CreateAgentPage() {
         const skillCatalog = buildGlobalSkillCatalog(skillsPayload);
         setAvailableSkills(skillCatalog.all);
         setBuiltinSkills(skillCatalog.builtin);
+        setComponentSkills(skillCatalog.component);
         setCustomSkills(skillCatalog.custom);
         setSystemUiSkills(skillCatalog.systemUi);
         setSkillDescriptions(skillCatalog.descriptions);
@@ -573,21 +587,49 @@ export function CreateAgentPage() {
     const enabled = options.filter((item) => item.enabled);
     return (enabled[0] ?? options[0]) || null;
   };
+  const systemSkillGroup = useMemo(
+    () => uniqueSorted([...systemUiSkills, ...builtinSkills]),
+    [builtinSkills, systemUiSkills],
+  );
+  const componentSkillGroup = useMemo(
+    () => uniqueSorted(componentSkills),
+    [componentSkills],
+  );
   const customSkillGroup = useMemo(() => {
-    const systemUiSet = new Set(systemUiSkills);
-    const builtinSet = new Set(builtinSkills);
-    return uniqueSorted(
-      customSkills.filter((item) => !systemUiSet.has(item) && !builtinSet.has(item)),
+    const systemSet = new Set(systemSkillGroup);
+    const componentSet = new Set(componentSkillGroup);
+    const customSet = new Set(customSkills);
+    const uncategorized = availableSkills.filter(
+      (item) => !systemSet.has(item) && !componentSet.has(item) && !customSet.has(item),
     );
-  }, [builtinSkills, customSkills, systemUiSkills]);
-  const builtinSkillGroup = useMemo(() => {
-    const customSet = new Set(customSkillGroup);
-    return uniqueSorted([
-      ...systemUiSkills,
-      ...builtinSkills,
-      ...availableSkills.filter((item) => !customSet.has(item)),
-    ]);
-  }, [availableSkills, builtinSkills, customSkillGroup, systemUiSkills]);
+    return uniqueSorted([...customSkills, ...uncategorized]);
+  }, [availableSkills, componentSkillGroup, customSkills, systemSkillGroup]);
+  const skillSections = [
+    {
+      key: 'system' as const,
+      label: `系统内置 (${systemSkillGroup.length})`,
+      title: '系统内置 Skill',
+      description: '包含系统默认能力与 ui-skill。这里只能给当前智能体开启或关闭，不能删除、不能修改。',
+      empty: '当前没有系统内置 skill。',
+      skills: systemSkillGroup,
+    },
+    {
+      key: 'component' as const,
+      label: `组件 Skill (${componentSkillGroup.length})`,
+      title: '组件 Skill',
+      description: '来自组件中心生成的 ComfyUI / RunningHub 等 skill。删除或修改请前往组件中心，这里只做启停。',
+      empty: '当前还没有组件 skill，可先去组件中心创建。',
+      skills: componentSkillGroup,
+    },
+    {
+      key: 'custom' as const,
+      label: `自定义 Skill (${customSkillGroup.length})`,
+      title: '自定义 Skill',
+      description: '由设置页全局管理。这里仅决定新建智能体默认是否启用，不负责新增和删除。',
+      empty: '当前没有自定义 skill，可在设置里的“自定义SKILL”中导入。',
+      skills: customSkillGroup,
+    },
+  ];
 
   const navItems = [
     { id: 'basic', label: t('edit.nav.basic'), icon: User },
@@ -1161,7 +1203,7 @@ export function CreateAgentPage() {
                     <Hammer className="w-6 h-6 text-primary" /> Skill 选择
                   </CardTitle>
                   <CardDescription className="text-sm font-medium">
-                    预设智能体可用 Skill（创建后自动写入分配）。已整理为内置与自定义两组。
+                    预设智能体可用 Skill（创建后自动写入分配）。已按系统内置、组件、自定义三类整理。
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="p-8 pt-4 space-y-6">
@@ -1175,71 +1217,62 @@ export function CreateAgentPage() {
                     </div>
                   ) : (
                     <>
-                      <div className="rounded-2xl border overflow-hidden bg-background">
-                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">内置 Skills</div>
-                        {builtinSkillGroup.length === 0 ? (
-                          <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
-                        ) : (
-                          builtinSkillGroup.map((skill, index) => {
-                            const enabled = selectedSkills.includes(skill);
-                            return (
-                              <div
-                                key={`builtin-${skill}`}
-                                className={cn(
-                                  'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== builtinSkillGroup.length - 1 && 'border-b',
-                                )}
-                              >
-                                <div className="flex items-center gap-3 min-w-0">
-                                  <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
-                                    <FileText className="w-4 h-4 text-muted-foreground" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="text-sm font-semibold truncate">{skill}</div>
-                                    <div className="text-xs text-muted-foreground truncate">
-                                      {skillDescriptions[skill] || '未提供功能描述'}
-                                    </div>
-                                  </div>
-                                </div>
-                                <Switch checked={enabled} onCheckedChange={(checked) => toggleSkillSelection(skill, checked)} />
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
+                      <Tabs value={skillViewTab} onValueChange={(value) => setSkillViewTab(value as SkillViewTab)} className="space-y-4">
+                        <TabsList className="grid h-auto grid-cols-3 rounded-2xl bg-muted/30 p-1">
+                          {skillSections.map((section) => (
+                            <TabsTrigger
+                              key={section.key}
+                              value={section.key}
+                              className="rounded-xl px-3 py-2 text-xs font-black tracking-wide"
+                            >
+                              {section.label}
+                            </TabsTrigger>
+                          ))}
+                        </TabsList>
+                      </Tabs>
 
-                      <div className="rounded-2xl border overflow-hidden bg-background">
-                        <div className="px-4 py-2 text-xs font-black uppercase tracking-widest text-foreground/50 bg-muted/20 border-b">自定义 Skills</div>
-                        {customSkillGroup.length === 0 ? (
-                          <div className="px-4 py-6 text-xs text-muted-foreground">无</div>
-                        ) : (
-                          customSkillGroup.map((skill, index) => {
-                            const enabled = selectedSkills.includes(skill);
-                            return (
-                              <div
-                                key={`custom-${skill}`}
-                                className={cn(
-                                  'px-4 py-3 flex items-center justify-between gap-4',
-                                  index !== customSkillGroup.length - 1 && 'border-b',
-                                )}
-                              >
-                                <div className="flex items-center gap-3 min-w-0">
-                                  <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
-                                    <FileText className="w-4 h-4 text-muted-foreground" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="text-sm font-semibold truncate">{skill}</div>
-                                    <div className="text-xs text-muted-foreground truncate">
-                                      {skillDescriptions[skill] || '未提供功能描述'}
+                      {skillSections.map((section) => (
+                        section.key === skillViewTab ? (
+                          <div key={section.key} className="rounded-2xl border overflow-hidden bg-background">
+                            <div className="border-b bg-muted/20 px-4 py-3">
+                              <div className="text-sm font-semibold text-foreground">{section.title}</div>
+                              <div className="mt-1 text-xs leading-5 text-muted-foreground">{section.description}</div>
+                            </div>
+                            {section.skills.length === 0 ? (
+                              <div className="px-4 py-8 text-sm text-muted-foreground">{section.empty}</div>
+                            ) : (
+                              section.skills.map((skill, index) => {
+                                const enabled = selectedSkills.includes(skill);
+                                return (
+                                  <div
+                                    key={`${section.key}-${skill}`}
+                                    className={cn(
+                                      'px-4 py-3 flex items-center justify-between gap-4',
+                                      index !== section.skills.length - 1 && 'border-b',
+                                    )}
+                                  >
+                                    <div className="flex items-center gap-3 min-w-0">
+                                      <div className="w-9 h-9 rounded-lg bg-muted/40 flex items-center justify-center shrink-0">
+                                        <FileText className="w-4 h-4 text-muted-foreground" />
+                                      </div>
+                                      <div className="min-w-0">
+                                        <div className="text-sm font-semibold truncate">{skill}</div>
+                                        <div className="text-xs text-muted-foreground truncate">
+                                          {skillDescriptions[skill] || '未提供功能描述'}
+                                        </div>
+                                      </div>
                                     </div>
+                                    <Switch
+                                      checked={enabled}
+                                      onCheckedChange={(checked) => toggleSkillSelection(skill, checked)}
+                                    />
                                   </div>
-                                </div>
-                                <Switch checked={enabled} onCheckedChange={(checked) => toggleSkillSelection(skill, checked)} />
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
+                                );
+                              })
+                            )}
+                          </div>
+                        ) : null
+                      ))}
                     </>
                   )}
                 </CardContent>
