@@ -229,7 +229,7 @@ impl SetupWizard {
             hints.push("- Use web_fetch to read the full content of a specific URL as markdown.");
         }
         if has("browser_navigate") {
-            hints.push("- Use browser_navigate/click/type/read_page to interact with websites.");
+            hints.push("- Use browser_navigate/click/type/read_page only for http/https websites, never for local files or chat-uploaded images.");
         }
         if has("file_read") {
             hints.push("- Use file_read to examine files before modifying them.");

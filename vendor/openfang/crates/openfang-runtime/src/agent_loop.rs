@@ -8,7 +8,7 @@ use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, C
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
-use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
+use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
@@ -258,6 +258,110 @@ fn strip_injected_system_context(text: &str) -> String {
     }
 
     remaining.trim().to_string()
+}
+
+fn normalize_tool_call_response(response: &mut CompletionResponse) -> Option<String> {
+    let mut name_by_id: HashMap<String, String> = HashMap::new();
+
+    for tool_call in &mut response.tool_calls {
+        let trimmed = tool_call.name.trim();
+        if !trimmed.is_empty() {
+            if tool_call.name != trimmed {
+                tool_call.name = trimmed.to_string();
+            }
+            name_by_id
+                .entry(tool_call.id.clone())
+                .or_insert_with(|| tool_call.name.clone());
+        }
+    }
+
+    for block in &mut response.content {
+        if let ContentBlock::ToolUse { id, name, .. } = block {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                if *name != trimmed {
+                    *name = trimmed.to_string();
+                }
+                name_by_id.entry(id.clone()).or_insert_with(|| name.clone());
+            }
+        }
+    }
+
+    for tool_call in &mut response.tool_calls {
+        if tool_call.name.trim().is_empty() {
+            if let Some(resolved) = name_by_id.get(&tool_call.id) {
+                tool_call.name = resolved.clone();
+            }
+        }
+    }
+
+    for block in &mut response.content {
+        if let ContentBlock::ToolUse { id, name, .. } = block {
+            if name.trim().is_empty() {
+                if let Some(resolved) = name_by_id.get(id) {
+                    *name = resolved.clone();
+                }
+            }
+        }
+    }
+
+    if response.tool_calls.is_empty() {
+        response.tool_calls = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } => Some(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+    }
+
+    let has_tool_use_blocks = response
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    if !has_tool_use_blocks && !response.tool_calls.is_empty() {
+        response
+            .content
+            .extend(
+                response
+                    .tool_calls
+                    .iter()
+                    .map(|tool_call| ContentBlock::ToolUse {
+                        id: tool_call.id.clone(),
+                        name: tool_call.name.clone(),
+                        input: tool_call.input.clone(),
+                    }),
+            );
+    }
+
+    let mut invalid_ids: Vec<String> = response
+        .tool_calls
+        .iter()
+        .filter(|tool_call| tool_call.name.trim().is_empty())
+        .map(|tool_call| tool_call.id.clone())
+        .collect();
+
+    invalid_ids.extend(response.content.iter().filter_map(|block| match block {
+        ContentBlock::ToolUse { id, name, .. } if name.trim().is_empty() => Some(id.clone()),
+        _ => None,
+    }));
+
+    invalid_ids.sort_unstable();
+    invalid_ids.dedup();
+
+    if invalid_ids.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "[Tool call failed: model returned a malformed tool invocation with an empty tool name (IDs: {}). Please retry or adjust the provider compatibility layer.]",
+            invalid_ids.join(", ")
+        ))
+    }
 }
 
 fn is_personal_memory_type(memory_type: &str) -> bool {
@@ -1001,6 +1105,19 @@ pub async fn run_agent_loop(
                     });
                 }
                 response.content = new_blocks;
+            }
+        }
+
+        if matches!(response.stop_reason, StopReason::ToolUse) {
+            if let Some(error_text) = normalize_tool_call_response(&mut response) {
+                warn!(
+                    agent = %manifest.name,
+                    provider = provider_name,
+                    "Malformed tool call response detected; converting to guarded text reply"
+                );
+                response.stop_reason = StopReason::EndTurn;
+                response.tool_calls.clear();
+                response.content = vec![ContentBlock::Text { text: error_text }];
             }
         }
 
@@ -1859,6 +1976,19 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
                 response.content = new_blocks;
+            }
+        }
+
+        if matches!(response.stop_reason, StopReason::ToolUse) {
+            if let Some(error_text) = normalize_tool_call_response(&mut response) {
+                warn!(
+                    agent = %manifest.name,
+                    provider = provider_name,
+                    "Malformed streaming tool call response detected; converting to guarded text reply"
+                );
+                response.stop_reason = StopReason::EndTurn;
+                response.tool_calls.clear();
+                response.content = vec![ContentBlock::Text { text: error_text }];
             }
         }
 
@@ -3616,6 +3746,56 @@ mod tests {
         let text = r#"Try `unknown_tool {"key":"val"}` instead."#;
         let calls = recover_text_tool_calls(text, &tools);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_tool_call_response_repairs_content_block_name() {
+        let mut response = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: String::new(),
+                input: serde_json::json!({"query": "rust"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            tool_calls: vec![ToolCall {
+                id: "tu-1".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({"query": "rust"}),
+            }],
+            usage: TokenUsage::default(),
+        };
+
+        let error = normalize_tool_call_response(&mut response);
+        assert!(error.is_none(), "Expected tool name recovery to succeed");
+        match &response.content[0] {
+            ContentBlock::ToolUse { name, .. } => assert_eq!(name, "web_search"),
+            other => panic!("Unexpected block after normalization: {other:?}"),
+        }
+        assert_eq!(response.tool_calls[0].name, "web_search");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_response_rejects_empty_names() {
+        let mut response = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "tu-bad".to_string(),
+                name: String::new(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            tool_calls: vec![ToolCall {
+                id: "tu-bad".to_string(),
+                name: String::new(),
+                input: serde_json::json!({}),
+            }],
+            usage: TokenUsage::default(),
+        };
+
+        let error = normalize_tool_call_response(&mut response);
+        assert!(
+            error.as_deref().is_some_and(|msg| msg.contains("tu-bad")),
+            "Expected malformed tool call to be rejected, got: {error:?}"
+        );
     }
 
     #[test]

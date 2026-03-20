@@ -11,7 +11,6 @@ import {
   Square,
   Loader2,
   ChevronDown,
-  RotateCcw,
   Image as ImageIcon,
   Paperclip,
   X,
@@ -25,6 +24,8 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { looksLikeProtocolOnlyText, normalizeIncomingSpec, parseJsonSafely, extractUiRawText, repairUiJsonString, sanitizeAiUiOutput, getBestEffortUiJsonBlocks } from '@/components/chat/chat-page-helpers';
+import { ChatMessageList } from '@/components/chat/ChatMessageList';
+import { ChatAttachmentDeck } from '@/components/chat/ChatAttachmentDeck';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Agent } from '@/types';
@@ -36,6 +37,9 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { uploadManagementAgentChatAsset } from '@/services/management-client';
+import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
+import { canOpenAttachmentWithSystem, isDesktopFileOpenSupported, openAttachmentWithSystem } from '@/services/desktop-file-client';
+import { getApiBaseUrl } from '@/services/transport';
 
 type UserActivitySource = 'input' | 'send' | 'focus' | 'keydown' | 'ui_action';
 
@@ -51,6 +55,35 @@ const CLIPBOARD_IMAGE_EXTENSION_BY_MIME: Record<string, string> = {
   'image/svg+xml': 'svg',
   'image/bmp': 'bmp',
 };
+
+const LOCAL_MANAGEMENT_ASSET_URL_PATTERN = /^https?:\/\/(?:127\.0\.0\.1|localhost):\d+(\/api\/management\/agents\/.+)$/i;
+
+function buildStableChatAttachmentAssetUrl(baseUrl: string | undefined, agentId: string | undefined, relativePath: string): string | undefined {
+  const normalizedBaseUrl = baseUrl?.trim().replace(/\/+$/, '');
+  const normalizedAgentId = agentId?.trim();
+  const normalizedPath = relativePath.trim();
+  if (!normalizedBaseUrl || !normalizedAgentId || !normalizedPath) {
+    return undefined;
+  }
+  const searchParams = new URLSearchParams({ path: normalizedPath });
+  return `${normalizedBaseUrl}/api/management/agents/${encodeURIComponent(normalizedAgentId)}/chat-assets/file?${searchParams.toString()}`;
+}
+
+function normalizeLocalManagementAssetUrl(baseUrl: string | undefined, assetUrl: string | undefined): string | undefined {
+  const normalizedBaseUrl = baseUrl?.trim().replace(/\/+$/, '');
+  const normalizedAssetUrl = assetUrl?.trim();
+  if (!normalizedBaseUrl || !normalizedAssetUrl) {
+    return normalizedAssetUrl;
+  }
+  const localMatch = normalizedAssetUrl.match(LOCAL_MANAGEMENT_ASSET_URL_PATTERN);
+  if (localMatch) {
+    return `${normalizedBaseUrl}${localMatch[1]}`;
+  }
+  if (normalizedAssetUrl.startsWith('/api/management/')) {
+    return `${normalizedBaseUrl}${normalizedAssetUrl}`;
+  }
+  return normalizedAssetUrl;
+}
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
@@ -516,11 +549,13 @@ export function ChatConversationPane({
   onToggleInfoSidebar,
 }: ChatConversationPaneProps) {
   const { t } = useTranslation();
+  const { showAlert } = useGlobalAlert();
   const [inputValue, setInputValue] = useState('');
   const [traceOpen, setTraceOpen] = useState<Record<string, boolean>>({});
   const [copiedTraceKey, setCopiedTraceKey] = useState('');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
+  const [apiBaseUrl, setApiBaseUrl] = useState<string>('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const autoStickToBottomRef = useRef(true);
@@ -530,6 +565,25 @@ export function ChatConversationPane({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerAttachmentsRef = useRef<ComposerAttachmentDraft[]>([]);
   const isDesktopRuntime = isTauriRuntime();
+  const desktopFileOpenSupported = isDesktopFileOpenSupported();
+
+  useEffect(() => {
+    let active = true;
+    getApiBaseUrl({ forceRefresh: true })
+      .then((resolvedBaseUrl) => {
+        if (active) {
+          setApiBaseUrl(resolvedBaseUrl);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setApiBaseUrl('');
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
   const draftCharCount = useMemo(
     () => inputValue.trim().length + estimateAttachmentPromptChars(composerAttachments),
     [composerAttachments, inputValue],
@@ -1066,7 +1120,7 @@ export function ChatConversationPane({
   }, [messages, streamingMessage]);
 
   const displayStatus = isSending ? 'busy' : 'online';
-  const formatElapsed = (ms?: number): string => {
+  const formatElapsed = useCallback((ms?: number): string => {
     const safeMs = Math.max(0, ms || 0);
     if (safeMs < 60000) {
       const seconds = safeMs / 1000;
@@ -1076,9 +1130,9 @@ export function ChatConversationPane({
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
     return `${minutes}分${seconds.toString().padStart(2, '0')}秒`;
-  };
+  }, []);
 
-  const canRegenerateAt = (index: number): boolean => {
+  const canRegenerateAt = useCallback((index: number): boolean => {
     if (isSending) return false;
     const current = messages[index];
     if (!current || current.role !== 'agent') return false;
@@ -1088,9 +1142,9 @@ export function ChatConversationPane({
       }
     }
     return false;
-  };
+  }, [isSending, messages]);
 
-  const renderSimpleCardSpec = (spec: unknown) => {
+  const renderSimpleCardSpec = useCallback((spec: unknown) => {
     if (!spec || typeof spec !== 'object') return null;
     const obj = spec as Record<string, unknown>;
     const type = typeof obj.type === 'string' ? obj.type.trim().toLowerCase() : '';
@@ -1124,9 +1178,9 @@ export function ChatConversationPane({
         {footer ? <div className="px-6 pb-4 text-xs text-muted-foreground whitespace-pre-wrap break-words">{footer}</div> : null}
       </Card>
     );
-  };
+  }, []);
 
-  const renderLoadingCard = (uiRawText?: string, uiStreamState?: 'idle' | 'streaming' | 'ready') => {
+  const renderLoadingCard = useCallback((uiRawText?: string, uiStreamState?: 'idle' | 'streaming' | 'ready') => {
     const stageText = uiStreamState === 'streaming'
       ? '正在接收 UI 数据流…'
       : uiStreamState === 'ready'
@@ -1152,39 +1206,39 @@ export function ChatConversationPane({
         </CardContent>
       </Card>
     );
-  };
+  }, []);
 
-  const taskStageLabel = (stage: ChatTaskCardData['stage']): string => {
+  const taskStageLabel = useCallback((stage: ChatTaskCardData['stage']): string => {
     if (stage === 'proposal') return '待确认';
     if (stage === 'scheduled') return '等待执行';
     if (stage === 'running') return '执行中';
     if (stage === 'completed') return '已完成';
     if (stage === 'cancelled') return '已取消';
     return '执行失败';
-  };
+  }, []);
 
-  const taskStageClass = (stage: ChatTaskCardData['stage']): string => {
+  const taskStageClass = useCallback((stage: ChatTaskCardData['stage']): string => {
     if (stage === 'completed') return 'bg-success';
     if (stage === 'running') return 'bg-primary';
     if (stage === 'cancelled') return 'bg-muted';
     if (stage === 'failed') return 'bg-destructive';
     return 'bg-warning';
-  };
+  }, []);
 
-  const taskKindLabel = (kind?: ChatTaskCardData['taskKind']): string => {
+  const taskKindLabel = useCallback((kind?: ChatTaskCardData['taskKind']): string => {
     if (kind === 'chat_async') return '聊天异步任务';
     if (kind === 'manual_schedule') return '任务中心定时任务';
     if (kind === 'a2a_delegate') return '智能体委派任务';
     return '聊天定时任务';
-  };
+  }, []);
 
-  const taskReportStatusLabel = (status?: ChatTaskCardData['reportStatus']): string => {
+  const taskReportStatusLabel = useCallback((status?: ChatTaskCardData['reportStatus']): string => {
     if (status === 'acknowledged') return '已同步到当前会话';
     if (status === 'reported') return '已生成会话回执';
     return '待汇报';
-  };
+  }, []);
 
-  const taskTimelineLabel = (kind: ChatTaskLifecycleItem['kind']): string => {
+  const taskTimelineLabel = useCallback((kind: ChatTaskLifecycleItem['kind']): string => {
     if (kind === 'created') return '草案';
     if (kind === 'started') return '启动';
     if (kind === 'progress') return '进度';
@@ -1192,21 +1246,21 @@ export function ChatConversationPane({
     if (kind === 'final') return '总结';
     if (kind === 'cancelled') return '取消';
     return '失败';
-  };
+  }, []);
 
-  const taskTimelineClass = (entry: ChatTaskLifecycleItem): string => {
+  const taskTimelineClass = useCallback((entry: ChatTaskLifecycleItem): string => {
     if (entry.level === 'success' || entry.kind === 'final') return 'text-success';
     if (entry.level === 'error' || entry.kind === 'anomaly' || entry.kind === 'failed') return 'text-destructive';
     return 'text-primary';
-  };
+  }, []);
 
-  const formatTaskTimelineTime = (raw: string): string => {
+  const formatTaskTimelineTime = useCallback((raw: string): string => {
     const date = new Date(raw);
     if (Number.isNaN(date.getTime())) return raw;
     return date.toLocaleString();
-  };
+  }, []);
 
-  const renderTaskCard = (msg: Message, taskCard: ChatTaskCardData) => {
+  const renderTaskCard = useCallback((msg: Message, taskCard: ChatTaskCardData) => {
     const stage = taskCard.stage;
     const logCount = taskCard.logCount ?? taskCard.runCount;
     const errorCount = taskCard.errorCount ?? 0;
@@ -1400,15 +1454,28 @@ export function ChatConversationPane({
         </CardContent>
       </Card>
     );
-  };
+  }, [
+    formatTaskTimelineTime,
+    onCancelTaskCard,
+    onConfirmCreateTaskCard,
+    onCreateTaskCard,
+    onDeleteTaskCard,
+    onOpenTaskCardDetails,
+    taskKindLabel,
+    taskReportStatusLabel,
+    taskStageClass,
+    taskStageLabel,
+    taskTimelineClass,
+    taskTimelineLabel,
+  ]);
 
-  const a2aStatusText = (card: A2AWorkCardData): string => {
+  const a2aStatusText = useCallback((card: A2AWorkCardData): string => {
     if (card.status === 'working') return '工作中';
     if (card.status === 'completed') return '已完成';
     return '失败';
-  };
+  }, []);
 
-  const renderA2aCards = (msg: Message, cards: A2AWorkCardData[]) => {
+  const renderA2aCards = useCallback((msg: Message, cards: A2AWorkCardData[]) => {
     const visibleCards = getVisibleA2aCards(cards);
     if (visibleCards.length === 0) {
       return null;
@@ -1491,9 +1558,9 @@ export function ChatConversationPane({
         </div>
       </div>
     );
-  };
+  }, [a2aStatusText, onOpenA2aCardDetails]);
 
-  const renderTraceItems = (rows: MessageTrace[]) => (
+  const renderTraceItems = useCallback((rows: MessageTrace[]) => (
     <div className="space-y-3 min-w-0">
       {rows.map((trace) => (
         <div
@@ -1515,13 +1582,22 @@ export function ChatConversationPane({
         </div>
       ))}
     </div>
-  );
+  ), []);
 
-  const toggleTracePanel = (key: string) => {
+  const toggleTracePanel = useCallback((key: string) => {
     setTraceOpen((prev) => ({ ...prev, [key]: !prev[key] }));
-  };
+  }, []);
 
-  const copyTraceBlock = async (key: string, label: string, rows: MessageTrace[] | undefined) => {
+  const traceRenderToken = useMemo(() => {
+    const openedKeys = Object.entries(traceOpen)
+      .filter(([, opened]) => opened)
+      .map(([key]) => key)
+      .sort()
+      .join('|');
+    return `${copiedTraceKey}::${openedKeys}`;
+  }, [copiedTraceKey, traceOpen]);
+
+  const copyTraceBlock = useCallback(async (key: string, label: string, rows: MessageTrace[] | undefined) => {
     const content = (rows ?? [])
       .map((row) => `${row.title}\n${row.detail || ''}\n${row.at}`)
       .join('\n\n');
@@ -1535,9 +1611,9 @@ export function ChatConversationPane({
     } catch {
       console.warn(`[Trace] failed to copy ${label}`);
     }
-  };
+  }, []);
 
-  const renderTraceBlock = (key: string, label: string, rows: MessageTrace[] | undefined) => {
+  const renderTraceBlock = useCallback((key: string, label: string, rows: MessageTrace[] | undefined) => {
     const count = rows?.length ?? 0;
     if (count <= 0) return null;
     const opened = Boolean(traceOpen[key]);
@@ -1592,9 +1668,9 @@ export function ChatConversationPane({
         </div>
       </div>
     );
-  };
+  }, [copiedTraceKey, copyTraceBlock, renderTraceItems, toggleTracePanel, traceOpen]);
 
-  const buildRuntimeLogRows = (msg: Message): MessageTrace[] => {
+  const buildRuntimeLogRows = useCallback((msg: Message): MessageTrace[] => {
     const rows: MessageTrace[] = [];
     const baseAt = Number.isFinite(new Date(msg.timestamp).getTime()) ? new Date(msg.timestamp).getTime() : Date.now();
     let autoIndex = 0;
@@ -1690,21 +1766,21 @@ export function ChatConversationPane({
         const bTime = new Date(b.at).getTime();
         return aTime - bTime;
       });
-  };
+  }, []);
 
-  const buildRuntimeLogRowsForMessages = (items: Message[]): MessageTrace[] =>
+  const buildRuntimeLogRowsForMessages = useCallback((items: Message[]): MessageTrace[] =>
     items
       .flatMap((item) => buildRuntimeLogRows(item))
-      .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+      .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime()), [buildRuntimeLogRows]);
 
-  const renderProcessPanel = (key: string, items: Message[]) => {
+  const renderProcessPanel = useCallback((key: string, items: Message[]) => {
     if (!items.some((item) => hasRuntimeLogData(item))) {
       return null;
     }
     return renderTraceBlock(`${key}-runtime-log`, '运行日志', buildRuntimeLogRowsForMessages(items));
-  };
+  }, [buildRuntimeLogRowsForMessages, renderTraceBlock]);
 
-  const hasMeaningfulMarkdownText = (msg: Message): boolean => {
+  const hasMeaningfulMarkdownText = useCallback((msg: Message): boolean => {
     const text = (msg.text || '').trim();
     if (!text) return false;
     if (
@@ -1714,38 +1790,39 @@ export function ChatConversationPane({
       return false;
     }
     return !looksLikeProtocolOnlyText(text);
-  };
+  }, []);
 
-  const hasRenderableMessageContent = (msg: Message): boolean => {
+  const hasRenderableMessageContent = useCallback((msg: Message): boolean => {
     if ((msg.attachments?.length ?? 0) > 0) return true;
     if (msg.taskCard) return true;
     if ((msg.a2aCards?.length ?? 0) > 0) return true;
     if (msg.spec != null) return true;
+    if (hasRuntimeLogData(msg)) return true;
     if (msg.role === 'user') return Boolean((msg.text || '').trim());
     if (hasMeaningfulMarkdownText(msg)) return true;
     const meta = (msg.meta || '').trim();
     if (meta && !meta.startsWith('auto_dispatch:')) return true;
     return false;
-  };
+  }, [hasMeaningfulMarkdownText]);
 
-  const shouldRenderCardForMessage = (msg: Message, isUser: boolean): boolean => {
+  const shouldRenderCardForMessage = useCallback((msg: Message, isUser: boolean): boolean => {
     if (isUser || msg.spec == null) return false;
     return true;
-  };
+  }, []);
 
-  const shouldShowLoadingCardForMessage = (msg: Message, isUser: boolean): boolean => {
+  const shouldShowLoadingCardForMessage = useCallback((msg: Message, isUser: boolean): boolean => {
     if (isUser) return false;
     if (msg.spec != null) return false;
     if (!(msg.cardPending || msg.uiStreamState === 'streaming')) return false;
     if (hasMeaningfulMarkdownText(msg)) return false;
     return true;
-  };
+  }, [hasMeaningfulMarkdownText]);
 
   type MixedRenderSegment =
     | { kind: 'markdown'; content: string }
     | { kind: 'ui'; spec: unknown };
 
-  const extractMixedSegments = (raw: string): MixedRenderSegment[] => {
+  const extractMixedSegments = useCallback((raw: string): MixedRenderSegment[] => {
     const source = sanitizeAiUiOutput(raw).trim();
     if (!source || !source.includes('<UI_JSON>')) return [];
 
@@ -1786,7 +1863,7 @@ export function ChatConversationPane({
     }
 
     return segments;
-  };
+  }, []);
 
   const getCachedMixedSegments = useCallback((messageId: string, raw: string): MixedRenderSegment[] => {
     const source = sanitizeAiUiOutput(raw).trim();
@@ -1804,57 +1881,128 @@ export function ChatConversationPane({
       }
     }
     return parsed;
-  }, []);
+  }, [extractMixedSegments]);
 
-  const renderMessageBody = (
+  const getMessageMixedSegments = useCallback((msg: Message, isUser: boolean): MixedRenderSegment[] => {
+    if (isUser) {
+      return [];
+    }
+
+    const mixedSource = [
+      typeof msg.debugRawStream === 'string' ? msg.debugRawStream : '',
+      typeof msg.uiRawText === 'string' ? msg.uiRawText : '',
+      typeof msg.text === 'string' ? extractUiRawText(msg.text) : '',
+      typeof msg.text === 'string' ? msg.text : '',
+    ].find((item) => item.includes('<UI_JSON>')) || '';
+
+    const mixedSegments = getCachedMixedSegments(msg.id, mixedSource);
+    msg.debugMixedSegmentCount = mixedSegments.length;
+    return mixedSegments;
+  }, [getCachedMixedSegments]);
+
+  const hasMessageBubbleContent = useCallback((msg: Message, isUser: boolean): boolean => {
+    if (shouldShowLoadingCardForMessage(msg, isUser)) {
+      return true;
+    }
+    if (!isUser && msg.meta && !msg.meta.startsWith('auto_dispatch:')) {
+      return true;
+    }
+    if (!isUser && msg.taskCard) {
+      return true;
+    }
+
+    const mixedSegments = getMessageMixedSegments(msg, isUser);
+    if (!isUser && mixedSegments.length > 0) {
+      return true;
+    }
+
+    const shouldRenderCard = shouldRenderCardForMessage(msg, isUser);
+    const hasMarkdown = hasMeaningfulMarkdownText(msg);
+    const markdownContent = isUser
+      ? (msg.text || '')
+      : (hasMarkdown ? (msg.text || '') : '');
+
+    return Boolean(
+      markdownContent
+      || (!isUser && shouldRenderCard)
+      || (!isUser && (msg.a2aCards?.length ?? 0) > 0),
+    );
+  }, [
+    getMessageMixedSegments,
+    hasMeaningfulMarkdownText,
+    shouldRenderCardForMessage,
+    shouldShowLoadingCardForMessage,
+  ]);
+
+  const handleOpenAttachmentFile = useCallback(async (attachment: ChatAttachment) => {
+    const result = await openAttachmentWithSystem(attachment);
+    if (!result.ok) {
+      showAlert(result.message, '打开文件失败');
+    }
+  }, [showAlert]);
+
+  const canOpenAttachmentFile = useCallback((attachment: ChatAttachment) => (
+    desktopFileOpenSupported && canOpenAttachmentWithSystem(attachment)
+  ), [desktopFileOpenSupported]);
+
+  const resolveMessageAttachments = useCallback((msg: Message): readonly ChatAttachment[] => {
+    const attachments = msg.attachments ?? [];
+    if (attachments.length === 0) {
+      return attachments;
+    }
+
+    const ownerAgentId = msg.agentId || agent.id;
+    let resolved: ChatAttachment[] | null = null;
+
+    attachments.forEach((attachment, index) => {
+      if (attachment.kind !== 'image') {
+        return;
+      }
+      const normalizedExistingAssetUrl = normalizeLocalManagementAssetUrl(apiBaseUrl, attachment.assetUrl);
+      const fallbackStableAssetUrl = buildStableChatAttachmentAssetUrl(apiBaseUrl, ownerAgentId, attachment.relativePath);
+      const nextAssetUrl = normalizedExistingAssetUrl || fallbackStableAssetUrl;
+      if (!nextAssetUrl || nextAssetUrl === attachment.assetUrl) {
+        return;
+      }
+      if (!resolved) {
+        resolved = attachments.slice();
+      }
+      resolved[index] = {
+        ...attachment,
+        assetUrl: nextAssetUrl,
+      };
+    });
+
+    return resolved ?? attachments;
+  }, [agent.id, apiBaseUrl]);
+
+  const renderMessageAttachments = useCallback((msg: Message, isUser: boolean) => {
+    if (!msg.attachments || msg.attachments.length === 0) {
+      return null;
+    }
+
+    return (
+      <ChatAttachmentDeck
+        attachments={resolveMessageAttachments(msg)}
+        isUser={isUser}
+        desktopFileOpenSupported={desktopFileOpenSupported}
+        canOpenFile={canOpenAttachmentFile}
+        onOpenFile={handleOpenAttachmentFile}
+      />
+    );
+  }, [
+    canOpenAttachmentFile,
+    desktopFileOpenSupported,
+    handleOpenAttachmentFile,
+    resolveMessageAttachments,
+  ]);
+
+  const renderMessageBody = useCallback((
     msg: Message,
     isUser: boolean,
     options?: { deferHeavyUi?: boolean; includeProcessPanel?: boolean },
   ) => (
     <>
-      {msg.attachments && msg.attachments.length > 0 ? (
-        <div className={cn('mb-3 grid gap-2', msg.attachments.length > 1 ? 'sm:grid-cols-2' : 'grid-cols-1')}>
-          {msg.attachments.map((attachment) => (
-            <div key={attachment.id} className="rounded-xl border border-border/60 bg-background/50 p-2.5">
-              {attachment.kind === 'image' && attachment.assetUrl ? (
-                <a
-                  href={attachment.assetUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="block overflow-hidden rounded-lg border border-border/50 bg-muted/20"
-                >
-                  <img
-                    src={attachment.assetUrl}
-                    alt={attachment.name}
-                    loading="lazy"
-                    decoding="async"
-                    className="h-40 w-full object-cover"
-                  />
-                </a>
-              ) : null}
-              <div className="mt-2 space-y-1">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate text-xs font-semibold">{attachment.name}</span>
-                  <span className="shrink-0 text-[10px] text-muted-foreground">
-                    {attachment.kind === 'image' ? '图片' : '附件'}
-                  </span>
-                </div>
-                <div className="text-[11px] text-muted-foreground break-all">{attachment.relativePath}</div>
-                {attachment.assetUrl ? (
-                  <a
-                    href={attachment.assetUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex text-[11px] text-accent hover:underline"
-                  >
-                    打开文件
-                  </a>
-                ) : null}
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : null}
       {!isUser && msg.taskCard ? (
         <>
           {renderTaskCard(msg, msg.taskCard)}
@@ -1865,18 +2013,7 @@ export function ChatConversationPane({
         </>
       ) : (
       (() => {
-        const mixedSource = !isUser
-          ? [
-            typeof msg.debugRawStream === 'string' ? msg.debugRawStream : '',
-            typeof msg.uiRawText === 'string' ? msg.uiRawText : '',
-            typeof msg.text === 'string' ? extractUiRawText(msg.text) : '',
-            typeof msg.text === 'string' ? msg.text : '',
-          ].find((item) => item.includes('<UI_JSON>')) || ''
-          : '';
-        const mixedSegments = !isUser ? getCachedMixedSegments(msg.id, mixedSource) : [];
-        if (!isUser) {
-          msg.debugMixedSegmentCount = mixedSegments.length;
-        }
+        const mixedSegments = getMessageMixedSegments(msg, isUser);
         if (!isUser && mixedSegments.length > 0) {
           return (
             <>
@@ -1947,11 +2084,23 @@ export function ChatConversationPane({
         ? <div className="mt-2 text-[11px] text-muted-foreground">{msg.meta}</div>
         : null}
     </>
-  );
+  ), [
+    agent.id,
+    getMessageMixedSegments,
+    handleUiAction,
+    renderA2aCards,
+    renderLoadingCard,
+    renderProcessPanel,
+    renderSimpleCardSpec,
+    renderTaskCard,
+    shouldRenderCardForMessage,
+    shouldShowLoadingCardForMessage,
+    hasMeaningfulMarkdownText,
+  ]);
 
   const stableMessages = useMemo(
     () => messages.filter((msg) => !msg.streaming && hasRenderableMessageContent(msg)),
-    [messages],
+    [hasRenderableMessageContent, messages],
   );
   const messageIndexMap = useMemo(() => {
     const map = new Map<string, number>();
@@ -1994,87 +2143,6 @@ export function ChatConversationPane({
     () => streamingMessage ?? messages.find((msg) => msg.streaming) ?? null,
     [messages, streamingMessage],
   );
-
-  const messageRows = useMemo(() => (
-    <>
-      {messageGroups.map((group, groupIndex) => {
-        const groupMessages = group.messages;
-        const msg = groupMessages[groupMessages.length - 1];
-        const isUser = group.isUser;
-        const originalIndex = messageIndexMap.get(msg.id) ?? groupIndex;
-        const deferHeavyUi = !isUser && stableMessages.length > 18 && originalIndex < stableMessages.length - 6;
-        const canRegenerate = canRegenerateAt(originalIndex);
-        const messageAgentName = !isUser ? (msg.agentName || agent.name) : '';
-        const messageAgentAvatarUrl = !isUser ? (msg.agentAvatarUrl || agent.avatarUrl) : undefined;
-        const messageAgentColor = !isUser ? (msg.agentColor || agent.color) : undefined;
-        const showMeta = true;
-        const elapsedText = msg.role === 'agent' && msg.generationElapsedMs != null
-          ? formatElapsed(msg.generationElapsedMs)
-          : '';
-        return (
-          <div key={group.id} className={cn('chat-message-row', 'mb-6', isUser ? 'chat-message-row-user' : 'chat-message-row-agent')}>
-            {!isUser && showMeta && (
-              <div className="chat-avatar-frame">
-                <AgentAvatar name={messageAgentName} avatarUrl={messageAgentAvatarUrl} color={messageAgentColor} size="md" />
-              </div>
-            )}
-            <div className="flex flex-col w-full min-w-0">
-              {!isUser && showMeta && (
-                <div className="chat-message-meta flex items-center justify-between">
-                  <div className="chat-message-meta-left">
-                    <span className="text-xs font-bold text-muted-foreground">{messageAgentName}</span>
-                    <span className="text-[10px] text-muted-foreground/60">
-                      {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {elapsedText ? (
-                      <span className="text-[10px] text-muted-foreground/80">耗时 {elapsedText}</span>
-                    ) : null}
-                    {canRegenerate ? (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-6 px-2 text-[10px] text-muted-foreground"
-                        onClick={() => onRegenerateMessage(msg.id)}
-                        title="重复生成本条回复"
-                      >
-                        <RotateCcw className="w-3 h-3 mr-1" />
-                        重复生成
-                      </Button>
-                    ) : null}
-                  </div>
-                </div>
-              )}
-              <div className={cn('chat-bubble-container flex w-full', isUser ? 'justify-end' : 'justify-start mt-1')}>
-                <div className={cn('chat-bubble', isUser ? 'chat-bubble-user' : 'chat-bubble-agent')}>
-                  {!isUser ? renderProcessPanel(group.id, groupMessages) : null}
-                  <div className={cn(groupMessages.length > 1 ? 'space-y-4' : '')}>
-                    {groupMessages.map((item, itemIndex) => (
-                      <div
-                        key={item.id}
-                        data-message-id={item.id}
-                        className={cn(
-                          'transition-colors',
-                          itemIndex > 0 ? 'border-t border-border/40 pt-4' : '',
-                        )}
-                      >
-                        {renderMessageBody(item, isUser, {
-                          deferHeavyUi,
-                          includeProcessPanel: false,
-                        })}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        );
-      })}
-    </>
-  ), [agent.avatarUrl, agent.color, agent.name, canRegenerateAt, messageGroups, messageIndexMap, onRegenerateMessage, renderMessageBody, stableMessages]);
 
   const streamingRow = useMemo(() => {
     if (!activeStreaming) {
@@ -2163,7 +2231,24 @@ export function ChatConversationPane({
 
       <div ref={scrollRef} className="chat-messages" onScroll={handleScroll}>
         <div ref={contentRef} className="chat-messages-content">
-          {messageRows}
+          <ChatMessageList
+            agentName={agent.name}
+            agentAvatarUrl={agent.avatarUrl}
+            agentColor={agent.color}
+            isSending={isSending}
+            messageGroups={messageGroups}
+            messageIndexMap={messageIndexMap}
+            stableMessagesLength={stableMessages.length}
+            traceRenderToken={traceRenderToken}
+            scrollContainerRef={scrollRef}
+            renderMessageBody={renderMessageBody}
+            renderMessageAttachments={renderMessageAttachments}
+            hasMessageBubbleContent={hasMessageBubbleContent}
+            renderProcessPanel={renderProcessPanel}
+            canRegenerateAt={canRegenerateAt}
+            formatElapsed={formatElapsed}
+            onRegenerateMessage={onRegenerateMessage}
+          />
           {streamingRow}
         </div>
       </div>

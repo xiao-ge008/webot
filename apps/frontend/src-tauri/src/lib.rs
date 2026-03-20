@@ -78,6 +78,7 @@ pub fn run() {
             commands::save_markdown_as,
             commands::read_binary_file_base64,
             commands::save_binary_file_as,
+            commands::open_file_with_system,
             commands::load_skill_component_source,
             commands::load_skill_prompt_context,
             commands::list_available_skill_components,

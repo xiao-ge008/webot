@@ -590,6 +590,45 @@ pub fn save_binary_file_as(
     Ok(target.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+pub fn open_file_with_system(path: String) -> Result<(), String> {
+    let target = path.trim();
+    if target.is_empty() {
+        return Err("文件路径为空".to_string());
+    }
+
+    let file_path = PathBuf::from(target);
+    if !file_path.exists() {
+        return Err("文件不存在".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", target])
+            .spawn()
+            .map_err(|err| format!("调用系统打开文件失败: {err}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(target)
+            .spawn()
+            .map_err(|err| format!("调用系统打开文件失败: {err}"))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .map_err(|err| format!("调用系统打开文件失败: {err}"))?;
+    }
+
+    Ok(())
+}
+
 fn mpv_candidate_paths(app: &AppHandle) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let arch = std::env::consts::ARCH;

@@ -59,6 +59,16 @@ function platformFolders() {
   return ['linux'];
 }
 
+function tauriBuildArgs() {
+  if (process.platform === 'win32') {
+    return ['--target', 'x86_64-pc-windows-gnu', '--bundles', 'msi'];
+  }
+  if (process.platform === 'darwin') {
+    return ['--bundles', 'dmg,app'];
+  }
+  return [];
+}
+
 buildVendorOpenfangBinary();
 
 const binaryName = process.platform === 'win32' ? 'openfang.exe' : 'openfang';
@@ -95,15 +105,25 @@ if (!dryRun && process.platform !== 'win32') {
 }
 
 if (process.platform === 'win32') {
+  const args = ['npm', 'run', 'build:tauri', '--workspace', '@webot/frontend'];
+  const extraArgs = tauriBuildArgs();
+  if (extraArgs.length > 0) {
+    args.push('--', ...extraArgs);
+  }
   run(
     'cmd.exe',
-    ['/d', '/s', '/c', 'npm', 'run', 'build:tauri', '--workspace', '@webot/frontend'],
+    ['/d', '/s', '/c', ...args],
     { cwd: webotRoot, env: commandEnv }
   );
 } else {
+  const args = ['run', 'build:tauri', '--workspace', '@webot/frontend'];
+  const extraArgs = tauriBuildArgs();
+  if (extraArgs.length > 0) {
+    args.push('--', ...extraArgs);
+  }
   run(
     'npm',
-    ['run', 'build:tauri', '--workspace', '@webot/frontend'],
+    args,
     { cwd: webotRoot, env: commandEnv }
   );
 }

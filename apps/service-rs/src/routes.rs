@@ -950,7 +950,10 @@ pub async fn optimize_prompt_with_default_model(
 pub fn chat_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{id}/sessions", get(chat_sessions))
-        .route("/{id}/session", get(chat_session).delete(delete_chat_session))
+        .route(
+            "/{id}/session",
+            get(chat_session).delete(delete_chat_session),
+        )
         .route("/{id}/session/compact", post(chat_session_compact))
         .route("/{id}/message", post(chat_message))
         .route("/{id}/message/stream", post(chat_message_stream))
@@ -4567,7 +4570,8 @@ async fn normalize_agent_model_selector_if_needed(
                         .any(|item| item.trim().eq_ignore_ascii_case(candidate_model))
                 })
                 .unwrap_or(false);
-            if !candidate_provider.is_empty() && !candidate_model.is_empty() && matches_local_config {
+            if !candidate_provider.is_empty() && !candidate_model.is_empty() && matches_local_config
+            {
                 Some((candidate_provider, candidate_model.to_string()))
             } else {
                 None
@@ -8472,7 +8476,9 @@ fn resolve_upstream_request_origin(
     request_origin: Option<&str>,
     session_label: Option<&str>,
 ) -> Option<&'static str> {
-    let normalized_origin = request_origin.map(str::trim).filter(|value| !value.is_empty());
+    let normalized_origin = request_origin
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let normalized_label = session_label
         .map(normalize_session_label)
         .filter(|value| !value.is_empty());
@@ -9797,6 +9803,24 @@ fn apply_system_prompt_guard(
     format!("{}\n\n{}", blocks.join("\n\n"), message)
 }
 
+fn ensure_visible_reply_for_chat_turn(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || message.contains("[system:require-visible-reply]") {
+        return message.to_string();
+    }
+
+    [
+        "[system:require-visible-reply]",
+        "这是用户在当前聊天窗口主动发起的一次明确提问或指令。",
+        "必须给出面向用户的可见正文回复。",
+        "禁止仅返回 NO_REPLY、[[silent]]、空字符串，或只有工具/记忆日志。",
+        "如果需要先检索记忆、调用工具或做中间步骤，完成后仍必须继续输出最终正文。",
+        "",
+        message,
+    ]
+    .join("\n")
+}
+
 async fn resolve_semantic_memory_prompt(
     state: &Arc<AppState>,
     agent_id: &str,
@@ -10010,6 +10034,24 @@ fn parse_sse_event_frame(frame: &str) -> Option<(String, String)> {
         return None;
     }
     Some((event_name, data_lines.join("\n")))
+}
+
+fn extract_done_usage_tokens(data: &str) -> (Option<u64>, Option<u64>) {
+    let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+        return (None, None);
+    };
+
+    let usage = parsed.get("usage");
+    let input_tokens = usage
+        .and_then(|item| item.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| parsed.get("input_tokens").and_then(Value::as_u64));
+    let output_tokens = usage
+        .and_then(|item| item.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| parsed.get("output_tokens").and_then(Value::as_u64));
+
+    (input_tokens, output_tokens)
 }
 
 fn extract_text_from_json(value: &Value) -> Option<String> {
@@ -10245,7 +10287,7 @@ pub async fn chat_message(
     let current_session = state.openfang.get_json(&session_path).await.ok();
     let include_prompt_blocks = should_inject_prompt_blocks_for_session(current_session.as_ref());
 
-    let outgoing_message = apply_system_prompt_guard(
+    let guarded_message = apply_system_prompt_guard(
         &payload.message,
         system_prompt.as_deref(),
         collaboration_prompt.as_deref(),
@@ -10254,6 +10296,7 @@ pub async fn chat_message(
             .map(|item| item.prompt.as_str()),
         include_prompt_blocks,
     );
+    let outgoing_message = ensure_visible_reply_for_chat_turn(&guarded_message);
     let attachments = build_openfang_attachment_payload(&payload.attachments);
     let request_origin = resolve_upstream_request_origin(
         payload.request_origin.as_deref(),
@@ -10352,7 +10395,7 @@ pub async fn chat_message_stream(
     let current_session = state.openfang.get_json(&session_path).await.ok();
     let include_prompt_blocks = should_inject_prompt_blocks_for_session(current_session.as_ref());
 
-    let outgoing_message = apply_system_prompt_guard(
+    let guarded_message = apply_system_prompt_guard(
         &payload.message,
         system_prompt.as_deref(),
         collaboration_prompt.as_deref(),
@@ -10361,6 +10404,7 @@ pub async fn chat_message_stream(
             .map(|item| item.prompt.as_str()),
         include_prompt_blocks,
     );
+    let outgoing_message = ensure_visible_reply_for_chat_turn(&guarded_message);
     let attachments = build_openfang_attachment_payload(&payload.attachments);
     let request_origin = resolve_upstream_request_origin(
         payload.request_origin.as_deref(),
@@ -10434,6 +10478,8 @@ pub async fn chat_message_stream(
         let mut saw_tool_result = false;
         let mut saw_upstream_done = false;
         let mut saw_upstream_error = false;
+        let mut upstream_done_input_tokens: Option<u64> = None;
+        let mut upstream_done_output_tokens: Option<u64> = None;
         let baseline_assistant_count = baseline_assistant_count;
 
         while let Some(chunk) = upstream_stream.next().await {
@@ -10462,6 +10508,14 @@ pub async fn chat_message_stream(
                             }
                             if event_name == "done" {
                                 saw_upstream_done = true;
+                                let (input_tokens, output_tokens) =
+                                    extract_done_usage_tokens(&data);
+                                if input_tokens.is_some() {
+                                    upstream_done_input_tokens = input_tokens;
+                                }
+                                if output_tokens.is_some() {
+                                    upstream_done_output_tokens = output_tokens;
+                                }
                                 append_renderable_stream_text(&mut streamed_text, &data);
                             }
                         }
@@ -10528,6 +10582,51 @@ pub async fn chat_message_stream(
                 restore_original_session().await;
                 return;
             }
+        }
+
+        if saw_upstream_done
+            && !saw_upstream_error
+            && matches!(upstream_done_output_tokens, Some(0))
+        {
+            let fallback_text = if saw_tool_result {
+                "本次请求在记忆召回或工具调用后提前结束，未生成正文回复，请重试。"
+            } else {
+                "本次请求已结束，但未生成正文回复，请重试。"
+            };
+            tracing::warn!(
+                agent_id = %agent_id,
+                input_tokens = upstream_done_input_tokens.unwrap_or(0),
+                output_tokens = upstream_done_output_tokens.unwrap_or(0),
+                saw_tool_result = saw_tool_result,
+                "chat stream completed with zero output tokens and no renderable text; emitted fallback reply"
+            );
+            let chunk_data = json!({
+                "content": fallback_text,
+                "done": false,
+                "fallback": "zero_output_done"
+            })
+            .to_string();
+            let done_data = json!({
+                "done": true,
+                "usage": {
+                    "input_tokens": upstream_done_input_tokens.unwrap_or(0),
+                    "output_tokens": upstream_done_output_tokens.unwrap_or(0)
+                },
+                "fallback": "zero_output_done"
+            })
+            .to_string();
+            let _ = tx
+                .send(Ok(Bytes::from(format!(
+                    "event: chunk\ndata: {chunk_data}\n\n"
+                ))))
+                .await;
+            let _ = tx
+                .send(Ok(Bytes::from(format!(
+                    "event: done\ndata: {done_data}\n\n"
+                ))))
+                .await;
+            restore_original_session().await;
+            return;
         }
 
         if saw_tool_result {
@@ -11991,8 +12090,10 @@ async fn sync_agent_skill_assignments(
         assignment_store::list_agent_enabled_skills(agent_id).map_err(storage_error)?,
         &skill_aliases,
     );
-    let known =
-        canonicalize_skill_names(openfang_known_skill_names(state, agent_id).await?, &skill_aliases);
+    let known = canonicalize_skill_names(
+        openfang_known_skill_names(state, agent_id).await?,
+        &skill_aliases,
+    );
     let known_set = known.iter().cloned().collect::<HashSet<_>>();
     let desired_runtime: Vec<String> = desired
         .iter()
@@ -12331,7 +12432,11 @@ fn skill_name_alias_map() -> Result<HashMap<String, String>, ApiError> {
             continue;
         }
         let canonical = skill_folder_name_from_record(&record)
-            .and_then(|folder_name| folder_to_display.get(&folder_name.to_ascii_lowercase()).cloned())
+            .and_then(|folder_name| {
+                folder_to_display
+                    .get(&folder_name.to_ascii_lowercase())
+                    .cloned()
+            })
             .unwrap_or_else(|| record_name.to_string());
         aliases
             .entry(record_name.to_ascii_lowercase())

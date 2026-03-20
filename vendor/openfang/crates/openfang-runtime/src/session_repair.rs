@@ -21,6 +21,8 @@ use tracing::{debug, warn};
 pub struct RepairStats {
     /// Number of orphaned ToolResult blocks removed.
     pub orphaned_results_removed: usize,
+    /// Number of malformed ToolUse blocks removed because the tool name was empty.
+    pub malformed_tool_uses_removed: usize,
     /// Number of empty messages removed.
     pub empty_messages_removed: usize,
     /// Number of consecutive same-role messages merged.
@@ -57,7 +59,9 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
             MessageContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    ContentBlock::ToolUse { id, name, .. } if !name.trim().is_empty() => {
+                        Some(id.clone())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -81,6 +85,13 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
                 let filtered: Vec<ContentBlock> = blocks
                     .iter()
                     .filter(|b| match b {
+                        ContentBlock::ToolUse { name, .. } => {
+                            let keep = !name.trim().is_empty();
+                            if !keep {
+                                stats.malformed_tool_uses_removed += 1;
+                            }
+                            keep
+                        }
                         ContentBlock::ToolResult { tool_use_id, .. } => {
                             let keep = tool_use_ids.contains(tool_use_id);
                             if !keep {
@@ -166,6 +177,7 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
     if stats != RepairStats::default() {
         warn!(
             orphaned = stats.orphaned_results_removed,
+            malformed_tool_uses = stats.malformed_tool_uses_removed,
             empty = stats.empty_messages_removed,
             merged = stats.messages_merged,
             reordered = stats.results_reordered,
@@ -341,6 +353,22 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
         })
         .collect();
 
+    let tool_use_names: HashMap<String, String> = messages
+        .iter()
+        .flat_map(|m| match &m.content {
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, name, .. } if !name.trim().is_empty() => {
+                        Some((id.clone(), name.clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        })
+        .collect();
+
     // Find ToolUse blocks without matching results
     let mut orphaned_uses: Vec<(usize, String)> = Vec::new(); // (assistant_msg_idx, tool_use_id)
     for (idx, msg) in messages.iter().enumerate() {
@@ -370,8 +398,11 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
             .entry(idx)
             .or_default()
             .push(ContentBlock::ToolResult {
+                tool_name: tool_use_names
+                    .get(&tool_use_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 tool_use_id,
-                tool_name: String::new(),
                 content: "[Tool execution was interrupted or lost]".to_string(),
                 is_error: true,
             });
@@ -767,6 +798,46 @@ mod tests {
         assert_eq!(repaired.len(), 4);
     }
 
+    #[test]
+    fn drops_tool_use_with_empty_name() {
+        let messages = vec![
+            Message::user("Search for rust"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tu-empty".to_string(),
+                    name: String::new(),
+                    input: serde_json::json!({"query": "rust"}),
+                }]),
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu-empty".to_string(),
+                    tool_name: String::new(),
+                    content: "Results found".to_string(),
+                    is_error: false,
+                }]),
+            },
+            Message::assistant("Done"),
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(stats.malformed_tool_uses_removed, 1);
+        assert_eq!(stats.orphaned_results_removed, 1);
+        assert_eq!(repaired.len(), 2);
+        assert!(
+            repaired.iter().all(|msg| {
+                !matches!(
+                    &msg.content,
+                    MessageContent::Blocks(blocks)
+                        if blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "tu-empty"))
+                )
+            }),
+            "Malformed tool use should be removed from history"
+        );
+    }
+
     // --- New tests ---
 
     #[test]
@@ -859,6 +930,22 @@ mod tests {
             has_synthetic,
             "Should have inserted a synthetic error result"
         );
+
+        let synthetic_tool_name = repaired
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        ..
+                    } if tool_use_id == "tu-orphan" => Some(tool_name.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(synthetic_tool_name, "file_read");
     }
 
     #[test]

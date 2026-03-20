@@ -86,7 +86,28 @@ tokio::task_local! {
 }
 
 const CURRENT_MODEL_VISION_TIMEOUT_SECS: u64 = 75;
-const FALLBACK_VISION_TIMEOUT_SECS: u64 = 30;
+const FALLBACK_VISION_TIMEOUT_SECS: u64 = 75;
+
+fn browser_navigate_local_source_error(url: &str) -> Option<&'static str> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("file://")
+        || lower.starts_with("data:")
+        || lower.starts_with("blob:")
+        || trimmed.starts_with('\\')
+        || std::path::Path::new(trimmed).is_absolute()
+    {
+        return Some(
+            "browser_navigate only supports http/https web pages. Do not use it for local files, file:// URLs, data URLs, or chat-uploaded images. For local/workspace images, use image_analyze or media_describe instead.",
+        );
+    }
+
+    None
+}
 
 fn format_timeout_duration(timeout: std::time::Duration) -> String {
     if timeout.as_millis() < 1000 {
@@ -356,6 +377,13 @@ pub async fn execute_tool(
         // Browser automation tools
         "browser_navigate" => {
             let url = input["url"].as_str().unwrap_or("");
+            if let Some(message) = browser_navigate_local_source_error(url) {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: message.to_string(),
+                    is_error: true,
+                };
+            }
             if let Some(violation) = check_taint_net_fetch(url) {
                 return ToolResult {
                     tool_use_id: tool_use_id.to_string(),
@@ -850,7 +878,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Image analysis tool ---
         ToolDefinition {
             name: "image_analyze".to_string(),
-            description: "Analyze an image file. Always returns file metadata; when a prompt is provided, also performs direct vision analysis with the current agent model when possible, otherwise falls back to configured vision providers.".to_string(),
+            description: "Analyze a local or workspace image file. Always returns file metadata; when a prompt is provided, also performs direct vision analysis with the current agent model when possible, otherwise falls back to configured vision providers. Preferred tool for chat-uploaded images and screenshots.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -872,7 +900,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Browser automation tools ---
         ToolDefinition {
             name: "browser_navigate".to_string(),
-            description: "Navigate a browser to a URL. Returns the page title and readable content as markdown. Opens a persistent browser session.".to_string(),
+            description: "Navigate a browser to an http/https web page. Returns the page title and readable content as markdown. Do not use this for local files, file:// URLs, data URLs, or chat-uploaded images.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -973,7 +1001,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Media understanding tools ---
         ToolDefinition {
             name: "media_describe".to_string(),
-            description: "Describe an image using the current agent model when it supports vision; otherwise fall back to configured vision providers (Anthropic, OpenAI, or Gemini). Returns a text description of the image content.".to_string(),
+            description: "Describe a local or workspace image using the current agent model when it supports vision; otherwise fall back to configured vision providers. Use this for chat-uploaded images and screenshots, not browser_navigate.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2557,7 +2585,32 @@ async fn tool_image_analyze(
 
     if !prompt.is_empty() {
         result["prompt"] = serde_json::json!(prompt);
-        match tool_media_describe(input, media_engine, kernel, caller_agent_id).await {
+        let mime = match format.as_str() {
+            "png" => Some("image/png"),
+            "jpeg" | "jpg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            "bmp" => Some("image/bmp"),
+            "svg" => Some("image/svg+xml"),
+            _ => None,
+        };
+        let vision_result = match mime {
+            Some(mime_type) => {
+                describe_image_bytes_with_timeouts(
+                    prompt,
+                    mime_type,
+                    &data,
+                    media_engine,
+                    kernel,
+                    caller_agent_id,
+                    std::time::Duration::from_secs(CURRENT_MODEL_VISION_TIMEOUT_SECS),
+                    std::time::Duration::from_secs(FALLBACK_VISION_TIMEOUT_SECS),
+                )
+                .await
+            }
+            None => Err(format!("Unsupported image format: .{format}")),
+        };
+        match vision_result {
             Ok(vision_json) => {
                 let vision_result = serde_json::from_str::<serde_json::Value>(&vision_json)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": vision_json }));
@@ -2759,7 +2812,6 @@ async fn tool_media_describe_with_timeouts(
     current_model_timeout: std::time::Duration,
     fallback_timeout: std::time::Duration,
 ) -> Result<String, String> {
-    use base64::Engine;
     let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let prompt = input["prompt"]
         .as_str()
@@ -2790,8 +2842,32 @@ async fn tool_media_describe_with_timeouts(
         "svg" => "image/svg+xml",
         _ => return Err(format!("Unsupported image format: .{ext}")),
     };
+    describe_image_bytes_with_timeouts(
+        prompt,
+        mime,
+        &data,
+        media_engine,
+        kernel,
+        caller_agent_id,
+        current_model_timeout,
+        fallback_timeout,
+    )
+    .await
+}
 
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+async fn describe_image_bytes_with_timeouts(
+    prompt: &str,
+    mime: &str,
+    data: &[u8],
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    current_model_timeout: std::time::Duration,
+    fallback_timeout: std::time::Duration,
+) -> Result<String, String> {
+    use base64::Engine;
+
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(data);
 
     let mut current_model_error = None;
     if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
@@ -2844,6 +2920,10 @@ async fn tool_media_describe_with_timeouts(
     parts.push(format!(
         "Fallback vision provider path failed: {fallback_error}"
     ));
+    parts.push(
+        "Do not retry local image analysis with browser_navigate or shell_exec. Use image_analyze/media_describe for chat-uploaded images, and if the screenshot is blurry ask for a clearer image instead."
+            .to_string(),
+    );
     Err(parts.join(" | "))
 }
 
@@ -3413,6 +3493,15 @@ mod tests {
     }
 
     #[test]
+    fn test_browser_navigate_local_source_error_for_file_inputs() {
+        assert!(browser_navigate_local_source_error("file:///tmp/example.png").is_some());
+        assert!(browser_navigate_local_source_error("C:\\tmp\\example.png").is_some());
+        assert!(browser_navigate_local_source_error("\\\\server\\share\\example.png").is_some());
+        assert!(browser_navigate_local_source_error("data:image/png;base64,abc").is_some());
+        assert!(browser_navigate_local_source_error("https://example.com").is_none());
+    }
+
+    #[test]
     fn test_collaboration_tool_schemas() {
         let tools = builtin_tool_definitions();
         let collab_tools = [
@@ -3465,6 +3554,32 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_browser_navigate_rejects_local_file_inputs() {
+        let result = execute_tool(
+            "test-id",
+            "browser_navigate",
+            &serde_json::json!({"url": "file:///C:/tmp/example.webp"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("image_analyze"));
     }
 
     #[tokio::test]

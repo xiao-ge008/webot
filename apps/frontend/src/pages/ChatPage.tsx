@@ -79,6 +79,8 @@ import {
 } from '@/components/chat/chat-page-helpers';
 
 type StreamState = 'idle' | 'streaming' | 'waiting';
+
+const STREAM_VISUAL_FLUSH_MIN_INTERVAL_MS = 24;
 type ChatSession = StoredChatSession;
 type IdleAutoScope = 'agent' | 'group';
 
@@ -277,6 +279,7 @@ function parseBackendMessageRole(value: unknown): Message['role'] {
 
 const CHAT_ATTACHMENT_PROMPT_BEGIN = '[WEBOT_CHAT_ATTACHMENTS_BEGIN]';
 const CHAT_ATTACHMENT_PROMPT_END = '[WEBOT_CHAT_ATTACHMENTS_END]';
+const TOOL_TRACE_ONLY_FALLBACK_TEXT = '本次请求只返回了工具/记忆日志，未生成正文回复，请重试。';
 const CHAT_ATTACHMENT_LEGACY_HEADER = '以下文件已上传到当前智能体工作区的 data/chat-uploads 目录，请按需读取：';
 
 function buildRecoveredChatAssetUrl(agentId: string | undefined, relativePath: string): string | undefined {
@@ -2638,6 +2641,8 @@ export function ChatPage({
     const thinkingSnapshotRef = useRef('');
     const pendingSilentMessagesRef = useRef<string[]>([]);
     const streamPatchTimerRef = useRef<number | null>(null);
+    const streamPatchRafRef = useRef<number | null>(null);
+    const lastStreamVisualFlushAtRef = useRef(0);
     const pendingSilentCountRef = useRef(0);
     const compactingSessionIdsRef = useRef<Set<string>>(new Set());
     const requestGroupQueueMapRef = useRef<Map<string, { sessionId: string; itemId: string; speakerId: string }>>(new Map());
@@ -3300,6 +3305,10 @@ export function ChatPage({
             window.clearTimeout(streamPatchTimerRef.current);
             streamPatchTimerRef.current = null;
         }
+        if (streamPatchRafRef.current != null) {
+            window.cancelAnimationFrame(streamPatchRafRef.current);
+            streamPatchRafRef.current = null;
+        }
     };
 
     const bindRuntimeRequest = (requestId: string, sessionId: string, messageId: string) => {
@@ -3408,18 +3417,37 @@ export function ChatPage({
         const next = streamingDraftRef.current;
         if (!next) return;
         const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
+        lastStreamVisualFlushAtRef.current = typeof performance !== 'undefined' ? performance.now() : Date.now();
         patchSessionMessageById(requestSessionId, pendingId, next);
         setStreamingMessage(null);
     };
 
     const schedulePendingStreamDraft = () => {
-        if (streamPatchTimerRef.current != null) {
+        if (streamPatchTimerRef.current != null || streamPatchRafRef.current != null) {
             return;
         }
-        streamPatchTimerRef.current = window.setTimeout(() => {
-            streamPatchTimerRef.current = null;
-            flushPendingStreamDraft();
-        }, 80);
+        const scheduleTimeout = (delay: number) => {
+            streamPatchTimerRef.current = window.setTimeout(() => {
+                streamPatchTimerRef.current = null;
+                flushPendingStreamDraft();
+            }, Math.max(0, delay));
+        };
+
+        if (typeof window.requestAnimationFrame !== 'function') {
+            scheduleTimeout(STREAM_VISUAL_FLUSH_MIN_INTERVAL_MS);
+            return;
+        }
+
+        streamPatchRafRef.current = window.requestAnimationFrame(() => {
+            streamPatchRafRef.current = null;
+            const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            const elapsed = now - lastStreamVisualFlushAtRef.current;
+            if (elapsed >= STREAM_VISUAL_FLUSH_MIN_INTERVAL_MS) {
+                flushPendingStreamDraft();
+                return;
+            }
+            scheduleTimeout(STREAM_VISUAL_FLUSH_MIN_INTERVAL_MS - elapsed);
+        });
     };
 
     const commitMessages = (
@@ -4782,7 +4810,7 @@ export function ChatPage({
                 } else if ((next.toolTrace?.length ?? 0) === 0) {
                     next.text = '本次回复暂未返回可展示内容。';
                 } else {
-                    next.text = '';
+                    next.text = TOOL_TRACE_ONLY_FALLBACK_TEXT;
                 }
             }
 
@@ -5196,7 +5224,7 @@ export function ChatPage({
                 if (fallbackText && !looksLikeProtocolOnlyText(fallbackText)) {
                     finalDraft.text = fallbackText;
                 } else {
-                    finalDraft.text = '已调用工具处理中，请稍后重试。';
+                    finalDraft.text = TOOL_TRACE_ONLY_FALLBACK_TEXT;
                 }
             }
             if (!result.success) {
@@ -5240,7 +5268,7 @@ export function ChatPage({
                 } else if ((finalDraft.toolTrace?.length ?? 0) === 0) {
                     finalDraft.text = '本次回复暂未返回可展示内容。';
                 } else {
-                    finalDraft.text = '';
+                    finalDraft.text = TOOL_TRACE_ONLY_FALLBACK_TEXT;
                 }
             }
             // sendAgentChat(stream=true) 只有在流结束后才 resolve；这里不应再进入 waiting 收尾。

@@ -9,6 +9,7 @@ use futures::StreamExt;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
 use openfang_types::tool::ToolCall;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
@@ -97,11 +98,45 @@ fn temperature_must_be_one(model: &str) -> bool {
     m.starts_with("kimi-k2") || m == "kimi-k2.5" || m == "kimi-k2.5-0711"
 }
 
+/// Merge a streamed tool/function name chunk without letting later empty deltas
+/// erase an earlier valid name.
+fn merge_streamed_tool_name(current: &mut String, delta: &str) -> bool {
+    if delta.is_empty() {
+        return false;
+    }
+
+    let was_empty = current.is_empty();
+    if was_empty {
+        current.push_str(delta);
+        return true;
+    }
+
+    if current == delta || current.ends_with(delta) {
+        return false;
+    }
+
+    if delta.starts_with(current.as_str()) {
+        current.clear();
+        current.push_str(delta);
+        return false;
+    }
+
+    let max_overlap = current.len().min(delta.len());
+    let overlap = (1..=max_overlap)
+        .rev()
+        .find(|&len| current.ends_with(&delta[..len]))
+        .unwrap_or(0);
+    current.push_str(&delta[overlap..]);
+    false
+}
+
 #[derive(Debug, Serialize)]
 struct OaiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<OaiMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,12 +225,14 @@ struct OaiUsage {
 impl LlmDriver for OpenAIDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let mut oai_messages: Vec<OaiMessage> = Vec::new();
+        let mut tool_name_by_call_id: HashMap<String, String> = HashMap::new();
 
         // Add system message if present
         if let Some(ref system) = request.system {
             oai_messages.push(OaiMessage {
                 role: "system".to_string(),
                 content: Some(OaiMessageContent::Text(system.clone())),
+                name: None,
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -210,6 +247,7 @@ impl LlmDriver for OpenAIDriver {
                         oai_messages.push(OaiMessage {
                             role: "system".to_string(),
                             content: Some(OaiMessageContent::Text(text.clone())),
+                            name: None,
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: None,
@@ -220,6 +258,7 @@ impl LlmDriver for OpenAIDriver {
                     oai_messages.push(OaiMessage {
                         role: "user".to_string(),
                         content: Some(OaiMessageContent::Text(text.clone())),
+                        name: None,
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
@@ -229,6 +268,7 @@ impl LlmDriver for OpenAIDriver {
                     oai_messages.push(OaiMessage {
                         role: "assistant".to_string(),
                         content: Some(OaiMessageContent::Text(text.clone())),
+                        name: None,
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
@@ -242,10 +282,16 @@ impl LlmDriver for OpenAIDriver {
                         match block {
                             ContentBlock::ToolResult {
                                 tool_use_id,
+                                tool_name,
                                 content,
                                 ..
                             } => {
                                 has_tool_results = true;
+                                let resolved_tool_name = if tool_name.trim().is_empty() {
+                                    tool_name_by_call_id.get(tool_use_id).cloned()
+                                } else {
+                                    Some(tool_name.clone())
+                                };
                                 oai_messages.push(OaiMessage {
                                     role: "tool".to_string(),
                                     content: Some(OaiMessageContent::Text(if content.is_empty() {
@@ -253,6 +299,7 @@ impl LlmDriver for OpenAIDriver {
                                     } else {
                                         content.clone()
                                     })),
+                                    name: resolved_tool_name,
                                     tool_calls: None,
                                     tool_call_id: Some(tool_use_id.clone()),
                                     reasoning_content: None,
@@ -276,6 +323,7 @@ impl LlmDriver for OpenAIDriver {
                         oai_messages.push(OaiMessage {
                             role: "user".to_string(),
                             content: Some(OaiMessageContent::Parts(parts)),
+                            name: None,
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: None,
@@ -289,6 +337,7 @@ impl LlmDriver for OpenAIDriver {
                         match block {
                             ContentBlock::Text { text } => text_parts.push(text.clone()),
                             ContentBlock::ToolUse { id, name, input } => {
+                                tool_name_by_call_id.insert(id.clone(), name.clone());
                                 tool_calls.push(OaiToolCall {
                                     id: id.clone(),
                                     call_type: "function".to_string(),
@@ -319,6 +368,7 @@ impl LlmDriver for OpenAIDriver {
                         } else {
                             Some(tool_calls)
                         },
+                        name: None,
                         tool_call_id: None,
                         reasoning_content: if has_tool_calls
                             && self.kimi_needs_reasoning_content(&request.model)
@@ -646,11 +696,13 @@ impl LlmDriver for OpenAIDriver {
     ) -> Result<CompletionResponse, LlmError> {
         // Build request (same as complete but with stream: true)
         let mut oai_messages: Vec<OaiMessage> = Vec::new();
+        let mut tool_name_by_call_id: HashMap<String, String> = HashMap::new();
 
         if let Some(ref system) = request.system {
             oai_messages.push(OaiMessage {
                 role: "system".to_string(),
                 content: Some(OaiMessageContent::Text(system.clone())),
+                name: None,
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -664,6 +716,7 @@ impl LlmDriver for OpenAIDriver {
                         oai_messages.push(OaiMessage {
                             role: "system".to_string(),
                             content: Some(OaiMessageContent::Text(text.clone())),
+                            name: None,
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: None,
@@ -674,6 +727,7 @@ impl LlmDriver for OpenAIDriver {
                     oai_messages.push(OaiMessage {
                         role: "user".to_string(),
                         content: Some(OaiMessageContent::Text(text.clone())),
+                        name: None,
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
@@ -683,6 +737,7 @@ impl LlmDriver for OpenAIDriver {
                     oai_messages.push(OaiMessage {
                         role: "assistant".to_string(),
                         content: Some(OaiMessageContent::Text(text.clone())),
+                        name: None,
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
@@ -692,10 +747,16 @@ impl LlmDriver for OpenAIDriver {
                     for block in blocks {
                         if let ContentBlock::ToolResult {
                             tool_use_id,
+                            tool_name,
                             content,
                             ..
                         } = block
                         {
+                            let resolved_tool_name = if tool_name.trim().is_empty() {
+                                tool_name_by_call_id.get(tool_use_id).cloned()
+                            } else {
+                                Some(tool_name.clone())
+                            };
                             oai_messages.push(OaiMessage {
                                 role: "tool".to_string(),
                                 content: Some(OaiMessageContent::Text(if content.is_empty() {
@@ -703,6 +764,7 @@ impl LlmDriver for OpenAIDriver {
                                 } else {
                                     content.clone()
                                 })),
+                                name: resolved_tool_name,
                                 tool_calls: None,
                                 tool_call_id: Some(tool_use_id.clone()),
                                 reasoning_content: None,
@@ -717,6 +779,7 @@ impl LlmDriver for OpenAIDriver {
                         match block {
                             ContentBlock::Text { text } => text_parts.push(text.clone()),
                             ContentBlock::ToolUse { id, name, input } => {
+                                tool_name_by_call_id.insert(id.clone(), name.clone());
                                 tool_calls_out.push(OaiToolCall {
                                     id: id.clone(),
                                     call_type: "function".to_string(),
@@ -747,6 +810,7 @@ impl LlmDriver for OpenAIDriver {
                         } else {
                             Some(tool_calls_out)
                         },
+                        name: None,
                         tool_call_id: None,
                         reasoning_content: if has_tool_calls
                             && self.kimi_needs_reasoning_content(&request.model)
@@ -1056,13 +1120,14 @@ impl LlmDriver for OpenAIDriver {
                                 if let Some(func) = call.get("function") {
                                     // Name (sent in first chunk)
                                     if let Some(name) = func["name"].as_str() {
-                                        tool_accum[idx].1 = name.to_string();
-                                        let _ = tx
-                                            .send(StreamEvent::ToolUseStart {
-                                                id: tool_accum[idx].0.clone(),
-                                                name: name.to_string(),
-                                            })
-                                            .await;
+                                        if merge_streamed_tool_name(&mut tool_accum[idx].1, name) {
+                                            let _ = tx
+                                                .send(StreamEvent::ToolUseStart {
+                                                    id: tool_accum[idx].0.clone(),
+                                                    name: tool_accum[idx].1.clone(),
+                                                })
+                                                .await;
+                                        }
                                     }
 
                                     // Arguments delta
@@ -1395,5 +1460,23 @@ mod tests {
         assert!(rejects_temperature("o3-mini"));
         assert!(rejects_temperature("gpt-5-mini"));
         assert!(!rejects_temperature("gpt-4o"));
+    }
+
+    #[test]
+    fn test_merge_streamed_tool_name_ignores_empty_deltas() {
+        let mut current = String::new();
+        assert!(merge_streamed_tool_name(&mut current, "time"));
+        assert_eq!(current, "time");
+        assert!(!merge_streamed_tool_name(&mut current, ""));
+        assert_eq!(current, "time");
+    }
+
+    #[test]
+    fn test_merge_streamed_tool_name_appends_partial_chunks() {
+        let mut current = String::new();
+        assert!(merge_streamed_tool_name(&mut current, "ti"));
+        assert_eq!(current, "ti");
+        assert!(!merge_streamed_tool_name(&mut current, "me"));
+        assert_eq!(current, "time");
     }
 }

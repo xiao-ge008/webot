@@ -666,10 +666,9 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
     .map((message, messageIndex) => normalizeMessage(message, messageIndex))
     .filter((message): message is Message => message != null);
   const autoTitle = item.autoTitle === true;
-  const streamStateRaw = typeof item.streamState === 'string' ? item.streamState : '';
-  const streamState = streamStateRaw === 'streaming' || streamStateRaw === 'waiting' || streamStateRaw === 'idle'
-    ? streamStateRaw
-    : 'idle';
+  // 持久化恢复后无法继续之前的流式请求；若保留 waiting/streaming，会导致输入框长期锁死。
+  // 消息本身已经在 normalizeMessage/cloneMessage 中清除了 streaming 标记，这里同步把会话级状态复位。
+  const streamState = 'idle';
   return {
     id,
     title,

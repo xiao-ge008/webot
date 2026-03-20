@@ -505,7 +505,7 @@ pub fn tool_hint(name: &str) -> &'static str {
         "web_fetch" => "fetch a URL and get its content as markdown",
 
         // Browser
-        "browser_navigate" => "open a URL in the browser",
+        "browser_navigate" => "open an http/https web page in the browser, never a local file or chat image",
         "browser_click" => "click an element on the page",
         "browser_type" => "type text into an input field",
         "browser_screenshot" => "capture a screenshot",

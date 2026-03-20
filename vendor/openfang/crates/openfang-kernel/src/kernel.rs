@@ -64,6 +64,27 @@ fn detect_known_vision_support(
     raw_model: &str,
     provider: &str,
 ) -> Option<bool> {
+    fn find_model_for_provider<'a>(
+        catalog: &'a openfang_runtime::model_catalog::ModelCatalog,
+        candidate: &str,
+        provider: &str,
+    ) -> Option<&'a openfang_types::model_catalog::ModelCatalogEntry> {
+        let lower = candidate.to_lowercase();
+        if let Some(entry) = catalog
+            .list_models()
+            .iter()
+            .find(|model| model.provider == provider && model.id.to_lowercase() == lower)
+        {
+            return Some(entry);
+        }
+
+        let canonical = catalog.list_aliases().get(&lower)?;
+        catalog
+            .list_models()
+            .iter()
+            .find(|model| model.provider == provider && model.id == *canonical)
+    }
+
     let stripped_model = strip_provider_prefix(raw_model, provider);
     let mut candidates = vec![raw_model.to_string()];
     if stripped_model != raw_model {
@@ -82,7 +103,7 @@ fn detect_known_vision_support(
 
     let mut saw_explicit_false = false;
     for candidate in candidates {
-        if let Some(model) = catalog.find_model(&candidate) {
+        if let Some(model) = find_model_for_provider(catalog, &candidate, provider) {
             if model.supports_vision {
                 return Some(true);
             }
@@ -872,8 +893,11 @@ impl OpenFangKernel {
         let browser_ctx = openfang_runtime::browser::BrowserManager::new(config.browser.clone());
 
         // Initialize media understanding engine
-        let media_engine =
-            openfang_runtime::media_understanding::MediaEngine::new(config.media.clone());
+        let media_engine = openfang_runtime::media_understanding::MediaEngine::new(
+            config.media.clone(),
+            config.fallback_providers.clone(),
+            config.providers.clone(),
+        );
         let tts_engine = openfang_runtime::tts::TtsEngine::new(config.tts.clone());
         let mut pairing = crate::pairing::PairingManager::new(config.pairing.clone());
 
@@ -7364,13 +7388,13 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_known_vision_support_prefers_true_alias_over_false_raw_match() {
+    fn test_detect_known_vision_support_respects_provider_boundary_for_aliases() {
         let mut catalog = openfang_runtime::model_catalog::ModelCatalog::new();
         catalog.merge_discovered_models("modelscope", &["ZhipuAI/GLM-5".to_string()]);
 
         assert_eq!(
             detect_known_vision_support(&catalog, "ZhipuAI/GLM-5", "modelscope"),
-            Some(true)
+            Some(false)
         );
     }
 
