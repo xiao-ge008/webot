@@ -6438,6 +6438,111 @@ impl KernelHandle for OpenFangKernel {
             .await
     }
 
+    fn get_agent_self_context(&self, agent_id: &str) -> Result<serde_json::Value, String> {
+        let agent = resolve_agent_entry_for_collaboration(&self.registry, agent_id)?;
+        Ok(serde_json::json!({
+            "agent_id": agent.id.to_string(),
+            "name": agent.name,
+            "workspace": agent.manifest.workspace.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "system_prompt": agent.manifest.model.system_prompt,
+            "avatar_url": agent.identity.avatar_url,
+            "color": agent.identity.color,
+        }))
+    }
+
+    fn patch_agent_self_context(
+        &self,
+        agent_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let agent = resolve_agent_entry_for_collaboration(&self.registry, agent_id)?;
+        let patch_obj = patch
+            .as_object()
+            .ok_or_else(|| "Self context patch must be a JSON object".to_string())?;
+
+        if let Some(system_prompt) = patch_obj.get("system_prompt") {
+            let value = system_prompt
+                .as_str()
+                .ok_or_else(|| "system_prompt must be a string".to_string())?
+                .trim()
+                .to_string();
+            if value.is_empty() {
+                return Err("system_prompt cannot be empty".to_string());
+            }
+            self.registry
+                .update_system_prompt(agent.id, value)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if patch_obj.contains_key("avatar_url") || patch_obj.contains_key("color") {
+            let mut identity = agent.identity.clone();
+            if let Some(avatar_url) = patch_obj.get("avatar_url") {
+                identity.avatar_url = match avatar_url {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(value) => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    _ => return Err("avatar_url must be a string or null".to_string()),
+                };
+            }
+            if let Some(color) = patch_obj.get("color") {
+                identity.color = match color {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(value) => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    _ => return Err("color must be a string or null".to_string()),
+                };
+            }
+            self.registry
+                .update_identity(agent.id, identity)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if let Some(updated) = self.registry.get(agent.id) {
+            let _ = self.memory.save_agent(&updated);
+        }
+
+        self.get_agent_self_context(agent_id)
+    }
+
+    async fn remember_agent_memory(
+        &self,
+        agent_id: &str,
+        content: &str,
+        scope: &str,
+        metadata: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let agent = resolve_agent_entry_for_collaboration(&self.registry, agent_id)?;
+        let metadata_map: HashMap<String, serde_json::Value> = match metadata {
+            serde_json::Value::Object(map) => map.into_iter().collect(),
+            serde_json::Value::Null => HashMap::new(),
+            _ => return Err("memory metadata must be a JSON object".to_string()),
+        };
+
+        let memory_id = self
+            .memory
+            .remember(agent.id, content, MemorySource::System, scope, metadata_map)
+            .await
+            .map_err(|e| format!("Failed to remember agent memory: {e}"))?;
+
+        Ok(serde_json::json!({
+            "memory_id": memory_id.to_string(),
+            "agent_id": agent.id.to_string(),
+            "scope": scope,
+        }))
+    }
+
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {
         let q = query.to_lowercase();
         self.registry

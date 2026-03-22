@@ -28,6 +28,7 @@ use crate::assignment_store;
 use crate::component_center;
 use crate::error::ApiError;
 use crate::image_generation;
+use crate::media_index::{self, PhotoIndexRequest};
 use crate::path_resolver;
 use crate::vision_analysis;
 use crate::AppState;
@@ -470,6 +471,7 @@ pub fn management_router() -> Router<Arc<AppState>> {
             post(upload_agent_avatar_inline),
         )
         .route("/agents/{id}/avatar/import", post(import_agent_avatar))
+        .route("/agents/{id}/photo-library", get(list_agent_photo_library))
         .route(
             "/agents/{id}/chat-assets/file",
             get(get_agent_chat_asset_file),
@@ -754,7 +756,10 @@ pub async fn proxy_openfang_upload(
 ) -> Result<(AxumHeaderMap, Bytes), ApiError> {
     let source = query.source.trim();
     if source.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "上传图片来源不能为空"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "上传图片来源不能为空",
+        ));
     }
     let normalized = source.to_ascii_lowercase();
     if !normalized.starts_with("/api/uploads/")
@@ -3926,6 +3931,46 @@ fn build_portrait_url(agent_id: &str, filename: &str) -> String {
     format!("/api/management/agents/{agent_id}/portrait/{filename}")
 }
 
+async fn index_agent_photo_asset_best_effort(
+    agent_id: &str,
+    source_tool: &str,
+    purpose: &str,
+    image_url: &str,
+    file_name: &str,
+    saved_path: &str,
+) {
+    if let Err(err) = media_index::index_photo_asset(PhotoIndexRequest {
+        agent_id: Some(agent_id.to_string()),
+        owner_scope: "self".to_string(),
+        asset_family: "photo".to_string(),
+        media_kind: "image".to_string(),
+        source_tool: source_tool.to_string(),
+        purpose: Some(purpose.to_string()),
+        prompt_text: None,
+        negative_prompt: None,
+        model: None,
+        mime_type: None,
+        file_name: Some(file_name.to_string()),
+        saved_path: saved_path.to_string(),
+        image_url: Some(image_url.to_string()),
+        relative_path: None,
+        metadata: json!({
+            "source": "agent_appearance",
+            "appearance_kind": purpose,
+        }),
+    })
+    .await
+    {
+        tracing::warn!(
+            agent_id = %agent_id,
+            source_tool = %source_tool,
+            purpose = %purpose,
+            error = %err,
+            "failed to index agent appearance photo"
+        );
+    }
+}
+
 async fn resolve_agent_chat_upload_root(
     state: &Arc<AppState>,
     agent_id: &str,
@@ -6420,6 +6465,40 @@ pub struct ImportAgentAvatarRequest {
     pub source_path: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct ListAgentPhotoLibraryQuery {
+    #[serde(default, alias = "ownerScope")]
+    pub owner_scope: Option<String>,
+    #[serde(default, alias = "q")]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+pub async fn list_agent_photo_library(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ListAgentPhotoLibraryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    validate_agent_path_segment(&resolved.resolved)?;
+    let items = assignment_store::list_media_assets(assignment_store::MediaAssetListQuery {
+        agent_id: Some(resolved.resolved.clone()),
+        owner_scope: query.owner_scope.clone(),
+        asset_family: Some("photo".to_string()),
+        media_kind: Some("image".to_string()),
+        query: query.query.clone(),
+        limit: query.limit,
+    })
+    .map_err(storage_error)?;
+
+    Ok(Json(json!({
+        "agent_id": resolved.requested,
+        "resolved_agent_id": resolved.resolved,
+        "items": items,
+    })))
+}
+
 pub async fn import_agent_avatar(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -6450,6 +6529,15 @@ pub async fn import_agent_avatar(
     if resolved.alias_used {
         avatar_url = build_avatar_url(&public_id, &filename);
     }
+    index_agent_photo_asset_best_effort(
+        &agent_id,
+        "avatar_import",
+        "avatar",
+        &avatar_url,
+        &filename,
+        &saved_path,
+    )
+    .await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -6519,6 +6607,15 @@ pub async fn upload_agent_avatar(
     if resolved.alias_used {
         avatar_url = build_avatar_url(&public_id, &filename);
     }
+    index_agent_photo_asset_best_effort(
+        &agent_id,
+        "avatar_upload",
+        "avatar",
+        &avatar_url,
+        &filename,
+        &saved_path,
+    )
+    .await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -6769,6 +6866,15 @@ pub async fn upload_agent_avatar_inline(
     if resolved.alias_used {
         avatar_url = build_avatar_url(&public_id, &filename);
     }
+    index_agent_photo_asset_best_effort(
+        &agent_id,
+        "avatar_upload_inline",
+        "avatar",
+        &avatar_url,
+        &filename,
+        &saved_path,
+    )
+    .await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -6850,6 +6956,15 @@ pub async fn import_agent_portrait(
     if resolved.alias_used {
         portrait_url = build_portrait_url(&public_id, &filename);
     }
+    index_agent_photo_asset_best_effort(
+        &agent_id,
+        "portrait_import",
+        "portrait",
+        &portrait_url,
+        &filename,
+        &saved_path,
+    )
+    .await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -6919,6 +7034,15 @@ pub async fn upload_agent_portrait(
     if resolved.alias_used {
         portrait_url = build_portrait_url(&public_id, &filename);
     }
+    index_agent_photo_asset_best_effort(
+        &agent_id,
+        "portrait_upload",
+        "portrait",
+        &portrait_url,
+        &filename,
+        &saved_path,
+    )
+    .await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -6955,6 +7079,15 @@ pub async fn upload_agent_portrait_inline(
     if resolved.alias_used {
         portrait_url = build_portrait_url(&public_id, &filename);
     }
+    index_agent_photo_asset_best_effort(
+        &agent_id,
+        "portrait_upload_inline",
+        "portrait",
+        &portrait_url,
+        &filename,
+        &saved_path,
+    )
+    .await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -10738,7 +10871,7 @@ async fn resolve_agent_self_appearance_asset(
         fetch_agent_appearance_source_bytes(state, trimmed).await?;
     let public_url = match kind {
         "avatar" => {
-            let (_, filename, _) = save_agent_avatar_bytes(
+            let (_, filename, saved_path) = save_agent_avatar_bytes(
                 state,
                 resolved_agent_id,
                 filename_hint.as_deref(),
@@ -10747,10 +10880,20 @@ async fn resolve_agent_self_appearance_asset(
                 None,
             )
             .await?;
-            build_avatar_url(public_agent_id, &filename)
+            let public_url = build_avatar_url(public_agent_id, &filename);
+            index_agent_photo_asset_best_effort(
+                resolved_agent_id,
+                "avatar_self_materialize",
+                "avatar",
+                &public_url,
+                &filename,
+                &saved_path,
+            )
+            .await;
+            public_url
         }
         _ => {
-            let (_, filename, _) = save_agent_portrait_bytes(
+            let (_, filename, saved_path) = save_agent_portrait_bytes(
                 state,
                 resolved_agent_id,
                 filename_hint.as_deref(),
@@ -10759,7 +10902,17 @@ async fn resolve_agent_self_appearance_asset(
                 None,
             )
             .await?;
-            build_portrait_url(public_agent_id, &filename)
+            let public_url = build_portrait_url(public_agent_id, &filename);
+            index_agent_photo_asset_best_effort(
+                resolved_agent_id,
+                "portrait_self_materialize",
+                "portrait",
+                &public_url,
+                &filename,
+                &saved_path,
+            )
+            .await;
+            public_url
         }
     };
     Ok(Some(public_url))

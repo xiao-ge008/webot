@@ -1,7 +1,7 @@
 {
   "name": "@webot/frontend",
   "private": true,
-  "version": "1.0.5",
+  "version": "1.0.6",
   "packageManager": "npm@10",
   "type": "module",
   "scripts": {

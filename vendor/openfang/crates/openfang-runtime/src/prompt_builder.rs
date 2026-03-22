@@ -216,14 +216,9 @@ const TOOL_CALL_BEHAVIOR: &str = "\
 - If the current turn already includes local image-analysis text for an uploaded image, treat that text as the authoritative image context. Answer from it first, and do not invent unsupported details.
 - If the user is asking about an uploaded/local image and no local image-analysis text is present in context, you MUST call `image_analyze` or `media_describe` before answering. Do not guess what is in the image.
 - Do not use `browser_navigate` for local files, `file://` images, `/api/uploads/...` images, screenshots, or other non-web image sources. Use `image_analyze` or `media_describe` instead.
+- For your own identity, long-term memories, prompt files, or self-photo workflows, prefer the dedicated self-management tools when they are available: `my_identity_patch`, `my_memory_patch`, `my_photo_generate`, and `my_photo_edit`.
 - For image tasks, distinguish brand-new generation from editing an existing image. If the user wants to modify, retouch, restyle, change clothes, or continue from an existing image, you MUST use `image_edit`, not `image_generate`.
 - Image generation does NOT reliably preserve the exact same person/identity from an existing image. If identity consistency matters, reuse the existing image with `image_edit`.
-- For an agent's own avatar, portrait, standing illustration, or self-image, treat the current avatar/portrait as that agent's identity anchor in the virtual world. The avatar is not a disposable style sample: if the face/person changes, it becomes a different person.
-- The agent's own later photos, selfies, portraits, and appearance variants should derive from that current avatar/portrait identity by default. Do not treat each self-image request as permission to redesign who the agent is.
-- If the user is referring to the agent itself (`you`, `your avatar`, `your portrait`, `show me you`, `your new photo`, etc.), you MUST NOT use `image_generate` to invent a brand-new self image and present or replace it as the same agent.
-- Replacing or regenerating the agent's own avatar/portrait as a new face is forbidden unless the user gives explicit consent to change that identity anchor.
-- The only allowed path for self-image updates is when the user clearly means the same agent is changing clothes, expression, pose, background, scene, or other local attributes and there is a real source image to continue from. In that case, use `image_edit` and preserve the same identity.
-- If the task is about the agent itself but no reliable current avatar/portrait source image is available, do not generate a replacement stranger. Ask for the current avatar/portrait or explain that generating a new self image would break identity continuity.
 - When editing an image, always reuse the best available source image from the current message, the workspace, or the recent chat context. Prefer `image_path` for workspace files, then `image_url`, then `image_base64`.
 - When the source image comes from chat history as `/api/uploads/...`, treat it as an `image_url` (or reuse the recovered original workspace file). Do not treat `/api/uploads/...` as a filesystem directory.
 - Use `image_edit` for fine or medium changes where the original person, object, or scene should remain recognizable.
@@ -231,7 +226,7 @@ const TOOL_CALL_BEHAVIOR: &str = "\
 - For `image_edit`, do NOT add extra accessories, props, pose changes, outfit redesigns, beautification, scene rewrites, or any other \"improvements\" unless the user explicitly asked for them.
 - If the user only asked for one local change, write the edit prompt as a minimal delta: state what to change, and explicitly state that everything else must remain unchanged.
 - Use `image_generate` only when the user clearly wants a brand-new image from scratch, a new person/character, or a major redesign where consistency with the previous image is not required.
-- If the requested image is explicitly another person, another character, a roleplay character, or any image unrelated to the agent's own identity, `image_generate` is allowed.
+- Use `image_generate` and `image_edit` for non-self image work. If only generic image tools are available and the task is about your own avatar or self-image, do not replace your identity anchor without explicit user consent.
 - If the current turn or recent chat context already contains a usable candidate image for the user's request, reuse that exact image URL/path instead of generating again.
 - For avatar, portrait, cover, or agent-appearance updates, produce only the minimum number of images needed to satisfy the request. Do not create speculative extras, backup variants, or \"improved\" versions unless the user explicitly asked for alternatives.
 - For a standard avatar-plus-portrait refresh from scratch, the default maximum is one avatar candidate and one portrait candidate in the same task. If one existing image already satisfies both needs, reuse it instead of generating more.
@@ -495,6 +490,8 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "memory_store" | "memory_recall" | "memory_delete" | "memory_list" => "Memory",
 
+        "my_identity_patch" | "my_memory_patch" | "my_photo_generate" | "my_photo_edit" => "Self",
+
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" => "Agents",
 
         "image_describe" | "image_generate" | "image_edit" | "audio_transcribe" | "tts_speak" => {
@@ -555,6 +552,14 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_recall" => "read a known shared memory key",
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
+
+        // Self
+        "my_identity_patch" => "patch your own identity files, system prompt, or avatar fields",
+        "my_memory_patch" => "write or supersede your own long-term memory notes",
+        "my_photo_generate" => {
+            "create a new photo of yourself while preserving the same identity anchor by default"
+        }
+        "my_photo_edit" => "edit an existing photo of yourself while preserving the same identity",
 
         // Agents
         "agent_send" => "send a message to another agent",
@@ -746,6 +751,7 @@ mod tests {
         assert_eq!(tool_category("browser_navigate"), "Browser");
         assert_eq!(tool_category("shell_exec"), "Shell");
         assert_eq!(tool_category("memory_store"), "Memory");
+        assert_eq!(tool_category("my_photo_generate"), "Self");
         assert_eq!(tool_category("agent_send"), "Agents");
         assert_eq!(tool_category("mcp_github_search"), "MCP");
         assert_eq!(tool_category("unknown_tool"), "Other");
@@ -756,6 +762,7 @@ mod tests {
         assert!(!tool_hint("web_search").is_empty());
         assert!(!tool_hint("file_read").is_empty());
         assert!(!tool_hint("browser_navigate").is_empty());
+        assert!(!tool_hint("my_identity_patch").is_empty());
         assert!(tool_hint("some_unknown_tool").is_empty());
     }
 
@@ -947,12 +954,10 @@ mod tests {
         assert!(prompt.contains("reuse that exact image URL/path instead of generating again"));
         assert!(prompt.contains("produce only the minimum number of images needed"));
         assert!(prompt.contains("stop calling image tools and finalize"));
-        assert!(prompt.contains("identity anchor in the virtual world"));
-        assert!(prompt.contains("MUST NOT use `image_generate` to invent a brand-new self image"));
+        assert!(prompt.contains("prefer the dedicated self-management tools"));
         assert!(
-            prompt.contains("should derive from that current avatar/portrait identity by default")
+            prompt.contains("do not replace your identity anchor without explicit user consent")
         );
-        assert!(prompt.contains("unless the user gives explicit consent"));
     }
 
     #[test]

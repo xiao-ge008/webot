@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::time::sleep;
 
 use crate::error::ApiError;
+use crate::media_index::{self, PhotoIndexRequest};
 use crate::path_resolver;
 
 const DEFAULT_OUTPUT_PREFIX: &str = "webot-image";
@@ -26,6 +27,10 @@ const MODELSCOPE_SECRET_HEADER: &str = "x-modelscope-api-secret";
 const COMFYUI_TEMPLATE_ROOT_DIR: &str = "comfyui";
 const COMFYUI_GENERATE_TEMPLATE_REL_PATH: &str = "generate/Z-Image-Turbo-api.json";
 const COMFYUI_EDIT_TEMPLATE_REL_PATH: &str = "edit/Qwen-AIO-api.json";
+const IMAGE_SAVE_TARGET_OUTPUT: &str = "output";
+const IMAGE_SAVE_TARGET_AGENT_PROFILE_META: &str = "agent_profile_meta";
+const AGENT_PROFILE_DIR_NAME: &str = "agent_profile";
+const AGENT_PROFILE_META_DIR_NAME: &str = "meta";
 const COMFYUI_GENERATE_REQUIRED_NODES: &[(&str, &str)] = &[
     (
         "CheckpointLoaderSimple",
@@ -352,6 +357,24 @@ pub struct ExecuteImageGenerateRequest {
     pub count: u8,
     #[serde(default)]
     pub workspace_root: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default = "default_asset_owner_scope")]
+    pub owner_scope: String,
+    #[serde(default = "default_asset_source_tool_generate")]
+    pub source_tool: String,
+    #[serde(default)]
+    pub purpose: String,
+    #[serde(default = "default_asset_family")]
+    pub asset_family: String,
+    #[serde(default = "default_media_kind")]
+    pub media_kind: String,
+    #[serde(default)]
+    pub index_enabled: Option<bool>,
+    #[serde(default = "default_image_save_target")]
+    pub save_target: String,
+    #[serde(default)]
+    pub meta_label: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,6 +403,24 @@ pub struct ExecuteImageEditRequest {
     pub mime_type: String,
     #[serde(default)]
     pub workspace_root: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default = "default_asset_owner_scope")]
+    pub owner_scope: String,
+    #[serde(default = "default_asset_source_tool_edit")]
+    pub source_tool: String,
+    #[serde(default)]
+    pub purpose: String,
+    #[serde(default = "default_asset_family")]
+    pub asset_family: String,
+    #[serde(default = "default_media_kind")]
+    pub media_kind: String,
+    #[serde(default)]
+    pub index_enabled: Option<bool>,
+    #[serde(default = "default_image_save_target")]
+    pub save_target: String,
+    #[serde(default)]
+    pub meta_label: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,6 +445,27 @@ struct ProviderImageResult {
     revised_prompt: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedUploadImage {
+    image_url: String,
+    saved_path: String,
+    mime_type: String,
+}
+
+#[derive(Debug, Clone)]
+struct SavedWorkspaceImage {
+    saved_path: String,
+    relative_path: Option<String>,
+    mime_type: String,
+    save_target: String,
+}
+
+#[derive(Debug)]
+struct BuiltToolImageResponse {
+    response: Value,
+    indexed_images: Vec<SavedWorkspaceImage>,
+}
+
 fn default_image_size() -> String {
     "1024x1024".to_string()
 }
@@ -414,6 +476,30 @@ fn default_image_quality() -> String {
 
 fn default_image_count() -> u8 {
     1
+}
+
+fn default_image_save_target() -> String {
+    IMAGE_SAVE_TARGET_OUTPUT.to_string()
+}
+
+fn default_asset_owner_scope() -> String {
+    "other".to_string()
+}
+
+fn default_asset_source_tool_generate() -> String {
+    "image_generate".to_string()
+}
+
+fn default_asset_source_tool_edit() -> String {
+    "image_edit".to_string()
+}
+
+fn default_asset_family() -> String {
+    "photo".to_string()
+}
+
+fn default_media_kind() -> String {
+    "image".to_string()
 }
 
 pub async fn get_image_generation_config() -> Result<Json<Value>, ApiError> {
@@ -922,13 +1008,49 @@ async fn execute_image_generate_inner(
         }
     };
 
+    let meta_label = normalize_meta_label(Some(&payload.meta_label))
+        .or_else(|| normalize_meta_label(Some(&payload.purpose)));
+    let mut built = build_tool_image_response(
+        result,
+        workspace_root.as_deref(),
+        &payload.save_target,
+        &payload.owner_scope,
+        &payload.agent_id,
+        &payload.media_kind,
+        meta_label.as_deref(),
+    )?;
+    let model_name = built
+        .response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    attach_indexing_result(
+        &mut built.response,
+        maybe_index_generated_images(
+            GeneratedImageIndexContext {
+                agent_id: payload.agent_id.clone(),
+                owner_scope: payload.owner_scope.clone(),
+                source_tool: payload.source_tool.clone(),
+                purpose: payload.purpose.clone(),
+                asset_family: payload.asset_family.clone(),
+                media_kind: payload.media_kind.clone(),
+                prompt: payload.prompt.clone(),
+                negative_prompt: payload.negative_prompt.clone(),
+                model: model_name,
+                index_enabled: payload.index_enabled,
+                save_target: normalize_save_target_key(&payload.save_target).to_string(),
+                meta_label: meta_label.unwrap_or_default(),
+            },
+            &built.indexed_images,
+        )
+        .await,
+    );
+
     Ok(ExecuteImageServiceEnvelope {
         handled: true,
         message: "ok".to_string(),
-        response: Some(build_tool_image_response(
-            result,
-            workspace_root.as_deref(),
-        )?),
+        response: Some(built.response),
     })
 }
 
@@ -977,13 +1099,49 @@ async fn execute_image_edit_inner(
         }
     };
 
+    let meta_label = normalize_meta_label(Some(&payload.meta_label))
+        .or_else(|| normalize_meta_label(Some(&payload.purpose)));
+    let mut built = build_tool_image_response(
+        result,
+        workspace_root.as_deref(),
+        &payload.save_target,
+        &payload.owner_scope,
+        &payload.agent_id,
+        &payload.media_kind,
+        meta_label.as_deref(),
+    )?;
+    let model_name = built
+        .response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    attach_indexing_result(
+        &mut built.response,
+        maybe_index_generated_images(
+            GeneratedImageIndexContext {
+                agent_id: payload.agent_id.clone(),
+                owner_scope: payload.owner_scope.clone(),
+                source_tool: payload.source_tool.clone(),
+                purpose: payload.purpose.clone(),
+                asset_family: payload.asset_family.clone(),
+                media_kind: payload.media_kind.clone(),
+                prompt: payload.prompt.clone(),
+                negative_prompt: payload.negative_prompt.clone(),
+                model: model_name,
+                index_enabled: payload.index_enabled,
+                save_target: normalize_save_target_key(&payload.save_target).to_string(),
+                meta_label: meta_label.unwrap_or_default(),
+            },
+            &built.indexed_images,
+        )
+        .await,
+    );
+
     Ok(ExecuteImageServiceEnvelope {
         handled: true,
         message: "ok".to_string(),
-        response: Some(build_tool_image_response(
-            result,
-            workspace_root.as_deref(),
-        )?),
+        response: Some(built.response),
     })
 }
 
@@ -1495,35 +1653,114 @@ async fn generate_image_via_modelscope_provider(
     })
 }
 
+#[derive(Debug, Clone)]
+struct GeneratedImageIndexContext {
+    agent_id: String,
+    owner_scope: String,
+    source_tool: String,
+    purpose: String,
+    asset_family: String,
+    media_kind: String,
+    prompt: String,
+    negative_prompt: String,
+    model: String,
+    index_enabled: Option<bool>,
+    save_target: String,
+    meta_label: String,
+}
+
+#[derive(Debug, Default)]
+struct PhotoIndexingResult {
+    asset_ids: Vec<String>,
+    warnings: Vec<String>,
+}
+
 fn build_tool_image_response(
     result: ProviderImageResult,
     workspace_root: Option<&Path>,
-) -> Result<Value, String> {
-    let saved_paths = save_provider_images_to_workspace(&result.images, workspace_root)?;
-    let image_urls = save_provider_images_to_upload_cache(&result.images)?;
-    Ok(json!({
+    save_target: &str,
+    owner_scope: &str,
+    agent_id: &str,
+    media_kind: &str,
+    meta_label: Option<&str>,
+) -> Result<BuiltToolImageResponse, String> {
+    let saved_images = save_provider_images_to_workspace(
+        &result.images,
+        workspace_root,
+        save_target,
+        owner_scope,
+        agent_id,
+        media_kind,
+        meta_label,
+    )?;
+    let cached_images = save_provider_images_to_upload_cache(&result.images)?;
+    let image_urls = cached_images
+        .iter()
+        .map(|item| item.image_url.clone())
+        .collect::<Vec<_>>();
+    let saved_paths = saved_images
+        .iter()
+        .map(|item| item.saved_path.clone())
+        .collect::<Vec<_>>();
+    let saved_relative_paths = saved_images
+        .iter()
+        .filter_map(|item| item.relative_path.clone())
+        .collect::<Vec<_>>();
+    let indexed_images = cached_images
+        .iter()
+        .enumerate()
+        .map(|(index, cached)| {
+            saved_images
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| SavedWorkspaceImage {
+                    saved_path: cached.saved_path.clone(),
+                    relative_path: None,
+                    mime_type: cached.mime_type.clone(),
+                    save_target: "upload_cache".to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    Ok(BuiltToolImageResponse {
+        response: json!({
         "model": result.model,
         "images_generated": result.images.len(),
         "saved_to": saved_paths,
+        "saved_relative_paths": saved_relative_paths,
+        "save_target": normalize_save_target_key(save_target),
+        "meta_label": meta_label,
         "revised_prompt": result.revised_prompt,
         "image_urls": image_urls,
-    }))
+        }),
+        indexed_images,
+    })
 }
 
 fn save_provider_images_to_workspace(
     images: &[ProviderImageData],
     workspace_root: Option<&Path>,
-) -> Result<Vec<String>, String> {
+    save_target: &str,
+    owner_scope: &str,
+    agent_id: &str,
+    media_kind: &str,
+    meta_label: Option<&str>,
+) -> Result<Vec<SavedWorkspaceImage>, String> {
     let Some(workspace_root) = workspace_root else {
+        if normalize_save_target_key(save_target) == IMAGE_SAVE_TARGET_AGENT_PROFILE_META {
+            return Err("save_target=agent_profile_meta 需要有效的 workspace_root".to_string());
+        }
         return Ok(Vec::new());
     };
-    let output_dir = workspace_root.join("output");
-    fs::create_dir_all(&output_dir).map_err(|err| {
-        format!(
-            "创建工作目录输出文件夹失败({}): {err}",
-            output_dir.display()
-        )
-    })?;
+    let plan = resolve_workspace_image_save_plan(
+        workspace_root,
+        save_target,
+        owner_scope,
+        agent_id,
+        media_kind,
+        meta_label,
+    )?;
+    fs::create_dir_all(&plan.base_dir)
+        .map_err(|err| format!("创建图片输出目录失败({}): {err}", plan.base_dir.display()))?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1534,30 +1771,212 @@ fn save_provider_images_to_workspace(
     for (index, image) in images.iter().enumerate() {
         let ext = extension_from_mime_type(&image.mime_type).unwrap_or("png");
         let filename = format!("image_{timestamp}_{index}.{ext}");
-        let path = output_dir.join(filename);
+        let path = plan.base_dir.join(&filename);
         fs::write(&path, &image.bytes)
             .map_err(|err| format!("写入生成图片失败({}): {err}", path.display()))?;
-        paths.push(path.to_string_lossy().to_string());
+        let relative_path = plan
+            .relative_prefix
+            .as_deref()
+            .map(|prefix| format!("{prefix}/{filename}"));
+        paths.push(SavedWorkspaceImage {
+            saved_path: path.to_string_lossy().to_string(),
+            relative_path,
+            mime_type: image.mime_type.clone(),
+            save_target: plan.save_target.to_string(),
+        });
     }
     Ok(paths)
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceImageSavePlan {
+    base_dir: PathBuf,
+    relative_prefix: Option<String>,
+    save_target: &'static str,
+}
+
+fn resolve_workspace_image_save_plan(
+    workspace_root: &Path,
+    raw_save_target: &str,
+    owner_scope: &str,
+    agent_id: &str,
+    media_kind: &str,
+    meta_label: Option<&str>,
+) -> Result<WorkspaceImageSavePlan, String> {
+    let save_target = parse_save_target_key(raw_save_target)?;
+    match save_target {
+        IMAGE_SAVE_TARGET_OUTPUT => Ok(WorkspaceImageSavePlan {
+            base_dir: workspace_root.join("output"),
+            relative_prefix: Some("output".to_string()),
+            save_target,
+        }),
+        IMAGE_SAVE_TARGET_AGENT_PROFILE_META => {
+            if !owner_scope.eq_ignore_ascii_case("self") {
+                return Err(
+                    "save_target=agent_profile_meta 只允许 owner_scope=self 的个人媒体使用"
+                        .to_string(),
+                );
+            }
+            if agent_id.trim().is_empty() {
+                return Err("save_target=agent_profile_meta 需要提供 agent_id".to_string());
+            }
+            let media_dir = normalize_media_kind_dir_name(media_kind);
+            let label = normalize_meta_label(meta_label).unwrap_or_else(|| "default".to_string());
+            let relative_prefix = format!(
+                "{AGENT_PROFILE_DIR_NAME}/{AGENT_PROFILE_META_DIR_NAME}/{media_dir}/{label}"
+            );
+            Ok(WorkspaceImageSavePlan {
+                base_dir: workspace_root.join(&relative_prefix),
+                relative_prefix: Some(relative_prefix),
+                save_target,
+            })
+        }
+        other => Err(format!(
+            "不支持的 save_target: {other}。仅支持 output 或 agent_profile_meta"
+        )),
+    }
+}
+
+fn parse_save_target_key(raw: &str) -> Result<&'static str, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "output" => Ok(IMAGE_SAVE_TARGET_OUTPUT),
+        "agent_profile_meta" | "agent-profile-meta" | "profile_meta" | "self_media"
+        | "agent_profile" => Ok(IMAGE_SAVE_TARGET_AGENT_PROFILE_META),
+        other => Err(format!(
+            "不支持的 save_target: {other}。仅支持 output 或 agent_profile_meta"
+        )),
+    }
+}
+
+fn normalize_save_target_key(raw: &str) -> &'static str {
+    parse_save_target_key(raw).unwrap_or(IMAGE_SAVE_TARGET_OUTPUT)
+}
+
+fn normalize_media_kind_dir_name(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "video" => "videos",
+        "audio" => "audios",
+        "file" | "document" => "files",
+        _ => "images",
+    }
+}
+
+fn normalize_meta_label(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') || is_cjk(ch) {
+            output.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | '：' | '|' | '.') {
+            if !output.ends_with('_') {
+                output.push('_');
+            }
+        }
+    }
+    let normalized = output.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF)
+}
+
 fn save_provider_images_to_upload_cache(
     images: &[ProviderImageData],
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<CachedUploadImage>, String> {
     let upload_dir = env::temp_dir().join("openfang_uploads");
     fs::create_dir_all(&upload_dir)
         .map_err(|err| format!("创建上传缓存目录失败({}): {err}", upload_dir.display()))?;
 
-    let mut urls = Vec::new();
+    let mut output = Vec::new();
     for image in images {
         let file_id = uuid::Uuid::new_v4().to_string();
         let path = upload_dir.join(&file_id);
         fs::write(&path, &image.bytes)
             .map_err(|err| format!("写入上传缓存失败({}): {err}", path.display()))?;
-        urls.push(format!("/api/uploads/{file_id}"));
+        output.push(CachedUploadImage {
+            image_url: format!("/api/uploads/{file_id}"),
+            saved_path: path.to_string_lossy().to_string(),
+            mime_type: image.mime_type.clone(),
+        });
     }
-    Ok(urls)
+    Ok(output)
+}
+
+async fn maybe_index_generated_images(
+    context: GeneratedImageIndexContext,
+    saved_images: &[SavedWorkspaceImage],
+) -> PhotoIndexingResult {
+    if context.index_enabled == Some(false)
+        || !context.asset_family.eq_ignore_ascii_case("photo")
+        || !context.media_kind.eq_ignore_ascii_case("image")
+    {
+        return PhotoIndexingResult::default();
+    }
+
+    let mut result = PhotoIndexingResult::default();
+    for image in saved_images {
+        let indexed = media_index::index_photo_asset(PhotoIndexRequest {
+            agent_id: normalize_optional_owned(context.agent_id.clone()),
+            owner_scope: context.owner_scope.clone(),
+            asset_family: context.asset_family.clone(),
+            media_kind: context.media_kind.clone(),
+            source_tool: context.source_tool.clone(),
+            purpose: normalize_optional_owned(context.purpose.clone()),
+            prompt_text: normalize_optional_owned(context.prompt.clone()),
+            negative_prompt: normalize_optional_owned(context.negative_prompt.clone()),
+            model: normalize_optional_owned(context.model.clone()),
+            mime_type: Some(image.mime_type.clone()),
+            file_name: None,
+            saved_path: image.saved_path.clone(),
+            image_url: None,
+            relative_path: image.relative_path.clone(),
+            metadata: json!({
+                "source": "image_generation",
+                "generated": true,
+                "save_target": context.save_target.clone(),
+                "meta_label": normalize_optional_owned(context.meta_label.clone()),
+                "storage_target": image.save_target.clone(),
+            }),
+        })
+        .await;
+
+        match indexed {
+            Ok(record) => result.asset_ids.push(record.asset_id),
+            Err(err) => result.warnings.push(err),
+        }
+    }
+    result
+}
+
+fn attach_indexing_result(response: &mut Value, indexed: PhotoIndexingResult) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    if !indexed.asset_ids.is_empty() {
+        object.insert("indexed_asset_ids".to_string(), json!(indexed.asset_ids));
+    }
+    if !indexed.warnings.is_empty() {
+        object.insert("index_warnings".to_string(), json!(indexed.warnings));
+    }
+}
+
+fn normalize_optional_owned(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {

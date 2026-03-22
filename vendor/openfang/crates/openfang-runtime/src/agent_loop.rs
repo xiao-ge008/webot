@@ -84,8 +84,14 @@ fn tool_result_guidance(tool_name: &str, is_error: bool) -> Option<ContentBlock>
         ("image_edit", true) => Some(ContentBlock::Text {
             text: "[System: image_edit failed. This request is still an edit of an existing image. Do NOT fall back to image_generate, because generation will create a different image/person and break continuity. Instead, explain the image_edit failure to the user and ask for the missing prerequisite, permission, or image-service fix.]".to_string(),
         }),
+        ("my_photo_edit", true) => Some(ContentBlock::Text {
+            text: "[System: my_photo_edit failed. This request is still about your own existing self image. Do NOT fall back to image_generate. Explain the failure, ask for the missing source image or permission, or use my_photo_generate only if the user actually wanted a new self photo of the same identity.]".to_string(),
+        }),
         ("image_generate", false) => Some(ContentBlock::Text {
-            text: "[System: image_generate succeeded. Reuse the image URLs/paths from this successful result. If you now have enough images to satisfy the user's request, especially for avatar, portrait, cover, or appearance updates, finalize immediately and stop generating more images. Do NOT call image_generate again unless the user explicitly asked for more versions or alternatives, or the current result is clearly unusable.]".to_string(),
+            text: "[System: image_generate succeeded. Reuse the image URLs/paths from this successful result. If you now have enough images to satisfy the user's request, finalize immediately and stop generating more images. Do NOT call image_generate again unless the user explicitly asked for more versions or alternatives, or the current result is clearly unusable.]".to_string(),
+        }),
+        ("my_photo_generate", false) => Some(ContentBlock::Text {
+            text: "[System: my_photo_generate succeeded. Reuse the returned image URLs/paths as the current self-photo candidate and stop generating more images unless the user explicitly asked for alternatives.]".to_string(),
         }),
         _ => None,
     }
@@ -3422,6 +3428,13 @@ mod tests {
 
         assert!(tool_result_guidance("image_generate", true).is_none());
         assert!(tool_result_guidance("image_edit", false).is_none());
+        let self_guidance = tool_result_guidance("my_photo_edit", true);
+        match self_guidance {
+            Some(ContentBlock::Text { text }) => {
+                assert!(text.contains("still about your own existing self image"));
+            }
+            other => panic!("expected my_photo_edit recovery guidance, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3433,6 +3446,14 @@ mod tests {
                 assert!(text.contains("Do NOT call image_generate again"));
             }
             other => panic!("expected image_generate success guidance, got {other:?}"),
+        }
+
+        let self_guidance = tool_result_guidance("my_photo_generate", false);
+        match self_guidance {
+            Some(ContentBlock::Text { text }) => {
+                assert!(text.contains("current self-photo candidate"));
+            }
+            other => panic!("expected my_photo_generate success guidance, got {other:?}"),
         }
     }
 

@@ -347,6 +347,18 @@ pub async fn execute_tool(
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id).await,
 
+        // Self-management tools
+        "my_identity_patch" => {
+            tool_my_identity_patch(input, workspace_root, kernel, caller_agent_id).await
+        }
+        "my_memory_patch" => {
+            tool_my_memory_patch(input, workspace_root, kernel, caller_agent_id).await
+        }
+        "my_photo_generate" => {
+            tool_my_photo_generate(input, workspace_root, kernel, caller_agent_id).await
+        }
+        "my_photo_edit" => tool_my_photo_edit(input, workspace_root, kernel, caller_agent_id).await,
+
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
         "task_post" => tool_task_post(input, kernel, caller_agent_id).await,
@@ -783,6 +795,84 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["key"]
             }),
         },
+        ToolDefinition {
+            name: "my_identity_patch".to_string(),
+            description: "Patch the current agent's own identity files or tightly scoped self-owned manifest fields. Use this for updating your own IDENTITY.md, SOUL.md, USER.md, MEMORY.md, AGENTS.md, BOOTSTRAP.md, HEARTBEAT.md, system prompt, avatar URL, or color. This tool only applies to the current agent itself and should be preferred over generic file or image tools for self-management.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "description": "How to apply file content updates: 'replace' (default) or 'append'." },
+                    "files": {
+                        "type": "object",
+                        "description": "Map of allowed self identity filenames to content. Allowed keys: IDENTITY.md, SOUL.md, USER.md, MEMORY.md, AGENTS.md, BOOTSTRAP.md, HEARTBEAT.md.",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "system_prompt": { "type": "string", "description": "Optional replacement for the current agent's own base system prompt." },
+                    "avatar_url": { "type": "string", "description": "Optional new avatar URL for the current agent. Treat as high-risk identity change." },
+                    "color": { "type": "string", "description": "Optional UI accent color for the current agent, such as '#FF5C00'." },
+                    "confirmed_by_user": { "type": "boolean", "description": "Set true only when the user has already explicitly approved a high-risk self identity change." },
+                    "reason": { "type": "string", "description": "Short reason for why this self patch is needed." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "my_memory_patch".to_string(),
+            description: "Write or supersede the current agent's own long-term memory notes. Use this after a self-review, user correction, explicit preference update, or upgrade summary. This tool is for self memory, not shared cross-agent coordination.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "The memory content to store for the current agent." },
+                    "memory_type": { "type": "string", "description": "Typed memory label such as preference, guardrail, relationship_note, task_state, or self_upgrade_note." },
+                    "scope": { "type": "string", "description": "Logical memory scope. Default: self_management." },
+                    "entity_key": { "type": "string", "description": "Optional stable slot key for superseding older memories of the same kind." },
+                    "importance": { "type": "number", "description": "Optional importance score between 0 and 1." },
+                    "confidence": { "type": "number", "description": "Optional confidence score between 0 and 1." },
+                    "reason": { "type": "string", "description": "Short explanation for why this memory should be stored." },
+                    "append_to_memory_md": { "type": "boolean", "description": "Whether to also append an audit note into the current workspace MEMORY.md file. Default: true." }
+                },
+                "required": ["content"]
+            }),
+        },
+        ToolDefinition {
+            name: "my_photo_edit".to_string(),
+            description: "Edit an existing photo of the current agent while preserving the same identity. Use this for your own outfit change, scene change, expression change, pose tweak, or other local updates when a source self-photo already exists. Prefer this over generic image_edit when the task is about the agent itself. By default, self photos are stored under agent_profile/meta so the agent can manage its own media library later; set save_target='output' only when you explicitly want a temporary/default output copy.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Describe the exact change to make to the current agent's existing self-photo while preserving the same identity." },
+                    "purpose": { "type": "string", "description": "Optional intent label such as self_photo, scene_variant, outfit_change, avatar_refine, or portrait_refine." },
+                    "meta_label": { "type": "string", "description": "Optional personal media label stored under agent_profile/meta, such as 今日穿搭, 居家自拍, 最近视频, or 节日写真." },
+                    "save_target": { "type": "string", "description": "Optional save target: 'agent_profile_meta' (default for self media) or 'output'." },
+                    "image_path": { "type": "string", "description": "Optional explicit source self-photo path. If omitted, the tool will try the current avatar URL first, then portrait URL." },
+                    "image_url": { "type": "string", "description": "Optional explicit source self-photo URL. If omitted, the tool will try the current avatar URL first, then portrait URL." },
+                    "image_base64": { "type": "string", "description": "Optional explicit base64 source self-photo." },
+                    "mime_type": { "type": "string", "description": "Required when image_base64 is provided." },
+                    "width": { "type": "integer", "description": "Optional output width override." },
+                    "height": { "type": "integer", "description": "Optional output height override." },
+                    "size": { "type": "string", "description": "Legacy size string such as '1024x1024'." },
+                    "quality": { "type": "string", "description": "Legacy quality hint for the fallback provider." }
+                },
+                "required": ["prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "my_photo_generate".to_string(),
+            description: "Create a new photo of the current agent, but always continue from the current avatar first, or the current portrait as fallback, so the same identity anchor stays locked automatically. The runtime injects this self identity anchor for you; the model does not need to pass any source image fields. Use this for new self-photos, same-character roleplay scenes, selfies, portraits, or appearance variants of the current agent. This tool must not create a brand-new unrelated face or replace the current self identity anchor; for unrelated characters or fully new people, use the generic image_generate tool instead. By default, self photos are stored under agent_profile/meta so the agent can manage its own personal media library later; set save_target='output' only when you explicitly want the normal workspace output instead.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Describe the new photo you want of the current agent." },
+                    "purpose": { "type": "string", "description": "Optional intent label such as self_photo, selfie, avatar_candidate, portrait_candidate, roleplay_scene, or scene_variant." },
+                    "meta_label": { "type": "string", "description": "Optional personal media label stored under agent_profile/meta, such as 今日穿搭, 自拍合集, 角色扮演, or 节日写真." },
+                    "save_target": { "type": "string", "description": "Optional save target: 'agent_profile_meta' (default for self media) or 'output'." },
+                    "width": { "type": "integer", "description": "Optional output width override." },
+                    "height": { "type": "integer", "description": "Optional output height override." },
+                    "size": { "type": "string", "description": "Legacy size string such as '1024x1024'." },
+                    "quality": { "type": "string", "description": "Legacy quality hint for the fallback provider." }
+                },
+                "required": ["prompt"]
+            }),
+        },
         // --- Collaboration tools ---
         ToolDefinition {
             name: "agent_find".to_string(),
@@ -1075,12 +1165,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "image_edit".to_string(),
-            description: "Edit a single existing image using a text instruction. Use this when the user wants to keep the same person/identity, the same base picture, or the same overall scene while making targeted changes such as outfit, hairstyle, makeup, pose adjustment, background adjustment, prop changes, retouching, or other fine-to-medium edits. This is the correct tool when consistency matters. It is also the only allowed tool for updating an agent's own avatar, portrait, or self-image while keeping that same virtual identity. The agent's later self photos should continue to derive from that existing avatar/portrait identity by default. Default rule: only change the user-requested parts and keep everything else unchanged, including identity, style, composition, lighting, camera angle, and unmentioned details. A source image is required: pass exactly one of `image_path`, `image_url`, or `image_base64` (+ `mime_type`). Prefer passing `image_path` for a file inside the current agent workspace/workdir; the runtime will resolve and upload that local file automatically before editing. Resolution priority: component skill provider first, then configured generic image service editor (ComfyUI built-in Qwen-edit workflow when configured), then the current agent model if it supports image editing. Edited images are saved to the workspace output/ directory.".to_string(),
+            description: "Edit a single existing image using a text instruction. Use this when the user wants to keep the same person/identity, the same base picture, or the same overall scene while making targeted changes such as outfit, hairstyle, makeup, pose adjustment, background adjustment, prop changes, retouching, or other fine-to-medium edits. This is the correct generic tool when consistency matters for a non-self image workflow. Default rule: only change the user-requested parts and keep everything else unchanged, including identity, style, composition, lighting, camera angle, and unmentioned details. A source image is required: pass exactly one of `image_path`, `image_url`, or `image_base64` (+ `mime_type`). Prefer passing `image_path` for a file inside the current agent workspace/workdir; the runtime will resolve and upload that local file automatically before editing. Resolution priority: component skill provider first, then configured generic image service editor (ComfyUI built-in Qwen-edit workflow when configured), then the current agent model if it supports image editing. Edited images default to the workspace output/ directory, unless save_target='agent_profile_meta' is explicitly used for self-owned personal media.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "description": "Modify an existing image while keeping the original as the base. Requires exactly one source image via image_path, image_url, or image_base64 with mime_type.",
                 "properties": {
-                    "prompt": { "type": "string", "description": "Text instruction describing how to modify the existing input image while preserving the original image as the base. Prefer image_edit when the same person/identity or same base scene should stay recognizable. This is also the required path when the user means the agent's own avatar/portrait/self-image and only wants the same character to change clothes, scene, expression, or other local details. Only describe the exact requested change, and explicitly keep all other unmentioned elements unchanged. Typical use cases: outfit change, background refinement, prop change, pose tweak, face cleanup, detail retouching, or other fine-to-medium edits." },
+                    "prompt": { "type": "string", "description": "Text instruction describing how to modify the existing input image while preserving the original image as the base. Prefer image_edit when the same person/identity or same base scene should stay recognizable. Only describe the exact requested change, and explicitly keep all other unmentioned elements unchanged. Typical use cases: outfit change, background refinement, prop change, pose tweak, face cleanup, detail retouching, or other fine-to-medium edits." },
                     "negative_prompt": { "type": "string", "description": "Optional negative prompt for providers that support it" },
                     "image_path": { "type": "string", "description": "Preferred only for a real relative or absolute file path inside the agent workspace/local filesystem. Do not use /api/uploads/... here unless you truly mean the chat-upload URL; the runtime will normalize that case automatically." },
                     "image_url": { "type": "string", "description": "Single source image URL such as /api/uploads/... or an http/https image URL. Prefer this for chat-history images and uploaded images shown in the UI." },
@@ -1091,7 +1181,9 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "width": { "type": "integer", "description": "Output image width override" },
                     "height": { "type": "integer", "description": "Output image height override" },
                     "quality": { "type": "string", "description": "Legacy quality hint for OpenAI-compatible fallback. Recommended default: 'standard'." },
-                    "count": { "type": "integer", "description": "Currently only supports 1." }
+                    "count": { "type": "integer", "description": "Currently only supports 1." },
+                    "save_target": { "type": "string", "description": "Optional save target: 'output' (default) or 'agent_profile_meta'. Only use agent_profile_meta when the edited image is explicitly the current agent's own personal media." },
+                    "meta_label": { "type": "string", "description": "Optional personal media label used only when save_target='agent_profile_meta', such as 今日穿搭 or 最近视频." }
                 },
                 "required": ["prompt"]
             }),
@@ -1099,18 +1191,20 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Image generation tool ---
         ToolDefinition {
             name: "image_generate".to_string(),
-            description: "Generate a brand-new image from scratch from a text prompt. Use this when the user wants a new picture, a new person/character, a new composition, a roleplay character, or a major redesign where exact continuity with a previous image is NOT required. Important: image generation cannot reliably preserve the exact same person/identity from an existing image, so do NOT use this to keep the same face/person consistent. Never use this to replace an agent's existing avatar, portrait, standing illustration, or self-image when the user means the same agent, because a newly generated face counts as a different person, unless the user explicitly consented to changing that identity anchor. Resolution priority: component skill provider first, then configured generic image provider (ComfyUI / ModelScope), then the current agent model if it supports image generation. Generated images are saved to the workspace output/ directory.".to_string(),
+            description: "Generate a brand-new image from scratch from a text prompt. Use this when the user wants a new picture, a new person/character, a new composition, a roleplay character, or a major redesign where exact continuity with a previous image is NOT required. Important: image generation cannot reliably preserve the exact same person/identity from an existing image, so do NOT use this to keep the same face/person consistent. This is the generic generation tool for non-self image workflows. If the request is about the current agent itself, prefer my_photo_generate or my_photo_edit instead. Resolution priority: component skill provider first, then configured generic image provider (ComfyUI / ModelScope), then the current agent model if it supports image generation. Generated images default to the workspace output/ directory, unless save_target='agent_profile_meta' is explicitly used for self-owned personal media.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string", "description": "Text description for a brand-new image from scratch (max 4000 chars). Use this for new people/characters, roleplay characters, new scenes, or major redesigns. Do not use image_generate when the main goal is to preserve the same person/identity from an existing image. If the user means the agent's own avatar/portrait/self-image, do not generate a new replacement face and pretend it is the same character unless the user explicitly agreed to changing that avatar identity." },
+                    "prompt": { "type": "string", "description": "Text description for a brand-new image from scratch (max 4000 chars). Use this for new people/characters, roleplay characters, new scenes, or major redesigns. Do not use image_generate when the main goal is to preserve the same person/identity from an existing image." },
                     "negative_prompt": { "type": "string", "description": "Optional negative prompt for providers that support it" },
                     "model": { "type": "string", "description": "Optional legacy model hint for direct OpenAI-compatible fallback: 'dall-e-3', 'dall-e-2', or 'gpt-image-1'" },
                     "size": { "type": "string", "description": "Legacy size string such as '1024x1024'. Ignored when width and height are provided." },
                     "width": { "type": "integer", "description": "Image width override" },
                     "height": { "type": "integer", "description": "Image height override" },
                     "quality": { "type": "string", "description": "Legacy quality hint for OpenAI-compatible fallback. Recommended default: 'standard'." },
-                    "count": { "type": "integer", "description": "Number of images to generate (1-4, default: 1). DALL-E 3 only supports 1." }
+                    "count": { "type": "integer", "description": "Number of images to generate (1-4, default: 1). DALL-E 3 only supports 1." },
+                    "save_target": { "type": "string", "description": "Optional save target: 'output' (default) or 'agent_profile_meta'. Only use agent_profile_meta when the generated image is explicitly the current agent's own personal media." },
+                    "meta_label": { "type": "string", "description": "Optional personal media label used only when save_target='agent_profile_meta', such as 今日穿搭 or 最近视频." }
                 },
                 "required": ["prompt"]
             }),
@@ -1928,6 +2022,628 @@ async fn tool_memory_recall(
             Ok(format!("No value found for key '{key}'."))
         }
     }
+}
+
+const SELF_IDENTITY_FILES: &[&str] = &[
+    "IDENTITY.md",
+    "SOUL.md",
+    "USER.md",
+    "MEMORY.md",
+    "AGENTS.md",
+    "BOOTSTRAP.md",
+    "HEARTBEAT.md",
+];
+
+fn require_self_tool_context<'a>(
+    kernel: Option<&'a Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&'a str>,
+) -> Result<(&'a Arc<dyn KernelHandle>, &'a str), String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "This self-management tool requires a current agent context.".to_string())?;
+    Ok((kh, agent_id))
+}
+
+fn bool_flag(input: &serde_json::Value, key: &str) -> bool {
+    input
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn parse_self_identity_files(
+    value: Option<&serde_json::Value>,
+) -> Result<Vec<(String, String)>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "'files' must be a JSON object".to_string())?;
+    let mut updates = Vec::new();
+    for (key, value) in object {
+        if !SELF_IDENTITY_FILES.contains(&key.as_str()) {
+            return Err(format!("Unsupported self identity file: {key}"));
+        }
+        let content = value
+            .as_str()
+            .ok_or_else(|| format!("Content for {key} must be a string"))?;
+        updates.push((key.clone(), content.to_string()));
+    }
+    Ok(updates)
+}
+
+fn self_identity_patch_needs_confirmation(
+    files: &[(String, String)],
+    wants_system_prompt: bool,
+    wants_avatar_change: bool,
+) -> bool {
+    wants_system_prompt
+        || wants_avatar_change
+        || files
+            .iter()
+            .any(|(name, _)| matches!(name.as_str(), "IDENTITY.md" | "SOUL.md" | "AGENTS.md"))
+}
+
+async fn write_self_identity_file(
+    workspace_root: &Path,
+    filename: &str,
+    mode: &str,
+    content: &str,
+) -> Result<(), String> {
+    let path = workspace_root.join(filename);
+    let next = if mode == "append" {
+        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        if existing.trim().is_empty() {
+            content.to_string()
+        } else {
+            format!("{}\n\n{}", existing.trim_end_matches(['\r', '\n']), content)
+        }
+    } else {
+        content.to_string()
+    };
+    tokio::fs::write(&path, next)
+        .await
+        .map_err(|e| format!("Failed to write {filename}: {e}"))
+}
+
+fn build_memory_audit_block(memory_type: &str, content: &str, reason: Option<&str>) -> String {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut lines = vec![
+        format!("## Self Memory Patch {timestamp}"),
+        format!("- 类型: {memory_type}"),
+        format!("- 内容: {content}"),
+    ];
+    if let Some(reason) = reason.map(str::trim).filter(|value| !value.is_empty()) {
+        lines.push(format!("- 原因: {reason}"));
+    }
+    lines.join("\n")
+}
+
+async fn append_to_memory_md(
+    workspace_root: Option<&Path>,
+    content: &str,
+) -> Result<Option<String>, String> {
+    let Some(root) = workspace_root else {
+        return Ok(None);
+    };
+    let path = root.join("MEMORY.md");
+    let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    let next = if existing.trim().is_empty() {
+        content.to_string()
+    } else {
+        format!("{}\n\n{}", existing.trim_end_matches(['\r', '\n']), content)
+    };
+    tokio::fs::write(&path, next)
+        .await
+        .map_err(|e| format!("Failed to append MEMORY.md audit note: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+fn pick_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+}
+
+fn build_image_asset_metadata(
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
+    default_owner_scope: &str,
+    default_source_tool: &str,
+    default_purpose: &str,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    if let Some(agent_id) = caller_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert(
+            "agentId".to_string(),
+            serde_json::Value::String(agent_id.to_string()),
+        );
+    }
+    metadata.insert(
+        "ownerScope".to_string(),
+        serde_json::Value::String(
+            pick_string_field(input, "asset_owner_scope")
+                .unwrap_or(default_owner_scope)
+                .to_string(),
+        ),
+    );
+    metadata.insert(
+        "sourceTool".to_string(),
+        serde_json::Value::String(
+            pick_string_field(input, "asset_source_tool")
+                .unwrap_or(default_source_tool)
+                .to_string(),
+        ),
+    );
+    metadata.insert(
+        "purpose".to_string(),
+        serde_json::Value::String(
+            pick_string_field(input, "asset_purpose")
+                .or_else(|| pick_string_field(input, "purpose"))
+                .unwrap_or(default_purpose)
+                .to_string(),
+        ),
+    );
+    metadata.insert(
+        "assetFamily".to_string(),
+        serde_json::Value::String(
+            pick_string_field(input, "asset_family")
+                .unwrap_or("photo")
+                .to_string(),
+        ),
+    );
+    metadata.insert(
+        "mediaKind".to_string(),
+        serde_json::Value::String(
+            pick_string_field(input, "media_kind")
+                .unwrap_or("image")
+                .to_string(),
+        ),
+    );
+    metadata.insert(
+        "saveTarget".to_string(),
+        serde_json::Value::String(
+            pick_string_field(input, "asset_save_target")
+                .or_else(|| pick_string_field(input, "save_target"))
+                .unwrap_or("output")
+                .to_string(),
+        ),
+    );
+    if let Some(meta_label) = pick_string_field(input, "asset_meta_label")
+        .or_else(|| pick_string_field(input, "meta_label"))
+    {
+        metadata.insert(
+            "metaLabel".to_string(),
+            serde_json::Value::String(meta_label.to_string()),
+        );
+    }
+    if let Some(index_enabled) = input
+        .get("asset_index_enabled")
+        .and_then(serde_json::Value::as_bool)
+    {
+        metadata.insert("indexEnabled".to_string(), serde_json::json!(index_enabled));
+    }
+    serde_json::Value::Object(metadata)
+}
+
+fn inject_image_asset_metadata(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    caller_agent_id: Option<&str>,
+    owner_scope: &str,
+    source_tool: &str,
+    purpose: Option<&str>,
+    save_target: Option<&str>,
+    meta_label: Option<&str>,
+) {
+    if let Some(agent_id) = caller_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        map.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(agent_id.to_string()),
+        );
+    }
+    map.insert(
+        "asset_owner_scope".to_string(),
+        serde_json::Value::String(owner_scope.to_string()),
+    );
+    map.insert(
+        "asset_source_tool".to_string(),
+        serde_json::Value::String(source_tool.to_string()),
+    );
+    map.insert(
+        "asset_family".to_string(),
+        serde_json::Value::String("photo".to_string()),
+    );
+    map.insert(
+        "media_kind".to_string(),
+        serde_json::Value::String("image".to_string()),
+    );
+    if let Some(purpose) = purpose.filter(|value| !value.trim().is_empty()) {
+        map.insert(
+            "asset_purpose".to_string(),
+            serde_json::Value::String(purpose.trim().to_string()),
+        );
+    }
+    if let Some(save_target) = save_target.filter(|value| !value.trim().is_empty()) {
+        map.insert(
+            "asset_save_target".to_string(),
+            serde_json::Value::String(save_target.trim().to_string()),
+        );
+    }
+    if let Some(meta_label) = meta_label.filter(|value| !value.trim().is_empty()) {
+        map.insert(
+            "asset_meta_label".to_string(),
+            serde_json::Value::String(meta_label.trim().to_string()),
+        );
+    }
+}
+
+fn resolve_self_identity_anchor_source(
+    self_ctx: &serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut source = serde_json::Map::new();
+    if let Some(url) = self_ctx
+        .get("avatar_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        source.insert(
+            "image_url".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+    } else if let Some(url) = self_ctx
+        .get("portrait_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        source.insert(
+            "image_url".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+    } else if let Some(url) = self_ctx
+        .get("portrait_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        source.insert(
+            "image_url".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+    } else {
+        return Err(
+            "No self-photo identity anchor is available. my_photo_generate can only continue from your current avatar or portrait. Set the current avatar/portrait first. If you want a brand-new unrelated person or roleplay character, use image_generate instead.".to_string(),
+        );
+    }
+    Ok(source)
+}
+
+fn resolve_self_photo_source(
+    input: &serde_json::Value,
+    self_ctx: &serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut source = serde_json::Map::new();
+    if let Some(path) = pick_string_field(input, "image_path") {
+        source.insert(
+            "image_path".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+    } else if let Some(url) = pick_string_field(input, "image_url") {
+        source.insert(
+            "image_url".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+    } else if let Some(base64) = pick_string_field(input, "image_base64") {
+        let mime_type = pick_string_field(input, "mime_type")
+            .ok_or_else(|| "mime_type is required when image_base64 is provided".to_string())?;
+        source.insert(
+            "image_base64".to_string(),
+            serde_json::Value::String(base64.to_string()),
+        );
+        source.insert(
+            "mime_type".to_string(),
+            serde_json::Value::String(mime_type.to_string()),
+        );
+        return Ok(source);
+    } else {
+        return resolve_self_identity_anchor_source(self_ctx);
+    }
+    Ok(source)
+}
+
+async fn tool_my_identity_patch(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let (kh, agent_id) = require_self_tool_context(kernel, caller_agent_id)?;
+    let files = parse_self_identity_files(input.get("files"))?;
+    let system_prompt = input
+        .get("system_prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let avatar_change_requested = input.get("avatar_url").is_some();
+    let color_requested = input.get("color").is_some();
+    if files.is_empty() && system_prompt.is_none() && !avatar_change_requested && !color_requested {
+        return Err(
+            "my_identity_patch requires at least one file update, system_prompt, avatar_url, or color."
+                .to_string(),
+        );
+    }
+
+    let confirmed = bool_flag(input, "confirmed_by_user");
+    if self_identity_patch_needs_confirmation(
+        &files,
+        system_prompt.is_some(),
+        avatar_change_requested,
+    ) && !confirmed
+    {
+        return Err(
+            "This self identity patch touches a high-risk self field. Ask the user for explicit confirmation first and then call my_identity_patch with confirmed_by_user=true.".to_string(),
+        );
+    }
+
+    let mode = input
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("replace");
+    if mode != "replace" && mode != "append" {
+        return Err("mode must be either 'replace' or 'append'".to_string());
+    }
+
+    let mut updated_files = Vec::new();
+    if !files.is_empty() {
+        let root = workspace_root.ok_or_else(|| {
+            "my_identity_patch requires the current agent workspace to be available for file updates."
+                .to_string()
+        })?;
+        for (filename, content) in &files {
+            write_self_identity_file(root, filename, mode, content).await?;
+            updated_files.push(filename.clone());
+        }
+    }
+
+    let mut patch = serde_json::Map::new();
+    if let Some(system_prompt) = system_prompt {
+        patch.insert(
+            "system_prompt".to_string(),
+            serde_json::Value::String(system_prompt),
+        );
+    }
+    if let Some(value) = input.get("avatar_url") {
+        patch.insert("avatar_url".to_string(), value.clone());
+    }
+    if let Some(value) = input.get("color") {
+        patch.insert("color".to_string(), value.clone());
+    }
+
+    let context = if patch.is_empty() {
+        kh.get_agent_self_context(agent_id)?
+    } else {
+        kh.patch_agent_self_context(agent_id, serde_json::Value::Object(patch))?
+    };
+
+    let response = serde_json::json!({
+        "agent_id": agent_id,
+        "updated_files": updated_files,
+        "mode": mode,
+        "updated_system_prompt": input.get("system_prompt").is_some(),
+        "updated_avatar_url": avatar_change_requested,
+        "updated_color": color_requested,
+        "self_context": context,
+    });
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
+async fn tool_my_memory_patch(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let (kh, agent_id) = require_self_tool_context(kernel, caller_agent_id)?;
+    let content = input
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Missing 'content' parameter".to_string())?;
+    let memory_type = input
+        .get("memory_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("self_upgrade_note");
+    let scope = input
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("self_management");
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "memory_type".to_string(),
+        serde_json::Value::String(memory_type.to_string()),
+    );
+    if let Some(entity_key) = pick_string_field(input, "entity_key") {
+        metadata.insert(
+            "entity_key".to_string(),
+            serde_json::Value::String(entity_key.to_string()),
+        );
+    }
+    if let Some(reason) = pick_string_field(input, "reason") {
+        metadata.insert(
+            "reason".to_string(),
+            serde_json::Value::String(reason.to_string()),
+        );
+    }
+    if let Some(importance) = input.get("importance").and_then(serde_json::Value::as_f64) {
+        metadata.insert(
+            "importance".to_string(),
+            serde_json::json!(importance.clamp(0.0, 1.0)),
+        );
+    }
+    if let Some(confidence) = input.get("confidence").and_then(serde_json::Value::as_f64) {
+        metadata.insert(
+            "confidence".to_string(),
+            serde_json::json!(confidence.clamp(0.0, 1.0)),
+        );
+    }
+
+    let memory_result = kh
+        .remember_agent_memory(
+            agent_id,
+            content,
+            scope,
+            serde_json::Value::Object(metadata),
+        )
+        .await?;
+
+    let memory_md_path = if input
+        .get("append_to_memory_md")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        append_to_memory_md(
+            workspace_root,
+            &build_memory_audit_block(memory_type, content, pick_string_field(input, "reason")),
+        )
+        .await?
+    } else {
+        None
+    };
+
+    let response = serde_json::json!({
+        "agent_id": agent_id,
+        "memory": memory_result,
+        "memory_md_path": memory_md_path,
+    });
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
+async fn tool_my_photo_generate(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let (kh, agent_id) = require_self_tool_context(kernel, caller_agent_id)?;
+    if bool_flag(input, "allow_identity_change") || bool_flag(input, "confirmed_by_user") {
+        return Err(
+            "my_photo_generate 不允许替换或重置自己的身份锚点。它只能基于当前头像/自有照片继续生成自己的照片；如果要生成无关人物或全新角色，请改用 image_generate。".to_string(),
+        );
+    }
+
+    let self_ctx = kh.get_agent_self_context(agent_id)?;
+    let mut delegated = serde_json::Map::new();
+    let prompt = input["prompt"]
+        .as_str()
+        .ok_or("Missing 'prompt' parameter")?;
+    let purpose = pick_string_field(input, "purpose").unwrap_or("self_photo");
+    delegated.insert(
+        "prompt".to_string(),
+        serde_json::Value::String(format!(
+            "Create a new {purpose} of the same agent identity. Keep the same face/person and treat the source image as the identity anchor. User request: {prompt}"
+        )),
+    );
+    delegated.extend(resolve_self_identity_anchor_source(&self_ctx)?);
+    for key in [
+        "negative_prompt",
+        "model",
+        "size",
+        "width",
+        "height",
+        "quality",
+        "count",
+    ] {
+        if let Some(value) = input.get(key) {
+            delegated.insert(key.to_string(), value.clone());
+        }
+    }
+    inject_image_asset_metadata(
+        &mut delegated,
+        caller_agent_id,
+        "self",
+        "my_photo_generate",
+        Some(purpose),
+        pick_string_field(input, "save_target").or(Some("agent_profile_meta")),
+        pick_string_field(input, "meta_label").or(Some(purpose)),
+    );
+    tool_image_edit(
+        &serde_json::Value::Object(delegated),
+        workspace_root,
+        kernel,
+        caller_agent_id,
+    )
+    .await
+}
+
+async fn tool_my_photo_edit(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let (kh, agent_id) = require_self_tool_context(kernel, caller_agent_id)?;
+    let self_ctx = kh.get_agent_self_context(agent_id)?;
+    let mut delegated = serde_json::Map::new();
+    let prompt = input["prompt"]
+        .as_str()
+        .ok_or("Missing 'prompt' parameter")?;
+    let purpose = pick_string_field(input, "purpose").unwrap_or("self_photo_edit");
+    delegated.insert(
+        "prompt".to_string(),
+        serde_json::Value::String(format!(
+            "Edit the current agent self-photo for {purpose} while preserving the exact same identity. User request: {prompt}"
+        )),
+    );
+    delegated.extend(resolve_self_photo_source(input, &self_ctx)?);
+    for key in [
+        "negative_prompt",
+        "model",
+        "size",
+        "width",
+        "height",
+        "quality",
+        "count",
+    ] {
+        if let Some(value) = input.get(key) {
+            delegated.insert(key.to_string(), value.clone());
+        }
+    }
+    inject_image_asset_metadata(
+        &mut delegated,
+        caller_agent_id,
+        "self",
+        "my_photo_edit",
+        Some(purpose),
+        pick_string_field(input, "save_target").or(Some("agent_profile_meta")),
+        pick_string_field(input, "meta_label").or(Some(purpose)),
+    );
+    tool_image_edit(
+        &serde_json::Value::Object(delegated),
+        workspace_root,
+        kernel,
+        caller_agent_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3053,12 +3769,8 @@ async fn tool_media_describe_with_timeouts(
         _ => return Err(format!("Unsupported image format: .{ext}")),
     };
     let local_vision_error =
-        match crate::local_vision::analyze_image_path_with_local_service(
-            &path,
-            mime,
-            Some(prompt),
-        )
-        .await
+        match crate::local_vision::analyze_image_path_with_local_service(&path, mime, Some(prompt))
+            .await
         {
             Ok(Some(understanding)) => {
                 return serde_json::to_string_pretty(&understanding)
@@ -3215,18 +3927,36 @@ async fn tool_media_transcribe(
 fn build_image_result_response(
     result: &openfang_types::media::ImageGenResult,
     workspace_root: Option<&Path>,
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
 ) -> serde_json::Value {
-    let saved_paths = if let Some(workspace) = workspace_root {
-        match crate::image_gen::save_images_to_workspace(result, workspace) {
-            Ok(paths) => paths,
-            Err(e) => {
-                warn!("Failed to save images to workspace: {e}");
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    let owner_scope = pick_string_field(input, "asset_owner_scope")
+        .or_else(|| pick_string_field(input, "owner_scope"))
+        .unwrap_or("other");
+    let save_target = pick_string_field(input, "asset_save_target")
+        .or_else(|| pick_string_field(input, "save_target"))
+        .unwrap_or("output");
+    let meta_label = pick_string_field(input, "asset_meta_label")
+        .or_else(|| pick_string_field(input, "meta_label"))
+        .or_else(|| pick_string_field(input, "purpose"));
+    let saved_paths = workspace_root
+        .map(|workspace| {
+            save_runtime_images_to_workspace(
+                result,
+                workspace,
+                save_target,
+                owner_scope,
+                caller_agent_id.unwrap_or_default(),
+                "image",
+                meta_label,
+            )
+        })
+        .transpose()
+        .unwrap_or_else(|e| {
+            warn!("Failed to save images to workspace: {e}");
+            Some(Vec::new())
+        })
+        .unwrap_or_default();
 
     let mut image_urls: Vec<String> = Vec::new();
     {
@@ -3249,9 +3979,133 @@ fn build_image_result_response(
         "model": result.model,
         "images_generated": result.images.len(),
         "saved_to": saved_paths,
+        "save_target": normalize_runtime_save_target(save_target),
+        "meta_label": meta_label,
         "revised_prompt": result.revised_prompt,
         "image_urls": image_urls,
     })
+}
+
+fn save_runtime_images_to_workspace(
+    result: &openfang_types::media::ImageGenResult,
+    workspace_root: &Path,
+    save_target: &str,
+    owner_scope: &str,
+    agent_id: &str,
+    media_kind: &str,
+    meta_label: Option<&str>,
+) -> Result<Vec<String>, String> {
+    use base64::Engine;
+
+    let (base_dir, _) = resolve_runtime_image_save_dir(
+        workspace_root,
+        save_target,
+        owner_scope,
+        agent_id,
+        media_kind,
+        meta_label,
+    )?;
+    std::fs::create_dir_all(&base_dir).map_err(|e| {
+        format!(
+            "Failed to create image output dir {}: {e}",
+            base_dir.display()
+        )
+    })?;
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let mut paths = Vec::new();
+    for (i, image) in result.images.iter().enumerate() {
+        let filename = if result.images.len() == 1 {
+            format!("image_{timestamp}.png")
+        } else {
+            format!("image_{timestamp}_{i}.png")
+        };
+        let path = base_dir.join(&filename);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&image.data_base64)
+            .map_err(|e| format!("Failed to decode base64 image: {e}"))?;
+        std::fs::write(&path, &decoded)
+            .map_err(|e| format!("Failed to write image to {}: {e}", path.display()))?;
+        paths.push(path.display().to_string());
+    }
+    Ok(paths)
+}
+
+fn resolve_runtime_image_save_dir(
+    workspace_root: &Path,
+    raw_save_target: &str,
+    owner_scope: &str,
+    agent_id: &str,
+    media_kind: &str,
+    meta_label: Option<&str>,
+) -> Result<(PathBuf, &'static str), String> {
+    let save_target = normalize_runtime_save_target(raw_save_target);
+    match save_target {
+        "output" => Ok((workspace_root.join("output"), save_target)),
+        "agent_profile_meta" => {
+            if !owner_scope.eq_ignore_ascii_case("self") {
+                return Err(
+                    "save_target=agent_profile_meta is only allowed for self-owned media"
+                        .to_string(),
+                );
+            }
+            if agent_id.trim().is_empty() {
+                return Err("save_target=agent_profile_meta requires caller agent id".to_string());
+            }
+            let kind_dir = match media_kind {
+                "video" => "videos",
+                "audio" => "audios",
+                "file" | "document" => "files",
+                _ => "images",
+            };
+            let label =
+                normalize_runtime_meta_label(meta_label).unwrap_or_else(|| "default".into());
+            Ok((
+                workspace_root
+                    .join("agent_profile")
+                    .join("meta")
+                    .join(kind_dir)
+                    .join(label),
+                save_target,
+            ))
+        }
+        _ => Ok((workspace_root.join("output"), "output")),
+    }
+}
+
+fn normalize_runtime_save_target(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "output" => "output",
+        "agent_profile_meta" | "agent-profile-meta" | "profile_meta" | "self_media"
+        | "agent_profile" => "agent_profile_meta",
+        _ => "output",
+    }
+}
+
+fn normalize_runtime_meta_label(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_')
+            || matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF)
+        {
+            output.push(ch);
+        } else if (ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | '：' | '|'))
+            && !output.ends_with('_')
+        {
+            output.push('_');
+        }
+    }
+    let normalized = output.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 /// Generate images from a text prompt.
@@ -3297,9 +4151,20 @@ async fn tool_image_generate(
         quality,
         count,
     };
+    let asset_metadata = build_image_asset_metadata(
+        input,
+        caller_agent_id,
+        "other",
+        "image_generate",
+        "generated_image",
+    );
 
-    if let Some(response_json) =
-        crate::image_gen::execute_configured_image_generate_tool(&request, workspace_root).await?
+    if let Some(response_json) = crate::image_gen::execute_configured_image_generate_tool(
+        &request,
+        workspace_root,
+        Some(&asset_metadata),
+    )
+    .await?
     {
         return Ok(response_json);
     }
@@ -3311,7 +4176,7 @@ async fn tool_image_generate(
     } else {
         crate::image_gen::generate_image(&request).await?
     };
-    let response = build_image_result_response(&result, workspace_root);
+    let response = build_image_result_response(&result, workspace_root, input, caller_agent_id);
 
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
@@ -3411,9 +4276,20 @@ async fn tool_image_edit(
         quality: input["quality"].as_str().unwrap_or("standard").to_string(),
         count: input["count"].as_u64().unwrap_or(1).min(4) as u8,
     };
+    let asset_metadata = build_image_asset_metadata(
+        input,
+        caller_agent_id,
+        "other",
+        "image_edit",
+        "edited_image",
+    );
 
-    if let Some(response_json) =
-        crate::image_gen::execute_configured_image_edit_tool(&request, workspace_root).await?
+    if let Some(response_json) = crate::image_gen::execute_configured_image_edit_tool(
+        &request,
+        workspace_root,
+        Some(&asset_metadata),
+    )
+    .await?
     {
         return Ok(response_json);
     }
@@ -3433,7 +4309,7 @@ async fn tool_image_edit(
         .await?
     };
 
-    let response = build_image_result_response(&result, workspace_root);
+    let response = build_image_result_response(&result, workspace_root, input, caller_agent_id);
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
@@ -3851,6 +4727,11 @@ mod tests {
         assert!(names.contains(&"browser_wait"));
         assert!(names.contains(&"browser_run_js"));
         assert!(names.contains(&"browser_back"));
+        // 4 self-management tools
+        assert!(names.contains(&"my_identity_patch"));
+        assert!(names.contains(&"my_memory_patch"));
+        assert!(names.contains(&"my_photo_generate"));
+        assert!(names.contains(&"my_photo_edit"));
         // 4 media/image tools
         assert!(names.contains(&"media_describe"));
         assert!(names.contains(&"media_transcribe"));
@@ -3895,19 +4776,7 @@ mod tests {
             image_edit.input_schema.get("oneOf").is_none(),
             "image_edit schema should stay flat for OpenAI-compatible tool calling providers"
         );
-        assert!(image_edit
-            .description
-            .contains("only allowed tool for updating an agent's own avatar"));
-        assert!(image_edit.description.contains(
-            "should continue to derive from that existing avatar/portrait identity by default"
-        ));
-        assert!(image_edit
-            .input_schema
-            .get("properties")
-            .and_then(|properties| properties.get("prompt"))
-            .and_then(|prompt| prompt.get("description"))
-            .and_then(|desc| desc.as_str())
-            .is_some_and(|desc| desc.contains("agent's own avatar/portrait/self-image")));
+        assert!(image_edit.description.contains("generic tool"));
 
         let image_generate = tools
             .iter()
@@ -3915,17 +4784,41 @@ mod tests {
             .expect("image_generate tool missing");
         assert!(image_generate
             .description
-            .contains("Never use this to replace an agent's existing avatar"));
-        assert!(image_generate
+            .contains("generic generation tool"));
+
+        let my_photo_generate = tools
+            .iter()
+            .find(|tool| tool.name == "my_photo_generate")
+            .expect("my_photo_generate tool missing");
+        assert!(my_photo_generate
             .description
-            .contains("unless the user explicitly consented to changing that identity anchor"));
-        assert!(image_generate
+            .contains("same identity anchor"));
+        assert!(my_photo_generate
+            .description
+            .contains("runtime injects this self identity anchor"));
+        assert!(my_photo_generate
             .input_schema
             .get("properties")
-            .and_then(|properties| properties.get("prompt"))
-            .and_then(|prompt| prompt.get("description"))
-            .and_then(|desc| desc.as_str())
-            .is_some_and(|desc| desc.contains("agent's own avatar/portrait/self-image")));
+            .and_then(|properties| properties.get("save_target"))
+            .is_some());
+        assert!(my_photo_generate
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("image_url"))
+            .is_none());
+
+        let my_identity_patch = tools
+            .iter()
+            .find(|tool| tool.name == "my_identity_patch")
+            .expect("my_identity_patch tool missing");
+        assert!(my_identity_patch
+            .description
+            .contains("current agent's own identity files"));
+        assert!(my_identity_patch
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("confirmed_by_user"))
+            .is_some());
     }
 
     #[test]
@@ -4007,6 +4900,81 @@ mod tests {
         .expect_err("image_edit without a source image should fail");
 
         assert!(err.contains("requires a source image"));
+    }
+
+    #[tokio::test]
+    async fn test_my_identity_patch_requires_confirmation_for_system_prompt() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let err = tool_my_identity_patch(
+            &serde_json::json!({
+                "system_prompt": "新的核心提示词"
+            }),
+            None,
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect_err("system prompt self patch should require confirmation");
+
+        assert!(err.contains("explicit confirmation"));
+    }
+
+    #[tokio::test]
+    async fn test_my_memory_patch_returns_kernel_memory_result() {
+        let workspace = std::env::temp_dir().join(format!(
+            "openfang_my_memory_workspace_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = tool_my_memory_patch(
+            &serde_json::json!({
+                "content": "用户喜欢我先给结果再解释",
+                "memory_type": "preference",
+                "reason": "多次明确表达"
+            }),
+            Some(workspace.as_path()),
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect("my_memory_patch should succeed");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        assert!(result.contains("memory-test-id"));
+        assert!(result.contains("MEMORY.md"));
+    }
+
+    #[test]
+    fn test_resolve_self_photo_source_falls_back_to_avatar_url() {
+        let self_ctx = serde_json::json!({
+            "avatar_url": "https://example.com/avatar.png"
+        });
+        let source = resolve_self_photo_source(&serde_json::json!({}), &self_ctx)
+            .expect("avatar fallback should resolve");
+        assert_eq!(
+            source.get("image_url").and_then(serde_json::Value::as_str),
+            Some("https://example.com/avatar.png")
+        );
+    }
+
+    #[test]
+    fn test_resolve_self_photo_source_falls_back_to_portrait_url() {
+        let self_ctx = serde_json::json!({
+            "portrait_url": "https://example.com/portrait.png"
+        });
+        let source = resolve_self_photo_source(&serde_json::json!({}), &self_ctx)
+            .expect("portrait fallback should resolve");
+        assert_eq!(
+            source.get("image_url").and_then(serde_json::Value::as_str),
+            Some("https://example.com/portrait.png")
+        );
     }
 
     #[test]
@@ -4682,6 +5650,28 @@ mod tests {
             Ok(None)
         }
 
+        fn get_agent_self_context(&self, agent_id: &str) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({
+                "agent_id": agent_id,
+                "name": "self-test-agent",
+                "workspace": null,
+                "system_prompt": "test prompt",
+                "avatar_url": "https://example.com/avatar.png",
+                "color": "#ff6600",
+            }))
+        }
+
+        fn patch_agent_self_context(
+            &self,
+            agent_id: &str,
+            patch: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({
+                "agent_id": agent_id,
+                "patch": patch,
+            }))
+        }
+
         fn find_agents(&self, _query: &str) -> Vec<AgentInfo> {
             Vec::new()
         }
@@ -4737,6 +5727,20 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn remember_agent_memory(
+            &self,
+            agent_id: &str,
+            _content: &str,
+            scope: &str,
+            _metadata: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({
+                "memory_id": "memory-test-id",
+                "agent_id": agent_id,
+                "scope": scope,
+            }))
+        }
+
         async fn describe_image_with_agent_model(
             &self,
             _agent_id: &str,
@@ -4752,6 +5756,21 @@ mod tests {
                 description: format!("vision-ok: {prompt}"),
                 provider: "test-provider".to_string(),
                 model: "test-model".to_string(),
+            })
+        }
+
+        async fn edit_image_with_agent_model(
+            &self,
+            _agent_id: &str,
+            request: &openfang_types::media::ImageEditRequest,
+        ) -> Result<openfang_types::media::ImageGenResult, String> {
+            Ok(openfang_types::media::ImageGenResult {
+                images: vec![openfang_types::media::GeneratedImage {
+                    data_base64: "aGVsbG8=".to_string(),
+                    url: None,
+                }],
+                model: "self-test-edit-model".to_string(),
+                revised_prompt: Some(request.prompt.clone()),
             })
         }
     }

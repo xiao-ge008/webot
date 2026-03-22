@@ -221,8 +221,26 @@ pub fn save_images_to_workspace(
 pub async fn execute_configured_image_generate_tool(
     request: &ImageGenRequest,
     workspace_root: Option<&Path>,
+    asset_metadata: Option<&Value>,
 ) -> Result<Option<String>, String> {
     let client = build_http_client(240)?;
+    let mut payload = json!({
+        "prompt": request.prompt,
+        "negativePrompt": request.negative_prompt,
+        "size": request.size,
+        "width": request.width,
+        "height": request.height,
+        "quality": request.quality,
+        "count": request.count,
+        "workspaceRoot": workspace_root.map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
+    });
+    if let (Some(metadata), Some(object)) = (asset_metadata, payload.as_object_mut()) {
+        if let Some(extra) = metadata.as_object() {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
     let response = client
         .post(format!(
             "{}/api/management/image-generation/generate",
@@ -230,16 +248,7 @@ pub async fn execute_configured_image_generate_tool(
         ))
         .header(CONTENT_TYPE, "application/json")
         .header(USER_AGENT, crate::USER_AGENT)
-        .json(&json!({
-            "prompt": request.prompt,
-            "negativePrompt": request.negative_prompt,
-            "size": request.size,
-            "width": request.width,
-            "height": request.height,
-            "quality": request.quality,
-            "count": request.count,
-            "workspaceRoot": workspace_root.map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
-        }))
+        .json(&payload)
         .send()
         .await
         .map_err(|err| format!("调用本地图片生成服务失败: {err}"))?;
@@ -270,8 +279,30 @@ pub async fn execute_configured_image_generate_tool(
 pub async fn execute_configured_image_edit_tool(
     request: &ImageEditRequest,
     workspace_root: Option<&Path>,
+    asset_metadata: Option<&Value>,
 ) -> Result<Option<String>, String> {
     let client = build_http_client(240)?;
+    let mut payload = json!({
+        "prompt": request.prompt,
+        "negativePrompt": request.negative_prompt,
+        "size": request.size,
+        "width": request.width,
+        "height": request.height,
+        "quality": request.quality,
+        "count": request.count,
+        "imagePath": request.image_path,
+        "imageUrl": request.image_url,
+        "imageBase64": request.image_base64,
+        "mimeType": request.mime_type,
+        "workspaceRoot": workspace_root.map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
+    });
+    if let (Some(metadata), Some(object)) = (asset_metadata, payload.as_object_mut()) {
+        if let Some(extra) = metadata.as_object() {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
     let response = client
         .post(format!(
             "{}/api/management/image-generation/edit",
@@ -279,20 +310,7 @@ pub async fn execute_configured_image_edit_tool(
         ))
         .header(CONTENT_TYPE, "application/json")
         .header(USER_AGENT, crate::USER_AGENT)
-        .json(&json!({
-            "prompt": request.prompt,
-            "negativePrompt": request.negative_prompt,
-            "size": request.size,
-            "width": request.width,
-            "height": request.height,
-            "quality": request.quality,
-            "count": request.count,
-            "imagePath": request.image_path,
-            "imageUrl": request.image_url,
-            "imageBase64": request.image_base64,
-            "mimeType": request.mime_type,
-            "workspaceRoot": workspace_root.map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
-        }))
+        .json(&payload)
         .send()
         .await
         .map_err(|err| format!("调用本地图片修改服务失败: {err}"))?;

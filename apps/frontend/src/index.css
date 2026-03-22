@@ -399,9 +399,7 @@ pre {
   gap: 1rem;
   width: 100%;
   min-width: 0;
-  content-visibility: auto;
-  contain: layout paint style;
-  contain-intrinsic-size: 260px;
+  /* 虚拟列表需要依赖真实行高，消息行不能再使用占位式可见性优化。 */
 }
 
 .chat-message-row-compact {

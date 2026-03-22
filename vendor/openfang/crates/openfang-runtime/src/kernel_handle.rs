@@ -73,6 +73,38 @@ pub trait KernelHandle: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Get self-management context for the current agent.
+    /// Returns a JSON object containing the current agent's stable identity fields
+    /// such as workspace, system prompt, avatar URL, and color.
+    fn get_agent_self_context(&self, agent_id: &str) -> Result<serde_json::Value, String> {
+        let _ = agent_id;
+        Err("Self-management context is not available".to_string())
+    }
+
+    /// Patch self-owned manifest/profile fields for the current agent.
+    /// Intended for tightly scoped self-management operations such as updating
+    /// the system prompt, avatar URL, or accent color.
+    fn patch_agent_self_context(
+        &self,
+        agent_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (agent_id, patch);
+        Err("Self-management patch is not available".to_string())
+    }
+
+    /// Persist a semantic memory fragment for the current agent.
+    async fn remember_agent_memory(
+        &self,
+        agent_id: &str,
+        content: &str,
+        scope: &str,
+        metadata: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (agent_id, content, scope, metadata);
+        Err("Agent semantic memory write is not available".to_string())
+    }
+
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;
 

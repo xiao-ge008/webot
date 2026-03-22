@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::Value as SqlValue, Connection};
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::path_resolver;
 
@@ -86,6 +87,69 @@ pub struct AgentWorkspaceFolderRecord {
     pub agent_id: String,
     pub folder_path: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaAssetRecord {
+    pub asset_id: String,
+    pub agent_id: Option<String>,
+    pub owner_scope: String,
+    pub asset_family: String,
+    pub media_kind: String,
+    pub source_tool: Option<String>,
+    pub purpose: Option<String>,
+    pub prompt_text: Option<String>,
+    pub negative_prompt: Option<String>,
+    pub model: Option<String>,
+    pub mime_type: String,
+    pub sha256: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_size: u64,
+    pub file_name: Option<String>,
+    pub saved_path: Option<String>,
+    pub image_url: Option<String>,
+    pub relative_path: Option<String>,
+    pub vision_summary: Option<String>,
+    pub tags: Vec<String>,
+    pub metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertMediaAssetRecord {
+    pub agent_id: Option<String>,
+    pub owner_scope: String,
+    pub asset_family: String,
+    pub media_kind: String,
+    pub source_tool: Option<String>,
+    pub purpose: Option<String>,
+    pub prompt_text: Option<String>,
+    pub negative_prompt: Option<String>,
+    pub model: Option<String>,
+    pub mime_type: String,
+    pub sha256: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_size: u64,
+    pub file_name: Option<String>,
+    pub saved_path: Option<String>,
+    pub image_url: Option<String>,
+    pub relative_path: Option<String>,
+    pub vision_summary: Option<String>,
+    pub tags: Vec<String>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MediaAssetListQuery {
+    pub agent_id: Option<String>,
+    pub owner_scope: Option<String>,
+    pub asset_family: Option<String>,
+    pub media_kind: Option<String>,
+    pub query: Option<String>,
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -400,6 +464,39 @@ pub fn ensure_db() -> Result<PathBuf, String> {
             PRIMARY KEY (agent_id, folder_path)
         );
 
+        CREATE TABLE IF NOT EXISTS media_assets (
+            asset_id TEXT PRIMARY KEY,
+            agent_id TEXT NULL,
+            owner_scope TEXT NOT NULL DEFAULT 'other',
+            asset_family TEXT NOT NULL DEFAULT 'photo',
+            media_kind TEXT NOT NULL DEFAULT 'image',
+            source_tool TEXT NULL,
+            purpose TEXT NULL,
+            prompt_text TEXT NULL,
+            negative_prompt TEXT NULL,
+            model TEXT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'image/png',
+            sha256 TEXT NOT NULL,
+            width INTEGER NULL,
+            height INTEGER NULL,
+            byte_size INTEGER NOT NULL DEFAULT 0,
+            file_name TEXT NULL,
+            saved_path TEXT NULL,
+            image_url TEXT NULL,
+            relative_path TEXT NULL,
+            vision_summary TEXT NULL,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_media_assets_agent_scope
+            ON media_assets(agent_id, owner_scope, asset_family, media_kind, updated_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_media_assets_sha256
+            ON media_assets(sha256);
+
         CREATE TABLE IF NOT EXISTS hidden_agents (
             agent_id TEXT PRIMARY KEY,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -510,6 +607,7 @@ pub fn ensure_db() -> Result<PathBuf, String> {
     .map_err(|e| format!("初始化数据库结构失败: {e}"))?;
     ensure_agent_profile_override_columns(&conn)?;
     ensure_chat_group_columns(&conn)?;
+    ensure_media_assets_columns(&conn)?;
     ensure_provider_model_state_migrated(&mut conn)?;
 
     Ok(db_path)
@@ -1052,6 +1150,7 @@ pub fn clear_agent_local_data(agent_id: &str) -> Result<(), String> {
         "DELETE FROM agent_profile_overrides WHERE agent_id = ?1",
         "DELETE FROM agent_context_files WHERE agent_id = ?1",
         "DELETE FROM agent_workspace_folders WHERE agent_id = ?1",
+        "DELETE FROM media_assets WHERE agent_id = ?1",
     ] {
         tx.execute(sql, params![agent_id])
             .map_err(|e| format!("清理智能体本地数据失败: {e}"))?;
@@ -1190,6 +1289,55 @@ pub fn set_provider_enabled(provider_id: &str, enabled: bool) -> Result<(), Stri
         params![provider_id, if enabled { 1 } else { 0 }],
     )
     .map_err(|e| format!("写入 provider 开关失败: {e}"))?;
+    Ok(())
+}
+
+fn ensure_media_assets_columns(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(media_assets)")
+        .map_err(|e| format!("读取 media_assets 字段失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("解析 media_assets 字段失败: {e}"))?;
+
+    let mut columns = std::collections::HashSet::new();
+    for row in rows {
+        columns.insert(row.map_err(|e| format!("读取 media_assets 字段名失败: {e}"))?);
+    }
+
+    for (column, definition) in [
+        ("agent_id", "TEXT NULL"),
+        ("owner_scope", "TEXT NOT NULL DEFAULT 'other'"),
+        ("asset_family", "TEXT NOT NULL DEFAULT 'photo'"),
+        ("media_kind", "TEXT NOT NULL DEFAULT 'image'"),
+        ("source_tool", "TEXT NULL"),
+        ("purpose", "TEXT NULL"),
+        ("prompt_text", "TEXT NULL"),
+        ("negative_prompt", "TEXT NULL"),
+        ("model", "TEXT NULL"),
+        ("mime_type", "TEXT NOT NULL DEFAULT 'image/png'"),
+        ("sha256", "TEXT NOT NULL DEFAULT ''"),
+        ("width", "INTEGER NULL"),
+        ("height", "INTEGER NULL"),
+        ("byte_size", "INTEGER NOT NULL DEFAULT 0"),
+        ("file_name", "TEXT NULL"),
+        ("saved_path", "TEXT NULL"),
+        ("image_url", "TEXT NULL"),
+        ("relative_path", "TEXT NULL"),
+        ("vision_summary", "TEXT NULL"),
+        ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("created_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    ] {
+        if columns.contains(column) {
+            continue;
+        }
+        let sql = format!("ALTER TABLE media_assets ADD COLUMN {column} {definition}");
+        conn.execute(&sql, [])
+            .map_err(|e| format!("为 media_assets 增加字段 {column} 失败: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -2923,6 +3071,330 @@ fn map_task_delivery_row(row: &rusqlite::Row<'_>) -> Result<TaskDeliveryRecord, 
         reported_at: row.get(24)?,
         acknowledged_at: row.get(25)?,
     })
+}
+
+fn normalize_media_owner_scope(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "self" => "self".to_string(),
+        "shared" => "shared".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+fn normalize_media_family(value: &str) -> String {
+    let trimmed = value.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        "photo".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn normalize_media_kind(value: &str) -> String {
+    let trimmed = value.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        "image".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn normalize_media_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for tag in tags {
+        let normalized = tag.trim().to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        output.push(normalized);
+        if output.len() >= 32 {
+            break;
+        }
+    }
+    output
+}
+
+fn parse_json_string_array(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn parse_json_value_or_default(raw: &str, fallback: Value) -> Value {
+    serde_json::from_str::<Value>(raw).unwrap_or(fallback)
+}
+
+fn parse_media_asset_row(row: &rusqlite::Row<'_>) -> Result<MediaAssetRecord, rusqlite::Error> {
+    let width = row
+        .get::<_, Option<i64>>(11)?
+        .and_then(|value| u32::try_from(value).ok());
+    let height = row
+        .get::<_, Option<i64>>(12)?
+        .and_then(|value| u32::try_from(value).ok());
+    let byte_size = row
+        .get::<_, i64>(13)
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(0);
+    let tags_json: String = row.get(19)?;
+    let metadata_json: String = row.get(20)?;
+
+    Ok(MediaAssetRecord {
+        asset_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        owner_scope: row.get(2)?,
+        asset_family: row.get(3)?,
+        media_kind: row.get(4)?,
+        source_tool: row.get(5)?,
+        purpose: row.get(6)?,
+        prompt_text: row.get(7)?,
+        negative_prompt: row.get(8)?,
+        model: row.get(9)?,
+        mime_type: row.get(10)?,
+        width,
+        height,
+        byte_size,
+        sha256: row.get(14)?,
+        file_name: row.get(15)?,
+        saved_path: row.get(16)?,
+        image_url: row.get(17)?,
+        relative_path: row.get(18)?,
+        tags: parse_json_string_array(&tags_json),
+        metadata: parse_json_value_or_default(&metadata_json, Value::Object(Default::default())),
+        vision_summary: row.get(21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
+    })
+}
+
+pub fn upsert_media_asset(input: UpsertMediaAssetRecord) -> Result<MediaAssetRecord, String> {
+    let conn = open_conn()?;
+    let agent_id = input.agent_id.and_then(normalize_nullable_text);
+    let owner_scope = normalize_media_owner_scope(&input.owner_scope);
+    let asset_family = normalize_media_family(&input.asset_family);
+    let media_kind = normalize_media_kind(&input.media_kind);
+    let source_tool = input.source_tool.and_then(normalize_nullable_text);
+    let purpose = input.purpose.and_then(normalize_nullable_text);
+    let prompt_text = input.prompt_text.and_then(normalize_nullable_text);
+    let negative_prompt = input.negative_prompt.and_then(normalize_nullable_text);
+    let model = input.model.and_then(normalize_nullable_text);
+    let mime_type =
+        normalize_nullable_text(input.mime_type).unwrap_or_else(|| "image/png".to_string());
+    let sha256 = input.sha256.trim().to_ascii_lowercase();
+    if sha256.len() != 64 || !sha256.chars().all(|item| item.is_ascii_hexdigit()) {
+        return Err("media asset sha256 无效".to_string());
+    }
+    let file_name = input.file_name.and_then(normalize_nullable_text);
+    let saved_path = input.saved_path.and_then(normalize_nullable_text);
+    let image_url = input.image_url.and_then(normalize_nullable_text);
+    let relative_path = input.relative_path.and_then(normalize_nullable_text);
+    let vision_summary = input.vision_summary.and_then(normalize_nullable_text);
+    let tags = normalize_media_tags(input.tags);
+    let metadata = if input.metadata.is_null() {
+        Value::Object(Default::default())
+    } else {
+        input.metadata
+    };
+    let tags_json = serde_json::to_string(&tags).map_err(|e| format!("序列化媒体标签失败: {e}"))?;
+    let metadata_json =
+        serde_json::to_string(&metadata).map_err(|e| format!("序列化媒体元数据失败: {e}"))?;
+    let lookup_agent = agent_id.clone().unwrap_or_default();
+
+    let existing_asset_id = {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT asset_id
+                FROM media_assets
+                WHERE sha256 = ?1
+                  AND ifnull(agent_id, '') = ?2
+                  AND owner_scope = ?3
+                  AND asset_family = ?4
+                  AND media_kind = ?5
+                ORDER BY updated_at DESC
+                LIMIT 1
+                "#,
+            )
+            .map_err(|e| format!("查询媒体资产失败: {e}"))?;
+        let mut rows = stmt
+            .query(params![
+                &sha256,
+                &lookup_agent,
+                &owner_scope,
+                &asset_family,
+                &media_kind
+            ])
+            .map_err(|e| format!("读取媒体资产失败: {e}"))?;
+        rows.next()
+            .map_err(|e| format!("读取媒体资产记录失败: {e}"))?
+            .map(|row| row.get::<_, String>(0))
+            .transpose()
+            .map_err(|e| format!("解析媒体资产 ID 失败: {e}"))?
+    };
+    let asset_id = existing_asset_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    conn.execute(
+        r#"
+        INSERT INTO media_assets(
+            asset_id, agent_id, owner_scope, asset_family, media_kind, source_tool, purpose,
+            prompt_text, negative_prompt, model, mime_type, width, height, byte_size, sha256,
+            file_name, saved_path, image_url, relative_path, tags_json, metadata_json,
+            vision_summary, created_at, updated_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21,
+            ?22, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(asset_id) DO UPDATE SET
+            agent_id = excluded.agent_id,
+            owner_scope = excluded.owner_scope,
+            asset_family = excluded.asset_family,
+            media_kind = excluded.media_kind,
+            source_tool = excluded.source_tool,
+            purpose = excluded.purpose,
+            prompt_text = excluded.prompt_text,
+            negative_prompt = excluded.negative_prompt,
+            model = excluded.model,
+            mime_type = excluded.mime_type,
+            width = excluded.width,
+            height = excluded.height,
+            byte_size = excluded.byte_size,
+            sha256 = excluded.sha256,
+            file_name = excluded.file_name,
+            saved_path = excluded.saved_path,
+            image_url = excluded.image_url,
+            relative_path = excluded.relative_path,
+            tags_json = excluded.tags_json,
+            metadata_json = excluded.metadata_json,
+            vision_summary = excluded.vision_summary,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            asset_id,
+            agent_id,
+            owner_scope,
+            asset_family,
+            media_kind,
+            source_tool,
+            purpose,
+            prompt_text,
+            negative_prompt,
+            model,
+            mime_type,
+            input.width.map(i64::from),
+            input.height.map(i64::from),
+            i64::try_from(input.byte_size).unwrap_or(i64::MAX),
+            sha256,
+            file_name,
+            saved_path,
+            image_url,
+            relative_path,
+            tags_json,
+            metadata_json,
+            vision_summary
+        ],
+    )
+    .map_err(|e| format!("写入媒体资产失败: {e}"))?;
+
+    get_media_asset(&asset_id)?.ok_or_else(|| "媒体资产写入后读取失败".to_string())
+}
+
+pub fn get_media_asset(asset_id: &str) -> Result<Option<MediaAssetRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                asset_id, agent_id, owner_scope, asset_family, media_kind, source_tool, purpose,
+                prompt_text, negative_prompt, model, mime_type, width, height, byte_size, sha256,
+                file_name, saved_path, image_url, relative_path, tags_json, metadata_json,
+                vision_summary, created_at, updated_at
+            FROM media_assets
+            WHERE asset_id = ?1
+            LIMIT 1
+            "#,
+        )
+        .map_err(|e| format!("查询媒体资产详情失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![asset_id.trim()])
+        .map_err(|e| format!("读取媒体资产详情失败: {e}"))?;
+    rows.next()
+        .map_err(|e| format!("读取媒体资产详情行失败: {e}"))?
+        .map(parse_media_asset_row)
+        .transpose()
+        .map_err(|e| format!("解析媒体资产详情失败: {e}"))
+}
+
+pub fn list_media_assets(filter: MediaAssetListQuery) -> Result<Vec<MediaAssetRecord>, String> {
+    let conn = open_conn()?;
+    let mut sql = String::from(
+        r#"
+        SELECT
+            asset_id, agent_id, owner_scope, asset_family, media_kind, source_tool, purpose,
+            prompt_text, negative_prompt, model, mime_type, width, height, byte_size, sha256,
+            file_name, saved_path, image_url, relative_path, tags_json, metadata_json,
+            vision_summary, created_at, updated_at
+        FROM media_assets
+        WHERE 1 = 1
+        "#,
+    );
+    let mut params_vec: Vec<SqlValue> = Vec::new();
+
+    if let Some(agent_id) = filter.agent_id.and_then(normalize_nullable_text) {
+        sql.push_str(" AND agent_id = ?");
+        params_vec.push(SqlValue::Text(agent_id));
+    }
+    if let Some(owner_scope) = filter.owner_scope.and_then(normalize_nullable_text) {
+        let normalized = owner_scope.trim().to_ascii_lowercase();
+        if normalized != "all" {
+            sql.push_str(" AND owner_scope = ?");
+            params_vec.push(SqlValue::Text(normalize_media_owner_scope(&normalized)));
+        }
+    }
+    if let Some(asset_family) = filter.asset_family.and_then(normalize_nullable_text) {
+        sql.push_str(" AND asset_family = ?");
+        params_vec.push(SqlValue::Text(normalize_media_family(&asset_family)));
+    }
+    if let Some(media_kind) = filter.media_kind.and_then(normalize_nullable_text) {
+        sql.push_str(" AND media_kind = ?");
+        params_vec.push(SqlValue::Text(normalize_media_kind(&media_kind)));
+    }
+    if let Some(query) = filter.query.and_then(normalize_nullable_text) {
+        let like = format!("%{}%", query.to_ascii_lowercase());
+        sql.push_str(
+            " AND (lower(ifnull(file_name, '')) LIKE ? OR lower(ifnull(prompt_text, '')) LIKE ? OR lower(ifnull(vision_summary, '')) LIKE ? OR lower(tags_json) LIKE ?)",
+        );
+        for _ in 0..4 {
+            params_vec.push(SqlValue::Text(like.clone()));
+        }
+    }
+
+    sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
+    params_vec.push(SqlValue::Integer(i64::from(
+        filter.limit.unwrap_or(120).clamp(1, 500),
+    )));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备媒体资产列表查询失败: {e}"))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params_vec),
+            parse_media_asset_row,
+        )
+        .map_err(|e| format!("查询媒体资产列表失败: {e}"))?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析媒体资产列表失败: {e}"))?);
+    }
+    Ok(output)
 }
 
 fn open_conn() -> Result<Connection, String> {

@@ -1834,6 +1834,39 @@ export interface AgentPortraitUploadResult {
   size?: number;
 }
 
+export interface ManagementPhotoAsset {
+  assetId: string;
+  agentId?: string;
+  ownerScope: string;
+  assetFamily: string;
+  mediaKind: string;
+  sourceTool?: string;
+  purpose?: string;
+  promptText?: string;
+  negativePrompt?: string;
+  model?: string;
+  mimeType: string;
+  sha256: string;
+  width?: number;
+  height?: number;
+  byteSize: number;
+  fileName?: string;
+  savedPath?: string;
+  imageUrl?: string;
+  relativePath?: string;
+  visionSummary?: string;
+  tags: string[];
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ListManagementAgentPhotoLibraryParams {
+  ownerScope?: 'self' | 'other' | 'shared' | 'all';
+  q?: string;
+  limit?: number;
+}
+
 export interface ApplyManagementAgentAvatarInput {
   sourceUrl: string;
 }
@@ -2140,6 +2173,66 @@ function parseAgentPortraitUploadResult(
     savedPath: asString(payload.saved_path) || undefined,
     size: typeof payload.size === 'number' ? payload.size : undefined,
   };
+}
+
+function parseManagementPhotoAsset(payload: unknown, baseUrl?: string): ManagementPhotoAsset {
+  if (!isRecord(payload)) {
+    throw new Error('照片库返回异常');
+  }
+  const imageRaw = asString(payload.image_url).trim();
+  const imageUrl = baseUrl
+    ? normalizeManagementAssetUrl(imageRaw, baseUrl) || imageRaw || undefined
+    : imageRaw || undefined;
+  const metadata = isRecord(payload.metadata) ? payload.metadata : {};
+  return {
+    assetId: asString(payload.asset_id),
+    agentId: asString(payload.agent_id) || undefined,
+    ownerScope: asString(payload.owner_scope, 'other'),
+    assetFamily: asString(payload.asset_family, 'photo'),
+    mediaKind: asString(payload.media_kind, 'image'),
+    sourceTool: asString(payload.source_tool) || undefined,
+    purpose: asString(payload.purpose) || undefined,
+    promptText: asString(payload.prompt_text) || undefined,
+    negativePrompt: asString(payload.negative_prompt) || undefined,
+    model: asString(payload.model) || undefined,
+    mimeType: asString(payload.mime_type, 'image/png'),
+    sha256: asString(payload.sha256),
+    width: typeof payload.width === 'number' ? payload.width : undefined,
+    height: typeof payload.height === 'number' ? payload.height : undefined,
+    byteSize: asNumber(payload.byte_size),
+    fileName: asString(payload.file_name) || undefined,
+    savedPath: asString(payload.saved_path) || undefined,
+    imageUrl,
+    relativePath: asString(payload.relative_path) || undefined,
+    visionSummary: asString(payload.vision_summary) || undefined,
+    tags: asStringArray(payload.tags),
+    metadata,
+    createdAt: asString(payload.created_at),
+    updatedAt: asString(payload.updated_at),
+  };
+}
+
+export async function listManagementAgentPhotoLibrary(
+  agentId: string,
+  params: ListManagementAgentPhotoLibraryParams = {},
+): Promise<ManagementPhotoAsset[]> {
+  const baseUrl = await getApiBaseUrl();
+  const query = new URLSearchParams();
+  if (params.ownerScope) {
+    query.set('ownerScope', params.ownerScope);
+  }
+  if (params.q?.trim()) {
+    query.set('q', params.q.trim());
+  }
+  if (typeof params.limit === 'number' && Number.isFinite(params.limit)) {
+    query.set('limit', String(Math.max(1, Math.min(500, Math.floor(params.limit)))));
+  }
+  const suffix = query.toString();
+  const payload = await requestJson<unknown>(
+    `/api/management/agents/${encodeURIComponent(agentId)}/photo-library${suffix ? `?${suffix}` : ''}`,
+  );
+  const rows = isRecord(payload) && Array.isArray(payload.items) ? payload.items : [];
+  return rows.map((item) => parseManagementPhotoAsset(item, baseUrl));
 }
 
 const LOCAL_MANAGEMENT_ASSET_PATTERN = /^https?:\/\/(?:127\.0\.0\.1|localhost):\d+(\/api\/management\/agents\/.+)$/i;

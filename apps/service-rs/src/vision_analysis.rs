@@ -385,7 +385,16 @@ fn resolve_focus_plan(user_text: &str, default_task_prompt: &str) -> VisionFocus
 
     if text_contains_any(
         &normalized,
-        &["提示词", "prompt", "tag", "标签", "生图", "改图", "复现", "同款"],
+        &[
+            "提示词",
+            "prompt",
+            "tag",
+            "标签",
+            "生图",
+            "改图",
+            "复现",
+            "同款",
+        ],
     ) {
         return VisionFocusPlan {
             mode: VisionFocusMode::Prompt,
@@ -396,7 +405,9 @@ fn resolve_focus_plan(user_text: &str, default_task_prompt: &str) -> VisionFocus
 
     if text_contains_any(
         &normalized,
-        &["背景", "布景", "场景", "环境", "构图", "机位", "镜头", "光影"],
+        &[
+            "背景", "布景", "场景", "环境", "构图", "机位", "镜头", "光影",
+        ],
     ) {
         return VisionFocusPlan {
             mode: VisionFocusMode::Background,
@@ -425,7 +436,15 @@ fn resolve_focus_plan(user_text: &str, default_task_prompt: &str) -> VisionFocus
     } else if text_contains_any(
         &normalized,
         &[
-            "脸", "表情", "发型", "头发", "眼睛", "五官", "face", "expression", "hair",
+            "脸",
+            "表情",
+            "发型",
+            "头发",
+            "眼睛",
+            "五官",
+            "face",
+            "expression",
+            "hair",
             "eyes",
         ],
     ) {
@@ -433,8 +452,19 @@ fn resolve_focus_plan(user_text: &str, default_task_prompt: &str) -> VisionFocus
     } else if text_contains_any(
         &normalized,
         &[
-            "配饰", "饰品", "项链", "耳环", "耳坠", "手套", "项圈", "首饰", "accessory",
-            "necklace", "earring", "collar", "jewelry",
+            "配饰",
+            "饰品",
+            "项链",
+            "耳环",
+            "耳坠",
+            "手套",
+            "项圈",
+            "首饰",
+            "accessory",
+            "necklace",
+            "earring",
+            "collar",
+            "jewelry",
         ],
     ) {
         VisionFocusMode::Accessories
@@ -465,30 +495,87 @@ fn focus_mode_keywords(mode: VisionFocusMode) -> &'static [&'static str] {
     match mode {
         VisionFocusMode::General => &[],
         VisionFocusMode::Clothing => &[
-            "dress", "outfit", "clothing", "clothes", "shirt", "skirt", "gown", "nightgown",
-            "nightdress", "lace", "velvet", "stocking", "stockings", "heels", "shoe", "bra",
-            "lingerie", "collar", "tie", "ribbon", "sleeve", "boots", "丝袜", "鞋", "裙",
-            "衣", "蕾丝", "丝绒", "领结", "项圈",
+            "dress",
+            "outfit",
+            "clothing",
+            "clothes",
+            "shirt",
+            "skirt",
+            "gown",
+            "nightgown",
+            "nightdress",
+            "lace",
+            "velvet",
+            "stocking",
+            "stockings",
+            "heels",
+            "shoe",
+            "bra",
+            "lingerie",
+            "collar",
+            "tie",
+            "ribbon",
+            "sleeve",
+            "boots",
+            "丝袜",
+            "鞋",
+            "裙",
+            "衣",
+            "蕾丝",
+            "丝绒",
+            "领结",
+            "项圈",
         ],
         VisionFocusMode::Pose => &[
             "pose", "posture", "standing", "sitting", "kneeling", "arms", "legs", "barefoot",
             "lying", "looking", "跪", "站", "坐", "姿", "动作", "手", "腿",
         ],
         VisionFocusMode::Background => &[
-            "background", "bedroom", "bed", "room", "wall", "lighting", "camera", "angle",
-            "composition", "palette", "atmosphere", "背景", "床", "房间", "构图", "镜头",
+            "background",
+            "bedroom",
+            "bed",
+            "room",
+            "wall",
+            "lighting",
+            "camera",
+            "angle",
+            "composition",
+            "palette",
+            "atmosphere",
+            "背景",
+            "床",
+            "房间",
+            "构图",
+            "镜头",
         ],
         VisionFocusMode::Face => &[
-            "face", "eyes", "hair", "smile", "expression", "mouth", "blush", "五官", "头发",
-            "眼", "表情", "脸",
+            "face",
+            "eyes",
+            "hair",
+            "smile",
+            "expression",
+            "mouth",
+            "blush",
+            "五官",
+            "头发",
+            "眼",
+            "表情",
+            "脸",
         ],
         VisionFocusMode::Accessories => &[
-            "necklace", "earring", "collar", "jewelry", "ring", "bracelet", "配饰", "项链",
-            "耳环", "项圈", "首饰",
+            "necklace", "earring", "collar", "jewelry", "ring", "bracelet", "配饰", "项链", "耳环",
+            "项圈", "首饰",
         ],
         VisionFocusMode::Prompt => &[
-            "1girl", "solo", "camera_angle", "art_style", "background", "dress", "outfit",
-            "style", "lighting",
+            "1girl",
+            "solo",
+            "camera_angle",
+            "art_style",
+            "background",
+            "dress",
+            "outfit",
+            "style",
+            "lighting",
         ],
     }
 }
@@ -1173,28 +1260,45 @@ pub async fn analyze_vision_image(
         ));
     }
 
+    let response = analyze_vision_image_with_status(payload, status)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({ "analysis": response })))
+}
+
+pub async fn analyze_vision_image_best_effort(
+    payload: AnalyzeVisionImageRequest,
+) -> Result<Option<AnalyzeVisionImageResponse>, String> {
+    let status = refresh_status().await?;
+    if !status.config.enabled || status.config.provider != FLORENCE_PROVIDER || !status.model_ready
+    {
+        return Ok(None);
+    }
+    analyze_vision_image_with_status(payload, status)
+        .await
+        .map(Some)
+}
+
+async fn analyze_vision_image_with_status(
+    payload: AnalyzeVisionImageRequest,
+    status: VisionAnalysisStatus,
+) -> Result<AnalyzeVisionImageResponse, String> {
     let image_path = payload.image_path.trim();
     if image_path.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "imagePath 不能为空"));
+        return Err("imagePath 不能为空".to_string());
     }
 
     let path = PathBuf::from(image_path);
     if !path.is_absolute() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "imagePath 必须是本地绝对路径",
-        ));
+        return Err("imagePath 必须是本地绝对路径".to_string());
     }
     if !path.is_file() {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("图片文件不存在: {}", path.display()),
-        ));
+        return Err(format!("图片文件不存在: {}", path.display()));
     }
 
     let bytes = tokio::fs::read(&path)
         .await
-        .map_err(|err| internal_error(format!("读取图片文件失败({}): {err}", path.display())))?;
+        .map_err(|err| format!("读取图片文件失败({}): {err}", path.display()))?;
     let focus_plan = resolve_focus_plan(&payload.user_text, &status.config.task_prompt);
     let sha256 = payload
         .sha256
@@ -1204,7 +1308,7 @@ pub async fn analyze_vision_image(
         .unwrap_or_else(|| format!("{:x}", sha2::Sha256::digest(bytes.as_slice())));
 
     if status.config.cache_enabled && focus_plan.cacheable {
-        if let Some(record) = read_cached_record(&sha256).map_err(internal_error)? {
+        if let Some(record) = read_cached_record(&sha256)? {
             let response = AnalyzeVisionImageResponse {
                 sha256: record.sha256,
                 summary: build_presented_summary(
@@ -1220,23 +1324,20 @@ pub async fn analyze_vision_image(
                 height: record.height,
                 cached: true,
             };
-            return Ok(Json(json!({ "analysis": response })));
+            return Ok(response);
         }
     }
 
-    let sidecar = analyze_with_florence_sidecar(
-        &path,
-        &status.config.model_id,
-        &focus_plan.task_prompt,
-    )
-        .await
-        .map_err(internal_error)?;
+    let sidecar =
+        analyze_with_florence_sidecar(&path, &status.config.model_id, &focus_plan.task_prompt)
+            .await
+            .map_err(|err| err.to_string())?;
     let raw_summary = sidecar
         .summary
         .clone()
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
-        .ok_or_else(|| internal_error("Florence-2 未返回可用摘要".to_string()))?;
+        .ok_or_else(|| "Florence-2 未返回可用摘要".to_string())?;
     let presented_summary =
         build_presented_summary(&raw_summary, &payload.user_text, focus_plan.mode);
     let mime_type = if payload.mime_type.trim().is_empty() {
@@ -1274,15 +1375,10 @@ pub async fn analyze_vision_image(
                 .or_else(|| Some(path.to_string_lossy().to_string())),
             upstream_file_id: payload.upstream_file_id.clone(),
             file_name: payload.file_name.clone(),
-        })
-        .map_err(internal_error)?;
+        })?;
         AnalyzeVisionImageResponse {
             sha256: record.sha256,
-            summary: build_presented_summary(
-                &record.summary,
-                &payload.user_text,
-                focus_plan.mode,
-            ),
+            summary: build_presented_summary(&record.summary, &payload.user_text, focus_plan.mode),
             provider: record.provider,
             model: record.model,
             task_prompt: record.task_prompt,
@@ -1304,7 +1400,7 @@ pub async fn analyze_vision_image(
             cached: false,
         }
     };
-    Ok(Json(json!({ "analysis": response })))
+    Ok(response)
 }
 
 pub async fn upsert_vision_analysis_cache(

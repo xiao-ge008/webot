@@ -3,6 +3,7 @@ pub mod component_center;
 pub mod config;
 pub mod error;
 pub mod image_generation;
+pub mod media_index;
 pub mod openfang;
 pub mod path_resolver;
 pub mod routes;
