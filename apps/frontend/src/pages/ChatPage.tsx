@@ -2363,6 +2363,7 @@ interface AgentDirectoryItem {
     name: string;
     aliases: string[];
     avatarUrl?: string;
+    portraitUrl?: string;
     color?: string;
 }
 

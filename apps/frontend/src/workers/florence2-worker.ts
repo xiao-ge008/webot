@@ -33,9 +33,22 @@ type WorkerResponse =
 
 type FlorenceSingleton = {
   tokenizer: Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
-  processor: Awaited<ReturnType<typeof AutoProcessor.from_pretrained>>;
+  processor: FlorenceProcessor;
   model: Awaited<ReturnType<typeof Florence2ForConditionalGeneration.from_pretrained>>;
 };
+
+type FlorenceProcessor = Awaited<ReturnType<typeof AutoProcessor.from_pretrained>> & {
+  construct_prompts(text: string | string[]): string[];
+  post_process_generation(
+    text: string,
+    task: string,
+    imageSize: [number, number],
+  ): unknown;
+};
+
+type DecodableSequences = Parameters<
+  Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>["batch_decode"]
+>[0];
 
 const PROVIDER_NAME = "florence2";
 
@@ -75,7 +88,8 @@ class FlorenceSingletonLoader {
         device,
       },
     );
-    const processor = await AutoProcessor.from_pretrained(modelId);
+    const processor =
+      (await AutoProcessor.from_pretrained(modelId)) as FlorenceProcessor;
     const tokenizer = await AutoTokenizer.from_pretrained(modelId);
 
     if (hasWebGpu) {
@@ -120,6 +134,15 @@ function extractSummary(taskPrompt: string, processed: unknown, fallback: string
   return fallback.trim();
 }
 
+function extractGeneratedSequences(
+  output: Awaited<ReturnType<FlorenceSingleton["model"]["generate"]>>,
+): DecodableSequences {
+  if (output && typeof output === "object" && "sequences" in output) {
+    return (output as { sequences: DecodableSequences }).sequences;
+  }
+  return output as DecodableSequences;
+}
+
 async function analyze(
   request: Extract<WorkerRequest, { type: "analyze" }>,
 ): Promise<WorkerResponse> {
@@ -134,9 +157,12 @@ async function analyze(
       ...visionInputs,
       max_new_tokens: 256,
     });
-    const generatedText = singleton.tokenizer.batch_decode(generatedIds, {
+    const generatedText = singleton.tokenizer.batch_decode(
+      extractGeneratedSequences(generatedIds),
+      {
       skip_special_tokens: false,
-    })[0];
+      },
+    )[0];
     const processed = singleton.processor.post_process_generation(
       generatedText,
       request.taskPrompt,
