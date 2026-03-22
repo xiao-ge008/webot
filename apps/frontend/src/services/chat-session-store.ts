@@ -22,6 +22,7 @@ export interface StoredChatSession {
     lastUserIntent?: string;
     updatedAt: string;
   };
+  contextDigestManual?: boolean;
   lastCompactedAt?: string;
   groupRuntime?: GroupSessionRuntime;
   sessionLabel?: string;
@@ -223,7 +224,13 @@ function normalizeGroupRuntime(raw: unknown): GroupSessionRuntime | undefined {
     stopReason: typeof item.stopReason === 'string' && item.stopReason.trim() ? item.stopReason.trim() : undefined,
     lastCompactedAt: typeof item.lastCompactedAt === 'string' && item.lastCompactedAt.trim() ? item.lastCompactedAt.trim() : undefined,
     lastEventAt: typeof item.lastEventAt === 'string' && item.lastEventAt.trim() ? item.lastEventAt.trim() : undefined,
+    memoryDigestManual: item.memoryDigestManual === true,
     memoryDigest: normalizeGroupMemoryDigest(item.memoryDigest),
+    agentContextDigestsManualIds: Array.isArray(item.agentContextDigestsManualIds)
+      ? item.agentContextDigestsManualIds
+        .filter((row): row is string => typeof row === 'string' && row.trim().length > 0)
+        .map((row) => row.trim())
+      : undefined,
     agentContextDigests: isRecord(item.agentContextDigests)
       ? Object.fromEntries(
         Object.entries(item.agentContextDigests)
@@ -239,7 +246,9 @@ function cloneGroupRuntime(runtime?: GroupSessionRuntime): GroupSessionRuntime |
   return {
     ...runtime,
     queue: runtime.queue.map((item) => ({ ...item })),
+    memoryDigestManual: runtime.memoryDigestManual === true,
     memoryDigest: runtime.memoryDigest ? { ...runtime.memoryDigest } : undefined,
+    agentContextDigestsManualIds: runtime.agentContextDigestsManualIds ? [...runtime.agentContextDigestsManualIds] : undefined,
     agentContextDigests: runtime.agentContextDigests
       ? Object.fromEntries(
         Object.entries(runtime.agentContextDigests).map(([agentId, digest]) => [agentId, { ...digest }]),
@@ -281,6 +290,10 @@ function normalizeAttachment(raw: unknown, index: number): ChatAttachment | null
     mimeType: typeof item.mimeType === 'string' ? item.mimeType : undefined,
     size: typeof item.size === 'number' && Number.isFinite(item.size) ? item.size : undefined,
     upstreamFileId: typeof item.upstreamFileId === 'string' ? item.upstreamFileId : undefined,
+    sha256: typeof item.sha256 === 'string' ? item.sha256 : undefined,
+    localVisionSummary: typeof item.localVisionSummary === 'string' ? item.localVisionSummary : undefined,
+    localVisionProvider: typeof item.localVisionProvider === 'string' ? item.localVisionProvider : undefined,
+    localVisionModel: typeof item.localVisionModel === 'string' ? item.localVisionModel : undefined,
   };
 }
 
@@ -647,6 +660,7 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
     ? Math.max(0, Math.floor(item.remoteContextOffset))
     : undefined;
   const contextDigest = normalizeContextDigest(item.contextDigest);
+  const contextDigestManual = item.contextDigestManual === true;
   const lastCompactedAt = typeof item.lastCompactedAt === 'string' && item.lastCompactedAt.trim()
     ? item.lastCompactedAt.trim()
     : undefined;
@@ -678,6 +692,7 @@ function normalizeSession(raw: unknown, index: number): StoredChatSession {
     remoteSessionOwnerAgentId,
     remoteContextOffset,
     contextDigest,
+    contextDigestManual: contextDigestManual || undefined,
     lastCompactedAt,
     groupRuntime,
     sessionLabel,
@@ -787,6 +802,7 @@ function cloneState(state: StoredAgentChatState): StoredAgentChatState {
       ...session,
       messages: session.messages.map((message) => cloneMessage(message)),
       contextDigest: session.contextDigest ? { ...session.contextDigest } : undefined,
+      contextDigestManual: session.contextDigestManual,
       lastCompactedAt: session.lastCompactedAt,
       groupRuntime: cloneGroupRuntime(session.groupRuntime),
     })),

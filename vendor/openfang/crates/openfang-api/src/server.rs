@@ -487,6 +487,10 @@ pub async fn build_router(
             axum::routing::delete(routes::delete_session),
         )
         .route(
+            "/api/sessions/{id}/content",
+            axum::routing::put(routes::replace_session_content),
+        )
+        .route(
             "/api/sessions/{id}/label",
             axum::routing::put(routes::set_session_label),
         )
@@ -513,7 +517,7 @@ pub async fn build_router(
         )
         .route(
             "/api/models/custom/{*id}",
-            axum::routing::delete(routes::remove_custom_model),
+            axum::routing::delete(routes::remove_custom_model).patch(routes::update_custom_model),
         )
         .route("/api/models/{*id}", axum::routing::get(routes::get_model))
         .route("/api/providers", axum::routing::get(routes::list_providers))

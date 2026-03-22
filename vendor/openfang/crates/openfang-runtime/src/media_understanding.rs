@@ -4,10 +4,10 @@
 
 use crate::drivers;
 use crate::llm_driver::DriverConfig;
+use openfang_types::config::{FallbackProviderConfig, ProviderConfigEntry};
 use openfang_types::media::{
     MediaAttachment, MediaConfig, MediaSource, MediaType, MediaUnderstanding,
 };
-use openfang_types::config::{FallbackProviderConfig, ProviderConfigEntry};
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -42,6 +42,8 @@ impl MediaEngine {
         &self,
         attachment: &MediaAttachment,
     ) -> Result<MediaUnderstanding, String> {
+        use base64::Engine;
+
         attachment.validate()?;
         if attachment.media_type != MediaType::Image {
             return Err("Expected image attachment".into());
@@ -49,16 +51,54 @@ impl MediaEngine {
 
         let _permit = self.semaphore.acquire().await.map_err(|e| e.to_string())?;
 
+        let maybe_cached = match &attachment.source {
+            MediaSource::Base64 { data, .. } => base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()
+                .and_then(|bytes| {
+                    crate::local_vision::cached_understanding_for_image_bytes(
+                        attachment.mime_type.as_str(),
+                        &bytes,
+                    )
+                }),
+            MediaSource::FilePath { path } => tokio::fs::read(path).await.ok().and_then(|bytes| {
+                crate::local_vision::cached_understanding_for_image_bytes(
+                    attachment.mime_type.as_str(),
+                    &bytes,
+                )
+            }),
+            MediaSource::Url { .. } => None,
+        };
+        if let Some(understanding) = maybe_cached {
+            return Ok(understanding);
+        }
+
+        let prompt = "请准确分析这张图片，逐字提取可见文本、数字、图表信息，不要猜测未看到的内容。";
+        let mut errors = Vec::new();
+        if let MediaSource::FilePath { path } = &attachment.source {
+            match crate::local_vision::analyze_image_path_with_local_service(
+                std::path::Path::new(path),
+                attachment.mime_type.as_str(),
+                Some(prompt),
+            )
+            .await
+            {
+                Ok(Some(understanding)) => return Ok(understanding),
+                Ok(None) => {}
+                Err(err) => errors.push(format!("Local Florence-2 path failed: {err}")),
+            }
+        }
+
         let candidates = self.resolve_vision_candidates();
         if candidates.is_empty() {
+            if !errors.is_empty() {
+                return Err(errors.join(" | "));
+            }
             return Err(
                 "No vision-capable LLM provider configured. Configure [[fallback_providers]] or set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY"
                     .into(),
             );
         }
-
-        let mut errors = Vec::new();
-        let prompt = "请准确分析这张图片，逐字提取可见文本、数字、图表信息，不要猜测未看到的内容。";
         let (media_type, data) = match &attachment.source {
             MediaSource::Base64 { data, mime_type } => (mime_type.as_str(), data.clone()),
             MediaSource::FilePath { path } => {
@@ -72,12 +112,18 @@ impl MediaEngine {
                 )
             }
             MediaSource::Url { url } => {
-                return Err(format!("URL-based image source not supported for vision: {}", url));
+                return Err(format!(
+                    "URL-based image source not supported for vision: {}",
+                    url
+                ));
             }
         };
 
         for candidate in candidates {
-            match self.describe_image_with_candidate(&candidate, prompt, media_type, &data).await {
+            match self
+                .describe_image_with_candidate(&candidate, prompt, media_type, &data)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(err) => errors.push(err),
             }

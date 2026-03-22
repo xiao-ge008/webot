@@ -5,6 +5,7 @@ import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import {
   Select,
   SelectContent,
@@ -13,7 +14,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
-import { Circle, RefreshCw, Search } from 'lucide-react';
+import { Circle, Eye, EyeOff, RefreshCw, Search } from 'lucide-react';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import {
   listManagementModels,
@@ -22,6 +23,7 @@ import {
   setManagementDefaultModel,
   testManagementModelConnection,
   toggleManagementModelEnabled,
+  updateManagementCustomModelVision,
   type ManagementModelsPayload,
   type ManagementModelOption,
   type ProviderConfigItem,
@@ -49,6 +51,7 @@ export function ModelsTab() {
     hasSavedConfig: boolean;
   }[]>([]);
   const [models, setModels] = useState<ManagementModelOption[]>([]);
+  const [providerConfigs, setProviderConfigs] = useState<ProviderConfigItem[]>([]);
   const [modelsMeta, setModelsMeta] = useState<Pick<ManagementModelsPayload, 'defaultModelId' | 'defaultModelValid' | 'defaultModelReason'>>({
     defaultModelId: undefined,
     defaultModelValid: true,
@@ -84,6 +87,7 @@ export function ModelsTab() {
           hasSavedConfig: configMap.has(item.providerId),
         })),
       );
+      setProviderConfigs(providerConfigRows);
       setModels(modelRows.models);
       setModelsMeta({
         defaultModelId: modelRows.defaultModelId,
@@ -133,6 +137,9 @@ export function ModelsTab() {
   const providerMap = useMemo(() => {
     return new Map(providers.map((item) => [item.providerId, item.displayName]));
   }, [providers]);
+  const providerConfigMap = useMemo(() => {
+    return new Map(providerConfigs.map((item) => [item.provider_id, item]));
+  }, [providerConfigs]);
 
   const providerEnabledMap = useMemo(() => {
     return new Map(providers.map((item) => [item.providerId, item.enabled]));
@@ -181,6 +188,19 @@ export function ModelsTab() {
     }
     return [];
   }, [selectedProviderId]);
+
+  const canEditVision = (model: ManagementModelOption) => {
+    if (model.source === 'custom' || model.source === 'local') {
+      return true;
+    }
+    const providerConfig = providerConfigMap.get(model.providerId);
+    if (!providerConfig) {
+      return false;
+    }
+    return providerConfig.models.some(
+      (item) => item.trim().toLowerCase() === model.modelName.trim().toLowerCase(),
+    );
+  };
 
   const handleSetDefault = async (modelId: string) => {
     const prev = models;
@@ -249,6 +269,44 @@ export function ModelsTab() {
     } catch (error) {
       console.error('[Settings][Models] 刷新全部失败:', error);
       alert(t('settings.models.refreshFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleToggleModelVision = async (model: ManagementModelOption) => {
+    if (!canEditVision(model)) {
+      return;
+    }
+    const nextSupportsVision = !model.supportsVision;
+    const prev = models;
+    setModels((current) =>
+      current.map((item) =>
+        item.modelId === model.modelId
+          ? {
+              ...item,
+              supportsVision: nextSupportsVision,
+            }
+          : item,
+      ),
+    );
+    setActionLoading(`vision:${model.modelId}`);
+    try {
+      await updateManagementCustomModelVision({
+        modelId: model.modelId,
+        providerId: model.providerId,
+        modelName: model.modelName,
+        supportsVision: nextSupportsVision,
+      });
+    } catch (error) {
+      console.error('[Settings][Models] 更新视觉能力失败:', error);
+      setModels(prev);
+      const message = error instanceof Error ? error.message : '视觉能力更新失败';
+      pushInAppNotice({
+        title: '视觉能力更新失败',
+        message,
+        level: 'error',
+      });
     } finally {
       setActionLoading(null);
     }
@@ -395,6 +453,19 @@ export function ModelsTab() {
                   <div className="bg-background-secondary/30 rounded-xl overflow-hidden border border-border-light/50">
                     {providerModels.map((model, index) => {
                       const testStatus = testStatusMap[model.modelId];
+                      const canToggleVision = canEditVision(model);
+                      const visionActionKey = `vision:${model.modelId}`;
+                      const modelBusy =
+                        actionLoading === model.modelId ||
+                        actionLoading === visionActionKey ||
+                        testingModelId === model.modelId;
+                      const visionTooltip = canToggleVision
+                        ? model.supportsVision
+                          ? '已开启视觉支持，点击关闭'
+                          : '已关闭视觉支持，点击开启'
+                        : model.supportsVision
+                          ? '该模型支持视觉，但当前不是可编辑的本地配置模型'
+                          : '只有你自己配置的模型才可以在这里修改视觉支持';
                       return (
                         <div
                           key={model.modelId}
@@ -424,6 +495,35 @@ export function ModelsTab() {
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
+                            <TooltipProvider delayDuration={120}>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className={cn(
+                                        'h-8 w-8 p-0 rounded-full border border-transparent',
+                                        model.supportsVision
+                                          ? 'text-sky-600 bg-sky-500/10 hover:bg-sky-500/15'
+                                          : 'text-foreground-tertiary hover:text-foreground hover:bg-background-secondary/60',
+                                        !canToggleVision && 'opacity-70 cursor-default',
+                                      )}
+                                      onClick={() => handleToggleModelVision(model)}
+                                      disabled={!canToggleVision || modelBusy}
+                                      aria-label={model.supportsVision ? '关闭视觉支持' : '开启视觉支持'}
+                                    >
+                                      {model.supportsVision ? (
+                                        <Eye className="w-4 h-4" />
+                                      ) : (
+                                        <EyeOff className="w-4 h-4" />
+                                      )}
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">{visionTooltip}</TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
                             <Button
                               variant="outline"
                               size="sm"
@@ -432,7 +532,7 @@ export function ModelsTab() {
                                 testStatus && !testStatus.ok && 'border-destructive/40 text-destructive hover:text-destructive',
                               )}
                               onClick={() => handleTestModel(model)}
-                              disabled={testingModelId === model.modelId}
+                              disabled={modelBusy}
                               title={testStatus && !testStatus.ok ? testStatus.message : '测试模型连接'}
                             >
                               <RefreshCw className={cn('w-3.5 h-3.5 mr-1', testingModelId === model.modelId && 'animate-spin')} />
@@ -444,7 +544,7 @@ export function ModelsTab() {
                                 size="sm"
                                 className="h-7 px-2.5"
                                 onClick={() => handleSetDefault(model.modelId)}
-                                disabled={actionLoading === model.modelId || testingModelId === model.modelId}
+                                disabled={modelBusy}
                               >
                                 {t('settings.models.setDefault')}
                               </Button>
@@ -453,7 +553,7 @@ export function ModelsTab() {
                               checked={model.enabled}
                               onCheckedChange={(checked) => handleToggleModel(model.modelId, checked)}
                               className="data-[state=checked]:bg-accent"
-                              disabled={actionLoading === model.modelId || testingModelId === model.modelId}
+                              disabled={modelBusy}
                             />
                           </div>
                         </div>

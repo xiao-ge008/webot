@@ -14,6 +14,7 @@ import { AgentAvatar } from '@/components/ui/agent-avatar';
 import { ChatPage } from '@/pages/ChatPage';
 import { deleteChatGroup, getChatGroup, updateChatGroup } from '@/services/group-client';
 import { listManagementAgents } from '@/services/management-client';
+import { subscribeAgentAppearanceUpdated } from '@/services/agent-appearance-events';
 import { chatRuntimeStore, useChatRuntimeSelector } from '@/services/chat-runtime-store';
 import type { StoredChatSession } from '@/services/chat-session-store';
 import { buildInitialMessages, generateId, mapManagementAgentToUi } from '@/components/chat/chat-page-helpers';
@@ -21,7 +22,7 @@ import type { Message } from '@/data/mock-chats';
 import { cn } from '@/lib/utils';
 import { DEFAULT_GROUP_LIMITS, type ChatGroup, type ChatGroupLimits, type ChatGroupMode, type GroupAgentContextDigest, type GroupMemoryDigest, type GroupSessionRuntime } from '@/types/group';
 import type { Agent } from '@/types';
-import { ChevronLeft, ChevronRight, Info, MessageCircle, Plus, Search, Settings, ListChecks, Users, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Info, MessageCircle, Plus, Search, Settings, ListChecks, Files, Users, X } from 'lucide-react';
 
 const MEMBER_DIRECTORY_CACHE_TTL_MS = 60_000;
 let memberDirectoryCache: Map<string, Agent> | null = null;
@@ -180,6 +181,8 @@ function normalizeGroupRuntimeValue(runtime: GroupSessionRuntime | undefined, le
         leaderAgentId: (runtime?.leaderAgentId || leaderAgentId || '').trim() || undefined,
         queue: Array.isArray(runtime?.queue) ? runtime!.queue.slice(-18) : [],
         stopRequested: runtime?.stopRequested === true,
+        memoryDigestManual: runtime?.memoryDigestManual === true,
+        agentContextDigestsManualIds: runtime?.agentContextDigestsManualIds ? [...runtime.agentContextDigestsManualIds] : undefined,
         agentContextDigests: runtime?.agentContextDigests
             ? Object.fromEntries(
                 Object.entries(runtime.agentContextDigests)
@@ -507,6 +510,35 @@ async function loadMemberDirectoryCached(force = false): Promise<Map<string, Age
     }
 }
 
+function patchMemberAppearanceInDirectory(
+    directory: Map<string, Agent>,
+    payload: { agentId: string; avatarUrl?: string; portraitUrl?: string },
+): Map<string, Agent> {
+    const agentId = payload.agentId.trim();
+    if (!agentId) {
+        return directory;
+    }
+    const hit = directory.get(agentId);
+    if (!hit) {
+        return directory;
+    }
+    const nextAvatarUrl = payload.avatarUrl?.trim() || undefined;
+    const nextPortraitUrl = payload.portraitUrl?.trim() || undefined;
+    if (!nextAvatarUrl && !nextPortraitUrl) {
+        return directory;
+    }
+    if (nextAvatarUrl === hit.avatarUrl && nextPortraitUrl === hit.portraitUrl) {
+        return directory;
+    }
+    const next = new Map(directory);
+    next.set(agentId, {
+        ...hit,
+        avatarUrl: nextAvatarUrl ?? hit.avatarUrl,
+        portraitUrl: nextPortraitUrl ?? hit.portraitUrl,
+    });
+    return next;
+}
+
 export function GroupChatPage() {
     const { id } = useParams();
     const { t } = useTranslation();
@@ -744,6 +776,59 @@ export function GroupChatPage() {
         });
     }, [memberDirectory, mentionDirectory, runtimeKey]);
 
+    useEffect(() => {
+        return subscribeAgentAppearanceUpdated((payload) => {
+            if (!group || !runtimeKey) {
+                return;
+            }
+            if (!group.memberAgentIds.includes(payload.agentId)) {
+                return;
+            }
+
+            setMemberDirectory((prev) => {
+                const next = patchMemberAppearanceInDirectory(prev, payload);
+                if (next === prev) {
+                    return prev;
+                }
+                memberDirectoryCache = next;
+                memberDirectoryCacheAt = Date.now();
+                return next;
+            });
+
+            chatRuntimeStore.updateSessions(runtimeKey, (prev) => {
+                let changed = false;
+                const nextSessions = prev.map((session) => {
+                    let sessionChanged = false;
+                    const nextMessages = session.messages.map((msg) => {
+                        if (msg.role !== 'agent' || (msg.agentId || '').trim() !== payload.agentId) {
+                            return msg;
+                        }
+                        const nextAvatarUrl = payload.avatarUrl?.trim() || msg.agentAvatarUrl;
+                        const nextPortraitUrl = payload.portraitUrl?.trim() || msg.agentPortraitUrl;
+                        if (nextAvatarUrl === msg.agentAvatarUrl && nextPortraitUrl === msg.agentPortraitUrl) {
+                            return msg;
+                        }
+                        sessionChanged = true;
+                        changed = true;
+                        return {
+                            ...msg,
+                            agentAvatarUrl: nextAvatarUrl,
+                            agentPortraitUrl: nextPortraitUrl,
+                        };
+                    });
+                    if (!sessionChanged) {
+                        return session;
+                    }
+                    return {
+                        ...session,
+                        messages: nextMessages,
+                    };
+                });
+                return changed ? nextSessions : prev;
+            });
+        });
+    }, [group, runtimeKey]);
+
     const [settingsName, setSettingsName] = useState('');
     const [settingsDescription, setSettingsDescription] = useState('');
     const [settingsTagsText, setSettingsTagsText] = useState('');
@@ -891,13 +976,26 @@ export function GroupChatPage() {
         if (!runtimeKey || !group || !activeSessionId || !activeSession) {
             return;
         }
-        const nextDigest = buildGroupMemoryDigest(activeSession.messages, activeGroupRuntime);
+        const nextDigest = activeSession.groupRuntime?.memoryDigestManual
+            ? activeSession.groupRuntime?.memoryDigest
+            : buildGroupMemoryDigest(activeSession.messages, activeGroupRuntime);
         const nextAgentDigests = buildGroupAgentContextDigests(activeSession.messages, activeGroupRuntime, groupMembers);
         const currentDigest = activeSession.groupRuntime?.memoryDigest;
         const currentAgentDigests = activeSession.groupRuntime?.agentContextDigests;
+        const manualIds = new Set(activeSession.groupRuntime?.agentContextDigestsManualIds ?? []);
+        const mergedAgentDigests = currentAgentDigests
+            ? { ...currentAgentDigests }
+            : {};
+        for (const [agentId, digest] of Object.entries(nextAgentDigests ?? {})) {
+            if (manualIds.has(agentId)) {
+                continue;
+            }
+            mergedAgentDigests[agentId] = digest;
+        }
+        const normalizedNextAgentDigests = Object.keys(mergedAgentDigests).length > 0 ? mergedAgentDigests : undefined;
         if (
             sameGroupMemoryDigestContent(nextDigest, currentDigest)
-            && sameGroupAgentContextDigestMap(nextAgentDigests, currentAgentDigests)
+            && sameGroupAgentContextDigestMap(normalizedNextAgentDigests, currentAgentDigests)
         ) {
             return;
         }
@@ -908,7 +1006,7 @@ export function GroupChatPage() {
                 groupRuntime: {
                     ...normalizeGroupRuntimeValue(session.groupRuntime, group.leaderAgentId),
                     memoryDigest: nextDigest,
-                    agentContextDigests: nextAgentDigests,
+                    agentContextDigests: normalizedNextAgentDigests,
                 },
             };
         }));
@@ -1723,6 +1821,16 @@ export function GroupChatPage() {
                                             size="icon"
                                             variant="secondary"
                                             className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="上下文管理"
+                                            onClick={() => navigate(`/group-chat/${encodeURIComponent(group.groupId)}/context?sessionId=${encodeURIComponent(activeSessionId)}&runtimeKey=${encodeURIComponent(runtimeKey)}&sessionOwnerAgentId=${encodeURIComponent(group.leaderAgentId)}`)}
+                                        >
+                                            <Files className="h-4 w-4" />
+                                        </Button>
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
                                             title="私聊该智能体"
                                             onClick={() => navigate(`/chat/${speaker.id}`)}
                                         >
@@ -1764,6 +1872,16 @@ export function GroupChatPage() {
                             {speaker?.id ? (
                                 <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-end bg-gradient-to-t from-black/55 via-black/15 to-transparent px-3 pb-3 pt-10 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
                                     <div className="pointer-events-auto flex items-center gap-2">
+                                        <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="secondary"
+                                            className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                            title="上下文管理"
+                                            onClick={() => navigate(`/group-chat/${encodeURIComponent(group.groupId)}/context?sessionId=${encodeURIComponent(activeSessionId)}&runtimeKey=${encodeURIComponent(runtimeKey)}&sessionOwnerAgentId=${encodeURIComponent(group.leaderAgentId)}`)}
+                                        >
+                                            <Files className="h-4 w-4" />
+                                        </Button>
                                         <Button
                                             type="button"
                                             size="icon"

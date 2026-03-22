@@ -89,6 +89,13 @@ function shouldResolveBackendRelativeImage(url: string): boolean {
   return value.startsWith('/') || value.startsWith('api/');
 }
 
+function shouldUseOpenFangBaseForImage(url: string): boolean {
+  const value = url.trim().toLowerCase();
+  return value.startsWith('/api/uploads/')
+    || value.startsWith('api/uploads/')
+    || /^https?:\/\/.+\/api\/uploads\//.test(value);
+}
+
 function buildImageProxyUrl(baseUrl: string, rawUrl: string): string {
   return `${baseUrl}/api/management/media/image-proxy?url=${encodeURIComponent(rawUrl)}`;
 }
@@ -97,6 +104,11 @@ function buildBackendImageUrl(baseUrl: string, rawPath: string): string {
   const normalizedBase = baseUrl.replace(/\/+$/, '');
   const normalizedPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
   return `${normalizedBase}${normalizedPath}`;
+}
+
+function buildOpenFangUploadProxyUrl(apiBaseUrl: string, source: string): string {
+  const normalizedBase = apiBaseUrl.replace(/\/+$/, '');
+  return `${normalizedBase}/api/management/media/openfang-upload?source=${encodeURIComponent(source)}`;
 }
 
 function useResolvedImageSrc(src: string): string {
@@ -114,6 +126,23 @@ function useResolvedImageSrc(src: string): string {
 
     if (!shouldProxyRemoteImage(raw) && !shouldResolveBackendRelativeImage(raw)) {
       setResolved(src);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (shouldUseOpenFangBaseForImage(raw)) {
+      getApiBaseUrl()
+        .then((apiBaseUrl) => {
+          if (cancelled) return;
+          // OpenFang uploads are more stable through the local management relay.
+          setResolved(buildOpenFangUploadProxyUrl(apiBaseUrl, raw));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setResolved(src);
+        });
+
       return () => {
         cancelled = true;
       };
@@ -960,6 +989,7 @@ function ComponentImageGallery({
 export function GenUIComponentImageCard(ctx: any) {
   const props = (ctx?.props && typeof ctx.props === 'object') ? ctx.props as Record<string, unknown> : {};
   const componentName = toSafeText(props.componentName) || toSafeText(props.englishName) || toSafeText(props.skillName);
+  const fallbackImages = React.useMemo(() => normalizeGalleryItems(props), [props]);
   const initialValues = (props.initialValues && typeof props.initialValues === 'object' && !Array.isArray(props.initialValues))
     ? props.initialValues as Record<string, unknown>
     : {};
@@ -1207,7 +1237,19 @@ export function GenUIComponentImageCard(ctx: any) {
   const effectiveDescription = description || definition?.description || '';
 
   if (!componentName) {
-    return <div className="p-2 text-sm text-destructive">组件配置缺少 `componentName`。</div>;
+    if (fallbackImages.length > 0) {
+      return (
+        <div className={cn('group relative', IMAGE_CARD_STAGE_MIN_HEIGHT)}>
+          <ComponentImageGallery
+            images={fallbackImages}
+            onOpen={() => {
+              // 静态降级卡只负责展示，不弹出组件设置态。
+            }}
+          />
+        </div>
+      );
+    }
+    return null;
   }
 
   if (loading) {
@@ -1415,7 +1457,7 @@ export function GenUIImageCover(ctx: any) {
         }}
         onClick={() => handleClick(item, 0)}
       >
-        <img
+        <ProxyImage
           src={item.src}
           alt={item.alt}
           className="h-full w-full transition-transform duration-300 group-hover:scale-[1.02]"
@@ -1585,7 +1627,7 @@ export function GenUIImageAlbum(ctx: any) {
             style={{ aspectRatio: `${ratio}` }}
             onClick={() => handleClick(item, index)}
           >
-            <img
+            <ProxyImage
               src={item.src}
               alt={item.alt}
               className="h-full w-full transition-transform duration-300 group-hover:scale-[1.03]"

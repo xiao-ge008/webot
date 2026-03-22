@@ -1193,6 +1193,20 @@ pub fn set_provider_enabled(provider_id: &str, enabled: bool) -> Result<(), Stri
     Ok(())
 }
 
+pub fn delete_provider_toggle(provider_id: &str) -> Result<(), String> {
+    let provider_id = normalize_provider_id(provider_id);
+    if provider_id.is_empty() {
+        return Ok(());
+    }
+    let conn = open_conn()?;
+    conn.execute(
+        "DELETE FROM provider_toggles WHERE provider_id = ?1",
+        params![provider_id],
+    )
+    .map_err(|e| format!("删除 provider 开关失败: {e}"))?;
+    Ok(())
+}
+
 pub fn list_provider_enabled_map() -> Result<HashMap<String, bool>, String> {
     let conn = open_conn()?;
     let mut stmt = conn
@@ -1233,6 +1247,19 @@ pub fn set_model_enabled(model_id: &str, enabled: bool) -> Result<(), String> {
     )
     .map_err(|e| format!("写入 model 开关失败: {e}"))?;
     Ok(())
+}
+
+pub fn delete_model_toggles_by_provider(provider_id: &str) -> Result<usize, String> {
+    let provider_id = normalize_provider_id(provider_id);
+    if provider_id.is_empty() {
+        return Ok(0);
+    }
+    let conn = open_conn()?;
+    conn.execute(
+        "DELETE FROM model_toggles WHERE lower(model_id) LIKE lower(?1 || '::%')",
+        params![provider_id],
+    )
+    .map_err(|e| format!("删除 provider 关联 model 开关失败: {e}"))
 }
 
 pub fn list_model_enabled_map() -> Result<HashMap<String, bool>, String> {

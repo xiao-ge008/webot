@@ -15,8 +15,11 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::io::{BufRead, BufReader};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 /// Shared application state.
@@ -184,11 +187,15 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(agents)
 }
 
-/// Resolve uploaded file attachments into ContentBlock::Image blocks.
+/// Resolve uploaded file attachments into image blocks.
 ///
-/// Reads each file from the upload directory, base64-encodes it, and
-/// returns image content blocks ready to insert into a session message.
-pub fn resolve_attachments(
+/// The primary local-vision path is handled on the frontend: the image is only
+/// uploaded at first, and local Florence-2 analysis is executed when the user
+/// actually sends the message. If that send-time analysis succeeds, the
+/// frontend injects the local-vision text into the user message and does not
+/// send the image again as an attachment. Only unresolved images should reach
+/// this path.
+pub fn resolve_image_attachments(
     attachments: &[AttachmentRef],
 ) -> Vec<openfang_types::message::ContentBlock> {
     use base64::Engine;
@@ -307,7 +314,7 @@ pub async fn send_message(
 
     // Resolve file attachments into image content blocks
     if !req.attachments.is_empty() {
-        let image_blocks = resolve_attachments(&req.attachments);
+        let image_blocks = resolve_image_attachments(&req.attachments);
         if !image_blocks.is_empty() {
             inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
         }
@@ -1049,6 +1056,15 @@ pub async fn send_message_stream(
             Json(serde_json::json!({"error": "Agent not found"})),
         )
             .into_response();
+    }
+
+    // Resolve file attachments into image content blocks before the streaming
+    // turn starts so the model sees the same context as the non-streaming route.
+    if !req.attachments.is_empty() {
+        let image_blocks = resolve_image_attachments(&req.attachments);
+        if !image_blocks.is_empty() {
+            inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
+        }
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
@@ -4695,12 +4711,29 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
         .iter()
         .map(|s| {
             let transport = match &s.transport {
-                openfang_types::config::McpTransportEntry::Stdio { command, args } => {
-                    serde_json::json!({
-                        "type": "stdio",
-                        "command": command,
-                        "args": args,
-                    })
+                openfang_types::config::McpTransportEntry::Stdio { command, args, cwd } => {
+                    let mut transport = serde_json::Map::new();
+                    transport.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("stdio".to_string()),
+                    );
+                    transport.insert(
+                        "command".to_string(),
+                        serde_json::Value::String(command.clone()),
+                    );
+                    transport.insert(
+                        "args".to_string(),
+                        serde_json::Value::Array(
+                            args.iter()
+                                .cloned()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                    if let Some(cwd) = cwd.as_ref().filter(|value| !value.trim().is_empty()) {
+                        transport.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
+                    }
+                    serde_json::Value::Object(transport)
                 }
                 openfang_types::config::McpTransportEntry::Sse { url } => {
                     serde_json::json!({
@@ -5358,6 +5391,143 @@ pub async fn delete_session(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EditableSessionMessageRequest {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplaceSessionContentRequest {
+    #[serde(default)]
+    pub messages: Vec<EditableSessionMessageRequest>,
+    pub label: Option<String>,
+    pub context_window_tokens: Option<u64>,
+}
+
+fn parse_editable_session_role(raw: &str) -> Option<openfang_types::message::Role> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "system" => Some(openfang_types::message::Role::System),
+        "user" => Some(openfang_types::message::Role::User),
+        "assistant" | "agent" => Some(openfang_types::message::Role::Assistant),
+        _ => None,
+    }
+}
+
+fn estimate_session_context_window_tokens(messages: &[openfang_types::message::Message]) -> u64 {
+    let total_chars: usize = messages
+        .iter()
+        .map(|message| message.content.text_length())
+        .sum();
+    ((total_chars as u64) / 4).max(1)
+}
+
+/// PUT /api/sessions/:id/content — Replace session messages.
+pub async fn replace_session_content(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ReplaceSessionContentRequest>,
+) -> impl IntoResponse {
+    let session_id = match id.parse::<uuid::Uuid>() {
+        Ok(u) => openfang_types::agent::SessionId(u),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid session ID"})),
+            );
+        }
+    };
+
+    if let Some(label) = req
+        .label
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Err(err) = openfang_types::agent::SessionLabel::new(label) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": err.to_string()})),
+            );
+        }
+    }
+
+    let Some(mut session) = (match state.kernel.memory.get_session(session_id) {
+        Ok(found) => found,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            );
+        }
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        );
+    };
+
+    let mut next_messages = Vec::with_capacity(req.messages.len());
+    for (index, item) in req.messages.iter().enumerate() {
+        let Some(role) = parse_editable_session_role(&item.role) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid role at messages[{index}]"),
+                })),
+            );
+        };
+        let content = item.content.trim().to_string();
+        if content.is_empty() {
+            continue;
+        }
+        next_messages.push(openfang_types::message::Message {
+            role,
+            content: openfang_types::message::MessageContent::Text(content),
+        });
+    }
+
+    session.messages = next_messages;
+    if let Some(label) = req.label {
+        let normalized = label.trim().to_string();
+        session.label = if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        };
+    }
+    session.context_window_tokens = req
+        .context_window_tokens
+        .unwrap_or_else(|| estimate_session_context_window_tokens(&session.messages));
+
+    match state.kernel.memory.save_session(&session) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "updated",
+                "session_id": session.id.0.to_string(),
+                "agent_id": session.agent_id.0.to_string(),
+                "message_count": session.messages.len(),
+                "context_window_tokens": session.context_window_tokens,
+                "label": session.label,
+                "messages": session.messages.iter().map(|message| {
+                    serde_json::json!({
+                        "role": match message.role {
+                            openfang_types::message::Role::System => "system",
+                            openfang_types::message::Role::User => "user",
+                            openfang_types::message::Role::Assistant => "assistant",
+                        },
+                        "content": message.content.text_content(),
+                    })
+                }).collect::<Vec<_>>(),
+            })),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
         ),
     }
 }
@@ -6042,17 +6212,27 @@ pub async fn add_custom_model(
 pub async fn remove_custom_model(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(model_id): axum::extract::Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let provider = params
+        .get("provider")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty());
     let mut catalog = state
         .kernel
         .model_catalog
         .write()
         .unwrap_or_else(|e| e.into_inner());
 
-    if !catalog.remove_custom_model(&model_id) {
+    if !catalog.remove_custom_model(&model_id, provider) {
+        let target = provider
+            .map(|value| format!(" for provider '{value}'"))
+            .unwrap_or_default();
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Custom model '{}' not found", model_id)})),
+            Json(
+                serde_json::json!({"error": format!("Custom model '{}'{} not found", model_id, target)}),
+            ),
         );
     }
 
@@ -6064,6 +6244,75 @@ pub async fn remove_custom_model(
     (
         StatusCode::OK,
         Json(serde_json::json!({"status": "removed"})),
+    )
+}
+
+/// PATCH /api/models/custom/{id} — Update capabilities for a custom model.
+pub async fn update_custom_model(
+    State(state): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let provider = body
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if provider.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: provider"})),
+        );
+    }
+
+    let supports_tools = body.get("supports_tools").and_then(|v| v.as_bool());
+    let supports_vision = body.get("supports_vision").and_then(|v| v.as_bool());
+    let supports_streaming = body.get("supports_streaming").and_then(|v| v.as_bool());
+    if supports_tools.is_none() && supports_vision.is_none() && supports_streaming.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "At least one capability field must be provided"})),
+        );
+    }
+
+    let mut catalog = state
+        .kernel
+        .model_catalog
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if !catalog.update_custom_model_capabilities(
+        &model_id,
+        &provider,
+        supports_tools,
+        supports_vision,
+        supports_streaming,
+    ) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::json!({"error": format!("Custom model '{}' not found for provider '{}'", model_id, provider)}),
+            ),
+        );
+    }
+
+    let custom_path = state.kernel.config.home_dir.join("custom_models.json");
+    if let Err(e) = catalog.save_custom_models(&custom_path) {
+        tracing::warn!("Failed to persist custom models: {e}");
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": model_id,
+            "provider": provider,
+            "supports_tools": supports_tools,
+            "supports_vision": supports_vision,
+            "supports_streaming": supports_streaming,
+            "status": "updated"
+        })),
     )
 }
 
@@ -6455,6 +6704,7 @@ pub async fn mcp_http(
             tool_name,
             &arguments,
             Some(&kernel_handle),
+            None,
             None,
             None,
             Some(&skill_snapshot),
@@ -8456,48 +8706,38 @@ pub async fn patch_agent_config(
         }
     }
 
-    // Update model/provider
-    if let Some(ref new_model) = req.model {
-        if !new_model.is_empty() {
-            if let Some(ref new_provider) = req.provider {
-                if !new_provider.is_empty() {
-                    if state
-                        .kernel
-                        .registry
-                        .update_model_and_provider(
-                            agent_id,
-                            new_model.clone(),
-                            new_provider.clone(),
-                        )
-                        .is_err()
-                    {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({"error": "Agent not found"})),
-                        );
-                    }
-                } else if state
-                    .kernel
-                    .registry
-                    .update_model(agent_id, new_model.clone())
-                    .is_err()
-                {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({"error": "Agent not found"})),
-                    );
-                }
-            } else if state
-                .kernel
-                .registry
-                .update_model(agent_id, new_model.clone())
-                .is_err()
-            {
+    // Update model/provider.
+    // Empty strings are treated as an explicit reset so management clients can
+    // revert agents back to the kernel default_model selection.
+    if req.model.is_some() || req.provider.is_some() {
+        let current_entry = match state.kernel.registry.get(agent_id) {
+            Some(entry) => entry,
+            None => {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": "Agent not found"})),
                 );
             }
+        };
+        let target_model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| current_entry.manifest.model.model.clone());
+        let target_provider = req
+            .provider
+            .clone()
+            .unwrap_or_else(|| current_entry.manifest.model.provider.clone());
+
+        if state
+            .kernel
+            .registry
+            .update_model_and_provider(agent_id, target_model, target_provider)
+            .is_err()
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            );
         }
     }
 
@@ -8931,6 +9171,9 @@ struct UploadMeta {
 
 /// In-memory upload metadata registry.
 static UPLOAD_REGISTRY: LazyLock<DashMap<String, UploadMeta>> = LazyLock::new(DashMap::new);
+static PERSISTED_UPLOAD_REGISTRY: LazyLock<DashMap<String, PathBuf>> = LazyLock::new(DashMap::new);
+static PERSISTED_UPLOAD_REGISTRY_INDEXED: LazyLock<Mutex<bool>> =
+    LazyLock::new(|| Mutex::new(false));
 
 /// Maximum upload size: 10 MB.
 const MAX_UPLOAD_SIZE: usize = 10 * 1024 * 1024;
@@ -8942,6 +9185,149 @@ fn is_allowed_content_type(ct: &str) -> bool {
     ALLOWED_CONTENT_TYPES
         .iter()
         .any(|prefix| ct.starts_with(prefix))
+}
+
+fn upload_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("openfang_uploads")
+}
+
+fn extract_local_upload_id(image_url: &str) -> Option<&str> {
+    let trimmed = image_url.trim();
+    trimmed
+        .strip_prefix("/api/uploads/")
+        .or_else(|| trimmed.strip_prefix("api/uploads/"))
+        .filter(|value| !value.is_empty())
+}
+
+fn infer_upload_content_type(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/png",
+    }
+}
+
+fn collect_persisted_upload_mappings_from_tool_result(content: &str) {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
+        return;
+    };
+    let Some(image_urls) = payload
+        .get("image_urls")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    let Some(saved_to) = payload
+        .get("saved_to")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    for (image_url, saved_path) in image_urls.iter().zip(saved_to.iter()) {
+        let Some(image_url) = image_url.as_str() else {
+            continue;
+        };
+        let Some(saved_path) = saved_path.as_str() else {
+            continue;
+        };
+        let Some(file_id) = extract_local_upload_id(image_url) else {
+            continue;
+        };
+        let path = PathBuf::from(saved_path.trim());
+        if path.exists() {
+            PERSISTED_UPLOAD_REGISTRY.insert(file_id.to_string(), path);
+        }
+    }
+}
+
+fn collect_persisted_upload_mappings_from_session_line(line: &str) {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let Some(tool_use_entries) = payload
+        .get("tool_use")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    for entry in tool_use_entries {
+        let Some(content) = entry.get("content").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        collect_persisted_upload_mappings_from_tool_result(content);
+    }
+}
+
+fn index_persisted_upload_mappings_from_dir(dir: &FsPath) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            index_persisted_upload_mappings_from_dir(&path)?;
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let file = std::fs::File::open(&path)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            collect_persisted_upload_mappings_from_session_line(&line);
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_persisted_upload_registry_indexed() {
+    let mut indexed = PERSISTED_UPLOAD_REGISTRY_INDEXED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if *indexed {
+        return;
+    }
+
+    let sessions_root = openfang_kernel::config::openfang_home().join("workspaces");
+    if let Err(err) = index_persisted_upload_mappings_from_dir(&sessions_root) {
+        tracing::warn!(
+            path = %sessions_root.display(),
+            error = %err,
+            "Failed to index persisted upload mappings from session logs"
+        );
+    }
+    *indexed = true;
+}
+
+fn recover_persisted_upload_to_cache(file_id: &str, cache_path: &FsPath) -> Option<PathBuf> {
+    ensure_persisted_upload_registry_indexed();
+    let saved_path = PERSISTED_UPLOAD_REGISTRY.get(file_id)?.clone();
+    if !saved_path.exists() {
+        return None;
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&saved_path, cache_path);
+    Some(saved_path)
 }
 
 /// POST /api/agents/{id}/upload — Upload a file attachment.
@@ -9090,15 +9476,13 @@ pub async fn serve_upload(Path(file_id): Path<String>) -> impl IntoResponse {
         );
     }
 
-    let file_path = std::env::temp_dir().join("openfang_uploads").join(&file_id);
-
-    // Look up metadata from registry; fall back to disk probe for generated images
-    // (image_generate saves files without registering in UPLOAD_REGISTRY).
-    let content_type = match UPLOAD_REGISTRY.get(&file_id) {
-        Some(m) => m.content_type.clone(),
-        None => {
-            // Infer content type from file magic bytes
-            if !file_path.exists() {
+    let file_path = upload_cache_dir().join(&file_id);
+    let resolved_path = if file_path.exists() {
+        file_path.clone()
+    } else {
+        match recover_persisted_upload_to_cache(&file_id, &file_path) {
+            Some(path) => path,
+            None => {
                 return (
                     StatusCode::NOT_FOUND,
                     [(
@@ -9108,11 +9492,17 @@ pub async fn serve_upload(Path(file_id): Path<String>) -> impl IntoResponse {
                     b"{\"error\":\"File not found\"}".to_vec(),
                 );
             }
-            "image/png".to_string()
         }
     };
 
-    match std::fs::read(&file_path) {
+    // Look up metadata from registry; fall back to disk probe for generated images
+    // (image_generate saves files without registering in UPLOAD_REGISTRY).
+    let content_type = match UPLOAD_REGISTRY.get(&file_id) {
+        Some(m) => m.content_type.clone(),
+        None => infer_upload_content_type(&resolved_path).to_string(),
+    };
+
+    match std::fs::read(&resolved_path) {
         Ok(data) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, content_type)],
@@ -9126,6 +9516,33 @@ pub async fn serve_upload(Path(file_id): Path<String>) -> impl IntoResponse {
             )],
             b"{\"error\":\"File not found on disk\"}".to_vec(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod upload_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn test_collect_persisted_upload_mappings_from_tool_result() {
+        let file_id = uuid::Uuid::new_v4().to_string();
+        let image_path = std::env::temp_dir().join(format!("{file_id}.png"));
+        std::fs::write(&image_path, b"png").unwrap();
+
+        let payload = serde_json::json!({
+            "image_urls": [format!("/api/uploads/{file_id}")],
+            "saved_to": [image_path.to_string_lossy().to_string()]
+        });
+        collect_persisted_upload_mappings_from_tool_result(&payload.to_string());
+
+        let restored = PERSISTED_UPLOAD_REGISTRY
+            .get(&file_id)
+            .map(|entry| entry.clone())
+            .expect("expected persisted upload mapping");
+        assert_eq!(restored, image_path);
+
+        let _ = std::fs::remove_file(restored);
+        PERSISTED_UPLOAD_REGISTRY.remove(&file_id);
     }
 }
 

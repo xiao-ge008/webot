@@ -28,6 +28,10 @@ export interface ChatAttachment {
     mimeType?: string;
     size?: number;
     upstreamFileId?: string;
+    sha256?: string;
+    localVisionSummary?: string;
+    localVisionProvider?: string;
+    localVisionModel?: string;
 }
 
 export interface Message {

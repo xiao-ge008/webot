@@ -1151,6 +1151,8 @@ pub enum McpTransportEntry {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// HTTP Server-Sent Events.
     Sse { url: String },

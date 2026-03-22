@@ -246,6 +246,26 @@ pub trait KernelHandle: Send + Sync {
         Err("Current agent model vision is not available".to_string())
     }
 
+    /// Generate an image with the caller agent's current model when that model supports it.
+    async fn generate_image_with_agent_model(
+        &self,
+        agent_id: &str,
+        request: &openfang_types::media::ImageGenRequest,
+    ) -> Result<openfang_types::media::ImageGenResult, String> {
+        let _ = (agent_id, request);
+        Err("Current agent model image generation is not available".to_string())
+    }
+
+    /// Edit an image with the caller agent's current model when that model supports it.
+    async fn edit_image_with_agent_model(
+        &self,
+        agent_id: &str,
+        request: &openfang_types::media::ImageEditRequest,
+    ) -> Result<openfang_types::media::ImageGenResult, String> {
+        let _ = (agent_id, request);
+        Err("Current agent model image editing is not available".to_string())
+    }
+
     /// Spawn an agent with capability inheritance enforcement.
     /// `parent_caps` are the parent's granted capabilities. The kernel MUST verify
     /// that every capability in the child manifest is covered by `parent_caps`.

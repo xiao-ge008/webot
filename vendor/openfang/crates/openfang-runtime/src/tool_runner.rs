@@ -12,6 +12,7 @@ use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
 use std::collections::HashSet;
 use std::future::Future;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -134,6 +135,42 @@ where
     }
 }
 
+async fn dispatch_skill_tool(
+    registry: &SkillRegistry,
+    tool_name: &str,
+    input: &serde_json::Value,
+    allowed_skills: Option<&[String]>,
+) -> Option<Result<String, String>> {
+    let skill =
+        registry.find_tool_provider_for_agent_skills(tool_name, allowed_skills.unwrap_or(&[]))?;
+    debug!(
+        tool = tool_name,
+        skill = %skill.manifest.skill.name,
+        "Dispatching to skill"
+    );
+    Some(
+        match openfang_skills::loader::execute_skill_tool(
+            &skill.manifest,
+            &skill.path,
+            tool_name,
+            input,
+        )
+        .await
+        {
+            Ok(skill_result) => {
+                let content = serde_json::to_string(&skill_result.output)
+                    .unwrap_or_else(|_| skill_result.output.to_string());
+                if skill_result.is_error {
+                    Err(content)
+                } else {
+                    Ok(content)
+                }
+            }
+            Err(e) => Err(format!("Skill execution failed for {tool_name}: {e}")),
+        },
+    )
+}
+
 /// Get the current inter-agent call depth from the task-local context.
 /// Returns 0 if called outside an agent task.
 pub fn current_agent_depth() -> u32 {
@@ -155,6 +192,7 @@ pub async fn execute_tool(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
     allowed_tools: Option<&[String]>,
+    allowed_skills: Option<&[String]>,
     caller_agent_id: Option<&str>,
     skill_registry: Option<&SkillRegistry>,
     mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
@@ -328,14 +366,43 @@ pub async fn execute_tool(
         "knowledge_query" => tool_knowledge_query(input, kernel).await,
 
         // Image analysis tool
-        "image_analyze" => tool_image_analyze(input, media_engine, kernel, caller_agent_id).await,
+        "image_analyze" => {
+            tool_image_analyze(input, workspace_root, media_engine, kernel, caller_agent_id).await
+        }
 
         // Media understanding tools
-        "media_describe" => tool_media_describe(input, media_engine, kernel, caller_agent_id).await,
+        "media_describe" => {
+            tool_media_describe(input, workspace_root, media_engine, kernel, caller_agent_id).await
+        }
         "media_transcribe" => tool_media_transcribe(input, media_engine).await,
 
         // Image generation tool
-        "image_generate" => tool_image_generate(input, workspace_root).await,
+        "image_generate" => {
+            if let Some(registry) = skill_registry {
+                if let Some(result) =
+                    dispatch_skill_tool(registry, "image_generate", input, allowed_skills).await
+                {
+                    result
+                } else {
+                    tool_image_generate(input, workspace_root, kernel, caller_agent_id).await
+                }
+            } else {
+                tool_image_generate(input, workspace_root, kernel, caller_agent_id).await
+            }
+        }
+        "image_edit" => {
+            if let Some(registry) = skill_registry {
+                if let Some(result) =
+                    dispatch_skill_tool(registry, "image_edit", input, allowed_skills).await
+                {
+                    result
+                } else {
+                    tool_image_edit(input, workspace_root, kernel, caller_agent_id).await
+                }
+            } else {
+                tool_image_edit(input, workspace_root, kernel, caller_agent_id).await
+            }
+        }
 
         // TTS/STT tools
         "text_to_speech" => tool_text_to_speech(input, tts_engine, workspace_root).await,
@@ -524,27 +591,10 @@ pub async fn execute_tool(
             }
             // Fallback 2: Skill registry tool providers
             else if let Some(registry) = skill_registry {
-                if let Some(skill) = registry.find_tool_provider(other) {
-                    debug!(tool = other, skill = %skill.manifest.skill.name, "Dispatching to skill");
-                    match openfang_skills::loader::execute_skill_tool(
-                        &skill.manifest,
-                        &skill.path,
-                        other,
-                        input,
-                    )
-                    .await
-                    {
-                        Ok(skill_result) => {
-                            let content = serde_json::to_string(&skill_result.output)
-                                .unwrap_or_else(|_| skill_result.output.to_string());
-                            if skill_result.is_error {
-                                Err(content)
-                            } else {
-                                Ok(content)
-                            }
-                        }
-                        Err(e) => Err(format!("Skill execution failed: {e}")),
-                    }
+                if let Some(result) =
+                    dispatch_skill_tool(registry, other, input, allowed_skills).await
+                {
+                    result
                 } else {
                     Err(format!("Unknown tool: {other}"))
                 }
@@ -878,7 +928,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Image analysis tool ---
         ToolDefinition {
             name: "image_analyze".to_string(),
-            description: "Analyze a local or workspace image file. Always returns file metadata; when a prompt is provided, also performs direct vision analysis with the current agent model when possible, otherwise falls back to configured vision providers. Preferred tool for chat-uploaded images and screenshots.".to_string(),
+            description: "Primary tool for understanding a local, workspace, or chat-uploaded image file. Use this first when the task is to inspect what is in an image, answer questions about an image, summarize a screenshot, or extract visible details from a local image path. When local Florence-2 vision is enabled, the runtime will prefer that local result automatically; otherwise it uses the current agent model vision path and then configured fallback vision providers. Without a prompt, returns basic file metadata and a preview for debugging.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1001,7 +1051,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Media understanding tools ---
         ToolDefinition {
             name: "media_describe".to_string(),
-            description: "Describe a local or workspace image using the current agent model when it supports vision; otherwise fall back to configured vision providers. Use this for chat-uploaded images and screenshots, not browser_navigate.".to_string(),
+            description: "Primary tool for describing a local, workspace, screenshot, or chat-uploaded image when you need a natural-language summary. Prefer this over browser_navigate for any local image path. When local Florence-2 vision is enabled, the runtime will prefer that local result automatically; otherwise it uses the current agent model vision path and then configured fallback vision providers.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1023,17 +1073,43 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         },
+        ToolDefinition {
+            name: "image_edit".to_string(),
+            description: "Edit a single existing image using a text instruction. Use this when the user wants to keep the same person/identity, the same base picture, or the same overall scene while making targeted changes such as outfit, hairstyle, makeup, pose adjustment, background adjustment, prop changes, retouching, or other fine-to-medium edits. This is the correct tool when consistency matters. It is also the only allowed tool for updating an agent's own avatar, portrait, or self-image while keeping that same virtual identity. The agent's later self photos should continue to derive from that existing avatar/portrait identity by default. Default rule: only change the user-requested parts and keep everything else unchanged, including identity, style, composition, lighting, camera angle, and unmentioned details. A source image is required: pass exactly one of `image_path`, `image_url`, or `image_base64` (+ `mime_type`). Prefer passing `image_path` for a file inside the current agent workspace/workdir; the runtime will resolve and upload that local file automatically before editing. Resolution priority: component skill provider first, then configured generic image service editor (ComfyUI built-in Qwen-edit workflow when configured), then the current agent model if it supports image editing. Edited images are saved to the workspace output/ directory.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "description": "Modify an existing image while keeping the original as the base. Requires exactly one source image via image_path, image_url, or image_base64 with mime_type.",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Text instruction describing how to modify the existing input image while preserving the original image as the base. Prefer image_edit when the same person/identity or same base scene should stay recognizable. This is also the required path when the user means the agent's own avatar/portrait/self-image and only wants the same character to change clothes, scene, expression, or other local details. Only describe the exact requested change, and explicitly keep all other unmentioned elements unchanged. Typical use cases: outfit change, background refinement, prop change, pose tweak, face cleanup, detail retouching, or other fine-to-medium edits." },
+                    "negative_prompt": { "type": "string", "description": "Optional negative prompt for providers that support it" },
+                    "image_path": { "type": "string", "description": "Preferred only for a real relative or absolute file path inside the agent workspace/local filesystem. Do not use /api/uploads/... here unless you truly mean the chat-upload URL; the runtime will normalize that case automatically." },
+                    "image_url": { "type": "string", "description": "Single source image URL such as /api/uploads/... or an http/https image URL. Prefer this for chat-history images and uploaded images shown in the UI." },
+                    "image_base64": { "type": "string", "description": "Optional base64-encoded source image data" },
+                    "mime_type": { "type": "string", "description": "Required when image_base64 is provided, e.g. image/png" },
+                    "model": { "type": "string", "description": "Optional legacy model hint for direct OpenAI-compatible fallback. Recommended default: 'gpt-image-1'." },
+                    "size": { "type": "string", "description": "Legacy output size string such as '1024x1024'. Ignored when width and height are provided." },
+                    "width": { "type": "integer", "description": "Output image width override" },
+                    "height": { "type": "integer", "description": "Output image height override" },
+                    "quality": { "type": "string", "description": "Legacy quality hint for OpenAI-compatible fallback. Recommended default: 'standard'." },
+                    "count": { "type": "integer", "description": "Currently only supports 1." }
+                },
+                "required": ["prompt"]
+            }),
+        },
         // --- Image generation tool ---
         ToolDefinition {
             name: "image_generate".to_string(),
-            description: "Generate images from a text prompt using DALL-E 3, DALL-E 2, or GPT-Image-1. Requires OPENAI_API_KEY. Generated images are saved to the workspace output/ directory.".to_string(),
+            description: "Generate a brand-new image from scratch from a text prompt. Use this when the user wants a new picture, a new person/character, a new composition, a roleplay character, or a major redesign where exact continuity with a previous image is NOT required. Important: image generation cannot reliably preserve the exact same person/identity from an existing image, so do NOT use this to keep the same face/person consistent. Never use this to replace an agent's existing avatar, portrait, standing illustration, or self-image when the user means the same agent, because a newly generated face counts as a different person, unless the user explicitly consented to changing that identity anchor. Resolution priority: component skill provider first, then configured generic image provider (ComfyUI / ModelScope), then the current agent model if it supports image generation. Generated images are saved to the workspace output/ directory.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string", "description": "Text description of the image to generate (max 4000 chars)" },
-                    "model": { "type": "string", "description": "Model to use: 'dall-e-3' (default), 'dall-e-2', or 'gpt-image-1'" },
-                    "size": { "type": "string", "description": "Image size: '1024x1024' (default), '1024x1792', '1792x1024', '256x256', '512x512'" },
-                    "quality": { "type": "string", "description": "Quality: 'hd' (default for dall-e-3) or 'standard'" },
+                    "prompt": { "type": "string", "description": "Text description for a brand-new image from scratch (max 4000 chars). Use this for new people/characters, roleplay characters, new scenes, or major redesigns. Do not use image_generate when the main goal is to preserve the same person/identity from an existing image. If the user means the agent's own avatar/portrait/self-image, do not generate a new replacement face and pretend it is the same character unless the user explicitly agreed to changing that avatar identity." },
+                    "negative_prompt": { "type": "string", "description": "Optional negative prompt for providers that support it" },
+                    "model": { "type": "string", "description": "Optional legacy model hint for direct OpenAI-compatible fallback: 'dall-e-3', 'dall-e-2', or 'gpt-image-1'" },
+                    "size": { "type": "string", "description": "Legacy size string such as '1024x1024'. Ignored when width and height are provided." },
+                    "width": { "type": "integer", "description": "Image width override" },
+                    "height": { "type": "integer", "description": "Image height override" },
+                    "quality": { "type": "string", "description": "Legacy quality hint for OpenAI-compatible fallback. Recommended default: 'standard'." },
                     "count": { "type": "integer", "description": "Number of images to generate (1-4, default: 1). DALL-E 3 only supports 1." }
                 },
                 "required": ["prompt"]
@@ -1305,6 +1381,124 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
         let _ = validate_path(raw_path)?;
         Ok(PathBuf::from(raw_path))
     }
+}
+
+fn resolve_media_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(root) = workspace_root {
+        let path = Path::new(raw_path);
+        if path.is_absolute() {
+            return crate::workspace_sandbox::resolve_sandbox_path(raw_path, root);
+        }
+
+        let mut candidates = vec![PathBuf::from(raw_path)];
+        let starts_with_data = path
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == "data");
+        if !starts_with_data {
+            candidates.push(Path::new("data").join(path));
+        }
+
+        let mut last_err = None;
+        for candidate in candidates {
+            let candidate_str = candidate.to_string_lossy().to_string();
+            match crate::workspace_sandbox::resolve_sandbox_path(&candidate_str, root) {
+                Ok(resolved) if resolved.exists() => return Ok(resolved),
+                Ok(_) => {
+                    last_err = Some(format!(
+                        "Resolved media path does not exist: {candidate_str}"
+                    ));
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| format!("Failed to resolve media path: {raw_path}")))
+    } else {
+        let _ = validate_path(raw_path)?;
+        Ok(PathBuf::from(raw_path))
+    }
+}
+
+fn extract_local_upload_id(image_ref: &str) -> Option<&str> {
+    let trimmed = image_ref.trim();
+    trimmed
+        .strip_prefix("/api/uploads/")
+        .or_else(|| trimmed.strip_prefix("api/uploads/"))
+        .filter(|value| !value.is_empty())
+}
+
+fn should_treat_image_ref_as_url(image_ref: &str) -> bool {
+    let trimmed = image_ref.trim();
+    trimmed.starts_with("/api/uploads/")
+        || trimmed.starts_with("api/uploads/")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+}
+
+fn extract_saved_image_path_from_tool_result_content(
+    content: &str,
+    file_id: &str,
+) -> Option<PathBuf> {
+    let payload = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let image_urls = payload.get("image_urls")?.as_array()?;
+    let saved_to = payload.get("saved_to")?.as_array()?;
+
+    for (image_url, saved_path) in image_urls.iter().zip(saved_to.iter()) {
+        let image_url = image_url.as_str()?;
+        let saved_path = saved_path.as_str()?;
+        if extract_local_upload_id(image_url) != Some(file_id) {
+            continue;
+        }
+        let path = PathBuf::from(saved_path.trim());
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn extract_saved_image_path_from_session_line(line: &str, file_id: &str) -> Option<PathBuf> {
+    let payload = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let tool_use_entries = payload.get("tool_use")?.as_array()?;
+
+    for entry in tool_use_entries {
+        let content = entry.get("content")?.as_str()?;
+        if let Some(path) = extract_saved_image_path_from_tool_result_content(content, file_id) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn recover_saved_upload_path_from_workspace(
+    file_id: &str,
+    workspace_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let sessions_dir = workspace_root?.join("sessions");
+    if !sessions_dir.exists() {
+        return None;
+    }
+
+    let entries = std::fs::read_dir(&sessions_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let file = std::fs::File::open(&path).ok()?;
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(saved_path) = extract_saved_image_path_from_session_line(&line, file_id) {
+                return Some(saved_path);
+            }
+        }
+    }
+
+    None
 }
 
 async fn tool_file_read(
@@ -2536,16 +2730,18 @@ async fn tool_a2a_send(
 
 async fn tool_image_analyze(
     input: &serde_json::Value,
+    workspace_root: Option<&Path>,
     media_engine: Option<&MediaEngine>,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
-    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let prompt = input["prompt"].as_str().map(str::trim).unwrap_or("");
+    let path = resolve_media_path(raw_path, workspace_root)?;
 
-    let data = tokio::fs::read(path)
+    let data = tokio::fs::read(&path)
         .await
-        .map_err(|e| format!("Failed to read image '{path}': {e}"))?;
+        .map_err(|e| format!("Failed to read image '{}': {e}", raw_path))?;
 
     let file_size = data.len();
 
@@ -2572,7 +2768,7 @@ async fn tool_image_analyze(
     };
 
     let mut result = serde_json::json!({
-        "path": path,
+        "path": path.to_string_lossy().to_string(),
         "format": format,
         "file_size_bytes": file_size,
         "file_size_human": format_file_size(file_size),
@@ -2596,6 +2792,24 @@ async fn tool_image_analyze(
         };
         let vision_result = match mime {
             Some(mime_type) => {
+                let local_vision_error =
+                    match crate::local_vision::analyze_image_path_with_local_service(
+                        &path,
+                        mime_type,
+                        Some(prompt),
+                    )
+                    .await
+                    {
+                        Ok(Some(understanding)) => {
+                            let local_json = serde_json::to_value(&understanding)
+                                .map_err(|e| format!("Serialize error: {e}"))?;
+                            result["vision_analysis"] = local_json;
+                            return serde_json::to_string_pretty(&result)
+                                .map_err(|e| format!("Serialize error: {e}"));
+                        }
+                        Ok(None) => None,
+                        Err(err) => Some(err),
+                    };
                 describe_image_bytes_with_timeouts(
                     prompt,
                     mime_type,
@@ -2607,28 +2821,21 @@ async fn tool_image_analyze(
                     std::time::Duration::from_secs(FALLBACK_VISION_TIMEOUT_SECS),
                 )
                 .await
+                .map_err(|err| match local_vision_error {
+                    Some(local_err) => {
+                        format!("Local Florence-2 path failed: {local_err} | {err}")
+                    }
+                    None => err,
+                })
             }
             None => Err(format!("Unsupported image format: .{format}")),
         };
-        match vision_result {
-            Ok(vision_json) => {
-                let vision_result = serde_json::from_str::<serde_json::Value>(&vision_json)
-                    .unwrap_or_else(|_| serde_json::json!({ "raw": vision_json }));
-                result["vision_analysis"] = vision_result;
-                result["note"] = serde_json::json!(
-                    "Direct vision analysis succeeded. Base64 preview omitted to reduce token usage."
-                );
-                result["base64_preview"] =
-                    serde_json::json!("[omitted because direct vision analysis succeeded]");
-            }
-            Err(err) => {
-                result["vision_error"] = serde_json::json!(err);
-                result["note"] = serde_json::json!(
-                    "Direct vision analysis was requested but failed. A base64 preview is kept for compatibility."
-                );
-                result["base64_preview"] = serde_json::json!(full_base64_preview);
-            }
-        }
+        let vision_json = vision_result
+            .map_err(|err| format!("Image analysis failed for '{}': {err}", raw_path))?;
+        let vision_result = serde_json::from_str::<serde_json::Value>(&vision_json)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": vision_json }));
+        result["vision_analysis"] = vision_result;
+        return serde_json::to_string_pretty(&result).map_err(|e| format!("Serialize error: {e}"));
     } else {
         result["base64_preview"] = serde_json::json!(full_base64_preview);
     }
@@ -2789,12 +2996,14 @@ async fn tool_location_get() -> Result<String, String> {
 /// Describe an image using a vision-capable LLM provider.
 async fn tool_media_describe(
     input: &serde_json::Value,
+    workspace_root: Option<&Path>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     tool_media_describe_with_timeouts(
         input,
+        workspace_root,
         media_engine,
         kernel,
         caller_agent_id,
@@ -2806,13 +3015,14 @@ async fn tool_media_describe(
 
 async fn tool_media_describe_with_timeouts(
     input: &serde_json::Value,
+    workspace_root: Option<&Path>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
     current_model_timeout: std::time::Duration,
     fallback_timeout: std::time::Duration,
 ) -> Result<String, String> {
-    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let prompt = input["prompt"]
         .as_str()
         .map(str::trim)
@@ -2820,15 +3030,15 @@ async fn tool_media_describe_with_timeouts(
         .unwrap_or(
             "Describe this image in detail. Extract visible text, numbers, tables, charts, UI elements, and any other relevant information.",
         );
-    let _ = validate_path(path)?;
+    let path = resolve_media_path(raw_path, workspace_root)?;
 
     // Read image file
-    let data = tokio::fs::read(path)
+    let data = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("Failed to read image file: {e}"))?;
 
     // Detect MIME type from extension
-    let ext = std::path::Path::new(path)
+    let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -2842,6 +3052,21 @@ async fn tool_media_describe_with_timeouts(
         "svg" => "image/svg+xml",
         _ => return Err(format!("Unsupported image format: .{ext}")),
     };
+    let local_vision_error =
+        match crate::local_vision::analyze_image_path_with_local_service(
+            &path,
+            mime,
+            Some(prompt),
+        )
+        .await
+        {
+            Ok(Some(understanding)) => {
+                return serde_json::to_string_pretty(&understanding)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            Ok(None) => None,
+            Err(err) => Some(err),
+        };
     describe_image_bytes_with_timeouts(
         prompt,
         mime,
@@ -2853,6 +3078,10 @@ async fn tool_media_describe_with_timeouts(
         fallback_timeout,
     )
     .await
+    .map_err(|err| match local_vision_error {
+        Some(local_err) => format!("Local Florence-2 path failed: {local_err} | {err}"),
+        None => err,
+    })
 }
 
 async fn describe_image_bytes_with_timeouts(
@@ -2866,6 +3095,13 @@ async fn describe_image_bytes_with_timeouts(
     fallback_timeout: std::time::Duration,
 ) -> Result<String, String> {
     use base64::Engine;
+
+    if let Some(understanding) =
+        crate::local_vision::cached_understanding_for_image_bytes(mime, data)
+    {
+        return serde_json::to_string_pretty(&understanding)
+            .map_err(|e| format!("Serialize error: {e}"));
+    }
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(data);
 
@@ -2976,44 +3212,12 @@ async fn tool_media_transcribe(
 // Image generation tool
 // ---------------------------------------------------------------------------
 
-/// Generate images from a text prompt.
-async fn tool_image_generate(
-    input: &serde_json::Value,
+fn build_image_result_response(
+    result: &openfang_types::media::ImageGenResult,
     workspace_root: Option<&Path>,
-) -> Result<String, String> {
-    let prompt = input["prompt"]
-        .as_str()
-        .ok_or("Missing 'prompt' parameter")?;
-
-    let model_str = input["model"].as_str().unwrap_or("dall-e-3");
-    let model = match model_str {
-        "dall-e-3" | "dalle3" | "dalle-3" => openfang_types::media::ImageGenModel::DallE3,
-        "dall-e-2" | "dalle2" | "dalle-2" => openfang_types::media::ImageGenModel::DallE2,
-        "gpt-image-1" | "gpt_image_1" => openfang_types::media::ImageGenModel::GptImage1,
-        _ => {
-            return Err(format!(
-                "Unknown image model: {model_str}. Use 'dall-e-3', 'dall-e-2', or 'gpt-image-1'."
-            ))
-        }
-    };
-
-    let size = input["size"].as_str().unwrap_or("1024x1024").to_string();
-    let quality = input["quality"].as_str().unwrap_or("hd").to_string();
-    let count = input["count"].as_u64().unwrap_or(1).min(4) as u8;
-
-    let request = openfang_types::media::ImageGenRequest {
-        prompt: prompt.to_string(),
-        model,
-        size,
-        quality,
-        count,
-    };
-
-    let result = crate::image_gen::generate_image(&request).await?;
-
-    // Save images to workspace if available
+) -> serde_json::Value {
     let saved_paths = if let Some(workspace) = workspace_root {
-        match crate::image_gen::save_images_to_workspace(&result, workspace) {
+        match crate::image_gen::save_images_to_workspace(result, workspace) {
             Ok(paths) => paths,
             Err(e) => {
                 warn!("Failed to save images to workspace: {e}");
@@ -3024,8 +3228,6 @@ async fn tool_image_generate(
         Vec::new()
     };
 
-    // Also save to the uploads temp dir so the web UI can serve them via
-    // GET /api/uploads/{file_id}.  Each image gets a UUID filename.
     let mut image_urls: Vec<String> = Vec::new();
     {
         use base64::Engine;
@@ -3043,15 +3245,195 @@ async fn tool_image_generate(
         }
     }
 
-    // Build response — include image_urls so the dashboard can render <img> tags
-    let response = serde_json::json!({
+    serde_json::json!({
         "model": result.model,
         "images_generated": result.images.len(),
         "saved_to": saved_paths,
         "revised_prompt": result.revised_prompt,
         "image_urls": image_urls,
-    });
+    })
+}
 
+/// Generate images from a text prompt.
+async fn tool_image_generate(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let prompt = input["prompt"]
+        .as_str()
+        .ok_or("Missing 'prompt' parameter")?;
+
+    let model_str = input["model"].as_str().unwrap_or("dall-e-3");
+    let model = match model_str {
+        "dall-e-3" | "dalle3" | "dalle-3" => openfang_types::media::ImageGenModel::DallE3,
+        "dall-e-2" | "dalle2" | "dalle-2" => openfang_types::media::ImageGenModel::DallE2,
+        "gpt-image-1" | "gpt_image_1" => openfang_types::media::ImageGenModel::GptImage1,
+        _ => openfang_types::media::ImageGenModel::DallE3,
+    };
+
+    let size = input["size"].as_str().unwrap_or("1024x1024").to_string();
+    let quality = input["quality"].as_str().unwrap_or("standard").to_string();
+    let count = input["count"].as_u64().unwrap_or(1).min(4) as u8;
+    let negative_prompt = input["negative_prompt"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let width = input["width"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok());
+    let height = input["height"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok());
+
+    let request = openfang_types::media::ImageGenRequest {
+        prompt: prompt.to_string(),
+        negative_prompt,
+        model,
+        size,
+        width,
+        height,
+        quality,
+        count,
+    };
+
+    if let Some(response_json) =
+        crate::image_gen::execute_configured_image_generate_tool(&request, workspace_root).await?
+    {
+        return Ok(response_json);
+    }
+
+    let result = if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+        kernel
+            .generate_image_with_agent_model(agent_id, &request)
+            .await?
+    } else {
+        crate::image_gen::generate_image(&request).await?
+    };
+    let response = build_image_result_response(&result, workspace_root);
+
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
+/// Edit a single image using a text instruction.
+async fn tool_image_edit(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let prompt = input["prompt"]
+        .as_str()
+        .ok_or("Missing 'prompt' parameter")?;
+
+    let model_str = input["model"].as_str().unwrap_or("gpt-image-1");
+    let model = match model_str {
+        "gpt-image-1" | "gpt_image_1" => openfang_types::media::ImageGenModel::GptImage1,
+        "dall-e-2" | "dalle2" | "dalle-2" => openfang_types::media::ImageGenModel::DallE2,
+        _ => openfang_types::media::ImageGenModel::GptImage1,
+    };
+
+    let raw_image_path = input["image_path"].as_str().unwrap_or_default().trim();
+    let mut image_url = input["image_url"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut resolved_image_path = None;
+
+    if !raw_image_path.is_empty() {
+        if should_treat_image_ref_as_url(raw_image_path) {
+            if image_url.is_empty() {
+                image_url = raw_image_path.to_string();
+            }
+            if let Some(file_id) = extract_local_upload_id(raw_image_path) {
+                resolved_image_path =
+                    recover_saved_upload_path_from_workspace(file_id, workspace_root)
+                        .map(|path| path.to_string_lossy().to_string());
+            }
+        } else {
+            resolved_image_path = Some(
+                resolve_media_path(raw_image_path, workspace_root)?
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+
+    if resolved_image_path.is_none() && !image_url.is_empty() {
+        if let Some(file_id) = extract_local_upload_id(&image_url) {
+            resolved_image_path = recover_saved_upload_path_from_workspace(file_id, workspace_root)
+                .map(|path| path.to_string_lossy().to_string());
+        }
+    }
+
+    let image_base64 = input["image_base64"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let mime_type = input["mime_type"].as_str().unwrap_or_default().to_string();
+
+    let has_image_path = resolved_image_path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty());
+    let has_image_url = !image_url.trim().is_empty();
+    let has_image_base64 = !image_base64.trim().is_empty();
+
+    if !has_image_path && !has_image_url && !has_image_base64 {
+        return Err(
+            "image_edit requires a source image. Provide exactly one of 'image_path', 'image_url', or 'image_base64' (with 'mime_type'). Use image_edit only when modifying an existing image.".to_string(),
+        );
+    }
+
+    if has_image_base64 && mime_type.trim().is_empty() {
+        return Err("image_edit requires 'mime_type' when 'image_base64' is provided.".to_string());
+    }
+
+    let request = openfang_types::media::ImageEditRequest {
+        prompt: prompt.to_string(),
+        negative_prompt: input["negative_prompt"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        model,
+        image_path: resolved_image_path.unwrap_or_default(),
+        image_url,
+        image_base64,
+        mime_type,
+        size: input["size"].as_str().unwrap_or("1024x1024").to_string(),
+        width: input["width"]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok()),
+        height: input["height"]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok()),
+        quality: input["quality"].as_str().unwrap_or("standard").to_string(),
+        count: input["count"].as_u64().unwrap_or(1).min(4) as u8,
+    };
+
+    if let Some(response_json) =
+        crate::image_gen::execute_configured_image_edit_tool(&request, workspace_root).await?
+    {
+        return Ok(response_json);
+    }
+
+    let result = if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+        kernel
+            .edit_image_with_agent_model(agent_id, &request)
+            .await?
+    } else {
+        crate::image_gen::generate_openai_compatible_image_edit(
+            &request,
+            &request.model.to_string(),
+            "https://api.openai.com/v1",
+            &std::env::var("OPENAI_API_KEY")
+                .map_err(|_| "OPENAI_API_KEY not set. Image editing requires an OpenAI API key.")?,
+        )
+        .await?
+    };
+
+    let response = build_image_result_response(&result, workspace_root);
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
@@ -3469,10 +3851,11 @@ mod tests {
         assert!(names.contains(&"browser_wait"));
         assert!(names.contains(&"browser_run_js"));
         assert!(names.contains(&"browser_back"));
-        // 3 media/image generation tools
+        // 4 media/image tools
         assert!(names.contains(&"media_describe"));
         assert!(names.contains(&"media_transcribe"));
         assert!(names.contains(&"image_generate"));
+        assert!(names.contains(&"image_edit"));
         // 3 cron tools
         assert!(names.contains(&"cron_create"));
         assert!(names.contains(&"cron_list"));
@@ -3490,6 +3873,59 @@ mod tests {
         assert!(names.contains(&"docker_exec"));
         // Canvas tool
         assert!(names.contains(&"canvas_present"));
+
+        let image_edit_index = names
+            .iter()
+            .position(|name| *name == "image_edit")
+            .expect("image_edit tool missing");
+        let image_generate_index = names
+            .iter()
+            .position(|name| *name == "image_generate")
+            .expect("image_generate tool missing");
+        assert!(
+            image_edit_index < image_generate_index,
+            "image_edit should be exposed before image_generate for tool selection disambiguation"
+        );
+
+        let image_edit = tools
+            .iter()
+            .find(|tool| tool.name == "image_edit")
+            .expect("image_edit tool missing");
+        assert!(
+            image_edit.input_schema.get("oneOf").is_none(),
+            "image_edit schema should stay flat for OpenAI-compatible tool calling providers"
+        );
+        assert!(image_edit
+            .description
+            .contains("only allowed tool for updating an agent's own avatar"));
+        assert!(image_edit.description.contains(
+            "should continue to derive from that existing avatar/portrait identity by default"
+        ));
+        assert!(image_edit
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("prompt"))
+            .and_then(|prompt| prompt.get("description"))
+            .and_then(|desc| desc.as_str())
+            .is_some_and(|desc| desc.contains("agent's own avatar/portrait/self-image")));
+
+        let image_generate = tools
+            .iter()
+            .find(|tool| tool.name == "image_generate")
+            .expect("image_generate tool missing");
+        assert!(image_generate
+            .description
+            .contains("Never use this to replace an agent's existing avatar"));
+        assert!(image_generate
+            .description
+            .contains("unless the user explicitly consented to changing that identity anchor"));
+        assert!(image_generate
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("prompt"))
+            .and_then(|prompt| prompt.get("description"))
+            .and_then(|desc| desc.as_str())
+            .is_some_and(|desc| desc.contains("agent's own avatar/portrait/self-image")));
     }
 
     #[test]
@@ -3546,6 +3982,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3554,6 +3991,57 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_image_edit_requires_source_image() {
+        let err = tool_image_edit(
+            &serde_json::json!({
+                "prompt": "把耳环换成红宝石款式"
+            }),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("image_edit without a source image should fail");
+
+        assert!(err.contains("requires a source image"));
+    }
+
+    #[test]
+    fn test_recover_saved_upload_path_from_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("openfang_edit_workspace_{}", std::process::id()));
+        let sessions_dir = workspace.join("sessions");
+        let output_dir = workspace.join("output");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let file_id = "11111111-2222-3333-4444-555555555555";
+        let saved_image = output_dir.join("image_20260322_000001.png");
+        std::fs::write(&saved_image, b"png").unwrap();
+
+        let session_line = serde_json::json!({
+            "tool_use": [{
+                "content": serde_json::json!({
+                    "image_urls": [format!("/api/uploads/{file_id}")],
+                    "saved_to": [saved_image.to_string_lossy().to_string()]
+                }).to_string()
+            }]
+        })
+        .to_string();
+        std::fs::write(
+            sessions_dir.join("test-session.jsonl"),
+            format!("{session_line}\n"),
+        )
+        .unwrap();
+
+        let restored = recover_saved_upload_path_from_workspace(file_id, Some(&workspace))
+            .expect("expected saved upload path");
+        assert_eq!(restored, saved_image);
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[tokio::test]
@@ -3571,6 +4059,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3597,6 +4086,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3623,6 +4113,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3649,6 +4140,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3675,6 +4167,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3701,6 +4194,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3727,6 +4221,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3754,6 +4249,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3781,6 +4277,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3948,6 +4445,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3961,11 +4459,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_image_analyze_with_prompt_uses_current_agent_vision_first() {
+        let png_bytes = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+        ];
         let temp_path = std::env::temp_dir().join(format!(
             "openfang_image_analyze_test_{}.png",
             std::process::id()
         ));
-        std::fs::write(&temp_path, b"fake-png-data").unwrap();
+        std::fs::write(&temp_path, png_bytes).unwrap();
 
         let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
             mode: MediaDescribeTestKernelMode::Immediate,
@@ -3979,13 +4481,14 @@ mod tests {
             }),
             Some(&kernel),
             None,
+            None,
             Some("agent-1"),
             None,
             None,
             None,
             None,
             None,
-            None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -4001,9 +4504,97 @@ mod tests {
         assert!(result
             .content
             .contains("vision-ok: extract every visible number"));
+        assert!(!result.content.contains("base64_preview"));
+    }
+
+    #[tokio::test]
+    async fn test_image_analyze_with_prompt_returns_error_when_vision_fails() {
+        let png_bytes = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+        ];
+        let temp_path = std::env::temp_dir().join(format!(
+            "openfang_image_analyze_failure_test_{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, png_bytes).unwrap();
+
+        let result = execute_tool(
+            "test-id",
+            "image_analyze",
+            &serde_json::json!({
+                "path": temp_path.to_string_lossy().to_string(),
+                "prompt": "extract all visible text"
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // workspace_root
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert!(result.is_error);
+        assert!(result.content.contains("Image analysis failed for"));
         assert!(result
             .content
-            .contains("[omitted because direct vision analysis succeeded]"));
+            .contains("Fallback vision provider path failed"));
+        assert!(!result.content.contains("base64_preview"));
+        assert!(!result.content.contains("file_size_bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_image_analyze_resolves_chat_upload_relative_path_from_workspace_data() {
+        let workspace =
+            std::env::temp_dir().join(format!("openfang_image_workspace_{}", std::process::id()));
+        let chat_upload_dir = workspace.join("data").join("chat-uploads").join("20532");
+        std::fs::create_dir_all(&chat_upload_dir).unwrap();
+        let image_path = chat_upload_dir.join("test-image.png");
+        let png_bytes = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+        ];
+        std::fs::write(&image_path, png_bytes).unwrap();
+
+        let result = execute_tool(
+            "test-id",
+            "image_analyze",
+            &serde_json::json!({"path": "chat-uploads/20532/test-image.png"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(workspace.as_path()),
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("\"format\": \"png\""));
+        assert!(result.content.contains("test-image.png"));
     }
 
     #[test]
@@ -4040,6 +4631,7 @@ mod tests {
             None,
             None,
             None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -4184,13 +4776,14 @@ mod tests {
             }),
             Some(&kernel),
             None,
+            None,
             Some("agent-1"),
             None,
             None,
             None,
             None,
             None,
-            None,
+            None, // workspace_root
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -4224,6 +4817,7 @@ mod tests {
                 "path": temp_path.to_string_lossy().to_string(),
                 "prompt": "extract every visible number"
             }),
+            None,
             None,
             Some(&kernel),
             Some("agent-1"),

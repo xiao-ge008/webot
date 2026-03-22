@@ -1,5 +1,5 @@
 import { saveOfficeBinaryAs } from '@/services/office-file-client';
-import { getApiBaseUrl, requestJson } from '@/services/transport';
+import { getApiBaseUrl, getOpenFangBaseUrl, requestJson } from '@/services/transport';
 
 interface JsonRecord {
   [key: string]: unknown;
@@ -185,6 +185,7 @@ export interface ManagementModelOption {
   available: boolean;
   enabled: boolean;
   isDefault: boolean;
+  supportsVision: boolean;
   source?: string;
 }
 
@@ -219,6 +220,7 @@ export async function listManagementModels(): Promise<ManagementModelsPayload> {
         available,
         enabled,
         isDefault,
+        supportsVision: asBool(row.supports_vision),
         source: asString(row.source) || undefined,
       };
     })
@@ -345,6 +347,14 @@ export interface ManagementProviderTestResult {
   model_count?: number;
 }
 
+export interface ManagementProviderDiscoverResult {
+  ok: boolean;
+  status: string;
+  message: string;
+  model_count?: number;
+  models: string[];
+}
+
 export async function testManagementProviderConnection(
   providerId: string,
 ): Promise<ManagementProviderTestResult> {
@@ -393,6 +403,52 @@ export async function setManagementDefaultModel(modelId: string): Promise<void> 
   await requestJson(`/api/management/models/${encodeURIComponent(modelId)}/default`, {
     method: 'PUT',
     body: {},
+  });
+}
+
+export async function discoverManagementProviderModels(
+  providerId: string,
+): Promise<ManagementProviderDiscoverResult> {
+  const payload = await requestJson<unknown>(
+    `/api/management/providers/${encodeURIComponent(providerId)}/discover-models`,
+    {
+      method: 'POST',
+      body: {},
+    },
+  );
+  if (!isRecord(payload)) {
+    return {
+      ok: false,
+      status: 'invalid_response',
+      message: '获取模型返回格式异常',
+      models: [],
+    };
+  }
+  return {
+    ok: asBool(payload.ok),
+    status: asString(payload.status),
+    message: asString(payload.message, '获取模型失败'),
+    model_count:
+      typeof payload.model_count === 'number' && Number.isFinite(payload.model_count)
+        ? payload.model_count
+        : undefined,
+    models: asStringArray(payload.models),
+  };
+}
+
+export async function updateManagementCustomModelVision(input: {
+  modelId: string;
+  providerId: string;
+  modelName: string;
+  supportsVision: boolean;
+}): Promise<void> {
+  await requestJson(`/api/management/models/${encodeURIComponent(input.modelId)}/vision`, {
+    method: 'PUT',
+    body: {
+      provider: input.providerId,
+      model: input.modelName,
+      supports_vision: input.supportsVision,
+    },
   });
 }
 
@@ -1778,6 +1834,25 @@ export interface AgentPortraitUploadResult {
   size?: number;
 }
 
+export interface ApplyManagementAgentAvatarInput {
+  sourceUrl: string;
+}
+
+export interface ApplyManagementAgentPortraitInput {
+  sourceUrl: string;
+}
+
+export interface ApplyManagementAgentAppearanceInput {
+  avatarUrl?: string;
+  portraitUrl?: string;
+}
+
+export interface ApplyManagementAgentAppearanceResult {
+  avatarUrl?: string;
+  portraitUrl?: string;
+  updatedFields: Array<'avatar' | 'portrait'>;
+}
+
 export interface AgentChatAssetUploadResult {
   assetUrl: string;
   filename: string;
@@ -1787,6 +1862,11 @@ export interface AgentChatAssetUploadResult {
   mimeType?: string;
   size?: number;
   upstreamFileId?: string;
+  sha256?: string;
+  // 历史字段名，当前实际承载的是“本地视觉结果文本”。
+  localVisionSummary?: string;
+  localVisionProvider?: string;
+  localVisionModel?: string;
 }
 
 const VISION_IMAGE_MAX_EDGE = 1568;
@@ -1959,6 +2039,25 @@ function toUploadFriendlyError(error: unknown): Error {
   return error instanceof Error ? error : new Error('上传失败');
 }
 
+function shouldRetryAppearanceInlineUpload(
+  error: unknown,
+  kind: 'avatar' | 'portrait',
+): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const message = error.message;
+  if (message.includes('HTTP 404')) {
+    return true;
+  }
+  if (!message.includes('HTTP 400')) {
+    return false;
+  }
+  return kind === 'avatar'
+    ? message.includes('不支持的头像格式')
+    : message.includes('不支持的立绘格式');
+}
+
 async function postMultipartJson(
   path: string,
   formData: FormData,
@@ -2043,6 +2142,90 @@ function parseAgentPortraitUploadResult(
   };
 }
 
+const LOCAL_MANAGEMENT_ASSET_PATTERN = /^https?:\/\/(?:127\.0\.0\.1|localhost):\d+(\/api\/management\/agents\/.+)$/i;
+
+function isManagedAppearanceAssetForAgent(agentId: string, rawUrl: string): boolean {
+  const normalizedAgentId = encodeURIComponent(agentId);
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed.startsWith(`/api/management/agents/${normalizedAgentId}/`)) {
+    return true;
+  }
+  const localMatch = trimmed.match(LOCAL_MANAGEMENT_ASSET_PATTERN);
+  return Boolean(localMatch?.[1]?.startsWith(`/api/management/agents/${normalizedAgentId}/`));
+}
+
+function inferManagedAppearanceFilename(
+  rawUrl: string,
+  fallbackBaseName: 'avatar' | 'portrait',
+  mimeType: string,
+): string {
+  const cleaned = rawUrl.split('#')[0]?.split('?')[0] ?? '';
+  const lastSegment = cleaned.split('/').filter(Boolean).pop() ?? '';
+  if (lastSegment && /\.[a-z0-9]+$/i.test(lastSegment)) {
+    return lastSegment;
+  }
+  const extension = mimeType.includes('png')
+    ? 'png'
+    : mimeType.includes('jpeg') || mimeType.includes('jpg')
+      ? 'jpg'
+      : mimeType.includes('webp')
+        ? 'webp'
+        : 'bin';
+  return `${fallbackBaseName}.${extension}`;
+}
+
+async function materializeManagedAppearanceAsset(
+  agentId: string,
+  rawUrl: string,
+  kind: 'avatar' | 'portrait',
+): Promise<string> {
+  const source = rawUrl.trim();
+  if (!source) {
+    throw new Error(`缺少${kind === 'avatar' ? '头像' : '立绘'}来源 URL`);
+  }
+  if (isManagedAppearanceAssetForAgent(agentId, source)) {
+    return source;
+  }
+
+  const resolvedSource = await (async (): Promise<string> => {
+    if (/^(?:https?:|data:|blob:|file:)/i.test(source)) {
+      return source;
+    }
+    if (/^\/?api\/uploads\//i.test(source)) {
+      const baseUrl = await getOpenFangBaseUrl();
+      return new URL(source.replace(/^\/+/, ''), `${baseUrl.replace(/\/+$/, '')}/`).toString();
+    }
+    if (source.startsWith('/')) {
+      const baseUrl = await getApiBaseUrl();
+      return new URL(source, `${baseUrl.replace(/\/+$/, '')}/`).toString();
+    }
+    return source;
+  })();
+
+  const response = await fetch(resolvedSource);
+  if (!response.ok) {
+    throw new Error(`下载${kind === 'avatar' ? '头像' : '立绘'}失败：HTTP ${response.status}`);
+  }
+  const blob = await response.blob();
+  const responseContentType = response.headers.get('content-type')?.trim() ?? '';
+  const contentType = blob.type || responseContentType || 'image/png';
+  const file = new File(
+    [blob],
+    inferManagedAppearanceFilename(source, kind, contentType),
+    { type: contentType },
+  );
+
+  if (kind === 'avatar') {
+    const uploaded = await uploadManagementAgentAvatar(agentId, file);
+    return uploaded.avatarUrl;
+  }
+  const uploaded = await uploadManagementAgentPortrait(agentId, file);
+  return uploaded.portraitUrl;
+}
+
 function parseAgentChatAssetUploadResult(
   payload: unknown,
   baseUrl?: string,
@@ -2069,6 +2252,7 @@ function parseAgentChatAssetUploadResult(
     mimeType: asString(payload.mime_type) || undefined,
     size: typeof payload.size === 'number' ? payload.size : undefined,
     upstreamFileId: asString(payload.upstream_file_id) || undefined,
+    sha256: asString(payload.sha256) || undefined,
   };
 }
 
@@ -2101,11 +2285,11 @@ export async function uploadManagementAgentAvatar(
       body: {
         filename: file.name || 'avatar',
         content_base64: contentBase64,
+        content_type: file.type || undefined,
       },
     });
   } catch (inlineError) {
-    const message = inlineError instanceof Error ? inlineError.message : '';
-    if (!message.includes('HTTP 404')) {
+    if (!shouldRetryAppearanceInlineUpload(inlineError, 'avatar')) {
       throw toUploadFriendlyError(inlineError);
     }
     const formData = new FormData();
@@ -2148,11 +2332,11 @@ export async function uploadManagementAgentPortrait(
       body: {
         filename: file.name || 'portrait',
         content_base64: contentBase64,
+        content_type: file.type || undefined,
       },
     });
   } catch (inlineError) {
-    const message = inlineError instanceof Error ? inlineError.message : '';
-    if (!message.includes('HTTP 404')) {
+    if (!shouldRetryAppearanceInlineUpload(inlineError, 'portrait')) {
       throw toUploadFriendlyError(inlineError);
     }
     const formData = new FormData();
@@ -2164,6 +2348,62 @@ export async function uploadManagementAgentPortrait(
   }
   const baseUrl = await getApiBaseUrl({ forceRefresh: true });
   return parseAgentPortraitUploadResult(payload, baseUrl);
+}
+
+export async function applyManagementAgentAvatarFromUrl(
+  agentId: string,
+  input: ApplyManagementAgentAvatarInput,
+): Promise<AgentAvatarUploadResult> {
+  const avatarUrl = await materializeManagedAppearanceAsset(agentId, input.sourceUrl, 'avatar');
+  await patchManagementAgentConfig(agentId, {
+    avatar_url: avatarUrl,
+  });
+  return { avatarUrl };
+}
+
+export async function applyManagementAgentPortraitFromUrl(
+  agentId: string,
+  input: ApplyManagementAgentPortraitInput,
+): Promise<AgentPortraitUploadResult> {
+  const portraitUrl = await materializeManagedAppearanceAsset(agentId, input.sourceUrl, 'portrait');
+  await patchManagementAgentConfig(agentId, {
+    portrait_url: portraitUrl,
+  });
+  return { portraitUrl };
+}
+
+export async function applyManagementAgentAppearance(
+  agentId: string,
+  input: ApplyManagementAgentAppearanceInput,
+): Promise<ApplyManagementAgentAppearanceResult> {
+  const avatarSource = asString(input.avatarUrl).trim();
+  const portraitSource = asString(input.portraitUrl).trim();
+  if (!avatarSource && !portraitSource) {
+    throw new Error('至少需要提供 avatarUrl 或 portraitUrl');
+  }
+
+  const [avatarUrl, portraitUrl] = await Promise.all([
+    avatarSource ? materializeManagedAppearanceAsset(agentId, avatarSource, 'avatar') : Promise.resolve(undefined),
+    portraitSource ? materializeManagedAppearanceAsset(agentId, portraitSource, 'portrait') : Promise.resolve(undefined),
+  ]);
+
+  const patch: AgentConfigPatchInput = {};
+  const updatedFields: Array<'avatar' | 'portrait'> = [];
+  if (avatarUrl) {
+    patch.avatar_url = avatarUrl;
+    updatedFields.push('avatar');
+  }
+  if (portraitUrl) {
+    patch.portrait_url = portraitUrl;
+    updatedFields.push('portrait');
+  }
+  await patchManagementAgentConfig(agentId, patch);
+
+  return {
+    avatarUrl,
+    portraitUrl,
+    updatedFields,
+  };
 }
 
 export async function uploadManagementAgentChatAsset(

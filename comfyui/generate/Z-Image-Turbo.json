@@ -1,0 +1,669 @@
+{
+  "id": "00000000-0000-0000-0000-000000000000",
+  "revision": 0,
+  "last_node_id": 40,
+  "last_link_id": 71,
+  "nodes": [
+    {
+      "id": 35,
+      "type": "CheckpointLoaderSimple",
+      "pos": [
+        -100.16195184167537,
+        -710.1033092198265
+      ],
+      "size": [
+        270,
+        98
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "label": "模型",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            63
+          ]
+        },
+        {
+          "label": "CLIP",
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            60,
+            68
+          ]
+        },
+        {
+          "label": "VAE",
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            61
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.75",
+        "Node name for S&R": "CheckpointLoaderSimple"
+      },
+      "widgets_values": [
+        "ZIMAGE\\redcraftMar0826LatestZib_zibDistilledDX3Lucis.safetensors"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "SaveImage",
+      "pos": [
+        1515.2434515777222,
+        -562.8733442771542
+      ],
+      "size": [
+        529.6580996987491,
+        557.2545187279784
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "图像",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 20
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.75",
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "ZIMAGE"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "VAEDecode",
+      "pos": [
+        1543.5638518422288,
+        -667.553315091351
+      ],
+      "size": [
+        255.40371215657024,
+        48.508765366293574
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "Latent",
+          "name": "samples",
+          "type": "LATENT",
+          "link": 18
+        },
+        {
+          "label": "VAE",
+          "name": "vae",
+          "type": "VAE",
+          "link": 61
+        }
+      ],
+      "outputs": [
+        {
+          "label": "图像",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            20
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.75",
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 16,
+      "type": "EmptySD3LatentImage",
+      "pos": [
+        -93.80765114692215,
+        -548.6567698229854
+      ],
+      "size": [
+        270,
+        106
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "label": "Latent",
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.75",
+        "Node name for S&R": "EmptySD3LatentImage"
+      },
+      "widgets_values": [
+        1296,
+        1088,
+        1
+      ]
+    },
+    {
+      "id": 24,
+      "type": "Lora Loader Stack (rgthree)",
+      "pos": [
+        261.721852975851,
+        -695.4457363854793
+      ],
+      "size": [
+        270,
+        246
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "模型",
+          "name": "model",
+          "type": "MODEL",
+          "link": 63
+        },
+        {
+          "label": "CLIP",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 60
+        }
+      ],
+      "outputs": [
+        {
+          "label": "模型",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            71
+          ]
+        },
+        {
+          "label": "CLIP",
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            51
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "rgthree-comfy",
+        "ver": "e5b2772686c9c6358a7801a2448fcadbb3d21a3e",
+        "Node name for S&R": "Lora Loader Stack (rgthree)"
+      },
+      "widgets_values": [
+        "None",
+        0.8,
+        "None",
+        1,
+        "None",
+        1,
+        "None",
+        1
+      ]
+    },
+    {
+      "id": 7,
+      "type": "KSampler",
+      "pos": [
+        1213.618116391757,
+        -704.8890106507704
+      ],
+      "size": [
+        270,
+        474
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "模型",
+          "name": "model",
+          "type": "MODEL",
+          "link": 71
+        },
+        {
+          "label": "正面条件",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 53
+        },
+        {
+          "label": "负面条件",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 67
+        },
+        {
+          "label": "Latent",
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "label": "Latent",
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.75",
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        813869498219402,
+        "randomize",
+        4,
+        1,
+        "euler",
+        "sgm_uniform",
+        1
+      ]
+    },
+    {
+      "id": 31,
+      "type": "a2d447ca-6615-4c78-8180-5e1a0fa33da9",
+      "pos": [
+        645.0867630670541,
+        -183.33391348596825
+      ],
+      "size": [
+        533.6476820579517,
+        341.26543924917553
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 51
+        },
+        {
+          "label": "text",
+          "name": "text",
+          "type": "STRING",
+          "widget": {
+            "name": "text"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "CONDITIONING",
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            53
+          ]
+        }
+      ],
+      "properties": {
+        "proxyWidgets": [
+          [
+            "1",
+            "text"
+          ]
+        ],
+        "cnr_id": "comfy-core",
+        "ver": "0.3.75"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 39,
+      "type": "CLIPTextEncode",
+      "pos": [
+        632.481675835073,
+        -534.0711488343478
+      ],
+      "size": [
+        539.2368568095922,
+        285.2982751075141
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "CLIP",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 68
+        }
+      ],
+      "outputs": [
+        {
+          "label": "条件",
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            67
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.75",
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        ""
+      ]
+    }
+  ],
+  "links": [
+    [
+      17,
+      16,
+      0,
+      7,
+      3,
+      "LATENT"
+    ],
+    [
+      18,
+      7,
+      0,
+      9,
+      0,
+      "LATENT"
+    ],
+    [
+      20,
+      9,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      51,
+      24,
+      1,
+      31,
+      0,
+      "CLIP"
+    ],
+    [
+      53,
+      31,
+      0,
+      7,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      60,
+      35,
+      1,
+      24,
+      1,
+      "CLIP"
+    ],
+    [
+      61,
+      35,
+      2,
+      9,
+      1,
+      "VAE"
+    ],
+    [
+      63,
+      35,
+      0,
+      24,
+      0,
+      "MODEL"
+    ],
+    [
+      67,
+      39,
+      0,
+      7,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      68,
+      35,
+      1,
+      39,
+      0,
+      "CLIP"
+    ],
+    [
+      71,
+      24,
+      0,
+      7,
+      0,
+      "MODEL"
+    ]
+  ],
+  "groups": [],
+  "definitions": {
+    "subgraphs": [
+      {
+        "id": "a2d447ca-6615-4c78-8180-5e1a0fa33da9",
+        "version": 1,
+        "state": {
+          "lastGroupId": 0,
+          "lastNodeId": 40,
+          "lastLinkId": 71,
+          "lastRerouteId": 0
+        },
+        "revision": 0,
+        "config": {},
+        "name": "New Subgraph",
+        "inputNode": {
+          "id": -10,
+          "bounding": [
+            542.6753119888959,
+            316.5697348249857,
+            120,
+            80
+          ]
+        },
+        "outputNode": {
+          "id": -20,
+          "bounding": [
+            1182.6753119888958,
+            326.5697348249857,
+            120,
+            60
+          ]
+        },
+        "inputs": [
+          {
+            "id": "eab57037-c5a7-4f37-87d5-3ec9ec48c508",
+            "name": "clip",
+            "type": "CLIP",
+            "linkIds": [
+              49
+            ],
+            "localized_name": "clip",
+            "label": "CLIP",
+            "pos": [
+              55,
+              20
+            ]
+          },
+          {
+            "id": "77234667-8772-41b0-a8c4-8f09df08f7da",
+            "name": "text",
+            "type": "STRING",
+            "linkIds": [
+              47
+            ],
+            "localized_name": "文本",
+            "pos": [
+              55,
+              40
+            ]
+          }
+        ],
+        "outputs": [
+          {
+            "id": "1267fb00-126b-49d5-bea2-627ef6258188",
+            "name": "CONDITIONING",
+            "type": "CONDITIONING",
+            "linkIds": [
+              15
+            ],
+            "localized_name": "条件",
+            "label": "条件",
+            "pos": [
+              20,
+              20
+            ]
+          }
+        ],
+        "widgets": [],
+        "nodes": [
+          {
+            "id": 1,
+            "type": "CLIPTextEncode",
+            "pos": [
+              722.6753119888959,
+              271.5697348249857
+            ],
+            "size": [
+              400,
+              200
+            ],
+            "flags": {
+              "collapsed": false
+            },
+            "order": 0,
+            "mode": 0,
+            "inputs": [
+              {
+                "label": "CLIP",
+                "localized_name": "clip",
+                "name": "clip",
+                "type": "CLIP",
+                "link": 49
+              },
+              {
+                "localized_name": "文本",
+                "name": "text",
+                "type": "STRING",
+                "widget": {
+                  "name": "text"
+                },
+                "link": 47
+              }
+            ],
+            "outputs": [
+              {
+                "label": "条件",
+                "localized_name": "条件",
+                "name": "CONDITIONING",
+                "type": "CONDITIONING",
+                "links": [
+                  15
+                ]
+              }
+            ],
+            "properties": {
+              "cnr_id": "comfy-core",
+              "ver": "0.3.75",
+              "Node name for S&R": "CLIPTextEncode"
+            },
+            "widgets_values": [
+              "王雨，18岁\n\nChinese female flight attendant 4K"
+            ]
+          }
+        ],
+        "groups": [],
+        "links": [
+          {
+            "id": 49,
+            "origin_id": -10,
+            "origin_slot": 0,
+            "target_id": 1,
+            "target_slot": 0,
+            "type": "CLIP"
+          },
+          {
+            "id": 47,
+            "origin_id": -10,
+            "origin_slot": 1,
+            "target_id": 1,
+            "target_slot": 1,
+            "type": "STRING"
+          },
+          {
+            "id": 15,
+            "origin_id": 1,
+            "origin_slot": 0,
+            "target_id": -20,
+            "target_slot": 0,
+            "type": "CONDITIONING"
+          }
+        ],
+        "extra": {
+          "workflowRendererVersion": "LG"
+        }
+      }
+    ]
+  },
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.876922695000005,
+      "offset": [
+        1154.6851114513863,
+        1196.1012261506057
+      ]
+    },
+    "workflowRendererVersion": "LG",
+    "ue_links": [],
+    "frontendVersion": "1.41.20",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

@@ -56,7 +56,9 @@ export interface GroupSessionRuntime {
   stopReason?: string;
   lastCompactedAt?: string;
   lastEventAt?: string;
+  memoryDigestManual?: boolean;
   memoryDigest?: GroupMemoryDigest;
+  agentContextDigestsManualIds?: string[];
   agentContextDigests?: Record<string, GroupAgentContextDigest>;
 }
 

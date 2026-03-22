@@ -17,6 +17,12 @@ export interface ParsedTrace {
   detail?: string;
 }
 
+export interface AgentSelfAppearanceActionPayload {
+  avatarUrl?: string;
+  portraitUrl?: string;
+  reason?: string;
+}
+
 const NON_UI_TYPES = new Set([
   'tool_result',
   'tool_use',
@@ -68,6 +74,53 @@ const COMPONENT_TYPE_ALIASES: Record<string, string> = {
 };
 
 const RESPONSE_WRAPPER_TYPES = new Set(['response', 'done', 'response_fallback', 'response_tool_fallback', 'response_retry_fallback']);
+const UI_JSON_OPEN_TAG_PATTERN = /<ui[-_]json>/i;
+const UI_JSON_BLOCK_PATTERN = /<ui[-_]json>\s*([\s\S]*?)\s*<\/ui[-_]json>/gi;
+
+export function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+export function containsUiJsonTag(raw: string): boolean {
+  return UI_JSON_OPEN_TAG_PATTERN.test(raw);
+}
+
+function normalizeAppearanceActionType(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+}
+
+export function isAgentSelfAppearanceActionType(value: unknown): boolean {
+  return typeof value === 'string' && normalizeAppearanceActionType(value) === 'agentselfappearanceaction';
+}
+
+export function normalizeAgentSelfAppearanceActionPayload(raw: unknown): AgentSelfAppearanceActionPayload | null {
+  if (!isRecordValue(raw)) {
+    return null;
+  }
+  const avatarUrl = typeof raw.avatarUrl === 'string'
+    ? raw.avatarUrl.trim()
+    : typeof raw.avatar_url === 'string'
+      ? raw.avatar_url.trim()
+      : '';
+  const portraitUrl = typeof raw.portraitUrl === 'string'
+    ? raw.portraitUrl.trim()
+    : typeof raw.portrait_url === 'string'
+      ? raw.portrait_url.trim()
+      : '';
+  const reason = typeof raw.reason === 'string'
+    ? raw.reason.trim()
+    : typeof raw.description === 'string'
+      ? raw.description.trim()
+      : '';
+  if (!avatarUrl && !portraitUrl) {
+    return null;
+  }
+  return {
+    avatarUrl: avatarUrl || undefined,
+    portraitUrl: portraitUrl || undefined,
+    reason: reason || undefined,
+  };
+}
 
 function unwrapResponseEnvelopeText(raw: string): string {
   let text = raw.trim();
@@ -780,8 +833,8 @@ export function extractToolCallTitles(delta: string): string[] {
 }
 
 export function findUiBoundary(raw: string): number {
-  const tagIndex = raw.indexOf('<UI_JSON>');
-  if (tagIndex >= 0) return tagIndex;
+  const tagMatch = raw.match(UI_JSON_OPEN_TAG_PATTERN);
+  if (tagMatch && typeof tagMatch.index === 'number') return tagMatch.index;
 
   const implicitCandidates = [
     raw.search(/```(?:json)?\s*\{/i),
@@ -855,9 +908,9 @@ export function sanitizeAiUiOutput(rawText: string): string {
   if (!normalized) return '';
 
   return normalized
-    .replace(/```xml\s*(<UI_JSON>[\s\S]*?<\/UI_JSON>)\s*```/gi, '$1')
-    .replace(/```json\s*(<UI_JSON>[\s\S]*?<\/UI_JSON>)\s*```/gi, '$1')
-    .replace(/```\s*(<UI_JSON>[\s\S]*?<\/UI_JSON>)\s*```/gi, '$1')
+    .replace(/```xml\s*(<ui[-_]json>[\s\S]*?<\/ui[-_]json>)\s*```/gi, '$1')
+    .replace(/```json\s*(<ui[-_]json>[\s\S]*?<\/ui[-_]json>)\s*```/gi, '$1')
+    .replace(/```\s*(<ui[-_]json>[\s\S]*?<\/ui[-_]json>)\s*```/gi, '$1')
     .trim();
 }
 
@@ -870,17 +923,17 @@ type ExtractedUiJsonBlock = {
 
 function extractUiJsonBlocks(rawText: string): ExtractedUiJsonBlock[] {
   const normalized = sanitizeAiUiOutput(rawText);
-  const pattern = /<UI_JSON>\s*([\s\S]*?)\s*<\/UI_JSON>/gi;
   const blocks: ExtractedUiJsonBlock[] = [];
   let match: RegExpExecArray | null = null;
-  while ((match = pattern.exec(normalized)) !== null) {
+  while ((match = UI_JSON_BLOCK_PATTERN.exec(normalized)) !== null) {
     blocks.push({
       fullMatch: match[0] || '',
       payload: (match[1] || '').trim(),
       start: match.index,
-      end: pattern.lastIndex,
+      end: UI_JSON_BLOCK_PATTERN.lastIndex,
     });
   }
+  UI_JSON_BLOCK_PATTERN.lastIndex = 0;
   return blocks;
 }
 
@@ -1200,8 +1253,8 @@ export function cleanupAssistantText(rawText: string, spec?: unknown): string {
   const normalizedRaw = unwrapResponseEnvelopeText(rawText);
   const withoutThinking = stripThinkingBlocks(normalizedRaw);
   const withoutUiBlock = withoutThinking
-    .replace(/<UI_JSON>[\s\S]*?<\/UI_JSON>/gi, '')
-    .replace(/<UI_JSON>[\s\S]*$/gi, '');
+    .replace(/<ui[-_]json>[\s\S]*?<\/ui[-_]json>/gi, '')
+    .replace(/<ui[-_]json>[\s\S]*$/gi, '');
   const slicedByBoundary = withoutUiBlock;
   const text = sanitizeAssistantText(slicedByBoundary);
   if (!text) return '';
@@ -1290,6 +1343,168 @@ export function normalizeIncomingSpec(spec: unknown): unknown | undefined {
   return tryParseInlineSpecFromText(text);
 }
 
+export function extractAgentSelfAppearanceActionFromSpec(spec: unknown): {
+  payload: AgentSelfAppearanceActionPayload;
+  strippedSpec: unknown | undefined;
+} | null {
+  let payload: AgentSelfAppearanceActionPayload | null = null;
+
+  const stripFlatRefValue = (
+    value: unknown,
+    removedIds: Set<string>,
+  ): unknown | undefined => {
+    if (typeof value === 'string') {
+      return removedIds.has(value) ? undefined : value;
+    }
+    if (Array.isArray(value)) {
+      const nextItems = value
+        .map((item) => stripFlatRefValue(item, removedIds))
+        .filter((item): item is unknown => item !== undefined);
+      return nextItems;
+    }
+    if (!isRecordValue(value)) {
+      return value;
+    }
+    let changed = false;
+    const nextValue: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const strippedEntry = stripFlatRefValue(entry, removedIds);
+      if (strippedEntry !== entry) {
+        changed = true;
+      }
+      if (strippedEntry !== undefined) {
+        nextValue[key] = strippedEntry;
+      }
+    }
+    return changed ? nextValue : value;
+  };
+
+  const stripFlatSpec = (node: Record<string, unknown>): unknown | undefined => {
+    if (typeof node.root !== 'string' || !isRecordValue(node.elements)) {
+      return undefined;
+    }
+
+    const removedIds = new Set<string>();
+    const sourceElements = node.elements as Record<string, unknown>;
+    for (const [key, element] of Object.entries(sourceElements)) {
+      if (!isRecordValue(element) || !isAgentSelfAppearanceActionType(element.type)) {
+        continue;
+      }
+      if (!payload) {
+        payload = normalizeAgentSelfAppearanceActionPayload(element.props);
+      }
+      removedIds.add(key);
+    }
+
+    if (removedIds.size === 0) {
+      return node;
+    }
+
+    const nextElements: Record<string, unknown> = {};
+    for (const [key, element] of Object.entries(sourceElements)) {
+      if (removedIds.has(key)) {
+        continue;
+      }
+      if (!isRecordValue(element)) {
+        nextElements[key] = element;
+        continue;
+      }
+
+      let changed = false;
+      let nextElement: Record<string, unknown> = element;
+
+      if (Object.prototype.hasOwnProperty.call(element, 'children')) {
+        const strippedChildren = stripFlatRefValue(element.children, removedIds);
+        if (strippedChildren !== element.children) {
+          changed = true;
+          nextElement = { ...nextElement };
+          if (strippedChildren === undefined) {
+            delete nextElement.children;
+          } else {
+            nextElement.children = strippedChildren;
+          }
+        }
+      }
+
+      if (Object.prototype.hasOwnProperty.call(element, 'slots')) {
+        const strippedSlots = stripFlatRefValue(element.slots, removedIds);
+        if (strippedSlots !== element.slots) {
+          changed = true;
+          nextElement = nextElement === element ? { ...nextElement } : nextElement;
+          if (strippedSlots === undefined) {
+            delete nextElement.slots;
+          } else {
+            nextElement.slots = strippedSlots;
+          }
+        }
+      }
+
+      nextElements[key] = changed ? nextElement : element;
+    }
+
+    const nextRoot = !removedIds.has(node.root) && Object.prototype.hasOwnProperty.call(nextElements, node.root)
+      ? node.root
+      : Object.keys(nextElements)[0];
+    if (!nextRoot) {
+      return undefined;
+    }
+
+    return {
+      ...node,
+      root: nextRoot,
+      elements: nextElements,
+    };
+  };
+
+  const stripNode = (node: unknown): unknown | undefined => {
+    if (Array.isArray(node)) {
+      const nextChildren = node
+        .map((item) => stripNode(item))
+        .filter((item): item is unknown => item !== undefined);
+      return nextChildren.length > 0 ? nextChildren : undefined;
+    }
+    if (!isRecordValue(node)) {
+      return node;
+    }
+
+    const strippedFlatSpec = stripFlatSpec(node);
+    if (strippedFlatSpec !== undefined || (typeof node.root === 'string' && isRecordValue(node.elements))) {
+      return strippedFlatSpec;
+    }
+
+    if (isAgentSelfAppearanceActionType(node.type)) {
+      if (!payload) {
+        payload = normalizeAgentSelfAppearanceActionPayload(node.props);
+      }
+      return undefined;
+    }
+
+    if (Array.isArray(node.children)) {
+      const nextChildren = node.children
+        .map((item) => stripNode(item))
+        .filter((item): item is unknown => item !== undefined);
+      if (nextChildren.length === 0) {
+        return undefined;
+      }
+      return {
+        ...node,
+        children: nextChildren,
+      };
+    }
+
+    return node;
+  };
+
+  const strippedSpec = stripNode(spec);
+  if (!payload) {
+    return null;
+  }
+  return {
+    payload,
+    strippedSpec,
+  };
+}
+
 export function extractReadableText(value: unknown): string | undefined {
   if (typeof value === 'string') {
     const text = sanitizeAssistantText(value);
@@ -1321,6 +1536,30 @@ function parseToolLogPayload(raw: string): Record<string, unknown> | undefined {
     return undefined;
   }
   return payload;
+}
+
+function parseNestedToolPayload(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const parsed = parseJsonSafely<unknown>(value.trim());
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return undefined;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function pickStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function getToolNameFromLogPayload(payload: Record<string, unknown> | undefined): string {
@@ -1364,6 +1603,60 @@ export function extractLatestToolReadableText(rows: MessageTrace[] | undefined):
   return undefined;
 }
 
+function buildImageFallbackSpec(payload: Record<string, unknown>): unknown | undefined {
+  const toolName = getToolNameFromLogPayload(payload).toLowerCase();
+  if ((toolName !== 'image_generate' && toolName !== 'image_edit') || payload.is_error === true) {
+    return undefined;
+  }
+
+  const resultPayload = parseNestedToolPayload(payload.result) || payload;
+  const imageUrls = pickStringArray(resultPayload.image_urls ?? resultPayload.imageUrls);
+  const savedPaths = pickStringArray(resultPayload.saved_to ?? resultPayload.savedTo);
+  const sources = imageUrls.length > 0 ? imageUrls : savedPaths;
+  if (sources.length === 0) {
+    return undefined;
+  }
+
+  const model = typeof resultPayload.model === 'string' ? resultPayload.model.trim() : '';
+  const prompt = parseNestedToolPayload(payload.input)?.prompt;
+  const title = typeof prompt === 'string' && prompt.trim()
+    ? prompt.trim().slice(0, 48)
+    : toolName === 'image_edit' ? '图片修改结果' : '图片生成结果';
+  const images = sources.map((src, index) => ({
+    src,
+    alt: `${title} ${index + 1}`,
+  }));
+
+  if (images.length === 1) {
+    return {
+      type: 'ImageCover',
+      props: {
+        src: images[0].src,
+        alt: images[0].alt,
+        title,
+        description: model || undefined,
+      },
+    };
+  }
+
+  return {
+    type: 'ImageCarousel',
+    props: {
+      images,
+      title,
+      showThumbs: true,
+    },
+  };
+}
+
+export function buildRenderableSpecFromToolLog(raw: string): unknown | undefined {
+  const payload = parseToolLogPayload(raw);
+  if (!payload) {
+    return undefined;
+  }
+  return buildImageFallbackSpec(payload);
+}
+
 export function buildFallbackSpecFromToolTrace(rows: MessageTrace[] | undefined): unknown | undefined {
   if (!rows || rows.length === 0) return undefined;
 
@@ -1379,6 +1672,10 @@ ${row.detail || ''}`));
   const detail = (latestTool.detail || '').trim();
   const title = latestTool.title.trim() || '工具结果';
   const payload = parseToolLogPayload(detail);
+  const renderableSpec = payload ? buildImageFallbackSpec(payload) : undefined;
+  if (renderableSpec != null) {
+    return renderableSpec;
+  }
   const payloadToolName = getToolNameFromLogPayload(payload);
   const readable = extractReadableTextFromLog(detail);
 

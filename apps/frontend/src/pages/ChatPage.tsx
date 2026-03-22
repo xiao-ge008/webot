@@ -10,7 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AgentAvatar } from '@/components/ui/agent-avatar';
 import { Badge } from '@/components/ui/badge';
-import { Search, Plus, GripVertical, Settings, ListChecks, X } from 'lucide-react';
+import { Search, Plus, GripVertical, Settings, ListChecks, Files, X } from 'lucide-react';
 import { mockAgents } from '@/data/mock-agents';
 import { type ChatAttachment, type Message, type MessageToolCall, type MessageTrace } from '@/data/mock-chats';
 import { cn } from '@/lib/utils';
@@ -35,7 +35,12 @@ import {
     executeAgentManagementAction,
     type AgentManagementProgressEvent,
 } from '@/services/agent-management-workflow';
-import { getManagementAgentDetail, listManagementAgents } from '@/services/management-client';
+import {
+    applyManagementAgentAppearance,
+    getManagementAgentDetail,
+    listManagementAgents,
+} from '@/services/management-client';
+import { emitAgentAppearanceUpdated } from '@/services/agent-appearance-events';
 import { createChatGroup } from '@/services/group-client';
 import { requestJson } from '@/services/transport';
 import {
@@ -53,10 +58,13 @@ import {
 } from '@/services/task-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import {
+    type AgentSelfAppearanceActionPayload,
+    extractAgentSelfAppearanceActionFromSpec,
     appendThinkingStream,
     buildHistory,
     buildInitialMessages,
     buildFallbackSpecFromToolTrace,
+    buildRenderableSpecFromToolLog,
     cleanupAssistantText,
     extractLatestToolReadableText,
     extractThinkingFromTaggedText,
@@ -68,6 +76,8 @@ import {
     looksLikeProtocolOnlyText,
     mapManagementAgentToUi,
     normalizeIncomingSpec,
+    normalizeAgentSelfAppearanceActionPayload,
+    isRecordValue,
     parseJsonSafely,
     parseTraceFromLog,
     pushTrace,
@@ -383,6 +393,290 @@ function parseEmbeddedChatAttachments(text: string, ownerAgentId?: string): {
         displayText,
         attachments: attachments.length > 0 ? attachments : undefined,
     };
+}
+
+const IMAGE_EDIT_ROUTING_TAG = '[system:image-edit-routing]';
+const IMAGE_EDIT_META_DISCUSSION_PATTERN = /(?:图片服务|图片生成|图片编辑|图像服务|图像生成|图像编辑|配置|设置|工作流|workflow|工具链|能力|逻辑|功能|provider|模型服务|comfyui|modelscope)/i;
+
+interface EditableImageCandidate {
+    key: string;
+    sourceType: 'path' | 'url';
+    value: string;
+    origin: string;
+}
+
+function toTrimmedText(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+function pickStringList(value: unknown): string[] {
+    return Array.isArray(value)
+        ? value
+            .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+            .map((item) => item.trim())
+        : [];
+}
+
+function looksLikeImageAssetName(value: string): boolean {
+    return /\.(?:png|jpe?g|webp|gif|bmp|svg)(?:$|[?#])/i.test(value);
+}
+
+function isImageLikeAttachment(attachment: ChatAttachment | null | undefined): attachment is ChatAttachment {
+    if (!attachment) return false;
+    if (attachment.kind === 'image') return true;
+    if ((attachment.mimeType || '').trim().toLowerCase().startsWith('image/')) return true;
+    return looksLikeImageAssetName(attachment.name || '');
+}
+
+function resolveEditableAttachmentSource(attachment: ChatAttachment): {
+    sourceType: EditableImageCandidate['sourceType'];
+    value: string;
+} | null {
+    const relativePath = toTrimmedText(attachment.relativePath);
+    if (relativePath) {
+        return { sourceType: 'path', value: relativePath };
+    }
+    const savedPath = toTrimmedText(attachment.savedPath);
+    if (savedPath) {
+        return { sourceType: 'path', value: savedPath };
+    }
+    const assetUrl = toTrimmedText(attachment.assetUrl);
+    if (assetUrl) {
+        return { sourceType: 'url', value: assetUrl };
+    }
+    return null;
+}
+
+function looksLikeEditableImageSource(value: string, key: string): boolean {
+    const normalized = value.trim();
+    if (!normalized) return false;
+    if (normalized.startsWith('data:image/')) return true;
+    if (normalized.startsWith('/api/uploads/')) return true;
+    if (normalized.includes('/chat-assets/file?path=')) return true;
+    if (normalized.startsWith('/api/management/agents/')) return true;
+    if (/^https?:\/\//i.test(normalized)) {
+        return looksLikeImageAssetName(normalized) || /\/images?\//i.test(normalized);
+    }
+    if (key === 'path') {
+        return looksLikeImageAssetName(normalized) || normalized.includes('\\') || normalized.includes('/');
+    }
+    if ((key === 'src' || key === 'url') && normalized.startsWith('/')) {
+        return true;
+    }
+    return false;
+}
+
+function collectEditableImageSourcesFromSpec(spec: unknown, limit = 4): string[] {
+    const results: string[] = [];
+    const seen = new Set<string>();
+
+    const visit = (node: unknown, depth: number) => {
+        if (depth > 6 || results.length >= limit || node == null) {
+            return;
+        }
+        if (Array.isArray(node)) {
+            for (const item of node) {
+                visit(item, depth + 1);
+                if (results.length >= limit) return;
+            }
+            return;
+        }
+        if (!isRecordValue(node)) {
+            return;
+        }
+
+        const record = node as Record<string, unknown>;
+        for (const key of ['src', 'url', 'path'] as const) {
+            const candidate = toTrimmedText(record[key]);
+            if (!candidate || !looksLikeEditableImageSource(candidate, key) || seen.has(candidate)) {
+                continue;
+            }
+            seen.add(candidate);
+            results.push(candidate);
+            if (results.length >= limit) return;
+        }
+
+        for (const value of Object.values(record)) {
+            if (Array.isArray(value) || isRecordValue(value)) {
+                visit(value, depth + 1);
+                if (results.length >= limit) return;
+            }
+        }
+    };
+
+    visit(spec, 0);
+    return results;
+}
+
+function collectEditableImageCandidatesFromToolTrace(
+    traces: MessageTrace[] | undefined,
+    origin: string,
+): EditableImageCandidate[] {
+    if (!traces || traces.length === 0) {
+        return [];
+    }
+
+    const candidates: EditableImageCandidate[] = [];
+    const seen = new Set<string>();
+
+    for (let index = traces.length - 1; index >= 0; index -= 1) {
+        const detail = toTrimmedText(traces[index]?.detail);
+        if (!detail) continue;
+        const payload = parseJsonSafely<Record<string, unknown>>(detail);
+        if (!payload) continue;
+        const toolName = toTrimmedText(payload.tool || payload.name || payload.tool_name).toLowerCase();
+        if (toolName !== 'image_generate' && toolName !== 'image_edit') {
+            continue;
+        }
+        if (payload.is_error === true) {
+            continue;
+        }
+
+        const nestedResult =
+            (typeof payload.result === 'string'
+                ? parseJsonSafely<Record<string, unknown>>(payload.result)
+                : (isRecordValue(payload.result) ? payload.result : null))
+            || payload;
+
+        const savedPaths = pickStringList(nestedResult.saved_to ?? nestedResult.savedTo);
+        const imageUrls = pickStringList(nestedResult.image_urls ?? nestedResult.imageUrls);
+        for (const savedPath of savedPaths) {
+            const key = `path:${savedPath}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            candidates.push({
+                key,
+                sourceType: 'path',
+                value: savedPath,
+                origin,
+            });
+        }
+        for (const imageUrl of imageUrls) {
+            const key = `url:${imageUrl}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            candidates.push({
+                key,
+                sourceType: 'url',
+                value: imageUrl,
+                origin,
+            });
+        }
+        if (candidates.length > 0) {
+            return candidates;
+        }
+    }
+
+    return candidates;
+}
+
+function collectRecentEditableImageCandidates(messages: Message[], limit = 4): EditableImageCandidate[] {
+    const out: EditableImageCandidate[] = [];
+    const seen = new Set<string>();
+    const recentMessages = messages.slice(-16);
+
+    const pushCandidate = (candidate: EditableImageCandidate | null | undefined) => {
+        if (!candidate || !candidate.value.trim() || seen.has(candidate.key)) {
+            return;
+        }
+        seen.add(candidate.key);
+        out.push(candidate);
+    };
+
+    for (let index = recentMessages.length - 1; index >= 0; index -= 1) {
+        if (out.length >= limit) break;
+        const message = recentMessages[index];
+        if (!message) continue;
+
+        if (message.role === 'user' && message.attachments?.length) {
+            for (const attachment of message.attachments) {
+                if (!isImageLikeAttachment(attachment)) continue;
+                const source = resolveEditableAttachmentSource(attachment);
+                if (!source) continue;
+                pushCandidate({
+                    key: `${source.sourceType}:${source.value}`,
+                    sourceType: source.sourceType,
+                    value: source.value,
+                    origin: `当前或最近用户图片：${attachment.name || '未命名图片'}`,
+                });
+                if (out.length >= limit) break;
+            }
+        }
+
+        if (out.length >= limit || message.role !== 'agent') {
+            continue;
+        }
+
+        const toolTraceCandidates = collectEditableImageCandidatesFromToolTrace(
+            message.toolTrace,
+            '最近聊天生成/修改结果',
+        );
+        for (const candidate of toolTraceCandidates) {
+            pushCandidate(candidate);
+            if (out.length >= limit) break;
+        }
+        if (out.length >= limit) break;
+
+        if (message.attachments?.length) {
+            for (const attachment of message.attachments) {
+                if (!isImageLikeAttachment(attachment)) continue;
+                const source = resolveEditableAttachmentSource(attachment);
+                if (!source) continue;
+                pushCandidate({
+                    key: `${source.sourceType}:${source.value}`,
+                    sourceType: source.sourceType,
+                    value: source.value,
+                    origin: `最近聊天附件图：${attachment.name || '未命名图片'}`,
+                });
+                if (out.length >= limit) break;
+            }
+        }
+        if (out.length >= limit) break;
+
+        const specSources = collectEditableImageSourcesFromSpec(message.spec, limit - out.length);
+        for (const specSource of specSources) {
+            pushCandidate({
+                key: `url:${specSource}`,
+                sourceType: 'url',
+                value: specSource,
+                origin: '最近聊天预览图',
+            });
+            if (out.length >= limit) break;
+        }
+    }
+
+    return out;
+}
+
+function buildImageEditRoutingPreamble(message: string, sessionMessages: Message[]): string {
+    const normalizedMessage = message.trim();
+    if (!normalizedMessage || IMAGE_EDIT_META_DISCUSSION_PATTERN.test(normalizedMessage)) {
+        return '';
+    }
+
+    const candidates = collectRecentEditableImageCandidates(sessionMessages, 4);
+    if (candidates.length === 0) {
+        return '';
+    }
+
+    const lines = [
+        IMAGE_EDIT_ROUTING_TAG,
+        '当前会话里有最近可复用的图片源。如果本轮涉及图片处理，请先按照图片工具协议判断 `image_edit` 还是 `image_generate`，不要默认重新生成。',
+        '图片工具决策大纲：',
+        '1. 需要保持同一个人物/主体/场景仍然可识别，或者只是局部微调/中等修改，用 `image_edit`。',
+        '2. 配饰、耳环、项链、首饰、衣服、发型、妆容、姿势、表情、背景、光线、道具、细节优化，这类通常属于 `image_edit`。',
+        '3. 只有当用户明确要全新图片、全新人物、全新构图、完全重做，或者不再要求延续上一张图时，才用 `image_generate`。',
+        '4. `image_generate` 不能保证还是同一个人物；如果人物身份一致性重要，就必须复用原图做 `image_edit`。',
+        '选择输入图时，优先顺序是：当前工作区/上传图片 > 最近聊天里已经生成或展示过的图片 > 没有源图时再说明缺少输入图。',
+    ];
+
+    lines.push('当前可直接复用的图片输入候选：');
+    candidates.forEach((candidate, index) => {
+        lines.push(`${index + 1}. ${candidate.origin}`);
+        lines.push(`- 推荐参数：${candidate.sourceType === 'path' ? 'image_path' : 'image_url'}="${candidate.value}"`);
+    });
+    lines.push('如果用户说“改下图 / 原图 / 这张图 / 刚才那张图”，默认优先使用上面最新且最匹配的候选源图。');
+    return lines.join('\n');
 }
 
 function normalizeBackendMessage(role: Message['role'], raw: string, ownerAgentId?: string): {
@@ -2655,6 +2949,7 @@ export function ChatPage({
     const remoteSyncTokenRef = useRef(0);
     const activeSessionContextRequestRef = useRef(0);
     const agentManagementBusyRef = useRef(false);
+    const selfAppearanceQueueRef = useRef<Promise<void>>(Promise.resolve());
     const lastUserActivityAtRef = useRef<number>(Date.now());
     const lastIdleAutoTriggeredAtRef = useRef<number>(0);
     const idleAutoTriggerCountRef = useRef<number>(0);
@@ -2666,6 +2961,7 @@ export function ChatPage({
             .filter(Boolean);
         return candidates.includes('nuwa') || candidates.includes('女娲');
     }, [agent.id, agent.name, chatAgentId]);
+    const agentManagementPermissionScope = isNuwaManagementAgent ? 'manage_all' as const : 'self_only' as const;
     const sessionOwnerAgentId = (sessionOwnerAgentIdProp ?? chatAgentId).trim() || chatAgentId;
     const runtimeAgentId = (runtimeKeyProp ?? chatAgentId).trim() || chatAgentId;
     const groupRuntimeEnabled = groupRuntimeEnabledProp ?? false;
@@ -2764,14 +3060,20 @@ export function ChatPage({
             message,
             mode,
         })?.trim() || '';
-        if (resolved) {
-            return resolved;
-        }
-        return systemPreambleRef.current || undefined;
+        const basePreamble = resolved || systemPreambleRef.current || '';
+        const imageEditPreamble = buildImageEditRoutingPreamble(
+            message,
+            getSessionMessagesSnapshot(activeSessionIdRef.current),
+        );
+        const combined = [basePreamble, imageEditPreamble].filter(Boolean).join('\n\n').trim();
+        return combined || undefined;
     };
     const messages = useMemo(() => activeSession?.messages ?? [], [activeSession]);
     useEffect(() => {
         if (groupRuntimeEnabled || !activeSessionId || !activeSession) {
+            return;
+        }
+        if (activeSession.contextDigestManual) {
             return;
         }
         const nextDigest = buildSessionContextDigest(activeSession);
@@ -2788,6 +3090,7 @@ export function ChatPage({
                 ? {
                     ...session,
                     contextDigest: nextDigest,
+                    contextDigestManual: false,
                 }
                 : session
         )));
@@ -3474,6 +3777,212 @@ export function ChatPage({
         }
         syncMessagesToSession(sid, next);
     };
+
+    const syncCurrentAgentAppearance = useCallback((
+        appearance: { avatarUrl?: string; portraitUrl?: string },
+        ctx?: { sessionId?: string; messageId?: string },
+    ) => {
+        const nextAvatarUrl = appearance.avatarUrl?.trim() || undefined;
+        const nextPortraitUrl = appearance.portraitUrl?.trim() || undefined;
+        if (!nextAvatarUrl && !nextPortraitUrl) {
+            return;
+        }
+        const targetAgentId = chatAgentId.trim();
+        if (!targetAgentId) {
+            return;
+        }
+
+        setAgent((prev) => {
+            if (prev.id !== targetAgentId) {
+                return prev;
+            }
+            return {
+                ...prev,
+                avatarUrl: nextAvatarUrl ?? prev.avatarUrl,
+                portraitUrl: nextPortraitUrl ?? prev.portraitUrl,
+            };
+        });
+
+        const directoryHit = agentDirectoryRef.current.get(targetAgentId);
+        if (directoryHit) {
+            agentDirectoryRef.current.set(targetAgentId, {
+                ...directoryHit,
+                avatarUrl: nextAvatarUrl ?? directoryHit.avatarUrl,
+                portraitUrl: nextPortraitUrl ?? directoryHit.portraitUrl,
+            });
+        }
+
+        const patchMessageAppearance = (message: Message): Message => {
+            if ((message.agentId || '').trim() !== targetAgentId) {
+                return message;
+            }
+            return {
+                ...message,
+                agentAvatarUrl: nextAvatarUrl ?? message.agentAvatarUrl,
+                agentPortraitUrl: nextPortraitUrl ?? message.agentPortraitUrl,
+            };
+        };
+
+        setSessions((prev) => {
+            let changed = false;
+            const nextSessions = prev.map((session) => {
+                let sessionChanged = false;
+                const nextMessages = session.messages.map((message) => {
+                    const patched = patchMessageAppearance(message);
+                    if (patched !== message) {
+                        sessionChanged = true;
+                    }
+                    return patched;
+                });
+                if (!sessionChanged) {
+                    return session;
+                }
+                changed = true;
+                if (session.id === activeSessionIdRef.current) {
+                    messagesRef.current = nextMessages;
+                }
+                return {
+                    ...session,
+                    messages: nextMessages,
+                };
+            });
+            return changed ? nextSessions : prev;
+        });
+
+        if (streamingDraftRef.current && (streamingDraftRef.current.agentId || '').trim() === targetAgentId) {
+            streamingDraftRef.current = {
+                ...streamingDraftRef.current,
+                agentAvatarUrl: nextAvatarUrl ?? streamingDraftRef.current.agentAvatarUrl,
+                agentPortraitUrl: nextPortraitUrl ?? streamingDraftRef.current.agentPortraitUrl,
+            };
+        }
+
+        setStreamingMessage((prev) => {
+            if (!prev || (prev.agentId || '').trim() !== targetAgentId) {
+                return prev;
+            }
+            return {
+                ...prev,
+                agentAvatarUrl: nextAvatarUrl ?? prev.agentAvatarUrl,
+                agentPortraitUrl: nextPortraitUrl ?? prev.agentPortraitUrl,
+            };
+        });
+
+        const sessionId = ctx?.sessionId?.trim();
+        const messageId = ctx?.messageId?.trim();
+        if (sessionId && messageId && sessionId === activeSessionIdRef.current) {
+            const currentMessages = messagesRef.current;
+            const hit = currentMessages.find((message) => message.id === messageId);
+            if (hit && (hit.agentId || '').trim() === targetAgentId) {
+                messagesRef.current = currentMessages.map((message) => (
+                    message.id === messageId
+                        ? {
+                            ...message,
+                            agentAvatarUrl: nextAvatarUrl ?? message.agentAvatarUrl,
+                            agentPortraitUrl: nextPortraitUrl ?? message.agentPortraitUrl,
+                        }
+                        : message
+                ));
+            }
+        }
+        emitAgentAppearanceUpdated({
+            agentId: targetAgentId,
+            avatarUrl: nextAvatarUrl,
+            portraitUrl: nextPortraitUrl,
+        });
+    }, [chatAgentId]);
+
+    const waitForCurrentAgentAppearanceCommit = useCallback(async (
+        payload: AgentSelfAppearanceActionPayload,
+        baseline: { avatarUrl?: string; portraitUrl?: string },
+    ): Promise<{ avatarUrl?: string; portraitUrl?: string } | null> => {
+        const targetAgentId = chatAgentId.trim();
+        if (!targetAgentId) {
+            return null;
+        }
+        const wantsAvatar = Boolean(payload.avatarUrl?.trim());
+        const wantsPortrait = Boolean(payload.portraitUrl?.trim());
+        if (!wantsAvatar && !wantsPortrait) {
+            return null;
+        }
+
+        const baselineAvatar = baseline.avatarUrl?.trim() || '';
+        const baselinePortrait = baseline.portraitUrl?.trim() || '';
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+            if (attempt > 0) {
+                await new Promise<void>((resolve) => {
+                    window.setTimeout(resolve, 220);
+                });
+            }
+            try {
+                const detail = await getManagementAgentDetail(targetAgentId);
+                const nextAvatarUrl = detail.identity.avatar_url?.trim() || undefined;
+                const nextPortraitUrl = detail.identity.portrait_url?.trim() || undefined;
+                const avatarCommitted = !wantsAvatar || (!!nextAvatarUrl && nextAvatarUrl !== baselineAvatar);
+                const portraitCommitted = !wantsPortrait || (!!nextPortraitUrl && nextPortraitUrl !== baselinePortrait);
+                if (avatarCommitted && portraitCommitted) {
+                    return {
+                        avatarUrl: nextAvatarUrl,
+                        portraitUrl: nextPortraitUrl,
+                    };
+                }
+            } catch {
+                // 后端异步写入期间短暂失败时继续轮询，避免误触发前端 fallback。
+            }
+        }
+        return null;
+    }, [chatAgentId]);
+
+    const enqueueSelfAppearanceAction = useCallback((
+        payload: AgentSelfAppearanceActionPayload,
+        ctx?: { sessionId?: string; messageId?: string },
+    ) => {
+        const normalizedPayload = normalizeAgentSelfAppearanceActionPayload(payload);
+        if (!normalizedPayload || !chatAgentId.trim()) {
+            return;
+        }
+        const baselineAppearance = {
+            avatarUrl: agent.avatarUrl,
+            portraitUrl: agent.portraitUrl,
+        };
+
+        // 先用候选图做无感刷新，随后再与后端真实落盘结果对齐。
+        syncCurrentAgentAppearance(normalizedPayload, ctx);
+
+        selfAppearanceQueueRef.current = selfAppearanceQueueRef.current
+            .catch(() => undefined)
+            .then(async () => {
+                const committedAppearance = await waitForCurrentAgentAppearanceCommit(
+                    normalizedPayload,
+                    baselineAppearance,
+                );
+                if (committedAppearance) {
+                    syncCurrentAgentAppearance(committedAppearance, ctx);
+                    return;
+                }
+                try {
+                    const applied = await applyManagementAgentAppearance(chatAgentId, normalizedPayload);
+                    syncCurrentAgentAppearance(applied, ctx);
+                } catch (error) {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    const targetSessionId = ctx?.sessionId?.trim() || activeSessionIdRef.current;
+                    if (targetSessionId) {
+                        appendSessionSystemMessage(targetSessionId, `自动更新外观失败：${detail || '未知错误'}`);
+                    }
+                    pushInAppNotice({
+                        title: '外观自动更新失败',
+                        message: detail || '未知错误',
+                        level: 'error',
+                    });
+                }
+            });
+    }, [
+        agent.avatarUrl,
+        agent.portraitUrl,
+        chatAgentId,
+        syncCurrentAgentAppearance,
+        waitForCurrentAgentAppearanceCommit,
+    ]);
 
     const appendSessionSystemMessage = (sessionId: string, text: string) => {
         const trimmed = text.trim();
@@ -4604,6 +5113,18 @@ export function ChatPage({
                     }
                     next.tools = toolList;
                     if (next.spec == null) {
+                        const renderableSpec = buildRenderableSpecFromToolLog(raw);
+                        if (renderableSpec != null) {
+                            next.spec = renderableSpec;
+                            next.debugSpecSource = 'tool_result';
+                            next.uiStreamState = 'ready';
+                            next.cardPending = false;
+                            if (!(next.text || '').trim()) {
+                                next.text = readable || '已生成卡片结果。';
+                            }
+                        }
+                    }
+                    if (next.spec == null) {
                         const inlineSpec = tryParseInlineSpecFromText(raw) ?? (readable ? tryParseInlineSpecFromText(readable) : undefined);
                         if (inlineSpec != null) {
                             next.spec = inlineSpec;
@@ -4726,10 +5247,21 @@ export function ChatPage({
                         next.debugSpecSource = 'inline';
                     }
                 }
+                const appearanceUpdated = normalizeAgentSelfAppearanceActionPayload(
+                    chunk.meta?.appearanceUpdated,
+                );
+                const autoAppearanceAction = extractAgentSelfAppearanceActionFromSpec(next.spec);
+                if (autoAppearanceAction) {
+                    next.spec = autoAppearanceAction.strippedSpec;
+                    next.uiRawText = '';
+                }
                 next.text = cleanupAssistantText(next.text || '', next.spec);
                 next.thinking = false;
                 next.streaming = false;
                 next.tools = (next.tools ?? []).map((tool) => ({ ...tool, running: false }));
+                next.uiStreamState = next.spec != null || (next.uiRawText || '').trim()
+                    ? 'ready'
+                    : 'idle';
                 if (next.a2aCards && next.a2aCards.length > 0) {
                     // A2A 委派链路以工具回执为准：tool_result 收到后会自动结项。
                     // 如果主智能体输出已结束但仍存在 working 卡片，视为未收到回执并标记失败，避免卡片长期悬挂。
@@ -4748,6 +5280,17 @@ export function ChatPage({
                             title: '执行失败',
                             detail: fallbackDetail,
                         }, 'failed');
+                    });
+                }
+                if (appearanceUpdated) {
+                    syncCurrentAgentAppearance(appearanceUpdated, {
+                        sessionId: activeRequestSessionIdRef.current || undefined,
+                        messageId: next.id,
+                    });
+                } else if (autoAppearanceAction) {
+                    enqueueSelfAppearanceAction(autoAppearanceAction.payload, {
+                        sessionId: activeRequestSessionIdRef.current || undefined,
+                        messageId: next.id,
                     });
                 }
                 next.cardPending = false;
@@ -4950,6 +5493,10 @@ export function ChatPage({
                 savedPath: item.savedPath,
                 assetUrl: item.assetUrl,
                 size: item.size,
+                sha256: item.sha256,
+                localVisionSummary: item.localVisionSummary,
+                localVisionProvider: item.localVisionProvider,
+                localVisionModel: item.localVisionModel,
             }))
             .filter((item) => Boolean(item.fileId));
         const draft: Message = {
@@ -5252,8 +5799,19 @@ export function ChatPage({
                     finalDraft.taskCard = proposalFromLlm;
                 }
             }
+            const appearanceUpdated = result.success
+                ? normalizeAgentSelfAppearanceActionPayload(result.appearanceUpdated)
+                : null;
+            const autoAppearanceAction = result.success
+                ? extractAgentSelfAppearanceActionFromSpec(finalDraft.spec)
+                : null;
+            if (autoAppearanceAction) {
+                finalDraft.spec = autoAppearanceAction.strippedSpec;
+                finalDraft.uiRawText = '';
+                finalDraft.uiStreamState = finalDraft.spec != null ? 'ready' : 'idle';
+            }
             const protocolOnly = looksLikeProtocolOnlyText(finalDraft.text || '');
-            const hasRenderable = Boolean(finalDraft.spec) || (!protocolOnly && Boolean(finalDraft.text));
+            const hasRenderable = Boolean(autoAppearanceAction) || Boolean(finalDraft.spec) || (!protocolOnly && Boolean(finalDraft.text));
             if (!hasRenderable && doneReceivedRef.current) {
                 const fallbackSpec = buildFallbackSpecFromToolTrace(finalDraft.toolTrace);
                 if (finalDraft.spec == null && fallbackSpec != null) {
@@ -5295,6 +5853,18 @@ export function ChatPage({
                 }
             } else if (!suppressDuplicate) {
                 commitMessages((prev) => [...prev, finalDraft]);
+            }
+            const committedMessageId = suppressDuplicate ? '' : (draftId || finalDraft.id);
+            if (appearanceUpdated) {
+                syncCurrentAgentAppearance(appearanceUpdated, {
+                    sessionId: requestSessionId,
+                    messageId: committedMessageId || undefined,
+                });
+            } else if (autoAppearanceAction) {
+                enqueueSelfAppearanceAction(autoAppearanceAction.payload, {
+                    sessionId: requestSessionId,
+                    messageId: committedMessageId || undefined,
+                });
             }
             const queueBinding = requestGroupQueueMapRef.current.get(requestId);
             if (queueBinding) {
@@ -5862,14 +6432,25 @@ export function ChatPage({
 
                         const raw = (result.text || result.content || '').trim();
                         const spec = raw ? tryParseInlineSpecFromText(raw) : null;
-                        const uiRawText = raw ? extractUiRawText(raw) : '';
+                        const appearanceUpdated = normalizeAgentSelfAppearanceActionPayload(
+                            result.appearanceUpdated,
+                        );
+                        const autoAppearanceAction = spec
+                            ? extractAgentSelfAppearanceActionFromSpec(spec)
+                            : null;
+                        const renderSpec = autoAppearanceAction
+                            ? autoAppearanceAction.strippedSpec
+                            : (spec ?? undefined);
+                        const uiRawText = autoAppearanceAction
+                            ? ''
+                            : (raw ? extractUiRawText(raw) : '');
                         const fallbackText = result.success
                             ? ''
                             : (result.error?.trim()
                                 ? '该成员当前不可用，已跳过。'
                                 : '该成员当前不可用，已跳过。');
                         const finalText = raw
-                            ? cleanupAssistantText(raw, spec)
+                            ? cleanupAssistantText(raw, renderSpec)
                             : (result.success ? '' : fallbackText);
 
                         if (result.success && finalText && isNearDuplicate(finalText, baselineTexts)) {
@@ -5887,16 +6468,32 @@ export function ChatPage({
                                 ...row,
                                 thinking: false,
                                 streaming: false,
-                                spec: spec ?? undefined,
+                                spec: renderSpec,
                                 uiRawText,
-                                uiStreamState: uiRawText ? 'ready' : 'idle',
+                                uiStreamState: renderSpec != null || uiRawText ? 'ready' : 'idle',
                                 text: finalText,
                                 generationElapsedMs: Math.max(0, Date.now() - startedAt),
                             };
                         }));
+                        if (appearanceUpdated) {
+                            syncCurrentAgentAppearance(appearanceUpdated, {
+                                sessionId: activeSessionIdRef.current || undefined,
+                                messageId: draftId,
+                            });
+                        } else if (autoAppearanceAction) {
+                            enqueueSelfAppearanceAction(autoAppearanceAction.payload, {
+                                sessionId: activeSessionIdRef.current || undefined,
+                                messageId: draftId,
+                            });
+                        }
                         updateGroupQueueItem(activeSessionIdRef.current, queueItemId, result.success ? 'done' : 'skipped', {
                             speakerId: targetId,
-                            note: compactGroupRuntimeNote(finalText || fallbackText),
+                            note: compactGroupRuntimeNote(
+                                finalText
+                                || appearanceUpdated?.reason
+                                || autoAppearanceAction?.payload.reason
+                                || fallbackText,
+                            ),
                         });
                     }
                 }
@@ -6096,14 +6693,25 @@ export function ChatPage({
 
                 const raw = (result.text || result.content || '').trim();
                 const spec = raw ? tryParseInlineSpecFromText(raw) : null;
-                const uiRawText = raw ? extractUiRawText(raw) : '';
+                const appearanceUpdated = normalizeAgentSelfAppearanceActionPayload(
+                    result.appearanceUpdated,
+                );
+                const autoAppearanceAction = spec
+                    ? extractAgentSelfAppearanceActionFromSpec(spec)
+                    : null;
+                const renderSpec = autoAppearanceAction
+                    ? autoAppearanceAction.strippedSpec
+                    : (spec ?? undefined);
+                const uiRawText = autoAppearanceAction
+                    ? ''
+                    : (raw ? extractUiRawText(raw) : '');
                 const fallbackText = result.success
                     ? ''
                     : (result.error?.trim()
                         ? '该成员当前不可用，已跳过。'
                         : '该成员当前不可用，已跳过。');
                 const finalText = raw
-                    ? cleanupAssistantText(raw, spec)
+                    ? cleanupAssistantText(raw, renderSpec)
                     : (result.success ? '' : fallbackText);
 
                 if (!result.success && budget.consumedNew) {
@@ -6128,16 +6736,32 @@ export function ChatPage({
                         ...msg,
                         thinking: false,
                         streaming: false,
-                        spec: spec ?? undefined,
+                        spec: renderSpec,
                         uiRawText,
-                        uiStreamState: uiRawText ? 'ready' : 'idle',
+                        uiStreamState: renderSpec != null || uiRawText ? 'ready' : 'idle',
                         text: finalText,
                         generationElapsedMs: Math.max(0, Date.now() - startedAt),
                     };
                 }));
+                if (appearanceUpdated) {
+                    syncCurrentAgentAppearance(appearanceUpdated, {
+                        sessionId: activeSessionIdRef.current || undefined,
+                        messageId: draftId,
+                    });
+                } else if (autoAppearanceAction) {
+                    enqueueSelfAppearanceAction(autoAppearanceAction.payload, {
+                        sessionId: activeSessionIdRef.current || undefined,
+                        messageId: draftId,
+                    });
+                }
                 updateGroupQueueItem(activeSessionIdRef.current, queueItemId, result.success ? 'done' : 'skipped', {
                     speakerId: extraId,
-                    note: compactGroupRuntimeNote(finalText || fallbackText),
+                    note: compactGroupRuntimeNote(
+                        finalText
+                        || appearanceUpdated?.reason
+                        || autoAppearanceAction?.payload.reason
+                        || fallbackText,
+                    ),
                 });
             }
         } finally {
@@ -6468,8 +7092,8 @@ export function ChatPage({
         payload: Record<string, unknown>,
         ctx?: { messageId?: string },
     ) => {
-        if (!isNuwaManagementAgent) {
-            appendLocalAgentMessage('仅女娲可执行智能体管理操作。');
+        if (!chatAgentId.trim()) {
+            appendLocalAgentMessage('当前会话未识别到有效智能体 ID，暂时无法执行自我修改。');
             return;
         }
         if (agentManagementBusyRef.current) {
@@ -6532,6 +7156,9 @@ export function ChatPage({
         void (async () => {
             try {
                 const result = await executeAgentManagementAction(payload, {
+                    actorAgentId: chatAgentId,
+                    actorAgentName: agent.name,
+                    permissionScope: agentManagementPermissionScope,
                     onProgress: (event: AgentManagementProgressEvent) => {
                         const at = new Date().toISOString();
                         const progressEntry = buildTaskTimelineEntry({
@@ -6578,7 +7205,11 @@ export function ChatPage({
                 }, finalEntry));
                 appendLocalAgentMessage(result.summary);
                 pushInAppNotice({
-                    title: result.mode === 'create' ? '智能体已创建' : '智能体已更新',
+                    title: result.mode === 'create'
+                        ? '智能体已创建'
+                        : agentManagementPermissionScope === 'self_only'
+                            ? '智能体自我更新完成'
+                            : '智能体已更新',
                     message: `${result.displayName} (${result.agentId})`,
                     level: 'success',
                 });
@@ -6607,7 +7238,7 @@ export function ChatPage({
                 }, failedEntry));
                 appendLocalAgentMessage(`执行失败：${detail || '未知错误'}`);
                 pushInAppNotice({
-                    title: '智能体管理失败',
+                    title: agentManagementPermissionScope === 'self_only' ? '智能体自我更新失败' : '智能体管理失败',
                     message: detail || '未知错误',
                     level: 'error',
                 });
@@ -6615,17 +7246,18 @@ export function ChatPage({
                 agentManagementBusyRef.current = false;
             }
         })();
-    }, [agent, appendLocalAgentMessage, chatAgentId, isNuwaManagementAgent]);
+    }, [agent, agentManagementPermissionScope, appendLocalAgentMessage, chatAgentId]);
 
     const handleCancelAgentManagement = useCallback((
         _payload: Record<string, unknown>,
         _ctx?: { messageId?: string },
     ) => {
-        if (!isNuwaManagementAgent) {
-            return;
-        }
-        appendLocalAgentMessage('已取消本次智能体创建/修改请求。');
-    }, [appendLocalAgentMessage, isNuwaManagementAgent]);
+        appendLocalAgentMessage(
+            agentManagementPermissionScope === 'self_only'
+                ? '已取消本次自我设定修改请求。'
+                : '已取消本次智能体创建/修改请求。',
+        );
+    }, [agentManagementPermissionScope, appendLocalAgentMessage]);
 
     const handleConfirmCreateTask = async () => {
         const sourceMessageId = pendingCreateTaskMessage?.id;
@@ -7582,6 +8214,16 @@ export function ChatPage({
                                         size="icon"
                                         variant="secondary"
                                         className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                        title="上下文管理"
+                                        onClick={() => navigate(`/chat/${encodeURIComponent(agent.id)}/context?sessionId=${encodeURIComponent(activeSessionId)}`)}
+                                    >
+                                        <Files className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                        type="button"
+                                        size="icon"
+                                        variant="secondary"
+                                        className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
                                         title="任务管理"
                                         onClick={() => navigate(`/agent/${encodeURIComponent(agent.id)}/tasks`)}
                                     >
@@ -7610,6 +8252,16 @@ export function ChatPage({
                                         onClick={() => navigate(`/edit/${agent.id}`)}
                                     >
                                         <Settings className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                        type="button"
+                                        size="icon"
+                                        variant="secondary"
+                                        className="h-9 w-9 rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur hover:bg-black/80"
+                                        title="上下文管理"
+                                        onClick={() => navigate(`/chat/${encodeURIComponent(agent.id)}/context?sessionId=${encodeURIComponent(activeSessionId)}`)}
+                                    >
+                                        <Files className="h-4 w-4" />
                                     </Button>
                                     <Button
                                         type="button"

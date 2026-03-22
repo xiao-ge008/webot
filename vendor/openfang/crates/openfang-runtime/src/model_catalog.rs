@@ -303,16 +303,60 @@ impl ModelCatalog {
         true
     }
 
+    /// Update capability flags for a custom model identified by ID and provider.
+    ///
+    /// Returns `true` if a matching custom model was found and updated.
+    pub fn update_custom_model_capabilities(
+        &mut self,
+        model_id: &str,
+        provider: &str,
+        supports_tools: Option<bool>,
+        supports_vision: Option<bool>,
+        supports_streaming: Option<bool>,
+    ) -> bool {
+        let lower_id = model_id.to_lowercase();
+        let lower_provider = provider.to_lowercase();
+        let Some(entry) = self.models.iter_mut().find(|m| {
+            m.id.to_lowercase() == lower_id
+                && m.provider.to_lowercase() == lower_provider
+                && m.tier == ModelTier::Custom
+        }) else {
+            return false;
+        };
+
+        if let Some(value) = supports_tools {
+            entry.supports_tools = value;
+        }
+        if let Some(value) = supports_vision {
+            entry.supports_vision = value;
+        }
+        if let Some(value) = supports_streaming {
+            entry.supports_streaming = value;
+        }
+
+        true
+    }
+
     /// Remove a custom model by ID.
     ///
     /// Only removes models with `Custom` tier to prevent accidental deletion
     /// of builtin models. Returns `true` if removed.
-    pub fn remove_custom_model(&mut self, model_id: &str) -> bool {
-        let lower = model_id.to_lowercase();
+    pub fn remove_custom_model(&mut self, model_id: &str, provider: Option<&str>) -> bool {
+        let lower_id = model_id.to_lowercase();
+        let lower_provider = provider.map(str::to_lowercase);
         let before = self.models.len();
-        self.models
-            .retain(|m| !(m.id.to_lowercase() == lower && m.tier == ModelTier::Custom));
-        self.models.len() < before
+        self.models.retain(|m| {
+            let matches_id = m.id.to_lowercase() == lower_id;
+            let matches_provider = lower_provider
+                .as_ref()
+                .is_none_or(|expected| m.provider.to_lowercase() == *expected);
+            !(matches_id && matches_provider && m.tier == ModelTier::Custom)
+        });
+        let removed = self.models.len() < before;
+        if removed {
+            self.refresh_provider_model_counts();
+        }
+        removed
     }
 
     /// Load custom models from a JSON file.
@@ -345,6 +389,16 @@ impl ModelCatalog {
         std::fs::write(path, json)
             .map_err(|e| format!("Failed to write custom models file: {e}"))?;
         Ok(())
+    }
+
+    fn refresh_provider_model_counts(&mut self) {
+        for provider in &mut self.providers {
+            provider.model_count = self
+                .models
+                .iter()
+                .filter(|m| m.provider == provider.id)
+                .count();
+        }
     }
 }
 
@@ -3276,6 +3330,103 @@ mod tests {
         let frontier = catalog.models_by_tier(ModelTier::Frontier);
         assert!(frontier.len() >= 3); // At least opus, gpt-4.1, gemini-2.5-pro
         assert!(frontier.iter().all(|m| m.tier == ModelTier::Frontier));
+    }
+
+    #[test]
+    fn test_update_custom_model_capabilities_is_provider_specific() {
+        let mut catalog = ModelCatalog::new();
+        assert!(catalog.add_custom_model(ModelCatalogEntry {
+            id: "gpt-5.4".into(),
+            display_name: "gs88/gpt-5.4".into(),
+            provider: "gs88".into(),
+            tier: ModelTier::Custom,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        }));
+        assert!(catalog.add_custom_model(ModelCatalogEntry {
+            id: "gpt-5.4".into(),
+            display_name: "other/gpt-5.4".into(),
+            provider: "other".into(),
+            tier: ModelTier::Custom,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        }));
+
+        assert!(catalog.update_custom_model_capabilities(
+            "gpt-5.4",
+            "gs88",
+            None,
+            Some(true),
+            None,
+        ));
+
+        let gs88 = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-5.4" && m.provider == "gs88")
+            .unwrap();
+        let other = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-5.4" && m.provider == "other")
+            .unwrap();
+        assert!(gs88.supports_vision);
+        assert!(!other.supports_vision);
+    }
+
+    #[test]
+    fn test_remove_custom_model_can_target_provider() {
+        let mut catalog = ModelCatalog::new();
+        assert!(catalog.add_custom_model(ModelCatalogEntry {
+            id: "kimi-k2.5".into(),
+            display_name: "moonshot/kimi-k2.5".into(),
+            provider: "moonshot".into(),
+            tier: ModelTier::Custom,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        }));
+        assert!(catalog.add_custom_model(ModelCatalogEntry {
+            id: "kimi-k2.5".into(),
+            display_name: "other/kimi-k2.5".into(),
+            provider: "other".into(),
+            tier: ModelTier::Custom,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        }));
+
+        assert!(catalog.remove_custom_model("kimi-k2.5", Some("moonshot")));
+        assert!(catalog
+            .models
+            .iter()
+            .any(|m| m.id == "kimi-k2.5" && m.provider == "other"));
+        assert!(!catalog
+            .models
+            .iter()
+            .any(|m| m.id == "kimi-k2.5" && m.provider == "moonshot"));
     }
 
     #[test]

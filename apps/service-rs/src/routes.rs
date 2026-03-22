@@ -25,8 +25,11 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
 use crate::assignment_store;
+use crate::component_center;
 use crate::error::ApiError;
+use crate::image_generation;
 use crate::path_resolver;
+use crate::vision_analysis;
 use crate::AppState;
 
 const DEFAULT_UI_SKILL_NAME: &str = "ui-skill";
@@ -444,6 +447,7 @@ static NUWA_AGENT_ID_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 pub fn management_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/media/image-proxy", get(proxy_remote_image))
+        .route("/media/openfang-upload", get(proxy_openfang_upload))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
             "/agents/context-files/reconcile",
@@ -536,6 +540,68 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/cron/jobs/{id}/enable", put(toggle_cron_job))
         .route("/cron/jobs/{id}/status", get(get_cron_job_status))
         .route("/skills", get(list_skills))
+        .route(
+            "/components/config",
+            get(component_center::get_component_provider_configs)
+                .put(component_center::set_component_provider_configs),
+        )
+        .route(
+            "/image-generation/config",
+            get(image_generation::get_image_generation_config)
+                .put(image_generation::set_image_generation_config),
+        )
+        .route(
+            "/image-generation/comfyui/models",
+            post(image_generation::probe_comfyui_models),
+        )
+        .route(
+            "/image-generation/generate",
+            post(image_generation::execute_image_generate),
+        )
+        .route(
+            "/image-generation/edit",
+            post(image_generation::execute_image_edit),
+        )
+        .route(
+            "/vision-analysis/config",
+            get(vision_analysis::get_vision_analysis_config)
+                .put(vision_analysis::set_vision_analysis_config),
+        )
+        .route(
+            "/vision-analysis/status",
+            get(vision_analysis::get_vision_analysis_status),
+        )
+        .route(
+            "/vision-analysis/download",
+            post(vision_analysis::start_vision_analysis_download),
+        )
+        .route(
+            "/vision-analysis/analyze",
+            post(vision_analysis::analyze_vision_image),
+        )
+        .route(
+            "/vision-analysis/cache",
+            post(vision_analysis::upsert_vision_analysis_cache),
+        )
+        .route(
+            "/vision-analysis/model/{vendor}/{repo}/{*path}",
+            get(vision_analysis::get_vision_analysis_model_file),
+        )
+        .route(
+            "/components",
+            get(component_center::list_component_definitions)
+                .post(component_center::create_component_definition),
+        )
+        .route(
+            "/components/{english_name}",
+            get(component_center::get_component_definition)
+                .put(component_center::update_component_definition)
+                .delete(component_center::delete_component_definition),
+        )
+        .route(
+            "/components/{english_name}/invoke",
+            post(component_center::invoke_component_definition),
+        )
         .route("/mcp/servers", get(list_mcp_servers))
         .route("/global/skills", get(list_global_skills))
         .route("/global/skills/import", post(import_global_skill))
@@ -566,6 +632,10 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/providers/test", post(test_provider_connection))
         .route("/providers/{id}/enabled", put(update_provider_enabled))
         .route(
+            "/providers/{id}/discover-models",
+            post(discover_provider_models),
+        )
+        .route(
             "/providers/{id}/config",
             put(update_provider_config).delete(delete_provider_config),
         )
@@ -579,6 +649,7 @@ pub fn management_router() -> Router<Arc<AppState>> {
             "/models/optimize-prompt",
             post(optimize_prompt_with_default_model),
         )
+        .route("/models/{id}/vision", put(update_model_vision))
         .route("/models/{id}/enabled", put(update_model_enabled))
         .route("/models/{id}/default", put(update_default_model))
         .route("/a2a/agents", get(list_a2a_agents))
@@ -590,6 +661,11 @@ pub fn management_router() -> Router<Arc<AppState>> {
 #[derive(Deserialize)]
 pub struct ImageProxyQuery {
     url: String,
+}
+
+#[derive(Deserialize)]
+pub struct OpenFangUploadProxyQuery {
+    source: String,
 }
 
 pub async fn proxy_remote_image(
@@ -669,7 +745,47 @@ pub async fn proxy_remote_image(
         header::HeaderValue::from_static("*"),
     );
 
-    Ok((headers, bytes))
+    Ok((headers, bytes.into()))
+}
+
+pub async fn proxy_openfang_upload(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OpenFangUploadProxyQuery>,
+) -> Result<(AxumHeaderMap, Bytes), ApiError> {
+    let source = query.source.trim();
+    if source.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "上传图片来源不能为空"));
+    }
+    let normalized = source.to_ascii_lowercase();
+    if !normalized.starts_with("/api/uploads/")
+        && !normalized.starts_with("api/uploads/")
+        && !normalized.contains("/api/uploads/")
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "仅支持 OpenFang /api/uploads/... 图片地址",
+        ));
+    }
+
+    let (bytes, _filename_hint, content_type) =
+        fetch_agent_appearance_source_bytes(&state, source).await?;
+
+    let mut headers = AxumHeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_str(content_type.as_deref().unwrap_or("image/jpeg"))
+            .unwrap_or(header::HeaderValue::from_static("image/jpeg")),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=600"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+
+    Ok((headers, bytes.into()))
 }
 
 #[derive(Deserialize)]
@@ -954,6 +1070,7 @@ pub fn chat_router() -> Router<Arc<AppState>> {
             "/{id}/session",
             get(chat_session).delete(delete_chat_session),
         )
+        .route("/{id}/session/content", put(update_chat_session_content))
         .route("/{id}/session/compact", post(chat_session_compact))
         .route("/{id}/message", post(chat_message))
         .route("/{id}/message/stream", post(chat_message_stream))
@@ -1265,6 +1382,20 @@ pub struct ChatSessionCompactRequest {
     pub session_id: Option<String>,
 }
 
+#[derive(Deserialize, Clone)]
+pub struct EditableChatSessionMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct UpdateChatSessionContentRequest {
+    pub session_label: Option<String>,
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<EditableChatSessionMessage>,
+}
+
 pub async fn chat_sessions(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1444,6 +1575,61 @@ pub async fn chat_session_compact(
         "ok": true,
         "agent_id": agent_id,
         "session_id": if session_ctx.target_session_id.trim().is_empty() { Value::Null } else { Value::String(session_ctx.target_session_id.clone()) },
+        "result": data,
+    })))
+}
+
+pub async fn update_chat_session_content(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateChatSessionContentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+
+    let session_ctx = ensure_switched_to_session_target(
+        &state,
+        &agent_id,
+        payload.session_id.as_deref(),
+        payload.session_label.as_deref(),
+    )
+    .await?;
+
+    let target_session_id = if session_ctx.target_session_id.trim().is_empty() {
+        get_openfang_agent_session_id(&state, &agent_id).await?
+    } else {
+        session_ctx.target_session_id.clone()
+    };
+
+    let path = format!("/api/sessions/{target_session_id}/content");
+    let body = json!({
+        "messages": payload.messages.iter().map(|item| json!({
+            "role": item.role.trim(),
+            "content": item.content,
+        })).collect::<Vec<_>>(),
+    });
+
+    let data = match state.openfang.put_json(&path, body).await {
+        Ok(value) => value,
+        Err(err) => {
+            if session_ctx.switched {
+                let _ =
+                    switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id)
+                        .await;
+            }
+            return Err(err);
+        }
+    };
+
+    if session_ctx.switched {
+        let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id).await;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "agent_id": agent_id,
+        "session_id": target_session_id,
         "result": data,
     })))
 }
@@ -3319,7 +3505,7 @@ async fn resolve_agent_workspace_binding(
     })
 }
 
-fn build_workspace_mcp_entry(workspaces: &[PathBuf]) -> Value {
+fn build_workspace_mcp_entry(private_workspace: &PathBuf, workspaces: &[PathBuf]) -> Value {
     let mut args = vec![
         "-y".to_string(),
         "@modelcontextprotocol/server-filesystem".to_string(),
@@ -3333,7 +3519,8 @@ fn build_workspace_mcp_entry(workspaces: &[PathBuf]) -> Value {
         "transport": {
             "type": "stdio",
             "command": "npx",
-            "args": args
+            "args": args,
+            "cwd": path_to_string(private_workspace)
         }
     })
 }
@@ -3367,7 +3554,7 @@ async fn collect_workspace_mcp_server_map(
         let binding = resolve_agent_workspace_binding(state, agent_id, Some(&row)).await?;
         map.insert(
             binding.server_name.clone(),
-            build_workspace_mcp_entry(&binding.all_workspaces()),
+            build_workspace_mcp_entry(&binding.private_workspace, &binding.all_workspaces()),
         );
     }
 
@@ -3588,6 +3775,23 @@ fn detect_avatar_ext_from_name(filename: &str) -> Option<&'static str> {
     }
 }
 
+fn detect_avatar_ext_from_content_type(content_type: &str) -> Option<&'static str> {
+    let normalized = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/bmp" => Some("bmp"),
+        _ => None,
+    }
+}
+
 fn detect_avatar_ext_from_magic(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 8 && bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) {
         return Some("png");
@@ -3755,9 +3959,12 @@ async fn save_agent_chat_asset_bytes(
         String,
         usize,
         Option<String>,
+        String,
     ),
     ApiError,
 > {
+    use sha2::{Digest, Sha256};
+
     if bytes.is_empty() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -3793,6 +4000,7 @@ async fn save_agent_chat_asset_bytes(
 
     let kind = chat_asset_kind_from_name(&file_name).to_string();
     let mime_type = chat_asset_content_type(&file_name).to_string();
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
     let asset_url = build_agent_chat_asset_url(agent_id, &relative_path);
     let upstream_file_id =
         mirror_agent_chat_asset_to_openfang(state, agent_id, &file_name, &mime_type, bytes).await;
@@ -3805,6 +4013,7 @@ async fn save_agent_chat_asset_bytes(
         mime_type,
         bytes.len(),
         upstream_file_id,
+        sha256,
     ))
 }
 
@@ -3845,6 +4054,7 @@ async fn save_agent_avatar_bytes(
     state: &Arc<AppState>,
     agent_id: &str,
     filename_hint: Option<&str>,
+    content_type_hint: Option<&str>,
     bytes: &[u8],
     upstream_hint: Option<&Value>,
 ) -> Result<(String, String, String), ApiError> {
@@ -3863,6 +4073,7 @@ async fn save_agent_avatar_bytes(
 
     let ext = filename_hint
         .and_then(detect_avatar_ext_from_name)
+        .or_else(|| content_type_hint.and_then(detect_avatar_ext_from_content_type))
         .or_else(|| detect_avatar_ext_from_magic(bytes))
         .ok_or_else(|| {
             ApiError::new(
@@ -3888,6 +4099,7 @@ async fn save_agent_portrait_bytes(
     state: &Arc<AppState>,
     agent_id: &str,
     filename_hint: Option<&str>,
+    content_type_hint: Option<&str>,
     bytes: &[u8],
     upstream_hint: Option<&Value>,
 ) -> Result<(String, String, String), ApiError> {
@@ -3906,6 +4118,7 @@ async fn save_agent_portrait_bytes(
 
     let ext = filename_hint
         .and_then(detect_avatar_ext_from_name)
+        .or_else(|| content_type_hint.and_then(detect_avatar_ext_from_content_type))
         .or_else(|| detect_avatar_ext_from_magic(bytes))
         .ok_or_else(|| {
             ApiError::new(
@@ -6233,7 +6446,7 @@ pub async fn import_agent_avatar(
         .and_then(OsStr::to_str)
         .unwrap_or("avatar");
     let (mut avatar_url, filename, saved_path) =
-        save_agent_avatar_bytes(&state, &agent_id, Some(source_name), &bytes, None).await?;
+        save_agent_avatar_bytes(&state, &agent_id, Some(source_name), None, &bytes, None).await?;
     if resolved.alias_used {
         avatar_url = build_avatar_url(&public_id, &filename);
     }
@@ -6294,8 +6507,15 @@ pub async fn upload_agent_avatar(
         )
     })?;
 
-    let (mut avatar_url, filename, saved_path) =
-        save_agent_avatar_bytes(&state, &agent_id, picked_name.as_deref(), &bytes, None).await?;
+    let (mut avatar_url, filename, saved_path) = save_agent_avatar_bytes(
+        &state,
+        &agent_id,
+        picked_name.as_deref(),
+        None,
+        &bytes,
+        None,
+    )
+    .await?;
     if resolved.alias_used {
         avatar_url = build_avatar_url(&public_id, &filename);
     }
@@ -6314,6 +6534,7 @@ pub async fn upload_agent_avatar(
 pub struct UploadInlineImageRequest {
     pub filename: Option<String>,
     pub content_base64: String,
+    pub content_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -6427,6 +6648,7 @@ pub async fn upload_agent_chat_asset(
         mime_type,
         size,
         upstream_file_id,
+        sha256,
     ) = save_agent_chat_asset_bytes(&state, &agent_id, picked_name.as_deref(), &bytes, None)
         .await?;
     if resolved.alias_used {
@@ -6443,7 +6665,8 @@ pub async fn upload_agent_chat_asset(
         "kind": kind,
         "mime_type": mime_type,
         "size": size,
-        "upstream_file_id": upstream_file_id
+        "upstream_file_id": upstream_file_id,
+        "sha256": sha256
     })))
 }
 
@@ -6469,6 +6692,7 @@ pub async fn upload_agent_chat_asset_inline(
         mime_type,
         size,
         upstream_file_id,
+        sha256,
     ) = save_agent_chat_asset_bytes(&state, &agent_id, payload.filename.as_deref(), &bytes, None)
         .await?;
     if resolved.alias_used {
@@ -6485,7 +6709,8 @@ pub async fn upload_agent_chat_asset_inline(
         "kind": kind,
         "mime_type": mime_type,
         "size": size,
-        "upstream_file_id": upstream_file_id
+        "upstream_file_id": upstream_file_id,
+        "sha256": sha256
     })))
 }
 
@@ -6532,9 +6757,15 @@ pub async fn upload_agent_avatar_inline(
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let bytes = decode_inline_upload_base64(&payload.content_base64)?;
-    let (mut avatar_url, filename, saved_path) =
-        save_agent_avatar_bytes(&state, &agent_id, payload.filename.as_deref(), &bytes, None)
-            .await?;
+    let (mut avatar_url, filename, saved_path) = save_agent_avatar_bytes(
+        &state,
+        &agent_id,
+        payload.filename.as_deref(),
+        payload.content_type.as_deref(),
+        &bytes,
+        None,
+    )
+    .await?;
     if resolved.alias_used {
         avatar_url = build_avatar_url(&public_id, &filename);
     }
@@ -6615,7 +6846,7 @@ pub async fn import_agent_portrait(
         .and_then(OsStr::to_str)
         .unwrap_or("portrait");
     let (mut portrait_url, filename, saved_path) =
-        save_agent_portrait_bytes(&state, &agent_id, Some(source_name), &bytes, None).await?;
+        save_agent_portrait_bytes(&state, &agent_id, Some(source_name), None, &bytes, None).await?;
     if resolved.alias_used {
         portrait_url = build_portrait_url(&public_id, &filename);
     }
@@ -6676,8 +6907,15 @@ pub async fn upload_agent_portrait(
         )
     })?;
 
-    let (mut portrait_url, filename, saved_path) =
-        save_agent_portrait_bytes(&state, &agent_id, picked_name.as_deref(), &bytes, None).await?;
+    let (mut portrait_url, filename, saved_path) = save_agent_portrait_bytes(
+        &state,
+        &agent_id,
+        picked_name.as_deref(),
+        None,
+        &bytes,
+        None,
+    )
+    .await?;
     if resolved.alias_used {
         portrait_url = build_portrait_url(&public_id, &filename);
     }
@@ -6705,9 +6943,15 @@ pub async fn upload_agent_portrait_inline(
     let _ = state.openfang.get_json(&detail_path).await?;
 
     let bytes = decode_inline_upload_base64(&payload.content_base64)?;
-    let (mut portrait_url, filename, saved_path) =
-        save_agent_portrait_bytes(&state, &agent_id, payload.filename.as_deref(), &bytes, None)
-            .await?;
+    let (mut portrait_url, filename, saved_path) = save_agent_portrait_bytes(
+        &state,
+        &agent_id,
+        payload.filename.as_deref(),
+        payload.content_type.as_deref(),
+        &bytes,
+        None,
+    )
+    .await?;
     if resolved.alias_used {
         portrait_url = build_portrait_url(&public_id, &filename);
     }
@@ -8440,6 +8684,9 @@ pub struct ChatMessageAttachmentRequest {
     pub file_id: Option<String>,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    pub local_vision_summary: Option<String>,
+    pub local_vision_provider: Option<String>,
+    pub local_vision_model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -10106,6 +10353,518 @@ fn extract_text_from_json(value: &Value) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AgentSelfAppearanceAction {
+    avatar_url: Option<String>,
+    portrait_url: Option<String>,
+    reason: Option<String>,
+}
+
+fn normalize_agent_ui_action_type(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn read_agent_action_prop_text(value: &Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    for key in keys {
+        if let Some(text) = to_trimmed_string(object.get(*key)) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn parse_agent_self_appearance_action_value(value: &Value) -> Option<AgentSelfAppearanceAction> {
+    let object = value.as_object()?;
+    let action_type = to_trimmed_string(object.get("type"))
+        .or_else(|| to_trimmed_string(object.get("component")))
+        .unwrap_or_default();
+    if normalize_agent_ui_action_type(&action_type) != "agentselfappearanceaction" {
+        return None;
+    }
+
+    let props = object
+        .get("props")
+        .or_else(|| object.get("payload"))
+        .unwrap_or(value);
+    let avatar_url = read_agent_action_prop_text(props, &["avatarUrl", "avatar_url"]);
+    let portrait_url = read_agent_action_prop_text(props, &["portraitUrl", "portrait_url"]);
+    let reason = read_agent_action_prop_text(props, &["reason"]);
+
+    if avatar_url.is_none() && portrait_url.is_none() {
+        return None;
+    }
+
+    Some(AgentSelfAppearanceAction {
+        avatar_url,
+        portrait_url,
+        reason,
+    })
+}
+
+fn extract_agent_self_appearance_action_from_text(text: &str) -> Option<AgentSelfAppearanceAction> {
+    let mut remaining = text;
+    let mut latest: Option<AgentSelfAppearanceAction> = None;
+    let open_tags = ["<UI_JSON>", "<ui_json>", "<ui-json>"];
+    let close_tags = ["</UI_JSON>", "</ui_json>", "</ui-json>"];
+
+    loop {
+        let start_hit = open_tags
+            .iter()
+            .filter_map(|tag| remaining.find(tag).map(|index| (index, *tag)))
+            .min_by_key(|(index, _)| *index);
+        let Some((start, open_tag)) = start_hit else {
+            break;
+        };
+
+        let after_start = &remaining[start + open_tag.len()..];
+        let end_hit = close_tags
+            .iter()
+            .filter_map(|tag| after_start.find(tag).map(|index| (index, *tag)))
+            .min_by_key(|(index, _)| *index);
+        let Some((end, close_tag)) = end_hit else {
+            break;
+        };
+        let raw_json = after_start[..end].trim();
+        if !raw_json.is_empty() {
+            if let Ok(value) = serde_json::from_str::<Value>(raw_json) {
+                if let Some(hit) = parse_agent_self_appearance_action_value(&value) {
+                    latest = Some(hit);
+                }
+            }
+        }
+        remaining = &after_start[end + close_tag.len()..];
+    }
+
+    if latest.is_some() {
+        return latest;
+    }
+
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            return parse_agent_self_appearance_action_value(&value);
+        }
+    }
+
+    None
+}
+
+fn extract_chat_response_text(value: &Value) -> Option<String> {
+    let preferred_paths: &[&[&str]] = &[
+        &["content"],
+        &["text"],
+        &["response"],
+        &["message"],
+        &["data", "content"],
+        &["data", "text"],
+        &["data", "response"],
+        &["result", "content"],
+        &["result", "text"],
+        &["result", "response"],
+    ];
+
+    for path in preferred_paths {
+        let mut current = value;
+        let mut found = true;
+        for key in *path {
+            let Some(next) = current.get(*key) else {
+                found = false;
+                break;
+            };
+            current = next;
+        }
+        if !found {
+            continue;
+        }
+        if let Some(text) = extract_text_from_json(current) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    extract_text_from_json(value).and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_management_media_reference(source_url: &str) -> Option<(String, &'static str, String)> {
+    let trimmed = source_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path_like = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let index = trimmed.find("/api/management/agents/")?;
+        &trimmed[index..]
+    } else {
+        trimmed
+    };
+    let path_only = path_like
+        .split('#')
+        .next()
+        .unwrap_or(path_like)
+        .split('?')
+        .next()
+        .unwrap_or(path_like);
+    let rest = path_only.strip_prefix("/api/management/agents/")?;
+    let (agent_id, tail) = rest.split_once('/')?;
+    if let Some(filename) = tail.strip_prefix("avatar/") {
+        let normalized = filename.trim();
+        if !normalized.is_empty() {
+            return Some((agent_id.to_string(), "avatar", normalized.to_string()));
+        }
+    }
+    if let Some(filename) = tail.strip_prefix("portrait/") {
+        let normalized = filename.trim();
+        if !normalized.is_empty() {
+            return Some((agent_id.to_string(), "portrait", normalized.to_string()));
+        }
+    }
+    None
+}
+
+fn extract_filename_hint_from_url(source_url: &str) -> Option<String> {
+    let trimmed = source_url.trim();
+    if trimmed.is_empty() || trimmed.starts_with("data:") {
+        return None;
+    }
+    let path_only = trimmed
+        .split('#')
+        .next()
+        .unwrap_or(trimmed)
+        .split('?')
+        .next()
+        .unwrap_or(trimmed);
+    StdPath::new(path_only)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn infer_image_filename_from_content_type(content_type: &str) -> Option<String> {
+    let normalized = content_type.trim().to_ascii_lowercase();
+    let ext = if normalized.starts_with("image/png") {
+        "png"
+    } else if normalized.starts_with("image/jpeg") || normalized.starts_with("image/jpg") {
+        "jpg"
+    } else if normalized.starts_with("image/gif") {
+        "gif"
+    } else if normalized.starts_with("image/webp") {
+        "webp"
+    } else if normalized.starts_with("image/bmp") {
+        "bmp"
+    } else {
+        return None;
+    };
+    Some(format!("image.{ext}"))
+}
+
+fn decode_data_url_image_bytes(
+    source_url: &str,
+) -> Result<Option<(Vec<u8>, Option<String>, Option<String>)>, ApiError> {
+    let trimmed = source_url.trim();
+    if !trimmed.starts_with("data:image/") {
+        return Ok(None);
+    }
+
+    let header = trimmed
+        .split(',')
+        .next()
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    let (filename_hint, content_type) = if header.starts_with("data:image/png") {
+        (Some("image.png".to_string()), Some("image/png".to_string()))
+    } else if header.starts_with("data:image/jpeg") || header.starts_with("data:image/jpg") {
+        (
+            Some("image.jpg".to_string()),
+            Some("image/jpeg".to_string()),
+        )
+    } else if header.starts_with("data:image/gif") {
+        (Some("image.gif".to_string()), Some("image/gif".to_string()))
+    } else if header.starts_with("data:image/webp") {
+        (
+            Some("image.webp".to_string()),
+            Some("image/webp".to_string()),
+        )
+    } else if header.starts_with("data:image/bmp") {
+        (Some("image.bmp".to_string()), Some("image/bmp".to_string()))
+    } else {
+        (None, None)
+    };
+
+    let bytes = decode_inline_upload_base64(trimmed)?;
+    Ok(Some((bytes, filename_hint, content_type)))
+}
+
+fn local_service_base_url(state: &AppState) -> String {
+    let listen_addr = state.config.listen_addr;
+    let host = if listen_addr.ip().is_unspecified() {
+        if listen_addr.is_ipv4() {
+            "127.0.0.1".to_string()
+        } else {
+            "[::1]".to_string()
+        }
+    } else if listen_addr.is_ipv6() {
+        format!("[{}]", listen_addr.ip())
+    } else {
+        listen_addr.ip().to_string()
+    };
+    format!("http://{}:{}", host, listen_addr.port())
+}
+
+async fn fetch_agent_appearance_source_bytes(
+    state: &Arc<AppState>,
+    source_url: &str,
+) -> Result<(Vec<u8>, Option<String>, Option<String>), ApiError> {
+    if let Some((bytes, filename_hint, content_type)) = decode_data_url_image_bytes(source_url)? {
+        return Ok((bytes, filename_hint, content_type));
+    }
+
+    let trimmed = source_url.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "外观资源地址不能为空",
+        ));
+    }
+
+    let openfang_base = state.config.openfang_base_url.trim_end_matches('/');
+    let service_base = local_service_base_url(state);
+    let request_url = if trimmed.starts_with("/api/uploads/") {
+        format!("{openfang_base}{trimmed}")
+    } else if trimmed.starts_with('/') {
+        format!("{service_base}{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+    let requires_openfang_auth = trimmed.starts_with("/api/uploads/")
+        || (trimmed.starts_with(openfang_base)
+            && trimmed[openfang_base.len()..].starts_with("/api/uploads/"));
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(state.config.request_timeout_ms))
+        .timeout(Duration::from_millis(state.config.request_timeout_ms))
+        .build()
+        .map_err(|e| storage_error(format!("创建外观资源下载客户端失败: {e}")))?;
+    let mut request = client.get(&request_url);
+    if requires_openfang_auth {
+        if let Some(key) = state
+            .config
+            .openfang_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            request = request.bearer_auth(key);
+        }
+    }
+
+    let response = request.send().await.map_err(|e| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("拉取外观资源失败({request_url}): {e}"),
+        )
+    })?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let body = response.bytes().await.map_err(|e| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("读取外观资源响应失败({request_url}): {e}"),
+        )
+    })?;
+
+    if !status.is_success() {
+        let snippet = String::from_utf8_lossy(&body);
+        return Err(ApiError::new(
+            status,
+            format!("外观资源下载返回错误({request_url}): {}", snippet.trim()),
+        ));
+    }
+
+    let filename_hint = extract_filename_hint_from_url(trimmed).or_else(|| {
+        content_type
+            .as_deref()
+            .and_then(infer_image_filename_from_content_type)
+    });
+    Ok((body.to_vec(), filename_hint, content_type))
+}
+
+async fn resolve_agent_self_appearance_asset(
+    state: &Arc<AppState>,
+    public_agent_id: &str,
+    resolved_agent_id: &str,
+    source_url: &str,
+    kind: &'static str,
+) -> Result<Option<String>, ApiError> {
+    let trimmed = source_url.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some((source_agent_id, source_kind, filename)) =
+        parse_management_media_reference(trimmed)
+    {
+        let same_agent = source_agent_id.eq_ignore_ascii_case(public_agent_id)
+            || source_agent_id.eq_ignore_ascii_case(resolved_agent_id);
+        if same_agent && source_kind == kind {
+            return Ok(Some(match kind {
+                "avatar" => build_avatar_url(public_agent_id, &filename),
+                _ => build_portrait_url(public_agent_id, &filename),
+            }));
+        }
+    }
+
+    let (bytes, filename_hint, content_type_hint) =
+        fetch_agent_appearance_source_bytes(state, trimmed).await?;
+    let public_url = match kind {
+        "avatar" => {
+            let (_, filename, _) = save_agent_avatar_bytes(
+                state,
+                resolved_agent_id,
+                filename_hint.as_deref(),
+                content_type_hint.as_deref(),
+                &bytes,
+                None,
+            )
+            .await?;
+            build_avatar_url(public_agent_id, &filename)
+        }
+        _ => {
+            let (_, filename, _) = save_agent_portrait_bytes(
+                state,
+                resolved_agent_id,
+                filename_hint.as_deref(),
+                content_type_hint.as_deref(),
+                &bytes,
+                None,
+            )
+            .await?;
+            build_portrait_url(public_agent_id, &filename)
+        }
+    };
+    Ok(Some(public_url))
+}
+
+async fn apply_agent_self_appearance_update_from_text(
+    state: &Arc<AppState>,
+    public_agent_id: &str,
+    resolved_agent_id: &str,
+    response_text: &str,
+) -> Result<Option<Value>, ApiError> {
+    let Some(action) = extract_agent_self_appearance_action_from_text(response_text) else {
+        return Ok(None);
+    };
+
+    let avatar_url = if let Some(source_url) = action.avatar_url.as_deref() {
+        resolve_agent_self_appearance_asset(
+            state,
+            public_agent_id,
+            resolved_agent_id,
+            source_url,
+            "avatar",
+        )
+        .await?
+    } else {
+        None
+    };
+    let portrait_url = if let Some(source_url) = action.portrait_url.as_deref() {
+        resolve_agent_self_appearance_asset(
+            state,
+            public_agent_id,
+            resolved_agent_id,
+            source_url,
+            "portrait",
+        )
+        .await?
+    } else {
+        None
+    };
+
+    let mut updated_fields = Vec::new();
+    if avatar_url.is_some() {
+        updated_fields.push("avatar");
+    }
+    if portrait_url.is_some() {
+        updated_fields.push("portrait");
+    }
+    if updated_fields.is_empty() {
+        return Ok(None);
+    }
+
+    assignment_store::upsert_agent_profile_override(
+        resolved_agent_id,
+        None,
+        None,
+        None,
+        None,
+        None,
+        avatar_url.clone(),
+        portrait_url.clone(),
+        None,
+        None,
+    )
+    .map_err(storage_error)?;
+
+    Ok(Some(json!({
+        "agent_id": public_agent_id,
+        "resolved_agent_id": resolved_agent_id,
+        "avatar_url": avatar_url,
+        "portrait_url": portrait_url,
+        "reason": action.reason,
+        "updated_fields": updated_fields,
+    })))
+}
+
+async fn emit_stream_agent_appearance_updated_event(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    state: &Arc<AppState>,
+    public_agent_id: &str,
+    resolved_agent_id: &str,
+    response_text: &str,
+) {
+    match apply_agent_self_appearance_update_from_text(
+        state,
+        public_agent_id,
+        resolved_agent_id,
+        response_text,
+    )
+    .await
+    {
+        Ok(Some(payload)) => {
+            let event = Bytes::from(format!("event: appearance_updated\ndata: {}\n\n", payload));
+            let _ = tx.send(Ok(event)).await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                agent_id = %resolved_agent_id,
+                error = %err.message,
+                "chat appearance auto-apply skipped due to error"
+            );
+        }
+    }
+}
+
 fn append_renderable_stream_text(buffer: &mut String, data: &str) {
     if let Ok(parsed) = serde_json::from_str::<Value>(data) {
         if let Some(text) = extract_text_from_json(&parsed) {
@@ -10211,11 +10970,24 @@ fn build_openfang_attachment_payload(attachments: &[ChatMessageAttachmentRequest
                 .file_id
                 .as_deref()
                 .map(str::trim)
-                .filter(|value| !value.is_empty())?;
+                .filter(|value| !value.is_empty())
+                .unwrap_or_default();
+            let local_vision_summary = item
+                .local_vision_summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_default();
+            if file_id.is_empty() && local_vision_summary.is_empty() {
+                return None;
+            }
             Some(json!({
                 "file_id": file_id,
                 "filename": item.filename.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or_default(),
-                "content_type": item.content_type.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or_default()
+                "content_type": item.content_type.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or_default(),
+                "local_vision_summary": local_vision_summary,
+                "local_vision_provider": item.local_vision_provider.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or_default(),
+                "local_vision_model": item.local_vision_model.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or_default()
             }))
         })
         .collect()
@@ -10228,6 +11000,7 @@ pub async fn chat_message(
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
     let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let public_agent_id = resolved.requested;
     let agent_id = resolved.resolved;
     if let Err(err) = normalize_agent_model_selector_if_needed(&state, &agent_id).await {
         tracing::warn!(
@@ -10303,7 +11076,7 @@ pub async fn chat_message(
         payload.session_label.as_deref(),
     );
     let path = format!("/api/agents/{agent_id}/message");
-    let data = match state
+    let mut data = match state
         .openfang
         .post_json(
             &path,
@@ -10326,6 +11099,36 @@ pub async fn chat_message(
         let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id).await;
     }
 
+    if let Some(response_text) = extract_chat_response_text(&data) {
+        match apply_agent_self_appearance_update_from_text(
+            &state,
+            &public_agent_id,
+            &agent_id,
+            &response_text,
+        )
+        .await
+        {
+            Ok(Some(appearance_updated)) => {
+                if let Some(object) = data.as_object_mut() {
+                    object.insert("appearance_updated".to_string(), appearance_updated);
+                } else {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        "chat_message: upstream response is not an object, skipped appearance_updated injection"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %err.message,
+                    "chat_message: appearance auto-apply skipped due to error"
+                );
+            }
+        }
+    }
+
     Ok(Json(data))
 }
 
@@ -10336,6 +11139,7 @@ pub async fn chat_message_stream(
 ) -> Result<axum::response::Response, ApiError> {
     ensure_online(&state).await?;
     let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let public_agent_id = resolved.requested;
     let agent_id = resolved.resolved;
     if let Err(err) = normalize_agent_model_selector_if_needed(&state, &agent_id).await {
         tracing::warn!(
@@ -10435,6 +11239,8 @@ pub async fn chat_message_stream(
         }
     };
     let openfang = state.openfang.clone();
+    let state_for_post_process = state.clone();
+    let public_agent_id = public_agent_id;
     let agent_id = agent_id;
     let message = outgoing_message;
     let session_ctx = session_ctx;
@@ -10531,16 +11337,16 @@ pub async fn chat_message_stream(
             }
         }
 
-        if saw_upstream_done
-            && !streamed_text.trim().is_empty()
-            && !looks_like_protocol_only_text(streamed_text.trim())
-        {
-            restore_original_session().await;
-            return;
-        }
-
-        if !streamed_text.trim().is_empty() && !looks_like_protocol_only_text(streamed_text.trim())
-        {
+        let final_streamed_text = streamed_text.trim().to_string();
+        if !final_streamed_text.is_empty() && !looks_like_protocol_only_text(&final_streamed_text) {
+            emit_stream_agent_appearance_updated_event(
+                &tx,
+                &state_for_post_process,
+                &public_agent_id,
+                &agent_id,
+                &final_streamed_text,
+            )
+            .await;
             restore_original_session().await;
             return;
         }
@@ -10579,6 +11385,14 @@ pub async fn chat_message_stream(
                         "event: done\ndata: {done_data}\n\n"
                     ))))
                     .await;
+                emit_stream_agent_appearance_updated_event(
+                    &tx,
+                    &state_for_post_process,
+                    &public_agent_id,
+                    &agent_id,
+                    &text,
+                )
+                .await;
                 restore_original_session().await;
                 return;
             }
@@ -10905,6 +11719,31 @@ fn to_models_endpoint(base_url: &str) -> Option<String> {
     Some(format!("{trimmed}/v1/models"))
 }
 
+fn provider_uses_manual_model_configuration(provider_id: &str, base_url: &str) -> bool {
+    let normalized_provider = provider_id.trim().to_ascii_lowercase();
+    if normalized_provider == "minimax" {
+        return true;
+    }
+    let normalized_base_url = base_url.trim().to_ascii_lowercase();
+    normalized_base_url.contains("api.minimaxi.com")
+        || normalized_base_url.contains("api.minimax.io")
+}
+
+fn manual_model_configuration_message(provider_id: &str, configured_model_count: usize) -> String {
+    let provider_label = match provider_id.trim().to_ascii_lowercase().as_str() {
+        "minimax" => "MiniMax",
+        _ => provider_id.trim(),
+    };
+    if configured_model_count > 0 {
+        return format!(
+            "{provider_label} 官方兼容接口不提供 `/v1/models` 自动探测，请以手动填写的模型列表为准（当前已配置 {configured_model_count} 个模型）。"
+        );
+    }
+    format!(
+        "{provider_label} 官方兼容接口不提供 `/v1/models` 自动探测，请手动填写模型列表后再使用。"
+    )
+}
+
 fn parse_model_ids_from_payload(payload: &Value) -> Vec<String> {
     payload
         .get("data")
@@ -10992,6 +11831,104 @@ async fn discover_models_from_provider(
         }
     }
     Err(format!("自动探测模型失败: {}", last_error))
+}
+
+async fn probe_model_via_chat_completion(
+    provider_id: &str,
+    protocol: &str,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<(), String> {
+    let trimmed_base_url = base_url.trim().trim_end_matches('/');
+    if trimmed_base_url.is_empty() {
+        return Err("base_url 为空，无法测试模型".to_string());
+    }
+    let trimmed_model = model.trim();
+    if trimmed_model.is_empty() {
+        return Err("model 为空，无法测试模型".to_string());
+    }
+
+    let endpoint = format!("{trimmed_base_url}/chat/completions");
+    let mut header_candidates: Vec<HeaderMap> = Vec::new();
+
+    let mut bearer_headers = HeaderMap::new();
+    bearer_headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", api_key.trim()))
+            .map_err(|e| format!("构造鉴权头失败: {e}"))?,
+    );
+    header_candidates.push(bearer_headers);
+
+    if protocol == "claude" {
+        let mut claude_headers = HeaderMap::new();
+        claude_headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(api_key.trim())
+                .map_err(|e| format!("构造 x-api-key 失败: {e}"))?,
+        );
+        claude_headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+        header_candidates.push(claude_headers);
+    } else if provider_id == "nvidia-nim" || provider_id == "nvidia" {
+        for key in ["x-api-key", "api-key", "nvidia-api-key"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_bytes(key.as_bytes())
+                    .map_err(|e| format!("构造请求头失败: {e}"))?,
+                HeaderValue::from_str(api_key.trim())
+                    .map_err(|e| format!("构造请求头失败: {e}"))?,
+            );
+            header_candidates.push(headers);
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+
+    let request_body = json!({
+        "model": trimmed_model,
+        "messages": [
+            { "role": "user", "content": "Hi" }
+        ],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "stream": false
+    });
+
+    let mut last_error = String::new();
+    for headers in header_candidates {
+        match client
+            .post(&endpoint)
+            .headers(headers)
+            .json(&request_body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    return Ok(());
+                }
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let body = body.trim();
+                last_error = if body.is_empty() {
+                    format!("HTTP {status}")
+                } else {
+                    format!("HTTP {status}: {}", &body[..body.len().min(200)])
+                };
+            }
+            Err(err) => {
+                last_error = err.to_string();
+            }
+        }
+    }
+
+    Err(format!("模型连通性测试失败: {last_error}"))
 }
 
 async fn get_upstream_json_quick(state: &Arc<AppState>, path: &str) -> Option<Value> {
@@ -11458,6 +12395,29 @@ pub async fn test_model_connection(
             })));
         };
 
+        if provider_uses_manual_model_configuration(&provider_id, base_url) {
+            return match probe_model_via_chat_completion(
+                &provider_id,
+                protocol,
+                base_url,
+                api_key,
+                &raw_model,
+            )
+            .await
+            {
+                Ok(()) => Ok(Json(json!({
+                    "ok": true,
+                    "status": "ok",
+                    "message": "连接正常，模型通信可用"
+                }))),
+                Err(error) => Ok(Json(json!({
+                    "ok": false,
+                    "status": "connection_error",
+                    "message": error
+                }))),
+            };
+        }
+
         return match discover_models_from_provider(&provider_id, protocol, base_url, api_key).await
         {
             Ok(found_models) => {
@@ -11579,6 +12539,14 @@ pub async fn test_provider_connection(
             .filter(|value| !value.is_empty());
 
         if let (Some(base_url), Some(api_key)) = (has_base_url, has_api_key) {
+            if provider_uses_manual_model_configuration(&provider_id, base_url) {
+                return Ok(Json(json!({
+                    "ok": false,
+                    "status": "configured",
+                    "message": manual_model_configuration_message(&provider_id, cfg.models.len()),
+                    "model_count": cfg.models.len()
+                })));
+            }
             return match discover_models_from_provider(&provider_id, protocol, base_url, api_key)
                 .await
             {
@@ -11713,6 +12681,163 @@ pub async fn list_provider_configs(
     Ok(Json(json!({ "providers": payload })))
 }
 
+async fn clear_runtime_agent_model_selection(
+    state: &Arc<AppState>,
+    agent_id: &str,
+) -> Result<(), ApiError> {
+    let path = format!("/api/agents/{agent_id}/config");
+    state
+        .openfang
+        .patch_json(
+            &path,
+            json!({
+                "provider": "",
+                "model": ""
+            }),
+        )
+        .await?;
+
+    let detail_path = format!("/api/agents/{agent_id}");
+    let detail = state.openfang.get_json(&detail_path).await?;
+    let provider = detail
+        .pointer("/model/provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let model = detail
+        .pointer("/model/model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if !provider.is_empty() || !model.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("清空智能体模型失败，当前仍为 {}/{}", provider, model),
+        ));
+    }
+    Ok(())
+}
+
+async fn clear_runtime_agent_model_assignments_for_provider(
+    state: &Arc<AppState>,
+    provider_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    ensure_online(state).await?;
+    let payload = state.openfang.get_json("/api/agents").await?;
+    let agent_rows = payload.as_array().cloned().unwrap_or_default();
+    let mut cleared_agent_ids = Vec::new();
+
+    for row in agent_rows {
+        let Some(agent_id) = row.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if agent_id.is_empty() {
+            continue;
+        }
+        let detail_path = format!("/api/agents/{agent_id}");
+        let detail = state.openfang.get_json(&detail_path).await?;
+        let bound_provider = detail
+            .pointer("/model/provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !bound_provider.eq_ignore_ascii_case(provider_id) {
+            continue;
+        }
+        clear_runtime_agent_model_selection(state, agent_id).await?;
+        cleared_agent_ids.push(agent_id.to_string());
+    }
+
+    Ok(cleared_agent_ids)
+}
+
+pub async fn discover_provider_models(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let provider_id = canonical_provider_id(&id);
+    if provider_id.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "provider id 不能为空",
+        ));
+    }
+
+    let mut record = assignment_store::get_provider_config(&provider_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "供应商尚未保存配置，无法获取模型",
+            )
+        })?;
+    let protocol = normalize_protocol(&record.protocol).unwrap_or("openai");
+    let base_url = record
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "未配置 Base URL，无法获取模型",
+            )
+        })?;
+    let api_key = record
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "未配置 API Key，无法获取模型",
+            )
+        })?;
+
+    if provider_uses_manual_model_configuration(&provider_id, base_url) {
+        return Ok(Json(json!({
+            "ok": !record.models.is_empty(),
+            "status": "manual_configuration_required",
+            "message": manual_model_configuration_message(&provider_id, record.models.len()),
+            "model_count": record.models.len(),
+            "models": record.models
+        })));
+    }
+
+    match discover_models_from_provider(&provider_id, protocol, base_url, api_key).await {
+        Ok(found_models) => {
+            if !found_models.is_empty() {
+                record.models = found_models.clone();
+                assignment_store::upsert_provider_config(&record).map_err(storage_error)?;
+                let _ = sync_provider_configs_to_runtime(&state).await;
+            }
+            Ok(Json(json!({
+                "ok": true,
+                "status": "ok",
+                "message": if found_models.is_empty() {
+                    "已连接，但供应商未返回可用模型".to_string()
+                } else {
+                    format!("已获取 {} 个模型", found_models.len())
+                },
+                "model_count": found_models.len(),
+                "models": found_models
+            })))
+        }
+        Err(error) => Ok(Json(json!({
+            "ok": false,
+            "status": "connection_error",
+            "message": error,
+            "model_count": record.models.len(),
+            "models": record.models
+        }))),
+    }
+}
+
 pub async fn create_custom_provider(
     State(_state): State<Arc<AppState>>,
     Json(payload): Json<CreateCustomProviderRequest>,
@@ -11730,7 +12855,7 @@ pub async fn create_custom_provider(
             "protocol 仅支持 openai/claude",
         )
     })?;
-    let mut models = payload
+    let models = payload
         .models
         .into_iter()
         .map(|item| item.trim().to_string())
@@ -11745,19 +12870,6 @@ pub async fn create_custom_provider(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    let mut discover_warning: Option<String> = None;
-    if models.is_empty() {
-        if let (Some(url), Some(key)) = (base_url.as_deref(), api_key.as_deref()) {
-            match discover_models_from_provider(&provider_id, protocol, url, key).await {
-                Ok(found) => {
-                    if !found.is_empty() {
-                        models = found;
-                    }
-                }
-                Err(err) => discover_warning = Some(err),
-            }
-        }
-    }
     let record = assignment_store::ProviderConfigRecord {
         provider_id: provider_id.clone(),
         display_name: Some(payload.display_name.trim().to_string()),
@@ -11775,8 +12887,7 @@ pub async fn create_custom_provider(
     Ok(Json(json!({
         "status": "ok",
         "provider_id": provider_id,
-        "model_count": record.models.len(),
-        "discover_warning": discover_warning
+        "model_count": record.models.len()
     })))
 }
 
@@ -11851,20 +12962,6 @@ pub async fn update_provider_config(
         record.is_custom = is_custom;
     }
 
-    let mut discover_warning: Option<String> = None;
-    if record.models.is_empty() {
-        if let (Some(url), Some(key)) = (record.base_url.as_deref(), record.api_key.as_deref()) {
-            match discover_models_from_provider(&provider_id, &record.protocol, url, key).await {
-                Ok(found) => {
-                    if !found.is_empty() {
-                        record.models = found;
-                    }
-                }
-                Err(err) => discover_warning = Some(err),
-            }
-        }
-    }
-
     assignment_store::upsert_provider_config(&record).map_err(storage_error)?;
     let _ = sync_provider_configs_to_runtime(&_state).await;
     Ok(Json(json!({
@@ -11872,8 +12969,7 @@ pub async fn update_provider_config(
         "provider_id": provider_id,
         "protocol": record.protocol,
         "has_api_key": record.api_key.as_deref().unwrap_or("").trim().len() > 0,
-        "model_count": record.models.len(),
-        "discover_warning": discover_warning
+        "model_count": record.models.len()
     })))
 }
 
@@ -11888,17 +12984,58 @@ pub async fn delete_provider_config(
             "provider id 不能为空",
         ));
     }
+
+    let existing = assignment_store::get_provider_config(&provider_id)
+        .map_err(storage_error)?
+        .ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_FOUND, "供应商配置不存在"))?;
+    let enabled = assignment_store::list_provider_enabled_map()
+        .map_err(storage_error)?
+        .get(&provider_id)
+        .copied()
+        .unwrap_or(true);
+    if enabled {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "请先断开供应商，再执行删除",
+        ));
+    }
+
+    let cleared_agent_ids =
+        clear_runtime_agent_model_assignments_for_provider(&_state, &provider_id).await?;
+    let removed_model_toggle_count =
+        assignment_store::delete_model_toggles_by_provider(&provider_id).map_err(storage_error)?;
+    assignment_store::delete_provider_toggle(&provider_id).map_err(storage_error)?;
+    let current_default = assignment_store::get_default_model().map_err(storage_error)?;
+    let default_cleared = current_default
+        .as_deref()
+        .and_then(|value| value.split_once("::"))
+        .map(|(provider, _)| provider.eq_ignore_ascii_case(&provider_id))
+        .unwrap_or(false);
+    if default_cleared {
+        assignment_store::clear_default_model().map_err(storage_error)?;
+    }
     assignment_store::delete_provider_config(&provider_id).map_err(storage_error)?;
     let _ = sync_provider_configs_to_runtime(&_state).await;
     Ok(Json(json!({
         "status": "deleted",
-        "provider_id": provider_id
+        "provider_id": provider_id,
+        "deleted_model_count": existing.models.len(),
+        "removed_model_toggle_count": removed_model_toggle_count,
+        "default_model_cleared": default_cleared,
+        "cleared_agent_ids": cleared_agent_ids
     })))
 }
 
 #[derive(Deserialize)]
 pub struct UpdateEnabledRequest {
     pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateModelVisionRequest {
+    pub provider: String,
+    pub model: String,
+    pub supports_vision: bool,
 }
 
 pub async fn update_provider_enabled(
@@ -11949,6 +13086,66 @@ pub async fn update_model_enabled(
         "status": "ok",
         "model_id": model_id,
         "enabled": payload.enabled
+    })))
+}
+
+pub async fn update_model_vision(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateModelVisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let model_id = canonical_model_id(&id);
+    if model_id.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "model id 不能为空",
+        ));
+    }
+
+    let provider_id = canonical_provider_id(&payload.provider);
+    if provider_id.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "provider 不能为空",
+        ));
+    }
+
+    let model_name = assignment_store::normalize_model_name(&payload.model);
+    if model_name.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "model 不能为空",
+        ));
+    }
+
+    let expected_model_id = assignment_store::make_model_id(&provider_id, &model_name);
+    if model_id != expected_model_id {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("模型标识不匹配，期望为 {expected_model_id}"),
+        ));
+    }
+
+    ensure_runtime_model_available(&state, &provider_id, &model_name).await?;
+
+    let encoded_model_name = urlencoding(&model_name);
+    state
+        .openfang
+        .patch_json(
+            &format!("/api/models/custom/{encoded_model_name}"),
+            json!({
+                "provider": provider_id,
+                "supports_vision": payload.supports_vision
+            }),
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "model_id": model_id,
+        "provider": payload.provider,
+        "model": model_name,
+        "supports_vision": payload.supports_vision
     })))
 }
 
@@ -12601,6 +13798,12 @@ fn convert_mcp_entry_to_toml(name: &str, value: &Value) -> Option<toml::value::T
                 .filter(|v| !v.is_empty())
                 .map(toml::Value::String)
                 .collect::<Vec<_>>();
+            let cwd = transport_obj
+                .get("cwd")
+                .or_else(|| entry_obj.get("cwd"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
             transport.insert("type".to_string(), toml::Value::String("stdio".to_string()));
             transport.insert(
                 "command".to_string(),
@@ -12608,6 +13811,9 @@ fn convert_mcp_entry_to_toml(name: &str, value: &Value) -> Option<toml::value::T
             );
             if !args.is_empty() {
                 transport.insert("args".to_string(), toml::Value::Array(args));
+            }
+            if let Some(cwd) = cwd {
+                transport.insert("cwd".to_string(), toml::Value::String(cwd.to_string()));
             }
         }
         "sse" | "streamablehttp" | "streamable_http" => {
@@ -12648,6 +13854,18 @@ fn canonical_provider_id(value: &str) -> String {
 
 fn canonical_model_id(value: &str) -> String {
     assignment_store::normalize_model_id(value)
+}
+
+fn urlencoding(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
+        })
+        .collect()
 }
 
 #[derive(Clone)]

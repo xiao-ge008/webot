@@ -42,7 +42,8 @@
     "resources": [
       "resources/mpv",
       "resources/openfang",
-      "resources/skills"
+      "resources/skills",
+      "../../../comfyui"
     ]
   }
 }

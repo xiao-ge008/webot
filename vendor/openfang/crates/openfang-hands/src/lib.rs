@@ -314,7 +314,9 @@ pub struct HandDefinition {
     /// Tools the agent needs access to.
     #[serde(default)]
     pub tools: Vec<String>,
-    /// Skill allowlist for the spawned agent (empty = all).
+    /// Skill allowlist for the spawned agent.
+    /// Empty keeps generic skills available, but component-center skills remain hidden
+    /// until explicitly attached to the agent.
     #[serde(default)]
     pub skills: Vec<String>,
     /// MCP server allowlist for the spawned agent (empty = all).

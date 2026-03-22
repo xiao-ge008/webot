@@ -186,6 +186,7 @@ impl IntegrationRegistry {
                         McpTransportEntry::Stdio {
                             command: command.clone(),
                             args: args.clone(),
+                            cwd: None,
                         }
                     }
                     crate::McpTransportTemplate::Sse { url } => {

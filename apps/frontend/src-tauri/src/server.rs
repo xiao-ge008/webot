@@ -1,8 +1,9 @@
 use std::env;
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
-use std::fs;
 
 use webot_service_rs::assignment_store;
 use webot_service_rs::config::ServiceConfig;
@@ -17,6 +18,20 @@ pub struct DesktopState {
 }
 
 const DEFAULT_UI_SKILL_NAME: &str = "ui-skill";
+
+fn files_equal(source: &PathBuf, target: &PathBuf) -> io::Result<bool> {
+    if !target.is_file() {
+        return Ok(false);
+    }
+
+    let source_meta = fs::metadata(source)?;
+    let target_meta = fs::metadata(target)?;
+    if source_meta.len() != target_meta.len() {
+        return Ok(false);
+    }
+
+    Ok(fs::read(source)? == fs::read(target)?)
+}
 
 fn openfang_binary_name() -> &'static str {
     #[cfg(target_os = "windows")]
@@ -104,6 +119,23 @@ fn resolve_bundled_ui_skill_dir() -> Option<PathBuf> {
     None
 }
 
+fn resolve_bundled_comfyui_dir() -> Option<PathBuf> {
+    for root in bundled_resource_roots() {
+        let candidate = root.join("comfyui");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dev_candidate = manifest_dir.join("../../../comfyui");
+    if dev_candidate.is_dir() {
+        return Some(dev_candidate);
+    }
+
+    None
+}
+
 fn merge_missing_entries(source: &PathBuf, target: &PathBuf) -> Result<bool, String> {
     if !source.is_dir() {
         return Ok(false);
@@ -150,6 +182,92 @@ fn merge_missing_entries(source: &PathBuf, target: &PathBuf) -> Result<bool, Str
     Ok(changed)
 }
 
+fn sync_dir_recursive(source: &PathBuf, target: &PathBuf) -> Result<bool, String> {
+    if !source.is_dir() {
+        return Err(format!("默认目录不存在: {}", source.display()));
+    }
+
+    fs::create_dir_all(target)
+        .map_err(|err| format!("创建目标目录失败({}): {err}", target.display()))?;
+
+    let mut changed = false;
+    let mut source_entries = std::collections::HashSet::new();
+
+    let entries = fs::read_dir(source)
+        .map_err(|err| format!("读取默认目录失败({}): {err}", source.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("读取默认目录项失败: {err}"))?;
+        let source_path = entry.path();
+        let file_name = entry.file_name();
+        let target_path = target.join(&file_name);
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("读取默认目录文件类型失败({}): {err}", source_path.display()))?;
+        source_entries.insert(file_name);
+
+        if file_type.is_dir() {
+            if target_path.is_file() {
+                fs::remove_file(&target_path).map_err(|err| {
+                    format!("删除冲突文件失败({}): {err}", target_path.display())
+                })?;
+                changed = true;
+            }
+            if sync_dir_recursive(&source_path, &target_path)? {
+                changed = true;
+            }
+            continue;
+        }
+
+        if target_path.is_dir() {
+            fs::remove_dir_all(&target_path).map_err(|err| {
+                format!("删除冲突目录失败({}): {err}", target_path.display())
+            })?;
+            changed = true;
+        }
+
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("创建目标父目录失败({}): {err}", parent.display()))?;
+        }
+
+        if !files_equal(&source_path, &target_path)
+            .map_err(|err| format!("比较文件失败({}): {err}", source_path.display()))?
+        {
+            fs::copy(&source_path, &target_path).map_err(|err| {
+                format!(
+                    "复制默认资源失败({} -> {}): {err}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+            changed = true;
+        }
+    }
+
+    let target_entries = fs::read_dir(target)
+        .map_err(|err| format!("读取目标目录失败({}): {err}", target.display()))?;
+    for entry in target_entries {
+        let entry = entry.map_err(|err| format!("读取目标目录项失败: {err}"))?;
+        if source_entries.contains(&entry.file_name()) {
+            continue;
+        }
+        let target_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("读取目标目录文件类型失败({}): {err}", target_path.display()))?;
+        if file_type.is_dir() {
+            fs::remove_dir_all(&target_path)
+                .map_err(|err| format!("删除多余目录失败({}): {err}", target_path.display()))?;
+        } else {
+            fs::remove_file(&target_path)
+                .map_err(|err| format!("删除多余文件失败({}): {err}", target_path.display()))?;
+        }
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
 fn ensure_default_ui_skill(webot_home: &PathBuf) -> Result<(), String> {
     let Some(source_dir) = resolve_bundled_ui_skill_dir() else {
         return Ok(());
@@ -157,6 +275,16 @@ fn ensure_default_ui_skill(webot_home: &PathBuf) -> Result<(), String> {
 
     let target_dir = webot_home.join("skills").join(DEFAULT_UI_SKILL_NAME);
     let _ = merge_missing_entries(&source_dir, &target_dir)?;
+    Ok(())
+}
+
+fn ensure_default_comfyui_assets(webot_home: &PathBuf) -> Result<(), String> {
+    let Some(source_dir) = resolve_bundled_comfyui_dir() else {
+        return Ok(());
+    };
+
+    let target_dir = webot_home.join("comfyui");
+    let _ = sync_dir_recursive(&source_dir, &target_dir)?;
     Ok(())
 }
 
@@ -191,7 +319,6 @@ fn ensure_openfang_config(webot_home: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-
 pub fn bootstrap() -> Result<DesktopState, String> {
     let webot_home = resolve_webot_home_dir()?;
 
@@ -200,6 +327,7 @@ pub fn bootstrap() -> Result<DesktopState, String> {
     env::set_var("WEBOT_ENABLE_LEGACY_MIGRATION", "0");
     assignment_store::bootstrap_storage().map_err(|err| format!("初始化本地目录失败: {err}"))?;
     ensure_default_ui_skill(&webot_home)?;
+    ensure_default_comfyui_assets(&webot_home)?;
 
     env::set_var("OPENFANG_BASE_URL", "http://127.0.0.1:4200");
 

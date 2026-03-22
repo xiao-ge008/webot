@@ -256,12 +256,31 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Get tool definitions visible to an agent under its skill allowlist.
+    ///
+    /// When the allowlist is empty, component-center skills stay hidden so they
+    /// must be explicitly attached to the target agent.
+    pub fn tool_definitions_for_agent_skills(&self, names: &[String]) -> Vec<SkillToolDef> {
+        self.visible_skills_for_agent(names)
+            .into_iter()
+            .flat_map(|skill| skill.manifest.tools.provided.iter().cloned())
+            .collect()
+    }
+
     /// Get tool definitions only from the named skills.
     pub fn tool_definitions_for_skills(&self, names: &[String]) -> Vec<SkillToolDef> {
         self.skills
             .values()
             .filter(|s| s.enabled && names.contains(&s.manifest.skill.name))
             .flat_map(|s| s.manifest.tools.provided.iter().cloned())
+            .collect()
+    }
+
+    /// List skills visible to an agent under its skill allowlist.
+    pub fn visible_skills_for_agent(&self, names: &[String]) -> Vec<&InstalledSkill> {
+        self.skills
+            .values()
+            .filter(|skill| skill_visible_for_agent(skill, names))
             .collect()
     }
 
@@ -280,6 +299,68 @@ impl SkillRegistry {
                     .iter()
                     .any(|t| t.name == tool_name)
         })
+    }
+
+    /// Find which visible skill for an agent provides a given tool name.
+    pub fn find_tool_provider_for_agent_skills(
+        &self,
+        tool_name: &str,
+        names: &[String],
+    ) -> Option<&InstalledSkill> {
+        self.skills.values().find(|skill| {
+            skill_visible_for_agent(skill, names)
+                && skill
+                    .manifest
+                    .tools
+                    .provided
+                    .iter()
+                    .any(|tool| tool.name == tool_name)
+        })
+    }
+
+    /// Find all enabled skills carrying the specified tag.
+    pub fn find_skills_by_tag(&self, tag: &str) -> Vec<&InstalledSkill> {
+        self.skills
+            .values()
+            .filter(|skill| skill.enabled && skill_has_tag(skill, tag))
+            .collect()
+    }
+
+    /// Find all enabled skills carrying any of the specified tags.
+    pub fn find_skills_by_any_tag(&self, tags: &[&str]) -> Vec<&InstalledSkill> {
+        self.skills
+            .values()
+            .filter(|skill| {
+                skill.enabled
+                    && tags
+                        .iter()
+                        .any(|tag| !tag.trim().is_empty() && skill_has_tag(skill, tag))
+            })
+            .collect()
+    }
+
+    /// Find all enabled component-center skills.
+    pub fn find_component_skills(&self) -> Vec<&InstalledSkill> {
+        self.find_skills_by_tag("component-center")
+    }
+
+    /// Find enabled component-center skills by capability tag.
+    ///
+    /// Accepts either `generate-image` or `capability:generate-image`.
+    pub fn find_component_skills_by_capability(&self, capability: &str) -> Vec<&InstalledSkill> {
+        let capability_tag = normalize_capability_tag(capability);
+        if capability_tag.is_empty() {
+            return Vec::new();
+        }
+
+        self.skills
+            .values()
+            .filter(|skill| {
+                skill.enabled
+                    && skill_has_tag(skill, "component-center")
+                    && skill_has_tag(skill, &capability_tag)
+            })
+            .collect()
     }
 
     /// Count installed skills.
@@ -384,14 +465,73 @@ impl SkillRegistry {
     }
 }
 
+fn skill_has_tag(skill: &InstalledSkill, tag: &str) -> bool {
+    let expected = tag.trim();
+    !expected.is_empty()
+        && skill
+            .manifest
+            .skill
+            .tags
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(expected))
+}
+
+fn is_component_skill(skill: &InstalledSkill) -> bool {
+    skill_has_tag(skill, "component-center") || skill_has_tag(skill, "component-skill")
+}
+
+fn skill_visible_for_agent(skill: &InstalledSkill, names: &[String]) -> bool {
+    if !skill.enabled {
+        return false;
+    }
+
+    if names.is_empty() {
+        !is_component_skill(skill)
+    } else {
+        names.contains(&skill.manifest.skill.name)
+    }
+}
+
+fn normalize_capability_tag(capability: &str) -> String {
+    let trimmed = capability.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    const PREFIX: &str = "capability:";
+    if trimmed.len() >= PREFIX.len() && trimmed[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        format!(
+            "{PREFIX}{}",
+            trimmed[PREFIX.len()..].trim().to_ascii_lowercase()
+        )
+    } else {
+        format!("{PREFIX}{}", trimmed.to_ascii_lowercase())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     fn create_test_skill(dir: &Path, name: &str) {
+        create_test_skill_with_tags(dir, name, &[]);
+    }
+
+    fn create_test_skill_with_tags(dir: &Path, name: &str, tags: &[&str]) {
         let skill_dir = dir.join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
+        let tags_literal = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "tags = [{}]\n",
+                tags.iter()
+                    .map(|tag| format!("\"{tag}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         std::fs::write(
             skill_dir.join("skill.toml"),
             format!(
@@ -400,6 +540,7 @@ mod tests {
 name = "{name}"
 version = "0.1.0"
 description = "Test skill"
+{tags_literal}
 
 [runtime]
 type = "python"
@@ -409,7 +550,8 @@ entry = "main.py"
 name = "{name}_tool"
 description = "A test tool"
 input_schema = {{ type = "object" }}
-"#
+"#,
+                tags_literal = tags_literal
             ),
         )
         .unwrap();
@@ -463,6 +605,106 @@ input_schema = {{ type = "object" }}
 
         assert!(registry.find_tool_provider("finder_tool").is_some());
         assert!(registry.find_tool_provider("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_find_skills_by_tag() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_tags(dir.path(), "image-component", &["component-center"]);
+        create_test_skill_with_tags(dir.path(), "other-skill", &["misc"]);
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let matches = registry.find_skills_by_tag("component-center");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].manifest.skill.name, "image-component");
+    }
+
+    #[test]
+    fn test_find_skills_by_any_tag() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_tags(
+            dir.path(),
+            "image-component",
+            &["capability:generate-image"],
+        );
+        create_test_skill_with_tags(
+            dir.path(),
+            "video-component",
+            &["capability:generate-video"],
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let matches =
+            registry.find_skills_by_any_tag(&["capability:generate-image", "unknown-tag"]);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].manifest.skill.name, "image-component");
+    }
+
+    #[test]
+    fn test_find_component_skills_by_capability() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_tags(
+            dir.path(),
+            "image-component",
+            &["component-center", "capability:generate-image"],
+        );
+        create_test_skill_with_tags(
+            dir.path(),
+            "plain-image-skill",
+            &["capability:generate-image"],
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let matches = registry.find_component_skills_by_capability("generate-image");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].manifest.skill.name, "image-component");
+    }
+
+    #[test]
+    fn test_visible_skills_for_agent_hides_component_skills_by_default() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_tags(dir.path(), "general-skill", &["utility"]);
+        create_test_skill_with_tags(
+            dir.path(),
+            "image-component",
+            &["component-center", "capability:generate-image"],
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let visible = registry.visible_skills_for_agent(&[]);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].manifest.skill.name, "general-skill");
+    }
+
+    #[test]
+    fn test_find_tool_provider_for_agent_skills_requires_component_allowlist() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_tags(
+            dir.path(),
+            "image-component",
+            &["component-center", "capability:generate-image"],
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        assert!(registry
+            .find_tool_provider_for_agent_skills("image-component_tool", &[])
+            .is_none());
+
+        let allowed = vec!["image-component".to_string()];
+        let provider = registry
+            .find_tool_provider_for_agent_skills("image-component_tool", &allowed)
+            .unwrap();
+        assert_eq!(provider.manifest.skill.name, "image-component");
     }
 
     #[test]

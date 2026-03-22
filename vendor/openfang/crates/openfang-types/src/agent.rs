@@ -445,7 +445,9 @@ pub struct AgentManifest {
     /// Tool-specific configurations.
     #[serde(default, deserialize_with = "crate::serde_compat::map_lenient")]
     pub tools: HashMap<String, ToolConfig>,
-    /// Installed skill references (empty = all skills available).
+    /// Installed skill references.
+    /// Empty keeps generic skills available, but component-center skills remain hidden
+    /// until explicitly attached to the agent.
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub skills: Vec<String>,
     /// MCP server allowlist (empty = all connected MCP servers available).

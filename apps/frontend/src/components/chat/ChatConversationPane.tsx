@@ -23,7 +23,17 @@ import {
   Gauge,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { looksLikeProtocolOnlyText, normalizeIncomingSpec, parseJsonSafely, extractUiRawText, repairUiJsonString, sanitizeAiUiOutput, getBestEffortUiJsonBlocks } from '@/components/chat/chat-page-helpers';
+import {
+  containsUiJsonTag,
+  extractAgentSelfAppearanceActionFromSpec,
+  extractUiRawText,
+  getBestEffortUiJsonBlocks,
+  looksLikeProtocolOnlyText,
+  normalizeIncomingSpec,
+  parseJsonSafely,
+  repairUiJsonString,
+  sanitizeAiUiOutput,
+} from '@/components/chat/chat-page-helpers';
 import { ChatMessageList } from '@/components/chat/ChatMessageList';
 import { ChatAttachmentDeck } from '@/components/chat/ChatAttachmentDeck';
 import ReactMarkdown from 'react-markdown';
@@ -37,6 +47,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { uploadManagementAgentChatAsset } from '@/services/management-client';
+import { analyzeAndCacheChatImageWithLocalVision } from '@/services/local-vision-service';
 import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 import { canOpenAttachmentWithSystem, isDesktopFileOpenSupported, openAttachmentWithSystem } from '@/services/desktop-file-client';
 import { getApiBaseUrl } from '@/services/transport';
@@ -221,6 +232,10 @@ interface ComposerAttachmentDraft {
   assetUrl?: string;
   mimeType?: string;
   size?: number;
+  sha256?: string;
+  localVisionSummary?: string;
+  localVisionProvider?: string;
+  localVisionModel?: string;
   previewUrl?: string;
   error?: string;
 }
@@ -475,9 +490,16 @@ function formatAttachmentSize(size?: number): string {
 const CHAT_ATTACHMENT_PROMPT_BEGIN = '[WEBOT_CHAT_ATTACHMENTS_BEGIN]';
 const CHAT_ATTACHMENT_PROMPT_END = '[WEBOT_CHAT_ATTACHMENTS_END]';
 
+function normalizeLocalVisionText(text?: string): string {
+  return typeof text === 'string'
+    ? text.replace(/\s+/g, ' ').trim()
+    : '';
+}
+
 function buildAttachmentPrompt(text: string, attachments: ChatAttachment[]): string {
   const userText = text.trim();
   const lines = attachments.map((attachment, index) => {
+    const localVisionText = normalizeLocalVisionText(attachment.localVisionSummary);
     const parts = [
       `${index + 1}. ${attachment.kind === 'image' ? '图片' : '附件'}：${attachment.name}`,
       `- 相对路径：${attachment.relativePath}`,
@@ -491,6 +513,17 @@ function buildAttachmentPrompt(text: string, attachments: ChatAttachment[]): str
     if (attachment.upstreamFileId?.trim()) {
       parts.push(`- OpenFang 文件ID：${attachment.upstreamFileId.trim()}`);
     }
+    if (localVisionText) {
+      parts.push(`- 已完成发送前本地视觉聚焦：是`);
+      parts.push(`- 本地视觉文本：${localVisionText}`);
+      const localVisionSource = [
+        attachment.localVisionProvider?.trim(),
+        attachment.localVisionModel?.trim(),
+      ].filter(Boolean).join(' / ');
+      if (localVisionSource) {
+        parts.push(`- 本地视觉模型：${localVisionSource}`);
+      }
+    }
     return parts.join('\n');
   });
 
@@ -500,8 +533,9 @@ function buildAttachmentPrompt(text: string, attachments: ChatAttachment[]): str
       '以下文件已上传到当前智能体工作区的 data/chat-uploads 目录，请按需读取：',
       ...lines,
       '处理要求：',
-      '- 若当前模型支持视觉，请优先直接查看图片附件。',
-      '- 若当前模型不支持视觉，或附件不是图片，请使用文件读取类工具按上述路径读取。',
+      '- 若附件已携带本地视觉文本，请直接把这段文本当作该图片在本轮问题下的可用事实，不要忽略它，也不要脱离它自行猜测。',
+      '- 已完成发送前本地视觉聚焦的图片，本轮不会再作为原始视觉附件发送；若需要继续编辑或读取，请直接使用上面的相对路径或绝对路径。',
+      '- 只有没有本地视觉文本的图片，才需要继续查看图片附件或读取文件。',
       '- 回复时优先引用文件名和关键结论，无需重复整段路径。',
       CHAT_ATTACHMENT_PROMPT_END,
     ].join('\n')
@@ -555,6 +589,7 @@ export function ChatConversationPane({
   const [copiedTraceKey, setCopiedTraceKey] = useState('');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
+  const [localVisionResolving, setLocalVisionResolving] = useState(false);
   const [apiBaseUrl, setApiBaseUrl] = useState<string>('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -993,6 +1028,10 @@ export function ChatConversationPane({
           assetUrl: uploaded.assetUrl,
           mimeType: uploaded.mimeType,
           size: uploaded.size,
+          sha256: uploaded.sha256,
+          localVisionSummary: uploaded.localVisionSummary,
+          localVisionProvider: uploaded.localVisionProvider,
+          localVisionModel: uploaded.localVisionModel,
         }));
       } catch (uploadError) {
         updateComposerAttachment(attachmentId, (current) => ({
@@ -1014,34 +1053,93 @@ export function ChatConversationPane({
     });
   }, [revokeComposerPreview]);
 
-  const handleSend = () => {
+  const resolveOutgoingAttachments = useCallback(async (
+    readyAttachments: ComposerAttachmentDraft[],
+    userText: string,
+  ): Promise<ChatAttachment[]> => {
+    const attachments = await Promise.all(readyAttachments.map(async (item) => {
+      const baseAttachment: ChatAttachment = {
+        id: item.id,
+        kind: item.kind,
+        name: item.name,
+        upstreamFileId: item.upstreamFileId,
+        relativePath: item.relativePath || '',
+        savedPath: item.savedPath,
+        assetUrl: item.assetUrl,
+        mimeType: item.mimeType,
+        size: item.size,
+        sha256: item.sha256,
+        localVisionSummary: item.localVisionSummary,
+        localVisionProvider: item.localVisionProvider,
+        localVisionModel: item.localVisionModel,
+      };
+      if (
+        item.kind !== 'image'
+        || !item.sha256
+        || !item.savedPath
+        || !item.mimeType
+      ) {
+        return baseAttachment;
+      }
+
+      try {
+        const localVision = await analyzeAndCacheChatImageWithLocalVision({
+          sha256: item.sha256,
+          imageUrl: item.assetUrl || '',
+          mimeType: item.mimeType,
+          relativePath: item.relativePath,
+          savedPath: item.savedPath,
+          upstreamFileId: item.upstreamFileId,
+          fileName: item.name,
+        }, userText);
+        if (!localVision) {
+          return baseAttachment;
+        }
+        return {
+          ...baseAttachment,
+          localVisionSummary: localVision.text,
+          localVisionProvider: localVision.provider,
+          localVisionModel: localVision.model,
+        };
+      } catch (error) {
+        console.warn('[local-vision] 发送前生成聚焦视觉结果失败', error);
+        return baseAttachment;
+      }
+    }));
+    return attachments;
+  }, []);
+
+  const handleSend = async () => {
     const readyAttachments = composerAttachments.filter((item) => item.status === 'ready');
     const uploadingCount = composerAttachments.filter((item) => item.status === 'uploading').length;
-    if ((inputValue.trim().length === 0 && readyAttachments.length === 0) || inputLocked || uploadingCount > 0) return;
+    if (
+      (inputValue.trim().length === 0 && readyAttachments.length === 0)
+      || inputLocked
+      || localVisionResolving
+      || uploadingCount > 0
+    ) {
+      return;
+    }
     if (typeof onUserActivity === 'function') {
       onUserActivity('send');
     }
-    const attachments: ChatAttachment[] = readyAttachments.map((item) => ({
-      id: item.id,
-      kind: item.kind,
-      name: item.name,
-      upstreamFileId: item.upstreamFileId,
-      relativePath: item.relativePath || '',
-      savedPath: item.savedPath,
-      assetUrl: item.assetUrl,
-      mimeType: item.mimeType,
-      size: item.size,
-    }));
-    onSendMessage({
-      displayText: inputValue.trim() || `已上传 ${attachments.length} 个附件`,
-      submitText: buildAttachmentPrompt(inputValue, attachments),
-      attachments,
-    });
-    setInputValue('');
-    setComposerAttachments((prev) => {
-      prev.forEach((item) => revokeComposerPreview(item.previewUrl));
-      return [];
-    });
+    const userText = inputValue.trim();
+    setLocalVisionResolving(true);
+    try {
+      const attachments = await resolveOutgoingAttachments(readyAttachments, userText);
+      onSendMessage({
+        displayText: userText || `已上传 ${attachments.length} 个附件`,
+        submitText: buildAttachmentPrompt(userText, attachments),
+        attachments,
+      });
+      setInputValue('');
+      setComposerAttachments((prev) => {
+        prev.forEach((item) => revokeComposerPreview(item.previewUrl));
+        return [];
+      });
+    } finally {
+      setLocalVisionResolving(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1050,7 +1148,7 @@ export function ChatConversationPane({
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      void handleSend();
     }
   };
 
@@ -1792,23 +1890,28 @@ export function ChatConversationPane({
     return !looksLikeProtocolOnlyText(text);
   }, []);
 
+  const getRenderableUiSpec = useCallback((spec: unknown): unknown | undefined => {
+    const appearanceAction = extractAgentSelfAppearanceActionFromSpec(spec);
+    return appearanceAction ? appearanceAction.strippedSpec : spec;
+  }, []);
+
   const hasRenderableMessageContent = useCallback((msg: Message): boolean => {
     if ((msg.attachments?.length ?? 0) > 0) return true;
     if (msg.taskCard) return true;
     if ((msg.a2aCards?.length ?? 0) > 0) return true;
-    if (msg.spec != null) return true;
+    if (getRenderableUiSpec(msg.spec) != null) return true;
     if (hasRuntimeLogData(msg)) return true;
     if (msg.role === 'user') return Boolean((msg.text || '').trim());
     if (hasMeaningfulMarkdownText(msg)) return true;
     const meta = (msg.meta || '').trim();
     if (meta && !meta.startsWith('auto_dispatch:')) return true;
     return false;
-  }, [hasMeaningfulMarkdownText]);
+  }, [getRenderableUiSpec, hasMeaningfulMarkdownText]);
 
   const shouldRenderCardForMessage = useCallback((msg: Message, isUser: boolean): boolean => {
-    if (isUser || msg.spec == null) return false;
-    return true;
-  }, []);
+    if (isUser) return false;
+    return getRenderableUiSpec(msg.spec) != null;
+  }, [getRenderableUiSpec]);
 
   const shouldShowLoadingCardForMessage = useCallback((msg: Message, isUser: boolean): boolean => {
     if (isUser) return false;
@@ -1824,7 +1927,7 @@ export function ChatConversationPane({
 
   const extractMixedSegments = useCallback((raw: string): MixedRenderSegment[] => {
     const source = sanitizeAiUiOutput(raw).trim();
-    if (!source || !source.includes('<UI_JSON>')) return [];
+    if (!source || !containsUiJsonTag(source)) return [];
 
     const segments: MixedRenderSegment[] = [];
     let lastIndex = 0;
@@ -1843,7 +1946,7 @@ export function ChatConversationPane({
       const jsonBlock = block.payload;
       if (jsonBlock) {
         const parsed = parseJsonSafely<unknown>(repairUiJsonString(jsonBlock));
-        const spec = normalizeIncomingSpec(parsed);
+        const spec = getRenderableUiSpec(normalizeIncomingSpec(parsed));
         if (spec != null) {
           segments.push({ kind: 'ui', spec });
           matchedUiCount += 1;
@@ -1863,11 +1966,11 @@ export function ChatConversationPane({
     }
 
     return segments;
-  }, []);
+  }, [getRenderableUiSpec]);
 
   const getCachedMixedSegments = useCallback((messageId: string, raw: string): MixedRenderSegment[] => {
     const source = sanitizeAiUiOutput(raw).trim();
-    if (!source || !source.includes('<UI_JSON>')) return [];
+    if (!source || !containsUiJsonTag(source)) return [];
     const key = `${messageId}::${source}`;
     const hit = mixedSegmentsCacheRef.current.get(key);
     if (hit) return hit;
@@ -1893,7 +1996,7 @@ export function ChatConversationPane({
       typeof msg.uiRawText === 'string' ? msg.uiRawText : '',
       typeof msg.text === 'string' ? extractUiRawText(msg.text) : '',
       typeof msg.text === 'string' ? msg.text : '',
-    ].find((item) => item.includes('<UI_JSON>')) || '';
+    ].find((item) => containsUiJsonTag(item)) || '';
 
     const mixedSegments = getCachedMixedSegments(msg.id, mixedSource);
     msg.debugMixedSegmentCount = mixedSegments.length;
@@ -2045,6 +2148,7 @@ export function ChatConversationPane({
         }
 
         const shouldRenderCard = shouldRenderCardForMessage(msg, isUser);
+        const renderableSpec = getRenderableUiSpec(msg.spec);
         const hasMarkdown = hasMeaningfulMarkdownText(msg);
         const markdownContent = isUser
           ? (msg.text || '')
@@ -2060,10 +2164,10 @@ export function ChatConversationPane({
             ) : null}
             {!isUser && shouldRenderCard && (
               <div className="mt-3">
-                {renderSimpleCardSpec(msg.spec) ?? (
+                {renderSimpleCardSpec(renderableSpec) ?? (
                   <DeferredUiCard shouldDefer={Boolean(options?.deferHeavyUi)}>
                     <DynamicUIRenderer
-                      schema={msg.spec as any}
+                      schema={renderableSpec as any}
                       onAction={(actionId, payload) => handleUiAction(actionId, payload, { messageId: msg.id })}
                       agentId={agent.id}
                       messageId={msg.id}
@@ -2087,6 +2191,7 @@ export function ChatConversationPane({
   ), [
     agent.id,
     getMessageMixedSegments,
+    getRenderableUiSpec,
     handleUiAction,
     renderA2aCards,
     renderLoadingCard,
@@ -2179,7 +2284,7 @@ export function ChatConversationPane({
 
   const readyAttachmentCount = composerAttachments.filter((item) => item.status === 'ready').length;
   const uploadingAttachmentCount = composerAttachments.filter((item) => item.status === 'uploading').length;
-  const canSendMessage = !inputLocked && uploadingAttachmentCount === 0 && (inputValue.trim().length > 0 || readyAttachmentCount > 0);
+  const canSendMessage = !inputLocked && !localVisionResolving && uploadingAttachmentCount === 0 && (inputValue.trim().length > 0 || readyAttachmentCount > 0);
   const showAutoConversationToggle = typeof onToggleAutoConversation === 'function';
 
   return (
@@ -2299,7 +2404,7 @@ export function ChatConversationPane({
               }}
               placeholder={autoConversationEnabled ? '自动群聊中，点击“自动中”可退出并恢复手动输入。' : t('chat.inputPlaceholder')}
               className="chat-input-field focus-visible:ring-0 focus-visible:ring-offset-0"
-              disabled={inputLocked}
+              disabled={inputLocked || localVisionResolving}
             />
             {composerAttachments.length > 0 ? (
               <div className="px-3 pb-3 space-y-2">
@@ -2343,7 +2448,10 @@ export function ChatConversationPane({
                                 上传中...
                               </span>
                             ) : attachment.status === 'ready' ? (
-                              <span className="text-emerald-600 break-all">{attachment.relativePath}</span>
+                              <span className="text-emerald-600 break-all">
+                                {attachment.relativePath}
+                            {attachment.localVisionSummary ? ' · 已生成本地视觉文本' : ''}
+                              </span>
                             ) : (
                               <span className="text-destructive break-all">{attachment.error || '上传失败'}</span>
                             )}
@@ -2362,7 +2470,7 @@ export function ChatConversationPane({
                   variant="ghost"
                   size="icon"
                   className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
-                  disabled={inputLocked}
+                  disabled={inputLocked || localVisionResolving}
                   title={isDesktopRuntime ? '上传图片或 Ctrl+V 粘贴图片' : 'Web 端支持上传或粘贴小图片'}
                   onClick={() => imageInputRef.current?.click()}
                 >
@@ -2373,7 +2481,7 @@ export function ChatConversationPane({
                   variant="ghost"
                   size="icon"
                   className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
-                  disabled={inputLocked || !isDesktopRuntime}
+                  disabled={inputLocked || localVisionResolving || !isDesktopRuntime}
                   title={isDesktopRuntime ? '上传附件或 Ctrl+V 粘贴文件' : 'Web 端暂不支持粘贴通用附件'}
                   onClick={() => fileInputRef.current?.click()}
                 >
@@ -2428,6 +2536,12 @@ export function ChatConversationPane({
                     附件上传中 {uploadingAttachmentCount}
                   </span>
                 ) : null}
+                {localVisionResolving ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    本地视觉聚焦中
+                  </span>
+                ) : null}
                 {!isSending && showAutoConversationToggle ? (
                   <Button
                     type="button"
@@ -2455,7 +2569,7 @@ export function ChatConversationPane({
                   </Button>
                 ) : (
                   <Button
-                    onClick={handleSend}
+                    onClick={() => void handleSend()}
                     disabled={!canSendMessage}
                     size="icon"
                     className="h-8 w-8 rounded-full shadow-md bg-black text-white hover:bg-zinc-800 active:scale-95 transition-all disabled:opacity-30"

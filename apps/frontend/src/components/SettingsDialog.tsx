@@ -35,6 +35,7 @@ import {
   Cpu,
   Sparkles,
   BrainCircuit,
+  Image as ImageIcon,
   Trash2,
   RefreshCw,
   FileText,
@@ -47,6 +48,8 @@ import { ModelsTab } from '@/components/settings/ModelsTab';
 import { MemoryEnhancementTab } from '@/components/settings/MemoryEnhancementTab';
 import { Live2DTab } from '@/components/settings/Live2DTab';
 import { ComponentProvidersTab } from '@/components/settings/ComponentProvidersTab';
+import { ImageGenerationTab } from '@/components/settings/ImageGenerationTab';
+import { VisionAnalysisTab } from '@/components/settings/VisionAnalysisTab';
 import {
   clearGlobalMcpConfig,
   deleteGlobalSkill,
@@ -90,6 +93,8 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
         items: [
           { id: 'providers', label: t('settings.menu.providers'), icon: Cpu },
           { id: 'models', label: t('settings.menu.models'), icon: Sparkles },
+          { id: 'imageGeneration', label: t('settings.menu.imageGeneration'), icon: ImageIcon },
+          { id: 'visionAnalysis', label: t('settings.menu.visionAnalysis', { defaultValue: '视觉分析' }), icon: ImageIcon },
           { id: 'memoryEnhancement', label: t('settings.menu.memoryEnhancement'), icon: BrainCircuit },
         ],
       },
@@ -186,6 +191,8 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
           {activeTab === 'general' && <GeneralTab />}
           {activeTab === 'providers' && <ProvidersTab />}
           {activeTab === 'models' && <ModelsTab />}
+          {activeTab === 'imageGeneration' && <ImageGenerationTab />}
+          {activeTab === 'visionAnalysis' && <VisionAnalysisTab />}
           {activeTab === 'memoryEnhancement' && <MemoryEnhancementTab />}
           {activeTab === 'componentProviders' && <ComponentProvidersTab />}
           {activeTab === 'skills' && <SkillsTab />}
@@ -194,6 +201,8 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
           {activeTab !== 'general' &&
             activeTab !== 'providers' &&
             activeTab !== 'models' &&
+            activeTab !== 'imageGeneration' &&
+            activeTab !== 'visionAnalysis' &&
             activeTab !== 'memoryEnhancement' &&
             activeTab !== 'componentProviders' &&
             activeTab !== 'skills' &&

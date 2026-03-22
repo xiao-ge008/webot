@@ -3084,6 +3084,22 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <label class="text-xs text-dim">Max Output Tokens</label>
                   <input class="form-input" type="number" x-model.number="customModelMaxOutput" placeholder="8192">
                 </div>
+                <div style="grid-column:1 / -1;display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,0.02)">
+                  <div>
+                    <div class="text-xs" style="font-weight:600">Vision</div>
+                    <div class="text-xs text-dim">Click the eye icon if this custom model can read images.</div>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-sm"
+                    @click="customModelSupportsVision = !customModelSupportsVision"
+                    :title="customModelSupportsVision ? 'Vision enabled' : 'Vision disabled'"
+                    :style="customModelSupportsVision
+                      ? 'padding:6px 8px;border:1px solid color-mix(in srgb, var(--success,#22c55e) 65%, transparent);color:var(--success,#22c55e);background:color-mix(in srgb, var(--success,#22c55e) 12%, transparent)'
+                      : 'padding:6px 8px;border:1px solid var(--border);color:var(--text-muted);background:transparent'">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  </button>
+                </div>
               </div>
               <button class="btn btn-primary btn-sm mt-2" @click="addCustomModel()" :disabled="!customModelId.trim()">Add Model</button>
               <span class="text-xs text-dim ml-2" x-text="customModelStatus"></span>
@@ -3097,9 +3113,9 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
             <div class="table-wrap" x-show="filteredModels.length">
               <table>
-                <thead><tr><th>Model</th><th>Provider</th><th>Tier</th><th>Context</th><th>Input Cost</th><th>Output Cost</th><th>Status</th><th></th></tr></thead>
+                <thead><tr><th>Model</th><th>Provider</th><th>Tier</th><th>Context</th><th>Input Cost</th><th>Output Cost</th><th>Status</th><th>Vision</th><th></th></tr></thead>
                 <tbody>
-                  <template x-for="m in filteredModels" :key="m.id">
+                  <template x-for="m in filteredModels" :key="customModelRowKey(m)">
                     <tr>
                       <td style="font-size:11px"><div class="font-bold" x-text="m.display_name || m.id"></div><div class="text-xs text-dim" style="font-family:var(--font-mono);opacity:0.7;user-select:all" x-show="m.display_name && m.display_name !== m.id" x-text="m.id"></div></td>
                       <td class="text-dim" x-text="m.provider"></td>
@@ -3108,7 +3124,22 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <td class="text-xs" x-text="formatCost(m.input_cost_per_m)"></td>
                       <td class="text-xs" x-text="formatCost(m.output_cost_per_m)"></td>
                       <td><span class="badge" :class="m.available ? 'badge-success' : 'badge-muted'" x-text="m.available ? 'Available' : 'Needs Key'"></span></td>
-                      <td><button x-show="m.tier === 'custom'" class="btn btn-ghost btn-sm" @click="deleteCustomModel(m.id)" title="Delete custom model" style="padding:2px 6px;font-size:11px;color:var(--text-muted)">&#x2715;</button></td>
+                      <td>
+                        <button
+                          type="button"
+                          class="btn btn-ghost btn-sm"
+                          @click="m.tier === 'custom' && toggleCustomModelVision(m)"
+                          :disabled="m.tier !== 'custom' || isCapabilitySaving(m)"
+                          :title="m.tier === 'custom'
+                            ? (m.supports_vision ? 'Click to disable vision support' : 'Click to enable vision support')
+                            : (m.supports_vision ? 'Vision supported' : 'Vision not supported')"
+                          :style="m.supports_vision
+                            ? 'padding:4px 7px;border:1px solid color-mix(in srgb, var(--success,#22c55e) 65%, transparent);color:var(--success,#22c55e);background:color-mix(in srgb, var(--success,#22c55e) 12%, transparent);opacity:' + (isCapabilitySaving(m) ? '0.65' : '1')
+                            : 'padding:4px 7px;border:1px solid var(--border);color:var(--text-muted);background:transparent;opacity:' + (m.tier === 'custom' ? (isCapabilitySaving(m) ? '0.65' : '0.92') : '0.45')">
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                        </button>
+                      </td>
+                      <td><button x-show="m.tier === 'custom'" class="btn btn-ghost btn-sm" @click="deleteCustomModel(m.id, m.provider)" title="Delete custom model" style="padding:2px 6px;font-size:11px;color:var(--text-muted)">&#x2715;</button></td>
                     </tr>
                   </template>
                 </tbody>

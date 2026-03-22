@@ -1,9 +1,12 @@
 pub mod assignment_store;
+pub mod component_center;
 pub mod config;
 pub mod error;
+pub mod image_generation;
 pub mod openfang;
 pub mod path_resolver;
 pub mod routes;
+pub mod vision_analysis;
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
@@ -482,6 +485,19 @@ impl AppState {
         }
 
         let mut spawn_errors: Vec<String> = Vec::new();
+        let service_host = if self.config.listen_addr.ip().is_unspecified() {
+            if self.config.listen_addr.is_ipv4() {
+                "127.0.0.1".to_string()
+            } else {
+                "[::1]".to_string()
+            }
+        } else if self.config.listen_addr.is_ipv6() {
+            format!("[{}]", self.config.listen_addr.ip())
+        } else {
+            self.config.listen_addr.ip().to_string()
+        };
+        let service_base_url =
+            format!("http://{}:{}", service_host, self.config.listen_addr.port());
 
         for candidate in candidates {
             let desc = format_launch_desc(
@@ -499,6 +515,7 @@ impl AppState {
                 command.env("OPENFANG_HOME", &runtime_home);
                 command.env("WEBOT_HOME", &runtime_home);
             }
+            command.env("WEBOT_SERVICE_BASE_URL", &service_base_url);
             command.stdin(Stdio::null());
             command.stdout(Stdio::null());
             command.stderr(Stdio::null());

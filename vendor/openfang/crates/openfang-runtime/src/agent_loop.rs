@@ -78,6 +78,18 @@ const TOPIC_SUMMARY_RECENT_MESSAGES: usize = 8;
 const GROUP_SESSION_LABEL_PREFIX: &str = "groupmem_";
 const META_CONVERSATION_SCOPE: &str = "conversation_scope";
 const META_PARTICIPANT_SCOPE: &str = "participant_scope";
+
+fn tool_result_guidance(tool_name: &str, is_error: bool) -> Option<ContentBlock> {
+    match (tool_name, is_error) {
+        ("image_edit", true) => Some(ContentBlock::Text {
+            text: "[System: image_edit failed. This request is still an edit of an existing image. Do NOT fall back to image_generate, because generation will create a different image/person and break continuity. Instead, explain the image_edit failure to the user and ask for the missing prerequisite, permission, or image-service fix.]".to_string(),
+        }),
+        ("image_generate", false) => Some(ContentBlock::Text {
+            text: "[System: image_generate succeeded. Reuse the image URLs/paths from this successful result. If you now have enough images to satisfy the user's request, especially for avatar, portrait, cover, or appearance updates, finalize immediately and stop generating more images. Do NOT call image_generate again unless the user explicitly asked for more versions or alternatives, or the current result is clearly unusable.]".to_string(),
+        }),
+        _ => None,
+    }
+}
 const MANIFEST_MEMORY_TURN_CONTEXT_KEY: &str = "memory_turn_context";
 const PARTICIPANT_RECALL_BOOST: f32 = 0.35;
 const RECALL_CANDIDATE_LIMIT_MULTIPLIER: usize = 2;
@@ -1354,6 +1366,7 @@ pub async fn run_agent_loop(
                             &tool_call.input,
                             kernel.as_ref(),
                             Some(&allowed_tool_names),
+                            Some(&manifest.skills),
                             Some(&caller_id_str),
                             skill_registry,
                             mcp_connections,
@@ -1419,6 +1432,9 @@ pub async fn run_agent_loop(
                         content: final_content,
                         is_error: result.is_error,
                     });
+                    if let Some(guidance) = tool_result_guidance(&tool_call.name, result.is_error) {
+                        tool_result_blocks.push(guidance);
+                    }
                 }
 
                 // Detect approval denials and inject guidance to prevent infinite retry loops
@@ -2218,6 +2234,7 @@ pub async fn run_agent_loop_streaming(
                             &tool_call.input,
                             kernel.as_ref(),
                             Some(&allowed_tool_names),
+                            Some(&manifest.skills),
                             Some(&caller_id_str),
                             skill_registry,
                             mcp_connections,
@@ -2298,6 +2315,9 @@ pub async fn run_agent_loop_streaming(
                         content: final_content,
                         is_error: result.is_error,
                     });
+                    if let Some(guidance) = tool_result_guidance(&tool_call.name, result.is_error) {
+                        tool_result_blocks.push(guidance);
+                    }
                 }
 
                 // Detect approval denials and inject guidance to prevent infinite retry loops
@@ -3388,6 +3408,32 @@ mod tests {
         assert_eq!(calls[0].name, "web_search");
         assert_eq!(calls[0].input["query"], "rust async");
         assert!(calls[0].id.starts_with("recovered_"));
+    }
+
+    #[test]
+    fn test_tool_result_guidance_blocks_image_generate_fallback() {
+        let guidance = tool_result_guidance("image_edit", true);
+        match guidance {
+            Some(ContentBlock::Text { text }) => {
+                assert!(text.contains("Do NOT fall back to image_generate"));
+            }
+            other => panic!("expected image_edit recovery guidance, got {other:?}"),
+        }
+
+        assert!(tool_result_guidance("image_generate", true).is_none());
+        assert!(tool_result_guidance("image_edit", false).is_none());
+    }
+
+    #[test]
+    fn test_tool_result_guidance_stops_after_successful_image_generate() {
+        let guidance = tool_result_guidance("image_generate", false);
+        match guidance {
+            Some(ContentBlock::Text { text }) => {
+                assert!(text.contains("finalize immediately"));
+                assert!(text.contains("Do NOT call image_generate again"));
+            }
+            other => panic!("expected image_generate success guidance, got {other:?}"),
+        }
     }
 
     #[test]

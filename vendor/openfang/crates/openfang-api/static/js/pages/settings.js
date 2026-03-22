@@ -19,7 +19,9 @@ function settingsPage() {
     customModelProvider: 'openrouter',
     customModelContext: 128000,
     customModelMaxOutput: 8192,
+    customModelSupportsVision: false,
     customModelStatus: '',
+    modelCapabilitySaving: {},
     providerKeyInputs: {},
     providerUrlInputs: {},
     providerUrlSaving: {},
@@ -238,6 +240,20 @@ function settingsPage() {
       } catch(e) { this.models = []; }
     },
 
+    customModelRowKey(model) {
+      return (model.provider || '') + '::' + model.id;
+    },
+
+    isCapabilitySaving(model) {
+      return this.modelCapabilitySaving[this.customModelRowKey(model)] === true;
+    },
+
+    resetCustomModelForm() {
+      this.customModelId = '';
+      this.customModelSupportsVision = false;
+      this.showCustomModelForm = false;
+    },
+
     async addCustomModel() {
       var id = this.customModelId.trim();
       if (!id) return;
@@ -248,20 +264,43 @@ function settingsPage() {
           provider: this.customModelProvider || 'openrouter',
           context_window: this.customModelContext || 128000,
           max_output_tokens: this.customModelMaxOutput || 8192,
+          supports_vision: !!this.customModelSupportsVision,
         });
         this.customModelStatus = 'Added!';
-        this.customModelId = '';
-        this.showCustomModelForm = false;
+        this.resetCustomModelForm();
         await this.loadModels();
       } catch(e) {
         this.customModelStatus = 'Error: ' + (e.message || 'Failed');
       }
     },
 
-    async deleteCustomModel(modelId) {
-      if (!confirm('Delete custom model "' + modelId + '"?')) return;
+    async toggleCustomModelVision(model) {
+      if (!model || model.tier !== 'custom') return;
+      var rowKey = this.customModelRowKey(model);
+      this.modelCapabilitySaving[rowKey] = true;
       try {
-        await OpenFangAPI.del('/api/models/custom/' + encodeURIComponent(modelId));
+        await OpenFangAPI.patch('/api/models/custom/' + encodeURIComponent(model.id), {
+          provider: model.provider,
+          supports_vision: !model.supports_vision,
+        });
+        OpenFangToast.success((model.display_name || model.id) + ' ' + (!model.supports_vision ? '已标记支持视觉' : '已取消视觉标记'));
+        await this.loadModels();
+      } catch(e) {
+        OpenFangToast.error('更新视觉能力失败: ' + (e.message || 'Unknown error'));
+      } finally {
+        this.modelCapabilitySaving[rowKey] = false;
+      }
+    },
+
+    async deleteCustomModel(modelId, provider) {
+      var label = provider ? (provider + '/' + modelId) : modelId;
+      if (!confirm('Delete custom model "' + label + '"?')) return;
+      try {
+        var path = '/api/models/custom/' + encodeURIComponent(modelId);
+        if (provider) {
+          path += '?provider=' + encodeURIComponent(provider);
+        }
+        await OpenFangAPI.del(path);
         OpenFangToast.success('Model deleted');
         await this.loadModels();
       } catch(e) {

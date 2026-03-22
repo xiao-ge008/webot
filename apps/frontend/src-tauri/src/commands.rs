@@ -68,18 +68,11 @@ fn compute_progress_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> 
     })
 }
 
-fn emit_update_install_progress(
-    app: &AppHandle,
-    payload: UpdateInstallProgressPayload,
-) {
+fn emit_update_install_progress(app: &AppHandle, payload: UpdateInstallProgressPayload) {
     let _ = app.emit(UPDATE_INSTALL_PROGRESS_EVENT, payload);
 }
 
-fn emit_update_install_failed(
-    app: &AppHandle,
-    file_name: &str,
-    message: String,
-) {
+fn emit_update_install_failed(app: &AppHandle, file_name: &str, message: String) {
     emit_update_install_progress(
         app,
         UpdateInstallProgressPayload {
@@ -232,7 +225,8 @@ fn is_component_file(path: &Path, component_name: &str) -> bool {
 }
 
 fn find_component_in_dir(dir: &Path, component_name: &str) -> Result<Option<PathBuf>, String> {
-    let entries = fs::read_dir(dir).map_err(|err| format!("读取目录失败: {} ({err})", dir.display()))?;
+    let entries =
+        fs::read_dir(dir).map_err(|err| format!("读取目录失败: {} ({err})", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("读取目录项失败: {} ({err})", dir.display()))?;
         let path = entry.path();
@@ -249,7 +243,10 @@ fn find_component_in_dir(dir: &Path, component_name: &str) -> Result<Option<Path
     Ok(None)
 }
 
-fn resolve_component_path(component_name: &str, agent_id: Option<&str>) -> Result<Option<PathBuf>, String> {
+fn resolve_component_path(
+    component_name: &str,
+    agent_id: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
     let mut roots = Vec::new();
     roots.push(webot_service_rs::assignment_store::skills_root()?);
     if let Some(agent) = agent_id {
@@ -280,16 +277,24 @@ fn manifest_allows_component(skill_dir: &Path, component_name: &str) -> Result<b
         return Ok(false);
     }
 
-    let raw = fs::read_to_string(&manifest_path)
-        .map_err(|err| format!("Failed to read component manifest: {} ({err})", manifest_path.display()))?;
-    let manifest: SkillManifestFile = serde_json::from_str(&raw)
-        .map_err(|err| format!("Failed to read component manifest: {} ({err})", manifest_path.display()))?;
+    let raw = fs::read_to_string(&manifest_path).map_err(|err| {
+        format!(
+            "Failed to read component manifest: {} ({err})",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: SkillManifestFile = serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "Failed to read component manifest: {} ({err})",
+            manifest_path.display()
+        )
+    })?;
 
     Ok(manifest.components.iter().any(|item| {
-        item.r#type.eq_ignore_ascii_case(component_name) || item.name.eq_ignore_ascii_case(component_name)
+        item.r#type.eq_ignore_ascii_case(component_name)
+            || item.name.eq_ignore_ascii_case(component_name)
     }))
 }
-
 
 #[tauri::command]
 pub fn load_skill_component_source(
@@ -324,10 +329,18 @@ fn read_manifest_components(skill_dir: &Path) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    let raw = fs::read_to_string(&manifest_path)
-        .map_err(|err| format!("Failed to read component manifest: {} ({err})", manifest_path.display()))?;
-    let manifest: SkillManifestFile = serde_json::from_str(&raw)
-        .map_err(|err| format!("Failed to read component manifest: {} ({err})", manifest_path.display()))?;
+    let raw = fs::read_to_string(&manifest_path).map_err(|err| {
+        format!(
+            "Failed to read component manifest: {} ({err})",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: SkillManifestFile = serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "Failed to read component manifest: {} ({err})",
+            manifest_path.display()
+        )
+    })?;
 
     Ok(manifest
         .components
@@ -359,11 +372,15 @@ pub fn load_skill_prompt_context(
         .parent()
         .ok_or_else(|| format!("Invalid component directory: {}", file_path.display()))?;
 
-    let candidates = [skill_dir.join("prompt_context.md"), skill_dir.join("SKILL.md")];
+    let candidates = [
+        skill_dir.join("prompt_context.md"),
+        skill_dir.join("SKILL.md"),
+    ];
     for candidate in candidates {
         if candidate.is_file() {
-            let content = fs::read_to_string(&candidate)
-                .map_err(|err| format!("读取 skill 提示上下文失败: {} ({err})", candidate.display()))?;
+            let content = fs::read_to_string(&candidate).map_err(|err| {
+                format!("读取 skill 提示上下文失败: {} ({err})", candidate.display())
+            })?;
             return Ok(SkillPromptContextPayload {
                 content,
                 file_path: candidate.to_string_lossy().to_string(),
@@ -371,7 +388,9 @@ pub fn load_skill_prompt_context(
         }
     }
 
-    Err(format!("Skill prompt context not found for component: {component}"))
+    Err(format!(
+        "Skill prompt context not found for component: {component}"
+    ))
 }
 
 #[tauri::command]
@@ -428,14 +447,27 @@ pub fn load_skill_component_manifest(
         .parent()
         .ok_or_else(|| format!("Invalid component directory: {}", file_path.display()))?;
     let manifest_path = skill_dir.join("components.manifest.json");
-    let raw = fs::read_to_string(&manifest_path)
-        .map_err(|err| format!("Failed to read component manifest: {} ({err})", manifest_path.display()))?;
-    let manifest: SkillManifestFile = serde_json::from_str(&raw)
-        .map_err(|err| format!("Failed to read component manifest: {} ({err})", manifest_path.display()))?;
+    let raw = fs::read_to_string(&manifest_path).map_err(|err| {
+        format!(
+            "Failed to read component manifest: {} ({err})",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: SkillManifestFile = serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "Failed to read component manifest: {} ({err})",
+            manifest_path.display()
+        )
+    })?;
 
-    let item = manifest.components.into_iter().find(|entry| {
-        entry.r#type.eq_ignore_ascii_case(&component) || entry.name.eq_ignore_ascii_case(&component)
-    }).ok_or_else(|| format!("Component not declared in manifest: {component}"))?;
+    let item = manifest
+        .components
+        .into_iter()
+        .find(|entry| {
+            entry.r#type.eq_ignore_ascii_case(&component)
+                || entry.name.eq_ignore_ascii_case(&component)
+        })
+        .ok_or_else(|| format!("Component not declared in manifest: {component}"))?;
 
     Ok(SkillComponentManifestPayload {
         name: item.name,
@@ -720,8 +752,8 @@ fn sanitize_download_name(raw_name: &str) -> String {
 
     let mut output = String::with_capacity(trimmed.len());
     for ch in trimmed.chars() {
-        let invalid = matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
-            || ch.is_control();
+        let invalid =
+            matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control();
         output.push(if invalid { '_' } else { ch });
     }
 
@@ -835,15 +867,11 @@ pub async fn download_and_install_update(
             message
         })?;
 
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|err| {
-            let message = format!("下载更新包失败: {err}");
-            emit_update_install_failed(&app, &file_name, message.clone());
-            message
-        })?;
+    let mut response = client.get(url).send().await.map_err(|err| {
+        let message = format!("下载更新包失败: {err}");
+        emit_update_install_failed(&app, &file_name, message.clone());
+        message
+    })?;
     if !response.status().is_success() {
         let message = format!("下载更新包失败: HTTP {}", response.status());
         emit_update_install_failed(&app, &file_name, message.clone());
@@ -891,7 +919,9 @@ pub async fn download_and_install_update(
 
         downloaded_bytes += chunk.len() as u64;
         let progress_percent = compute_progress_percent(downloaded_bytes, total_bytes);
-        let current_percent = progress_percent.map(|value| value.floor() as i64).unwrap_or(-1);
+        let current_percent = progress_percent
+            .map(|value| value.floor() as i64)
+            .unwrap_or(-1);
         let percent_changed = current_percent != last_reported_percent;
         let byte_threshold_reached =
             downloaded_bytes.saturating_sub(last_reported_bytes) >= 512 * 1024;

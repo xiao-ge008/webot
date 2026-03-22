@@ -1,0 +1,142 @@
+{
+  "371": {
+    "inputs": {
+      "positive_prompt": [
+        "547",
+        0
+      ],
+      "negative_prompt": "Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.",
+      "generation_mode": "图生图 image-to-image",
+      "batch_size": 1,
+      "width": [
+        "381",
+        3
+      ],
+      "height": [
+        "381",
+        4
+      ],
+      "seed": 1047544768079810,
+      "steps": 6,
+      "cfg": 1,
+      "sampler_name": "er_sde",
+      "scheduler": "beta57",
+      "denoise": 1,
+      "auraflow_shift": 3,
+      "cfg_norm_strength": 1,
+      "enable_clean_gpu_memory": true,
+      "enable_clean_cpu_memory_after_finish": true,
+      "enable_sound_notification": false,
+      "auto_save_output_folder": "",
+      "output_filename_prefix": "auto_save",
+      "instruction": "Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.",
+      "model": [
+        "373",
+        0
+      ],
+      "clip": [
+        "372",
+        1
+      ],
+      "vae": [
+        "372",
+        2
+      ],
+      "image1": [
+        "381",
+        0
+      ]
+    },
+    "class_type": "QwenImageIntegratedKSampler",
+    "_meta": {
+      "title": "🐋 千问图像集成采样器 - Github:﹫luguoli"
+    }
+  },
+  "372": {
+    "inputs": {
+      "ckpt_name": "QWEN\\Qwen-Rapid-AIO-SFW-v23.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Checkpoint加载器（简易）"
+    }
+  },
+  "373": {
+    "inputs": {
+      "lora_name": "Qwen-Image-Edit\\Qwen-Image-Edit-F2P.safetensors",
+      "strength_model": 0.25,
+      "model": [
+        "372",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器（仅模型）"
+    }
+  },
+  "374": {
+    "inputs": {
+      "image": "2kMM_00166_.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "379": {
+    "inputs": {
+      "filename_prefix": "Work-Fisher",
+      "images": [
+        "371",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "380": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "整数常量"
+    }
+  },
+  "381": {
+    "inputs": {
+      "aspect_ratio": "original",
+      "proportional_width": 1,
+      "proportional_height": 1,
+      "fit": "letterbox",
+      "method": "lanczos",
+      "round_to_multiple": "8",
+      "scale_to_side": "longest",
+      "scale_to_length": [
+        "380",
+        0
+      ],
+      "background_color": "#000000",
+      "image": [
+        "374",
+        0
+      ]
+    },
+    "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+    "_meta": {
+      "title": "LayerUtility: ImageScaleByAspectRatio V2"
+    }
+  },
+  "547": {
+    "inputs": {
+      "prompt": "人物脱掉上衣 露出乳房"
+    },
+    "class_type": "CR Prompt Text",
+    "_meta": {
+      "title": "⚙️ CR Prompt Text"
+    }
+  }
+}

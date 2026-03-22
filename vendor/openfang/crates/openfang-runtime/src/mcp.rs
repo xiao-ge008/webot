@@ -45,6 +45,8 @@ pub enum McpTransport {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// HTTP Server-Sent Events.
     Sse { url: String },
@@ -127,8 +129,8 @@ impl McpConnection {
     /// Connect to an MCP server, perform handshake, and discover tools.
     pub async fn connect(config: McpServerConfig) -> Result<Self, String> {
         let transport = match &config.transport {
-            McpTransport::Stdio { command, args } => {
-                Self::connect_stdio(command, args, &config.env).await?
+            McpTransport::Stdio { command, args, cwd } => {
+                Self::connect_stdio(command, args, cwd.as_deref(), &config.env).await?
             }
             McpTransport::Sse { url } => {
                 // SSRF check: reject private/localhost URLs unless explicitly configured
@@ -401,6 +403,7 @@ impl McpConnection {
     async fn connect_stdio(
         command: &str,
         args: &[String],
+        cwd: Option<&str>,
         env_whitelist: &[String],
     ) -> Result<McpTransportHandle, String> {
         // Validate command path (no path traversal)
@@ -432,6 +435,9 @@ impl McpConnection {
 
         let mut cmd = tokio::process::Command::new(&resolved_command);
         cmd.args(args);
+        if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
+            cmd.current_dir(cwd);
+        }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -725,6 +731,7 @@ mod tests {
                     "-y".to_string(),
                     "@modelcontextprotocol/server-github".to_string(),
                 ],
+                cwd: Some("C:\\workspace".to_string()),
             },
             timeout_secs: 30,
             env: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
@@ -737,9 +744,10 @@ mod tests {
         assert_eq!(back.env, vec!["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
         match back.transport {
-            McpTransport::Stdio { command, args } => {
+            McpTransport::Stdio { command, args, cwd } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args.len(), 2);
+                assert_eq!(cwd.as_deref(), Some("C:\\workspace"));
             }
             _ => panic!("Expected Stdio transport"),
         }

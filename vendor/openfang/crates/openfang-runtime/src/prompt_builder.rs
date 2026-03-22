@@ -211,6 +211,31 @@ const TOOL_CALL_BEHAVIOR: &str = "\
 - When you need to use a tool, call it immediately. Do not narrate or explain routine tool calls.
 - Only explain tool calls when the action is destructive, unusual, or the user explicitly asked for an explanation.
 - Prefer action over narration. If you can answer by using a tool, do it.
+- For any local/workspace/chat-uploaded image or screenshot analysis, prefer `image_analyze` or `media_describe` first instead of trying to inspect the image directly in the model response.
+- `image_analyze` and `media_describe` are the default entry points for local image understanding. The runtime will automatically prefer local Florence-2 results when local vision is enabled, and only fall back to model vision when needed.
+- If the current turn already includes local image-analysis text for an uploaded image, treat that text as the authoritative image context. Answer from it first, and do not invent unsupported details.
+- If the user is asking about an uploaded/local image and no local image-analysis text is present in context, you MUST call `image_analyze` or `media_describe` before answering. Do not guess what is in the image.
+- Do not use `browser_navigate` for local files, `file://` images, `/api/uploads/...` images, screenshots, or other non-web image sources. Use `image_analyze` or `media_describe` instead.
+- For image tasks, distinguish brand-new generation from editing an existing image. If the user wants to modify, retouch, restyle, change clothes, or continue from an existing image, you MUST use `image_edit`, not `image_generate`.
+- Image generation does NOT reliably preserve the exact same person/identity from an existing image. If identity consistency matters, reuse the existing image with `image_edit`.
+- For an agent's own avatar, portrait, standing illustration, or self-image, treat the current avatar/portrait as that agent's identity anchor in the virtual world. The avatar is not a disposable style sample: if the face/person changes, it becomes a different person.
+- The agent's own later photos, selfies, portraits, and appearance variants should derive from that current avatar/portrait identity by default. Do not treat each self-image request as permission to redesign who the agent is.
+- If the user is referring to the agent itself (`you`, `your avatar`, `your portrait`, `show me you`, `your new photo`, etc.), you MUST NOT use `image_generate` to invent a brand-new self image and present or replace it as the same agent.
+- Replacing or regenerating the agent's own avatar/portrait as a new face is forbidden unless the user gives explicit consent to change that identity anchor.
+- The only allowed path for self-image updates is when the user clearly means the same agent is changing clothes, expression, pose, background, scene, or other local attributes and there is a real source image to continue from. In that case, use `image_edit` and preserve the same identity.
+- If the task is about the agent itself but no reliable current avatar/portrait source image is available, do not generate a replacement stranger. Ask for the current avatar/portrait or explain that generating a new self image would break identity continuity.
+- When editing an image, always reuse the best available source image from the current message, the workspace, or the recent chat context. Prefer `image_path` for workspace files, then `image_url`, then `image_base64`.
+- When the source image comes from chat history as `/api/uploads/...`, treat it as an `image_url` (or reuse the recovered original workspace file). Do not treat `/api/uploads/...` as a filesystem directory.
+- Use `image_edit` for fine or medium changes where the original person, object, or scene should remain recognizable.
+- When writing an `image_edit` prompt, preserve the original person/identity, face, body, style, composition, camera angle, lighting, colors, and background by default. Only change the exact parts the user explicitly requested.
+- For `image_edit`, do NOT add extra accessories, props, pose changes, outfit redesigns, beautification, scene rewrites, or any other \"improvements\" unless the user explicitly asked for them.
+- If the user only asked for one local change, write the edit prompt as a minimal delta: state what to change, and explicitly state that everything else must remain unchanged.
+- Use `image_generate` only when the user clearly wants a brand-new image from scratch, a new person/character, or a major redesign where consistency with the previous image is not required.
+- If the requested image is explicitly another person, another character, a roleplay character, or any image unrelated to the agent's own identity, `image_generate` is allowed.
+- If the current turn or recent chat context already contains a usable candidate image for the user's request, reuse that exact image URL/path instead of generating again.
+- For avatar, portrait, cover, or agent-appearance updates, produce only the minimum number of images needed to satisfy the request. Do not create speculative extras, backup variants, or \"improved\" versions unless the user explicitly asked for alternatives.
+- For a standard avatar-plus-portrait refresh from scratch, the default maximum is one avatar candidate and one portrait candidate in the same task. If one existing image already satisfies both needs, reuse it instead of generating more.
+- After any successful image tool result that already satisfies the task, stop calling image tools and finalize with the returned image URLs/paths immediately.
 - When executing multiple sequential tool calls, batch them — don't output reasoning between each call.
 - If a tool returns useful results, present the KEY information, not the raw output.
 - When web_fetch or web_search returns content, you MUST include the relevant data in your response. \
@@ -472,7 +497,9 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" => "Agents",
 
-        "image_describe" | "image_generate" | "audio_transcribe" | "tts_speak" => "Media",
+        "image_describe" | "image_generate" | "image_edit" | "audio_transcribe" | "tts_speak" => {
+            "Media"
+        }
 
         "docker_exec" | "docker_build" | "docker_run" => "Docker",
 
@@ -505,7 +532,9 @@ pub fn tool_hint(name: &str) -> &'static str {
         "web_fetch" => "fetch a URL and get its content as markdown",
 
         // Browser
-        "browser_navigate" => "open an http/https web page in the browser, never a local file or chat image",
+        "browser_navigate" => {
+            "open an http/https web page in the browser, never a local file or chat image"
+        }
         "browser_click" => "click an element on the page",
         "browser_type" => "type text into an input field",
         "browser_screenshot" => "capture a screenshot",
@@ -535,7 +564,14 @@ pub fn tool_hint(name: &str) -> &'static str {
 
         // Media
         "image_describe" => "describe an image",
-        "image_generate" => "generate an image from a prompt",
+        "image_analyze" => {
+            "inspect a local/workspace/chat-uploaded image; auto-prefers local Florence-2 when enabled"
+        }
+        "media_describe" => {
+            "summarize a local/workspace/chat-uploaded image; auto-prefers local Florence-2 when enabled"
+        }
+        "image_generate" => "generate a brand-new image from scratch; not suitable for preserving the exact same person/identity from an existing image",
+        "image_edit" => "edit a single existing image while preserving the original as the base; prefer image_path for workspace files, otherwise image_url or image_base64",
         "audio_transcribe" => "transcribe audio to text",
         "tts_speak" => "convert text to speech",
 
@@ -903,6 +939,20 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Workspace"));
         assert!(prompt.contains("/home/user/project"));
+    }
+
+    #[test]
+    fn test_image_generation_rules_include_reuse_and_stop_conditions() {
+        let prompt = build_system_prompt(&basic_ctx());
+        assert!(prompt.contains("reuse that exact image URL/path instead of generating again"));
+        assert!(prompt.contains("produce only the minimum number of images needed"));
+        assert!(prompt.contains("stop calling image tools and finalize"));
+        assert!(prompt.contains("identity anchor in the virtual world"));
+        assert!(prompt.contains("MUST NOT use `image_generate` to invent a brand-new self image"));
+        assert!(
+            prompt.contains("should derive from that current avatar/portrait identity by default")
+        );
+        assert!(prompt.contains("unless the user gives explicit consent"));
     }
 
     #[test]

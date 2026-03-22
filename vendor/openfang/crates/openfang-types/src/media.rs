@@ -204,12 +204,21 @@ impl std::fmt::Display for ImageGenModel {
 pub struct ImageGenRequest {
     /// The prompt describing the image to generate.
     pub prompt: String,
+    /// Optional negative prompt for providers that support it.
+    #[serde(default)]
+    pub negative_prompt: String,
     /// Which model to use.
     #[serde(default)]
     pub model: ImageGenModel,
     /// Image size (e.g., "1024x1024").
     #[serde(default = "default_image_size")]
     pub size: String,
+    /// Explicit image width override.
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Explicit image height override.
+    #[serde(default)]
+    pub height: Option<u32>,
     /// Quality level (e.g., "standard", "hd").
     #[serde(default = "default_image_quality")]
     pub quality: String,
@@ -230,6 +239,10 @@ fn default_image_count() -> u8 {
     1
 }
 
+fn default_image_edit_model() -> ImageGenModel {
+    ImageGenModel::GptImage1
+}
+
 /// Allowed sizes per model.
 pub const DALLE3_SIZES: &[&str] = &["1024x1024", "1792x1024", "1024x1792"];
 pub const DALLE2_SIZES: &[&str] = &["256x256", "512x512", "1024x1024"];
@@ -239,27 +252,67 @@ impl ImageGenRequest {
     /// Max prompt length in characters.
     pub const MAX_PROMPT_LEN: usize = 4000;
 
+    /// Validate provider-agnostic fields.
+    pub fn validate_common(&self) -> Result<(), String> {
+        validate_prompt_text(&self.prompt, "Image generation prompt")?;
+        validate_prompt_text(&self.negative_prompt, "Image generation negative prompt")?;
+
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => {
+                if width == 0 || height == 0 {
+                    return Err("Image width and height must be greater than 0".into());
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "Image width and height must both be provided when overriding dimensions"
+                        .into(),
+                );
+            }
+            (None, None) => {
+                let _ = self.effective_size()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve the request to a concrete `WIDTHxHEIGHT` size string.
+    pub fn effective_size(&self) -> Result<String, String> {
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => Ok(format!("{width}x{height}")),
+            (Some(_), None) | (None, Some(_)) => Err(
+                "Image width and height must both be provided when overriding dimensions"
+                    .to_string(),
+            ),
+            (None, None) => {
+                let trimmed = self.size.trim();
+                if trimmed.is_empty() {
+                    Err("Image size cannot be empty".to_string())
+                } else {
+                    parse_size_string(trimmed)?;
+                    Ok(trimmed.to_string())
+                }
+            }
+        }
+    }
+
+    /// Resolve the request to concrete numeric dimensions.
+    pub fn dimensions(&self) -> Result<(u32, u32), String> {
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => Ok((width, height)),
+            (Some(_), None) | (None, Some(_)) => Err(
+                "Image width and height must both be provided when overriding dimensions"
+                    .to_string(),
+            ),
+            (None, None) => parse_size_string(self.size.trim()),
+        }
+    }
+
     /// Validate the request against model-specific constraints.
     pub fn validate(&self) -> Result<(), String> {
-        // Prompt length
-        if self.prompt.is_empty() {
-            return Err("Image generation prompt cannot be empty".into());
-        }
-        if self.prompt.len() > Self::MAX_PROMPT_LEN {
-            return Err(format!(
-                "Prompt too long: {} chars (max {})",
-                self.prompt.len(),
-                Self::MAX_PROMPT_LEN
-            ));
-        }
-        // Strip control chars check
-        if self
-            .prompt
-            .chars()
-            .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
-        {
-            return Err("Prompt contains invalid control characters".into());
-        }
+        self.validate_common()?;
+        let effective_size = self.effective_size()?;
 
         // Model-specific size validation
         let allowed_sizes = match self.model {
@@ -267,10 +320,10 @@ impl ImageGenRequest {
             ImageGenModel::DallE2 => DALLE2_SIZES,
             ImageGenModel::GptImage1 => GPT_IMAGE1_SIZES,
         };
-        if !allowed_sizes.contains(&self.size.as_str()) {
+        if !allowed_sizes.contains(&effective_size.as_str()) {
             return Err(format!(
                 "Invalid size '{}' for {}. Allowed: {:?}",
-                self.size, self.model, allowed_sizes
+                effective_size, self.model, allowed_sizes
             ));
         }
 
@@ -318,6 +371,222 @@ impl ImageGenRequest {
 
         Ok(())
     }
+}
+
+/// Image edit request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageEditRequest {
+    /// The text instruction describing how to modify the image.
+    pub prompt: String,
+    /// Optional negative prompt for providers that support it.
+    #[serde(default)]
+    pub negative_prompt: String,
+    /// Which fallback model to use for direct OpenAI-compatible editing.
+    #[serde(default = "default_image_edit_model")]
+    pub model: ImageGenModel,
+    /// Workspace/local image path.
+    #[serde(default)]
+    pub image_path: String,
+    /// Remote or session image URL.
+    #[serde(default)]
+    pub image_url: String,
+    /// Base64-encoded input image data.
+    #[serde(default)]
+    pub image_base64: String,
+    /// MIME type for `image_base64`.
+    #[serde(default)]
+    pub mime_type: String,
+    /// Output image size (e.g. "1024x1024").
+    #[serde(default = "default_image_size")]
+    pub size: String,
+    /// Explicit output image width override.
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Explicit output image height override.
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Quality level for providers that support it.
+    #[serde(default = "default_image_quality")]
+    pub quality: String,
+    /// Number of edited images to generate.
+    #[serde(default = "default_image_count")]
+    pub count: u8,
+}
+
+impl ImageEditRequest {
+    /// Validate provider-agnostic fields.
+    pub fn validate_common(&self) -> Result<(), String> {
+        validate_prompt_text(&self.prompt, "Image edit prompt")?;
+        validate_prompt_text(&self.negative_prompt, "Image edit negative prompt")?;
+        self.validate_image_source()?;
+
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => {
+                if width == 0 || height == 0 {
+                    return Err("Image width and height must be greater than 0".into());
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "Image width and height must both be provided when overriding dimensions"
+                        .into(),
+                );
+            }
+            (None, None) => {
+                let _ = self.effective_size()?;
+            }
+        }
+
+        if self.count != 1 {
+            return Err(format!(
+                "Image editing currently only supports count=1, got {}",
+                self.count
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate the request against current-model fallback constraints.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_common()?;
+        let effective_size = self.effective_size()?;
+
+        let allowed_sizes = match self.model {
+            ImageGenModel::GptImage1 => GPT_IMAGE1_SIZES,
+            ImageGenModel::DallE2 => DALLE2_SIZES,
+            ImageGenModel::DallE3 => {
+                return Err("DALL-E 3 does not support image editing fallback".to_string());
+            }
+        };
+        if !allowed_sizes.contains(&effective_size.as_str()) {
+            return Err(format!(
+                "Invalid size '{}' for {} image edit. Allowed: {:?}",
+                effective_size, self.model, allowed_sizes
+            ));
+        }
+
+        if self.quality != "standard"
+            && self.quality != "auto"
+            && self.quality != "high"
+            && self.quality != "medium"
+            && self.quality != "low"
+        {
+            return Err(format!(
+                "Invalid quality '{}'. Must be 'standard', 'auto', 'high', 'medium', or 'low'",
+                self.quality
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Resolve the request to a concrete `WIDTHxHEIGHT` size string.
+    pub fn effective_size(&self) -> Result<String, String> {
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => Ok(format!("{width}x{height}")),
+            (Some(_), None) | (None, Some(_)) => Err(
+                "Image width and height must both be provided when overriding dimensions"
+                    .to_string(),
+            ),
+            (None, None) => {
+                let trimmed = self.size.trim();
+                if trimmed.is_empty() {
+                    Err("Image size cannot be empty".to_string())
+                } else {
+                    parse_size_string(trimmed)?;
+                    Ok(trimmed.to_string())
+                }
+            }
+        }
+    }
+
+    /// Resolve the request to concrete numeric dimensions.
+    pub fn dimensions(&self) -> Result<(u32, u32), String> {
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => Ok((width, height)),
+            (Some(_), None) | (None, Some(_)) => Err(
+                "Image width and height must both be provided when overriding dimensions"
+                    .to_string(),
+            ),
+            (None, None) => parse_size_string(self.size.trim()),
+        }
+    }
+
+    fn validate_image_source(&self) -> Result<(), String> {
+        let mut count = 0;
+        if !self.image_path.trim().is_empty() {
+            count += 1;
+        }
+        if !self.image_url.trim().is_empty() {
+            count += 1;
+        }
+        if !self.image_base64.trim().is_empty() {
+            count += 1;
+            if self.mime_type.trim().is_empty() {
+                return Err("mime_type is required when image_base64 is provided".to_string());
+            }
+        }
+
+        if count == 0 {
+            return Err(
+                "Exactly one input image source is required: image_path, image_url, or image_base64"
+                    .to_string(),
+            );
+        }
+        if count > 1 {
+            return Err(
+                "Only one input image source may be provided: image_path, image_url, or image_base64"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_prompt_text(value: &str, field_name: &str) -> Result<(), String> {
+    if value.len() > ImageGenRequest::MAX_PROMPT_LEN {
+        return Err(format!(
+            "{field_name} too long: {} chars (max {})",
+            value.len(),
+            ImageGenRequest::MAX_PROMPT_LEN
+        ));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+    {
+        return Err(format!("{field_name} contains invalid control characters"));
+    }
+    if field_name == "Image generation prompt" && value.trim().is_empty() {
+        return Err("Image generation prompt cannot be empty".into());
+    }
+    Ok(())
+}
+
+fn parse_size_string(input: &str) -> Result<(u32, u32), String> {
+    let (width, height) = input.split_once('x').ok_or_else(|| {
+        format!(
+            "Invalid image size '{}'. Expected format WIDTHxHEIGHT",
+            input
+        )
+    })?;
+    let width = width
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid image width in size '{}'", input))?;
+    let height = height
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid image height in size '{}'", input))?;
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "Invalid image size '{}'. Width and height must be greater than 0",
+            input
+        ));
+    }
+    Ok((width, height))
 }
 
 /// Result of image generation.
@@ -446,8 +715,11 @@ mod tests {
     fn test_image_gen_request_validate_valid() {
         let req = ImageGenRequest {
             prompt: "A sunset over mountains".to_string(),
+            negative_prompt: String::new(),
             model: ImageGenModel::DallE3,
             size: "1024x1024".to_string(),
+            width: None,
+            height: None,
             quality: "hd".to_string(),
             count: 1,
         };
@@ -458,8 +730,11 @@ mod tests {
     fn test_image_gen_request_validate_empty_prompt() {
         let req = ImageGenRequest {
             prompt: String::new(),
+            negative_prompt: String::new(),
             model: ImageGenModel::DallE3,
             size: "1024x1024".to_string(),
+            width: None,
+            height: None,
             quality: "standard".to_string(),
             count: 1,
         };
@@ -470,8 +745,11 @@ mod tests {
     fn test_image_gen_request_validate_bad_size() {
         let req = ImageGenRequest {
             prompt: "test".to_string(),
+            negative_prompt: String::new(),
             model: ImageGenModel::DallE3,
             size: "512x512".to_string(),
+            width: None,
+            height: None,
             quality: "standard".to_string(),
             count: 1,
         };
@@ -482,8 +760,11 @@ mod tests {
     fn test_image_gen_request_validate_dalle3_count() {
         let req = ImageGenRequest {
             prompt: "test".to_string(),
+            negative_prompt: String::new(),
             model: ImageGenModel::DallE3,
             size: "1024x1024".to_string(),
+            width: None,
+            height: None,
             quality: "standard".to_string(),
             count: 2,
         };
@@ -494,8 +775,11 @@ mod tests {
     fn test_image_gen_request_validate_dalle2_multi() {
         let req = ImageGenRequest {
             prompt: "test".to_string(),
+            negative_prompt: String::new(),
             model: ImageGenModel::DallE2,
             size: "512x512".to_string(),
+            width: None,
+            height: None,
             quality: "standard".to_string(),
             count: 4,
         };
@@ -506,12 +790,104 @@ mod tests {
     fn test_image_gen_request_validate_control_chars() {
         let req = ImageGenRequest {
             prompt: "test\x00prompt".to_string(),
+            negative_prompt: String::new(),
             model: ImageGenModel::DallE3,
             size: "1024x1024".to_string(),
+            width: None,
+            height: None,
             quality: "standard".to_string(),
             count: 1,
         };
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_image_gen_request_validate_explicit_dimensions() {
+        let req = ImageGenRequest {
+            prompt: "test".to_string(),
+            negative_prompt: "bad hands".to_string(),
+            model: ImageGenModel::DallE3,
+            size: "1024x1024".to_string(),
+            width: Some(1024),
+            height: Some(1024),
+            quality: "standard".to_string(),
+            count: 1,
+        };
+        assert!(req.validate().is_ok());
+        assert_eq!(req.effective_size().unwrap(), "1024x1024");
+        assert_eq!(req.dimensions().unwrap(), (1024, 1024));
+    }
+
+    #[test]
+    fn test_image_gen_request_validate_partial_dimensions() {
+        let req = ImageGenRequest {
+            prompt: "test".to_string(),
+            negative_prompt: String::new(),
+            model: ImageGenModel::DallE3,
+            size: "1024x1024".to_string(),
+            width: Some(1024),
+            height: None,
+            quality: "standard".to_string(),
+            count: 1,
+        };
+        assert!(req.validate_common().is_err());
+    }
+
+    #[test]
+    fn test_image_edit_request_requires_exactly_one_source() {
+        let req = ImageEditRequest {
+            prompt: "edit".to_string(),
+            negative_prompt: String::new(),
+            model: ImageGenModel::GptImage1,
+            image_path: "a.png".to_string(),
+            image_url: "/api/uploads/x".to_string(),
+            image_base64: String::new(),
+            mime_type: String::new(),
+            size: "1024x1024".to_string(),
+            width: None,
+            height: None,
+            quality: "standard".to_string(),
+            count: 1,
+        };
+        assert!(req.validate_common().is_err());
+    }
+
+    #[test]
+    fn test_image_edit_request_validate_common_accepts_path_source() {
+        let req = ImageEditRequest {
+            prompt: "make it red".to_string(),
+            negative_prompt: String::new(),
+            model: ImageGenModel::GptImage1,
+            image_path: "a.png".to_string(),
+            image_url: String::new(),
+            image_base64: String::new(),
+            mime_type: String::new(),
+            size: "1024x1024".to_string(),
+            width: None,
+            height: None,
+            quality: "standard".to_string(),
+            count: 1,
+        };
+        assert!(req.validate_common().is_ok());
+    }
+
+    #[test]
+    fn test_image_edit_request_requires_mime_for_base64() {
+        let req = ImageEditRequest {
+            prompt: "make it red".to_string(),
+            negative_prompt: String::new(),
+            model: ImageGenModel::GptImage1,
+            image_path: String::new(),
+            image_url: String::new(),
+            image_base64: "abc".to_string(),
+            mime_type: String::new(),
+            size: "1024x1024".to_string(),
+            width: None,
+            height: None,
+            quality: "standard".to_string(),
+            count: 1,
+        };
+        assert!(req.validate_common().is_err());
     }
 
     #[test]

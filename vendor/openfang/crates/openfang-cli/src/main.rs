@@ -6522,9 +6522,10 @@ args = ["-y", "@modelcontextprotocol/server-github"]
         assert_eq!(config.mcp_servers.len(), 1);
         assert_eq!(config.mcp_servers[0].name, "github");
         match &config.mcp_servers[0].transport {
-            openfang_types::config::McpTransportEntry::Stdio { command, args } => {
+            openfang_types::config::McpTransportEntry::Stdio { command, args, cwd } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args.len(), 2);
+                assert!(cwd.is_none());
             }
             _ => panic!("Expected Stdio transport"),
         }

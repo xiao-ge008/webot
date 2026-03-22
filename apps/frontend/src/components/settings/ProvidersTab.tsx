@@ -11,13 +11,12 @@ import { Bot, Circle, Link2, Plus, RefreshCw, Search, Settings2, Unplug, Trash2 
 import {
   createManagementCustomProvider,
   deleteManagementProviderConfig,
+  discoverManagementProviderModels,
   listManagementProviderConfigs,
   listManagementProviders,
-  testManagementProviderConnection,
   toggleManagementProviderEnabled,
   updateManagementProviderConfig,
   type ManagementProviderOption,
-  type ManagementProviderTestResult,
   type ProviderConfigItem,
 } from '@/services/management-client';
 
@@ -26,6 +25,7 @@ type ProtocolType = 'openai' | 'claude';
 interface ProviderCatalogItem {
   id: string;
   name: string;
+  baseUrl?: string;
   tags?: string[];
   popular?: boolean;
   defaultProtocol: ProtocolType;
@@ -43,24 +43,54 @@ interface ProviderConfigFormState {
   isNew: boolean;
 }
 
-const PROVIDER_CATALOG: ProviderCatalogItem[] = [
-  { id: 'google-ai', name: 'Google', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
-  { id: 'nvidia', name: 'NVIDIA', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
-  { id: 'openrouter', name: 'OpenRouter', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
-  { id: 'vercel-ai', name: 'Vercel', tags: ['热门'], popular: true, defaultProtocol: 'openai' },
-  { id: 'openai', name: 'OpenAI', tags: ['主流'], popular: true, defaultProtocol: 'openai' },
-  { id: 'anthropic', name: 'Anthropic', tags: ['主流'], popular: true, defaultProtocol: 'claude' },
-  { id: '302-ai', name: '302.AI', tags: ['聚合'], defaultProtocol: 'openai' },
-  { id: 'alibaba-bailian', name: 'Alibaba', tags: ['国内'], defaultProtocol: 'openai' },
-  { id: 'moonshot', name: 'Moonshot', defaultProtocol: 'openai' },
-  { id: 'zhipu', name: '智谱 AI', defaultProtocol: 'openai' },
-  { id: 'deepseek', name: 'DeepSeek', defaultProtocol: 'openai' },
+const POPULAR_PROVIDER_IDS = new Set([
+  'anthropic',
+  'deepseek',
+  'gemini',
+  'minimax',
+  'moonshot',
+  'nvidia',
+  'openai',
+  'openrouter',
+  'qwen',
+  'zhipu',
+]);
+
+const PROVIDER_TAGS: Partial<Record<string, string[]>> = {
+  anthropic: ['主流'],
+  deepseek: ['热门'],
+  gemini: ['热门'],
+  minimax: ['国内'],
+  moonshot: ['国内'],
+  nvidia: ['热门'],
+  openai: ['主流'],
+  openrouter: ['热门'],
+  qwen: ['国内'],
+  zhipu: ['国内'],
+};
+
+const CUSTOM_PROVIDER_CATALOG: ProviderCatalogItem[] = [
   { id: 'custom-openai', name: '自定义 OpenAI 规范', tags: ['自定义'], defaultProtocol: 'openai', custom: true },
   { id: 'custom-claude', name: '自定义 Claude 规范', tags: ['自定义'], defaultProtocol: 'claude', custom: true },
 ];
 
 function toProtocol(value?: string): ProtocolType {
   return value === 'claude' ? 'claude' : 'openai';
+}
+
+function normalizeProviderCatalogKey(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function inferProviderProtocol(provider: Pick<ManagementProviderOption, 'providerId' | 'protocol'>): ProtocolType {
+  if (provider.protocol) {
+    return toProtocol(provider.protocol);
+  }
+  const normalizedId = normalizeProviderCatalogKey(provider.providerId);
+  if (normalizedId === 'anthropic' || normalizedId === 'claude-code') {
+    return 'claude';
+  }
+  return 'openai';
 }
 
 function parseModelsText(text: string): string[] {
@@ -105,6 +135,8 @@ function providerHealthLabel(
     case 'configured':
     case 'unverified':
       return { text: '已配置', tone: 'text-amber-600' };
+    case 'manual_configuration_required':
+      return { text: '手动模型', tone: 'text-amber-600' };
     default:
       return { text: '待配置', tone: 'text-amber-600' };
   }
@@ -120,12 +152,16 @@ function isManagedProvider(
 function providerSummaryText(
   provider: ManagementProviderOption,
   check?: { status: string; message: string },
+  cfg?: ProviderConfigItem,
 ): string {
+  const configuredModelCount = cfg?.models.length ?? provider.modelCount;
   if (check?.message) {
     return check.message;
   }
   if (!provider.enabled) {
-    return '已断开连接，本地配置仍保留，重新启用即可恢复。';
+    return configuredModelCount > 0
+      ? `已断开连接，本地仍保留 ${configuredModelCount} 个模型，可删除以彻底清理。`
+      : '已断开连接，本地配置仍保留，可删除以彻底清理。';
   }
   if (provider.healthy) {
     return '运行时已加载，可用于模型与智能体。';
@@ -133,8 +169,11 @@ function providerSummaryText(
   if (provider.runtimeLoaded && provider.configured) {
     return '运行时已识别，建议执行一次模型测试确认可用性。';
   }
+  if (configuredModelCount > 0) {
+    return `已保存 ${configuredModelCount} 个模型，可在模型页启用。`;
+  }
   if (provider.configured || provider.hasApiKey || provider.hasBaseUrl) {
-    return '已保存本地配置，完成模型列表后即可在模型页启用。';
+    return '已保存本地配置，点击“获取模型”后即可在模型页启用。';
   }
   return '尚未完成连接，请补充 URL、密钥和模型列表。';
 }
@@ -162,7 +201,7 @@ function createFormFromCatalog(item: ProviderCatalogItem): ProviderConfigFormSta
     providerId: baseId,
     displayName: isCustom ? '' : item.name,
     protocol: item.defaultProtocol,
-    baseUrl: '',
+    baseUrl: item.baseUrl || '',
     apiKey: '',
     modelsText: '',
     isCustom,
@@ -190,75 +229,6 @@ export function ProvidersTab() {
     return new Map(configs.map((item) => [item.provider_id, item]));
   }, [configs]);
 
-  const buildInitialProviderCheck = (
-    provider: ManagementProviderOption,
-    cfg?: ProviderConfigItem,
-  ): { status: string; message: string } => {
-    if (!provider.enabled) {
-      return {
-        status: 'disabled',
-        message: '已断开连接，本地配置仍保留，重新启用即可恢复。',
-      };
-    }
-    if (!authConfigured(provider, cfg)) {
-      return {
-        status: 'incomplete',
-        message: '尚未完成连接，请补充 URL、密钥和模型列表。',
-      };
-    }
-    return {
-      status: 'checking',
-      message: '正在检测 API 连通性...',
-    };
-  };
-
-  const normalizeProviderCheckResult = (
-    result: ManagementProviderTestResult,
-  ): { status: string; message: string } => ({
-    status: result.ok ? 'ok' : result.status || 'connection_error',
-    message: result.message || (result.ok ? 'API 已连通' : '供应商检测失败'),
-  });
-
-  const runProviderChecks = async (
-    providerRows: ManagementProviderOption[],
-    configRows: ProviderConfigItem[],
-  ) => {
-    const nextConfigMap = new Map(configRows.map((item) => [item.provider_id, item]));
-    setProviderCheckMap(
-      Object.fromEntries(
-        providerRows.map((provider) => [
-          provider.providerId,
-          buildInitialProviderCheck(provider, nextConfigMap.get(provider.providerId)),
-        ]),
-      ),
-    );
-
-    const checkResults = await Promise.all(
-      providerRows.map(async (provider) => {
-        const cfg = nextConfigMap.get(provider.providerId);
-        const initial = buildInitialProviderCheck(provider, cfg);
-        if (initial.status !== 'checking') {
-          return [provider.providerId, initial] as const;
-        }
-        try {
-          const result = await testManagementProviderConnection(provider.providerId);
-          return [provider.providerId, normalizeProviderCheckResult(result)] as const;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : '供应商检测失败';
-          return [
-            provider.providerId,
-            {
-              status: 'connection_error',
-              message,
-            },
-          ] as const;
-        }
-      }),
-    );
-
-    setProviderCheckMap(Object.fromEntries(checkResults));
-  };
-
   const loadProviders = async () => {
     setLoading(true);
     setErrorMessage('');
@@ -269,7 +239,13 @@ export function ProvidersTab() {
       ]);
       setProviders(providerRows);
       setConfigs(configRows);
-      void runProviderChecks(providerRows, configRows);
+      setProviderCheckMap((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([providerId]) =>
+            providerRows.some((item) => item.providerId === providerId),
+          ),
+        ),
+      );
     } catch (error) {
       console.error('[Settings][Providers] 加载失败:', error);
       setErrorMessage('加载提供商失败，请确认后端服务已开机。');
@@ -291,15 +267,45 @@ export function ProvidersTab() {
   const managedProviderIds = useMemo(() => {
     return new Set(
       managedProviders
-        .map((item) => item.providerId)
+        .map((item) => normalizeProviderCatalogKey(item.providerId))
         .filter((item) => !item.startsWith('custom-')),
     );
   }, [managedProviders]);
 
+  const providerCatalog = useMemo(() => {
+    const catalogMap = new Map<string, ProviderCatalogItem>();
+    for (const provider of providers) {
+      if (provider.isCustom) {
+        continue;
+      }
+      const normalizedId = normalizeProviderCatalogKey(provider.providerId);
+      if (!normalizedId || catalogMap.has(normalizedId)) {
+        continue;
+      }
+      catalogMap.set(normalizedId, {
+        id: provider.providerId,
+        name: provider.displayName || provider.providerId,
+        baseUrl: provider.baseUrl || '',
+        tags: PROVIDER_TAGS[normalizedId],
+        popular: POPULAR_PROVIDER_IDS.has(normalizedId),
+        defaultProtocol: inferProviderProtocol(provider),
+      });
+    }
+    for (const item of CUSTOM_PROVIDER_CATALOG) {
+      catalogMap.set(item.id, item);
+    }
+    return Array.from(catalogMap.values()).sort((left, right) => {
+      if (Boolean(left.popular) !== Boolean(right.popular)) {
+        return left.popular ? -1 : 1;
+      }
+      return left.name.localeCompare(right.name, 'zh-CN');
+    });
+  }, [providers]);
+
   const filteredCatalog = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-    return PROVIDER_CATALOG.filter((item) => {
-      if (managedProviderIds.has(item.id)) {
+    return providerCatalog.filter((item) => {
+      if (!item.custom && managedProviderIds.has(normalizeProviderCatalogKey(item.id))) {
         return false;
       }
       if (!keyword) {
@@ -307,12 +313,12 @@ export function ProvidersTab() {
       }
       return item.name.toLowerCase().includes(keyword) || item.id.toLowerCase().includes(keyword);
     });
-  }, [search, managedProviderIds]);
+  }, [providerCatalog, search, managedProviderIds]);
   const popularCatalog = filteredCatalog.filter((item) => item.popular);
   const otherCatalog = filteredCatalog.filter((item) => !item.popular);
 
   const handleDisconnect = async (providerId: string) => {
-    setActionLoading(providerId);
+    setActionLoading(`disconnect:${providerId}`);
     try {
       await toggleManagementProviderEnabled(providerId, false);
       await loadProviders();
@@ -324,8 +330,61 @@ export function ProvidersTab() {
     }
   };
 
+  const handleDiscoverModels = async (provider: ManagementProviderOption) => {
+    const providerId = provider.providerId;
+    setActionLoading(`discover:${providerId}`);
+    setErrorMessage('');
+    try {
+      const result = await discoverManagementProviderModels(providerId);
+      setProviderCheckMap((current) => ({
+        ...current,
+        [providerId]: {
+          status: result.status || (result.ok ? 'ok' : 'connection_error'),
+          message: result.message,
+        },
+      }));
+      await loadProviders();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '获取模型失败';
+      setProviderCheckMap((current) => ({
+        ...current,
+        [providerId]: {
+          status: 'connection_error',
+          message,
+        },
+      }));
+      setErrorMessage(message);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDeleteProvider = async (providerId: string) => {
+    setActionLoading(`delete:${providerId}`);
+    setErrorMessage('');
+    try {
+      await deleteManagementProviderConfig(providerId);
+      setProviderCheckMap((current) => {
+        const next = { ...current };
+        delete next[providerId];
+        return next;
+      });
+      if (configForm?.providerId === providerId) {
+        setConfigOpen(false);
+        setConfigForm(null);
+      }
+      await loadProviders();
+    } catch (error) {
+      console.error('[Settings][Providers] 删除失败:', error);
+      setErrorMessage(error instanceof Error ? error.message : '删除失败，请稍后重试。');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const openConfigureForProvider = (provider: ManagementProviderOption) => {
     const cfg = configMap.get(provider.providerId);
+    setErrorMessage('');
     setConfigForm(createFormFromProvider(provider, cfg));
     setConfigOpen(true);
   };
@@ -333,6 +392,7 @@ export function ProvidersTab() {
   const openConfigureFromCatalog = (item: ProviderCatalogItem) => {
     setSelectorOpen(false);
     setSearch('');
+    setErrorMessage('');
     setConfigForm(createFormFromCatalog(item));
     setConfigOpen(true);
   };
@@ -384,27 +444,15 @@ export function ProvidersTab() {
     }
   };
 
-  const deleteCustomProvider = async () => {
-    if (!configForm?.isCustom) {
+  const deleteProviderFromDialog = async () => {
+    if (!configForm) {
       return;
     }
     const providerId = configForm.providerId.trim();
     if (!providerId) {
       return;
     }
-    setActionLoading(providerId);
-    try {
-      await deleteManagementProviderConfig(providerId);
-      await toggleManagementProviderEnabled(providerId, false);
-      setConfigOpen(false);
-      setConfigForm(null);
-      await loadProviders();
-    } catch (error) {
-      console.error('[Settings][Providers] 删除自定义 provider 失败:', error);
-      setErrorMessage('删除失败，请稍后重试。');
-    } finally {
-      setActionLoading(null);
-    }
+    await handleDeleteProvider(providerId);
   };
 
   const renderCatalogItem = (item: ProviderCatalogItem) => (
@@ -435,6 +483,10 @@ export function ProvidersTab() {
       </div>
     </button>
   );
+
+  const providerMap = useMemo(() => {
+    return new Map(providers.map((item) => [item.providerId, item]));
+  }, [providers]);
 
   return (
     <div className="max-w-3xl animate-fade-in opacity-0">
@@ -485,63 +537,95 @@ export function ProvidersTab() {
           </div>
         ) : (
           managedProviders.map((provider, index) => (
-            <div
-              key={provider.providerId}
-              className={cn(
-                'flex items-center justify-between p-5',
-                index !== managedProviders.length - 1 && 'border-b border-border-light',
-              )}
-            >
-              <div className="flex items-start gap-3 min-w-0">
-                <div className="w-9 h-9 rounded-xl bg-accent/10 flex items-center justify-center text-xs font-semibold shrink-0">
-                  {(provider.displayName.slice(0, 2) || 'AI').toUpperCase()}
-                </div>
-                <div className="space-y-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[15px] font-medium text-foreground">{provider.displayName}</span>
-                    <span
-                      className={cn(
-                        'inline-flex items-center gap-1 text-xs',
-                        providerHealthLabel(provider, providerCheckMap[provider.providerId]).tone,
-                      )}
-                    >
-                      <Circle className="w-2.5 h-2.5 fill-current" />
-                      {providerHealthLabel(provider, providerCheckMap[provider.providerId]).text}
-                    </span>
-                    <Badge variant="outline" className="text-[10px]">
-                      {toProtocol(provider.protocol)}
-                    </Badge>
+            (() => {
+              const providerId = provider.providerId;
+              const providerCfg = configMap.get(providerId);
+              const discoverActionKey = `discover:${providerId}`;
+              const disconnectActionKey = `disconnect:${providerId}`;
+              const deleteActionKey = `delete:${providerId}`;
+              const providerHealth = providerHealthLabel(provider, providerCheckMap[providerId]);
+              const discoverDisabled =
+                !provider.enabled ||
+                !authConfigured(provider, providerCfg) ||
+                actionLoading === discoverActionKey;
+              return (
+                <div
+                  key={providerId}
+                  className={cn(
+                    'flex items-center justify-between p-5',
+                    index !== managedProviders.length - 1 && 'border-b border-border-light',
+                  )}
+                >
+                  <div className="flex items-start gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-xl bg-accent/10 flex items-center justify-center text-xs font-semibold shrink-0">
+                      {(provider.displayName.slice(0, 2) || 'AI').toUpperCase()}
+                    </div>
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[15px] font-medium text-foreground">{provider.displayName}</span>
+                        <span className={cn('inline-flex items-center gap-1 text-xs', providerHealth.tone)}>
+                          <Circle className="w-2.5 h-2.5 fill-current" />
+                          {providerHealth.text}
+                        </span>
+                        <Badge variant="outline" className="text-[10px]">
+                          {toProtocol(provider.protocol)}
+                        </Badge>
+                      </div>
+                      <p className="text-xs text-foreground-tertiary truncate">
+                        {authStatusLabel(authConfigured(provider, providerCfg), t)} · {providerId}
+                      </p>
+                      <p className="text-xs text-foreground-tertiary truncate">
+                        {providerSummaryText(provider, providerCheckMap[providerId], providerCfg)}
+                      </p>
+                    </div>
                   </div>
-                  <p className="text-xs text-foreground-tertiary truncate">
-                    {authStatusLabel(authConfigured(provider, configMap.get(provider.providerId)), t)} · {provider.providerId}
-                  </p>
-                  <p className="text-xs text-foreground-tertiary truncate">
-                    {providerSummaryText(provider, providerCheckMap[provider.providerId])}
-                  </p>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 gap-1.5"
+                      onClick={() => openConfigureForProvider(provider)}
+                    >
+                      <Settings2 className="w-3.5 h-3.5" />
+                      配置
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 gap-1.5"
+                      onClick={() => handleDiscoverModels(provider)}
+                      disabled={discoverDisabled}
+                    >
+                      <RefreshCw className={cn('w-3.5 h-3.5', actionLoading === discoverActionKey && 'animate-spin')} />
+                      获取模型
+                    </Button>
+                    {provider.enabled ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 gap-1.5 text-destructive hover:text-destructive hover:bg-destructive/10"
+                        onClick={() => handleDisconnect(providerId)}
+                        disabled={actionLoading === disconnectActionKey}
+                      >
+                        <Unplug className="w-3.5 h-3.5" />
+                        断开
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 gap-1.5 text-destructive hover:text-destructive hover:bg-destructive/10"
+                        onClick={() => handleDeleteProvider(providerId)}
+                        disabled={actionLoading === deleteActionKey}
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        删除
+                      </Button>
+                    )}
+                  </div>
                 </div>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8 gap-1.5"
-                  onClick={() => openConfigureForProvider(provider)}
-                >
-                  <Settings2 className="w-3.5 h-3.5" />
-                  配置
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-8 gap-1.5 text-destructive hover:text-destructive hover:bg-destructive/10"
-                  onClick={() => handleDisconnect(provider.providerId)}
-                  disabled={actionLoading === provider.providerId}
-                >
-                  <Unplug className="w-3.5 h-3.5" />
-                  断开
-                </Button>
-              </div>
-            </div>
+              );
+            })()
           ))
         )}
       </div>
@@ -599,7 +683,13 @@ export function ProvidersTab() {
             <DialogTitle>配置提供商</DialogTitle>
           </DialogHeader>
           {configForm && (
-            <div className="space-y-4">
+            (() => {
+              const currentProvider = providerMap.get(configForm.providerId);
+              const canDelete = !configForm.isNew && currentProvider && !currentProvider.enabled;
+              const saveButtonLabel =
+                currentProvider && !currentProvider.enabled ? '保存并重连' : '保存配置';
+              return (
+                <div className="space-y-4">
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1.5">
                   <Label>Provider ID</Label>
@@ -678,15 +768,15 @@ export function ProvidersTab() {
 
               <div className="flex items-center justify-between pt-2">
                 <div className="flex items-center gap-2">
-                  {configForm.isCustom && !configForm.isNew && (
+                  {canDelete && (
                     <Button
                       variant="ghost"
                       className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                      onClick={deleteCustomProvider}
-                      disabled={actionLoading === configForm.providerId}
+                      onClick={deleteProviderFromDialog}
+                      disabled={actionLoading === `delete:${configForm.providerId}`}
                     >
                       <Trash2 className="w-4 h-4 mr-1" />
-                      删除自定义
+                      删除供应商
                     </Button>
                   )}
                 </div>
@@ -695,11 +785,13 @@ export function ProvidersTab() {
                     取消
                   </Button>
                   <Button onClick={saveProviderConfig} disabled={actionLoading === configForm.providerId}>
-                    保存并连接
+                    {saveButtonLabel}
                   </Button>
                 </div>
               </div>
-            </div>
+                </div>
+              );
+            })()
           )}
         </DialogContent>
       </Dialog>

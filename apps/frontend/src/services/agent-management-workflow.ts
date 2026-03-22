@@ -15,6 +15,7 @@ import {
   type ManagementModelOption,
   type ManagementAgentSummary,
 } from '@/services/management-client';
+import { getApiBaseUrl, getOpenFangBaseUrl } from '@/services/transport';
 
 export type AgentManagementMode = 'create' | 'update' | 'delete';
 
@@ -54,6 +55,9 @@ export interface AgentManagementProgressEvent {
 
 interface ExecuteAgentManagementOptions {
   onProgress?: (event: AgentManagementProgressEvent) => void;
+  actorAgentId?: string;
+  actorAgentName?: string;
+  permissionScope?: 'manage_all' | 'self_only';
 }
 
 type AgentContextKey = ManagementContextFileName | 'SYSTEM_PROMPT';
@@ -176,7 +180,22 @@ async function materializeManagedAsset(
     return source;
   }
 
-  const response = await fetch(source);
+  const resolvedSource = await (async (): Promise<string> => {
+    if (/^(?:https?:|data:|blob:|file:)/i.test(source)) {
+      return source;
+    }
+    if (/^\/?api\/uploads\//i.test(source)) {
+      const baseUrl = await getOpenFangBaseUrl();
+      return new URL(source.replace(/^\/+/, ''), `${baseUrl.replace(/\/+$/, '')}/`).toString();
+    }
+    if (source.startsWith('/')) {
+      const baseUrl = await getApiBaseUrl();
+      return new URL(source, `${baseUrl.replace(/\/+$/, '')}/`).toString();
+    }
+    return source;
+  })();
+
+  const response = await fetch(resolvedSource);
   if (!response.ok) {
     throw new Error(`下载${kind === 'avatar' ? '头像' : '立绘'}失败：HTTP ${response.status}`);
   }
@@ -536,17 +555,46 @@ function buildUpdateSummary(input: {
   return segments.join('，');
 }
 
-async function resolveTargetAgent(payload: AgentManagementPayload): Promise<ManagementAgentSummary> {
-  const agents = await listManagementAgents();
+function normalizeAgentAlias(value: string | undefined): string {
+  return normalizeText(value).toLowerCase();
+}
+
+function matchesAgentAlias(agent: ManagementAgentSummary, candidate: string | undefined): boolean {
+  const normalizedCandidate = normalizeAgentAlias(candidate);
+  if (!normalizedCandidate) {
+    return false;
+  }
+  const aliases = [agent.id, agent.name, agent.nickname, agent.english_name]
+    .map((value) => normalizeAgentAlias(value))
+    .filter(Boolean);
+  return aliases.includes(normalizedCandidate);
+}
+
+function resolveActorAgent(
+  agents: readonly ManagementAgentSummary[],
+  actorAgentId?: string,
+  actorAgentName?: string,
+): ManagementAgentSummary | undefined {
+  return agents.find((item) =>
+    matchesAgentAlias(item, actorAgentId)
+    || matchesAgentAlias(item, actorAgentName),
+  );
+}
+
+async function resolveTargetAgent(
+  payload: AgentManagementPayload,
+  agents?: readonly ManagementAgentSummary[],
+): Promise<ManagementAgentSummary> {
+  const rows = agents ?? await listManagementAgents();
   const explicitId = normalizeText(payload.agentId);
   if (explicitId) {
-    const direct = agents.find((item) => item.id === explicitId);
+    const direct = rows.find((item) => item.id === explicitId);
     if (direct) return direct;
   }
   const candidate = [payload.targetName, payload.nickname, payload.englishName]
     .map((item) => normalizeText(item).toLowerCase())
     .filter(Boolean);
-  const matched = agents.find((item) => {
+  const matched = rows.find((item) => {
     const aliases = [item.id, item.name, item.nickname, item.english_name]
       .map((value) => normalizeText(value).toLowerCase())
       .filter(Boolean);
@@ -574,6 +622,7 @@ export async function executeAgentManagementAction(
   const payload = (rawPayload && typeof rawPayload === 'object') ? rawPayload as AgentManagementPayload : {};
   const mode = normalizeMode(payload.mode);
   const batchItems = normalizeBatchItems(payload);
+  const permissionScope = options?.permissionScope ?? 'manage_all';
   const reportProgress = (event: AgentManagementProgressEvent) => {
     options?.onProgress?.(event);
   };
@@ -581,8 +630,20 @@ export async function executeAgentManagementAction(
   if (mode === 'delete') {
     throw new Error('女娲不能执行删除操作；如需删除智能体，请让用户到界面 UI 中手动删除。');
   }
+  if (permissionScope === 'self_only' && mode !== 'update') {
+    throw new Error('当前智能体只能在用户确认后修改自己，不能创建、删除或批量管理其他智能体。');
+  }
+
+  const agents = await listManagementAgents();
+  const actorAgent = resolveActorAgent(agents, options?.actorAgentId, options?.actorAgentName);
+  if (permissionScope === 'self_only' && !actorAgent) {
+    throw new Error('未能识别当前智能体身份，无法执行自我修改。');
+  }
 
   if (batchItems.length > 0) {
+    if (permissionScope === 'self_only' && batchItems.length > 1) {
+      throw new Error('当前智能体只能处理单次自我修改，不能批量修改。');
+    }
     if (mode !== 'create' && batchItems.some((item) => item.mode === 'create')) {
       throw new Error('当前确认卡包含多个创建项，必须使用 create 模式执行。');
     }
@@ -621,7 +682,6 @@ export async function executeAgentManagementAction(
     };
   }
 
-  const agents = await listManagementAgents();
   const defaultModel = await resolveDefaultModel();
   const explicitName = normalizeText(payload.name);
   const explicitTargetName = normalizeText(payload.targetName);
@@ -748,7 +808,9 @@ export async function executeAgentManagementAction(
     title: '正在读取智能体当前配置',
     detail: payload.agentId || explicitTargetName || explicitName || '目标智能体',
   });
-  const target = await resolveTargetAgent(payload);
+  const target = permissionScope === 'self_only'
+    ? actorAgent as ManagementAgentSummary
+    : await resolveTargetAgent(payload, agents);
   const detail = await getManagementAgentDetail(target.id);
   const contextFiles = (shouldRewriteAllContextFiles || countContextFiles(explicitContextFiles) > 0)
     ? await getManagementAgentContextFiles(target.id)

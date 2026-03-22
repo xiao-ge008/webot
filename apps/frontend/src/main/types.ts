@@ -376,6 +376,10 @@ export interface AgentChatAttachmentInput {
   savedPath?: string;
   assetUrl?: string;
   size?: number;
+  sha256?: string;
+  localVisionSummary?: string;
+  localVisionProvider?: string;
+  localVisionModel?: string;
 }
 
 export const CHAT_CHANNELS = {
@@ -415,12 +419,22 @@ export interface AgentChatInput {
   homeDirOverride?: string;
 }
 
+export interface AgentAppearanceUpdated {
+  agentId?: string;
+  resolvedAgentId?: string;
+  avatarUrl?: string;
+  portraitUrl?: string;
+  reason?: string;
+  updatedFields?: Array<'avatar' | 'portrait'>;
+}
+
 export interface AgentChatResult {
   success: boolean;
   content: string;
   text?: string;
   uiRawText?: string;
   spec?: unknown;
+  appearanceUpdated?: AgentAppearanceUpdated;
   error?: string;
   usedFallback?: boolean;
   recoveredSessionLabel?: string;
@@ -435,7 +449,9 @@ export interface AgentChatStreamChunk {
   text?: string;
   spec?: unknown;
   event?: string;
-  meta?: Record<string, unknown>;
+  meta?: (Record<string, unknown> & {
+    appearanceUpdated?: AgentAppearanceUpdated;
+  });
 }
 
 export interface AgentTask {

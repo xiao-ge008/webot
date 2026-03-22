@@ -12,6 +12,7 @@ import { ComponentCenterPage } from '@/pages/ComponentCenterPage';
 import { ChatPage } from '@/pages/ChatPage';
 import { AgentTaskManagerPage } from '@/pages/AgentTaskManagerPage';
 import { SettingsPage } from '@/pages/SettingsPage';
+import { ContextManagerPage } from '@/pages/ContextManagerPage';
 
 type ModalState = {
   backgroundLocation?: Location;
@@ -34,6 +35,8 @@ function App() {
           <Route path="/groups/create" element={<CreateGroupPage />} />
           <Route path="/edit/:id" element={<EditAgentPage />} />
           <Route path="/import" element={<ImportPage />} />
+          <Route path="/chat/:id/context" element={<ContextManagerPage />} />
+          <Route path="/group-chat/:id/context" element={<ContextManagerPage />} />
           <Route path="/chat/:id" element={<ChatPage />} />
           <Route path="/group-chat/:id" element={<GroupChatPage />} />
           <Route path="/agent/:id/tasks" element={<AgentTaskManagerPage />} />

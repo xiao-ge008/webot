@@ -2,7 +2,8 @@
 param(
     [switch]$CheckOnly,
     [switch]$SkipNpmInstall,
-    [switch]$SkipOpenFangBuild
+    [switch]$SkipOpenFangBuild,
+    [switch]$FullOpenFangRelease
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,6 +95,22 @@ function Invoke-WithEnvironment {
     }
 }
 
+function Merge-Hashtable {
+    param(
+        [hashtable]$Base,
+        [hashtable]$Overlay
+    )
+
+    $merged = @{}
+    foreach ($key in $Base.Keys) {
+        $merged[$key] = $Base[$key]
+    }
+    foreach ($key in $Overlay.Keys) {
+        $merged[$key] = $Overlay[$key]
+    }
+    return $merged
+}
+
 function Test-InstalledItem {
     param(
         [string[]]$Lines,
@@ -128,6 +145,48 @@ function Sync-OpenFangBinary {
     }
 
     Copy-Item -Path $SourceBinary -Destination (Join-Path $resourceRoot 'openfang.exe') -Force
+}
+
+function Get-LatestFileWriteTimeUtc {
+    param(
+        [string]$RootPath
+    )
+
+    if (-not (Test-Path $RootPath)) {
+        return $null
+    }
+
+    $latest = $null
+    Get-ChildItem -Path $RootPath -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\target\\' } |
+        ForEach-Object {
+            $timestamp = $_.LastWriteTimeUtc
+            if ($null -eq $latest -or $timestamp -gt $latest) {
+                $latest = $timestamp
+            }
+        }
+
+    return $latest
+}
+
+function Test-OpenFangBinaryOutdated {
+    param(
+        [string]$RepoRoot,
+        [string]$BinaryPath
+    )
+
+    if (-not (Test-Path $BinaryPath)) {
+        return $true
+    }
+
+    $binaryTime = (Get-Item $BinaryPath).LastWriteTimeUtc
+    $sourceRoot = Join-Path $RepoRoot 'vendor\openfang'
+    $latestSourceTime = Get-LatestFileWriteTimeUtc -RootPath $sourceRoot
+    if ($null -eq $latestSourceTime) {
+        return $false
+    }
+
+    return $latestSourceTime -gt $binaryTime
 }
 
 function Resolve-MingwBin {
@@ -293,22 +352,36 @@ elseif ($CheckOnly) {
 }
 
 Write-Section 'OpenFang 二进制'
-if (-not (Test-Path $OpenFangVendorBinary)) {
+$needsOpenFangBuild = Test-OpenFangBinaryOutdated -RepoRoot $RepoRoot -BinaryPath $OpenFangVendorBinary
+if ($needsOpenFangBuild) {
     if ($CheckOnly) {
-        Write-Warning '当前未检测到 vendor/openfang 的 GNU release 产物。执行完整 bootstrap 时会尝试编译。'
+        Write-Warning 'vendor/openfang 的 GNU release 产物缺失或已过期。执行完整 bootstrap 时会重新编译。'
     }
     elseif ($SkipOpenFangBuild) {
-        Write-Warning '已跳过 OpenFang 编译。请自行确保 vendor/openfang/target/.../openfang.exe 存在。'
+        Write-Warning '已跳过 OpenFang 编译。请自行确保 vendor/openfang/target/.../openfang.exe 已按最新源码重新生成。'
     }
     else {
         Write-Host '[RUN] cargo build --release --target x86_64-pc-windows-gnu -p openfang-cli --bin openfang'
-        Invoke-WithEnvironment -Variables $GnuEnv -ScriptBlock {
+        $OpenFangBuildEnv = $GnuEnv
+        if (-not $FullOpenFangRelease) {
+            Write-Host '[INFO] OpenFang 开发构建使用快速 release 配置: LTO=off, codegen-units=16, strip=none'
+            $OpenFangBuildEnv = Merge-Hashtable -Base $GnuEnv -Overlay @{
+                CARGO_PROFILE_RELEASE_LTO = 'off'
+                CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '16'
+                CARGO_PROFILE_RELEASE_STRIP = 'none'
+            }
+        }
+
+        Invoke-WithEnvironment -Variables $OpenFangBuildEnv -ScriptBlock {
             Invoke-CheckedCommand `
                 -FilePath 'cargo' `
                 -ArgumentList @('build', '--release', '--target', 'x86_64-pc-windows-gnu', '-p', 'openfang-cli', '--bin', 'openfang') `
                 -WorkingDirectory (Join-Path $RepoRoot 'vendor\openfang')
         }
     }
+}
+else {
+    Write-Host '[OK] OpenFang GNU 产物已是最新，无需重新编译'
 }
 
 if (Test-Path $OpenFangVendorBinary) {
@@ -326,3 +399,4 @@ Write-Host '开发启动: npm run dev:start:app'
 Write-Host 'Web 模式:  npm run dev:start:web'
 Write-Host '桌面打包: npm run build:desktop'
 Write-Host '环境自检: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap-dev.ps1 -CheckOnly'
+Write-Host '完整 OpenFang release: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap-dev.ps1 -FullOpenFangRelease'

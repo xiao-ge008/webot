@@ -28,6 +28,10 @@
 
 - 需要用户选择下一步时，优先 `OptionSelector`，不要让用户输入“1/2/3”。
 - `OptionSelector` 的 `prompt` 必须是完整可执行指令句，不用占位词。
+- `ComfyUIImageCard` / `ComfyUIVideoCard` 是组件执行卡，不是普通媒体展示卡。
+- 只有明确知道组件英文名时，才允许输出 `ComfyUIImageCard` / `ComfyUIVideoCard`，并且必须携带 `props.componentName`。
+- 如果已经拿到了实际图片结果，优先用 `ImageCover` / `ImageAlbum` / `ImageCarousel` 展示，不要把 `prompt/width/height/count` 这类请求参数直接塞进 `ComfyUIImageCard`。
+- 若没有真实可展示的 `src/url/path/images`，不要强行输出图片卡片，降级为 Markdown。
 - 涉及“已打开视频/可播放/播放列表/点击播放”语义时，必须输出至少一个视频组件。
 - `Video*` 的 `src` 必须可播放（YouTube watch/shorts/youtu.be，B站 BV/video，TikTok video）；不要输出搜索页链接。
 - 遇到多项数据、时间序列、占比或评分对比时，优先输出图表组件，不要只给长 Markdown 列表。

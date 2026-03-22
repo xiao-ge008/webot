@@ -87,21 +87,19 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to build tauri app")
-        .run(|app, event| {
-            match event {
-                tauri::RunEvent::WindowEvent { label, event, .. } => {
-                    if label == MAIN_WINDOW_LABEL {
-                        if let WindowEvent::CloseRequested { api, .. } = event {
-                            api.prevent_close();
-                            hide_main_window(app);
-                        }
+        .run(|app, event| match event {
+            tauri::RunEvent::WindowEvent { label, event, .. } => {
+                if label == MAIN_WINDOW_LABEL {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        hide_main_window(app);
                     }
                 }
-                tauri::RunEvent::ExitRequested { .. } => {
-                    let state = app.state::<server::DesktopState>();
-                    server::shutdown(&state);
-                }
-                _ => {}
             }
+            tauri::RunEvent::ExitRequested { .. } => {
+                let state = app.state::<server::DesktopState>();
+                server::shutdown(&state);
+            }
+            _ => {}
         });
 }

@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { execSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { buildWindowsGnuRustEnv, resolveRepoRoot } from './windows-rust-env.mjs';
 
 const mode = process.argv[2];
@@ -36,7 +37,21 @@ const MODES = {
   app: {
     description: '启动桌面 App 调试模式（Tauri）',
     allowQqbot: false,
-    ports: [5173],
+    ports: [5173, 4200],
+    preCommands: [
+      {
+        label: 'bootstrap',
+        command: 'powershell',
+        args: [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          'scripts/bootstrap-dev.ps1',
+          '-SkipNpmInstall',
+        ],
+      },
+    ],
     commands: [
       {
         label: 'tauri',
@@ -193,6 +208,24 @@ function resolveQqbotBridgeCommand() {
   };
 }
 
+function runCommandSync({ label, command, args, env }) {
+  const result = spawnSync(command, args, {
+    cwd: process.cwd(),
+    shell: true,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      ...env,
+    },
+  });
+  if (result.error) {
+    throw new Error(`[${label}] 启动前命令失败: ${result.error.message}`);
+  }
+  if (typeof result.status === 'number' && result.status !== 0) {
+    throw new Error(`[${label}] 启动前命令退出码异常: ${result.status}`);
+  }
+}
+
 async function main() {
   if (!mode || mode === '--help' || mode === '-h') {
     printUsage();
@@ -217,6 +250,10 @@ async function main() {
 
   if (dryRun) {
     console.log('dry-run: 仅校验端口与命令，不执行启动');
+    const preCommands = config.preCommands ?? [];
+    preCommands.forEach((item) => {
+      console.log(`- pre:${item.label}: ${item.command} ${item.args.join(' ')}`);
+    });
     const commands = [...config.commands];
     if (withQqbot && config.allowQqbot !== false) {
       commands.push(resolveQqbotBridgeCommand());
@@ -225,6 +262,12 @@ async function main() {
       console.log(`- ${item.label}: ${item.command} ${item.args.join(' ')}`);
     });
     return;
+  }
+
+  const preCommands = config.preCommands ?? [];
+  for (const item of preCommands) {
+    console.log(`执行启动前准备: ${item.label}`);
+    runCommandSync(item);
   }
 
   const commands = [...config.commands];

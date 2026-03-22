@@ -243,6 +243,10 @@ location: ~/.webot/skills/ui-skill
 
 - 单图优先 `ImageCover`；多图瀑布/网格优先 `ImageAlbum`；连续浏览优先 `ImageCarousel`。
 - 单视频优先 `VideoCover`；多视频列表优先 `VideoGallery`；连续浏览优先 `VideoCarousel`。
+- `ComfyUIImageCard` / `ComfyUIVideoCard` 只用于组件执行与结果回填，不是普通图片/视频展示卡。
+- 使用 `ComfyUIImageCard` / `ComfyUIVideoCard` 时，`props.componentName` 必填；已识别参数统一放到 `props.initialValues`。
+- 若只有 `prompt/width/height/count` 这类生成请求参数，没有真实媒体结果，就不要输出 `ComfyUIImageCard` / `ComfyUIVideoCard`。
+- 已拿到图片结果时，优先用 `ImageCover` / `ImageAlbum` / `ImageCarousel` 直接展示。
 - 数据可视化优先：占比=`PieChartCard`，对比=`BarChartCard`，趋势=`LineChartCard/AreaChartCard`，多维=`RadarChartCard`；不确定时用 `ChartCard + chartType`。
 - 网页预览或 HTML 片段优先 `WebViewCard`。
 - 单条语音/音乐优先 `AudioPlayer`；多条节目列表优先 `AudioPlaylist`。
