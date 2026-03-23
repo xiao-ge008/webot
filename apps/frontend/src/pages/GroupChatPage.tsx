@@ -19,6 +19,7 @@ import { chatRuntimeStore, useChatRuntimeSelector } from '@/services/chat-runtim
 import type { StoredChatSession } from '@/services/chat-session-store';
 import { buildInitialMessages, generateId, mapManagementAgentToUi } from '@/components/chat/chat-page-helpers';
 import type { Message } from '@/data/mock-chats';
+import { useResolvedRuntimeAssetSrc } from '@/lib/runtime-asset-url';
 import { cn } from '@/lib/utils';
 import { DEFAULT_GROUP_LIMITS, type ChatGroup, type ChatGroupLimits, type ChatGroupMode, type GroupAgentContextDigest, type GroupMemoryDigest, type GroupSessionRuntime } from '@/types/group';
 import type { Agent } from '@/types';
@@ -640,6 +641,7 @@ export function GroupChatPage() {
     }, [group, idleAutoLeader]);
 
     const speakerId = speaker?.id ?? '';
+    const resolvedSpeakerPortraitUrl = useResolvedRuntimeAssetSrc(speaker?.portraitUrl);
     const speakerRef = useRef(speakerId);
     speakerRef.current = speakerId;
     const lastSpeakerIdRef = useRef<string>('');
@@ -1804,11 +1806,11 @@ export function GroupChatPage() {
                             </Popover>
                         </div>
                     </div>
-                    {speaker?.portraitUrl ? (
+                    {resolvedSpeakerPortraitUrl ? (
                         <div className="chat-info-portrait-card group relative overflow-hidden">
                             <img
-                                src={speaker.portraitUrl}
-                                alt={`${speaker.name} portrait`}
+                                src={resolvedSpeakerPortraitUrl}
+                                alt={`${speaker?.name || 'speaker'} portrait`}
                                 className="chat-info-portrait-img"
                                 loading="lazy"
                                 decoding="async"

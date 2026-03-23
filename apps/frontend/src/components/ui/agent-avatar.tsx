@@ -1,6 +1,7 @@
 import * as AvatarPrimitive from '@radix-ui/react-avatar';
 import { cn } from '@/lib/utils';
 import { cva, type VariantProps } from 'class-variance-authority';
+import { useResolvedRuntimeAssetSrc } from '@/lib/runtime-asset-url';
 
 const avatarVariants = cva(
   'relative flex shrink-0 overflow-hidden rounded-xl',
@@ -33,12 +34,13 @@ interface AgentAvatarProps extends VariantProps<typeof avatarVariants> {
 /** 智能体头像组件：图片优先，无图降级为 name 首字 + 主题色背景 */
 function AgentAvatar({ name, avatarUrl, color = '#6e6e73', size, className }: AgentAvatarProps) {
   const firstChar = name.charAt(0).toUpperCase();
+  const resolvedAvatarUrl = useResolvedRuntimeAssetSrc(avatarUrl);
 
   return (
     <AvatarPrimitive.Root className={cn(avatarVariants({ size }), className)}>
-      {avatarUrl && (
+      {resolvedAvatarUrl && (
         <AvatarPrimitive.Image
-          src={avatarUrl}
+          src={resolvedAvatarUrl}
           alt={name}
           className="aspect-square h-full w-full object-cover"
         />

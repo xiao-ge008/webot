@@ -1,3 +1,5 @@
+import type { AgentSpeakerProfile, AgentTtsConfig } from '@/types/tts';
+
 export interface ModelProviderTemplate {
   id: string;
   displayName: string;
@@ -207,6 +209,8 @@ export interface SaveAgentInput {
   ttsVoice?: string;
   ttsSpeed?: number;
   ttsPitch?: number;
+  ttsConfig?: AgentTtsConfig;
+  speakerProfiles?: AgentSpeakerProfile[];
   avatarUrl?: string;
   color?: string;
   teamMembers?: readonly AgentTeamMember[];
@@ -264,6 +268,8 @@ export interface AgentProfile {
     ttsVoice?: string;
     ttsSpeed?: number;
     ttsPitch?: number;
+    ttsConfig?: AgentTtsConfig;
+    speakerProfiles?: AgentSpeakerProfile[];
   };
   paths: {
     agentRoot: string;

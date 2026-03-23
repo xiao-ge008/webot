@@ -180,8 +180,14 @@ const skillPromptContextCache = new Map<string, string>();
 const availableSkillComponentsCache = new Map<string, string[]>();
 const skillComponentManifestCache = new Map<
   string,
-  { description: string; propsSchema: unknown; example: unknown }
+  {
+    description: string;
+    propsSchema: unknown;
+    example: unknown;
+    invokeExample: unknown;
+  }
 >();
+const managementComponentInvokeContextCache = new Map<string, string>();
 const collaborationHintCache = new Map<
   string,
   { expiresAt: number; hint: string }
@@ -193,6 +199,13 @@ const CHAT_RECOVERY_SETTLE_MS = 500;
 const COLLAB_TAG_DISPATCH = "webot:collab_dispatcher";
 const COLLAB_CONFIG_BEGIN = "[WEBOT_COLLAB_CONFIG_BEGIN]";
 const COLLAB_CONFIG_END = "[WEBOT_COLLAB_CONFIG_END]";
+
+export function invalidateComponentSkillRuntimeCaches(): void {
+  skillPromptContextCache.clear();
+  availableSkillComponentsCache.clear();
+  skillComponentManifestCache.clear();
+  managementComponentInvokeContextCache.clear();
+}
 
 interface CollaborationConfigPayload {
   discoverable: boolean;
@@ -210,6 +223,55 @@ function asArray<T>(value: unknown): T[] {
 
 function toStringValue(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function isStrictSourceParamName(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return /^(image|image_url|imageurl|src|url|path|photo|mask|reference|input_image|inputimage|lyrics)$/.test(normalized);
+}
+
+function isPromptLikeParamName(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return /prompt|style|theme|mood|description|desc|text|message|content|instruction|note|script|story|tag/.test(normalized);
+}
+
+function buildComponentMappingSemanticText(mapping: Record<string, unknown>): string {
+  return [
+    toStringValue(mapping.parameterName),
+    toStringValue(mapping.fieldName),
+    toStringValue(mapping.label),
+    toStringValue(mapping.description),
+  ]
+    .join(' ')
+    .trim()
+    .toLowerCase();
+}
+
+function isStrictSourceComponentMapping(mapping: Record<string, unknown>): boolean {
+  const parameterName = toStringValue(mapping.parameterName).trim();
+  if (!parameterName) {
+    return false;
+  }
+  if (isPromptLikeParamName(parameterName)) {
+    return false;
+  }
+  if (isStrictSourceParamName(parameterName)) {
+    return true;
+  }
+  const semanticText = buildComponentMappingSemanticText(mapping);
+  if (!semanticText) {
+    return false;
+  }
+  if (/(图片|照片|立绘|头像|遮罩|参考图|歌词|音频|声音文件|视频源|上传文件|附件)/.test(semanticText)) {
+    return true;
+  }
+  return /(^|[^a-z])(image|photo|portrait|avatar|mask|reference|audio|video|file|upload|attachment)([^a-z]|$)/.test(semanticText);
+}
+
+function isDescriptiveComponentMapping(mapping: Record<string, unknown>): boolean {
+  const semanticText = buildComponentMappingSemanticText(mapping);
+  return /prompt|style|theme|mood|description|desc|text|message|content|instruction|note|script|story|tag/.test(semanticText)
+    || /(提示词|风格|主题|氛围|描述|文案|脚本|剧情|标签|说明)/.test(semanticText);
 }
 
 function toBooleanValue(value: unknown, fallback = false): boolean {
@@ -1005,7 +1067,7 @@ function parseTextToolCallPayload(text: string): ParsedTextToolCall | null {
     return null;
   }
 
-  const firstLineMatch = lines[0].match(/^<tool_call>\s*([a-zA-Z0-9_.:-]+)/i);
+  const firstLineMatch = lines[0].match(/^<(?:[a-z0-9_.-]+:)?tool_call>\s*([a-zA-Z0-9_.:-]+)/i);
   if (!firstLineMatch?.[1]) {
     return null;
   }
@@ -1078,7 +1140,8 @@ function looksLikeTextToolCallOnly(text: string): boolean {
   if (!normalized) {
     return false;
   }
-  return /^<tool_call>/i.test(normalized) || /<tool_call>/i.test(normalized);
+  return /^<(?:[a-z0-9_.-]+:)?tool_call\b/i.test(normalized)
+    || /<(?:[a-z0-9_.-]+:)?tool_call\b/i.test(normalized);
 }
 
 function extractMcpToolCallText(payload: unknown): string {
@@ -1170,9 +1233,22 @@ async function buildUiEnvironmentSystemPrompt(
   const supportsSelfManagementAgent =
     !isNuwaManagementAgent && normalizedAgentId.length > 0;
   let components: string[] = [];
+  let customSkillNames: string[] = [];
   try {
     const assignments = await getAgentSkillAssignments(input.agentId);
-    const skillNames = assignments.assigned.filter(
+    const skillNames = Array.from(
+      new Set(
+        [
+          ...(assignments.assigned ?? []),
+          ...(assignments.custom_available ?? []),
+        ]
+          .filter((item): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+          )
+          .map((item) => item.trim()),
+      ),
+    ).sort();
+    customSkillNames = (assignments.custom_available ?? []).filter(
       (item): item is string =>
         typeof item === "string" && item.trim().length > 0,
     );
@@ -1191,6 +1267,13 @@ async function buildUiEnvironmentSystemPrompt(
   const manifestContexts = await Promise.all(
     components.map((name) => loadSkillComponentManifest(name, input.agentId)),
   );
+  const componentInvokeContexts = await Promise.all(
+    components.map((name, index) =>
+      loadManagementComponentInvokeContext(
+        resolveManifestInvokeComponentName(name, manifestContexts[index]),
+      ),
+    ),
+  );
   manifestContexts.forEach((item, index) => {
     if (item?.propsSchema) {
       primeManifestSchemaCache(components[index], item.propsSchema);
@@ -1207,25 +1290,40 @@ async function buildUiEnvironmentSystemPrompt(
           ? `propsSchema: ${JSON.stringify(item.propsSchema)}`
           : "",
         item.example ? `example: ${JSON.stringify(item.example)}` : "",
+        item.invokeExample
+          ? `invokeExample: ${JSON.stringify(item.invokeExample)}`
+          : "",
       ]
         .filter(Boolean)
         .join("\n");
     })
     .filter(Boolean);
+  const injectedComponentInvokeContexts = componentInvokeContexts.filter(Boolean);
   const collaborationHint = await buildCollaborationAgentHint(input.agentId);
 
   return [
     "[system:ui-environment]",
     `Current UI environment: channel=${channel}, renderMode=${renderMode}, A2UI rendering is available.`,
     "You are replying in chat mode for a json-render capable client, not a pure generation-only mode.",
-    "Default to a normal helpful chat reply in Markdown. Use UI only when it clearly improves the answer.",
-    "It is normal for a reply to contain zero UI blocks and only Markdown.",
+    "Render priority in this chat is fixed and strict: custom dynamic components declared by available skill manifests > built-in system components > pure Markdown text.",
+    "Priority override rule: when skill-component manifests or skill-local component contexts are present in this prompt, those component rules override any conflicting guidance from other generic/custom skills, writing styles, collaboration habits, or fallback habits.",
+    components.length > 0
+      ? `Available custom dynamic components with the highest priority right now: ${components.join(", ")}.`
+      : "No custom dynamic component is currently available, so you may fall back to built-in components or Markdown.",
+    customSkillNames.length > 0
+      ? `Global custom skills discovered for this agent session: ${customSkillNames.join(", ")}. Their manifest-declared components are callable in chat even when the user does not mention a button or entry explicitly.`
+      : "",
+    "If the user intent can be satisfied by an available custom dynamic component and you can produce manifest-compliant props, prefer that custom component over any built-in component.",
+    "Use built-in system components only when no suitable custom dynamic component is available for the task, or when the custom component manifest clearly does not fit the requested output.",
+    "Use pure Markdown only when neither a valid custom component nor a valid built-in component can be emitted safely.",
+    "Default to a normal helpful chat reply in Markdown only after the custom-component and built-in-component options have both been ruled out.",
+    "It is normal for a reply to contain zero UI blocks only when no valid custom or built-in component should be used.",
     "When using UI, prefer a mixed response: short Markdown explanation plus a small focused UI block.",
     "Do not convert the whole answer into UI unless the user explicitly asks for a fully structured card.",
     "When user intent is ambiguous and multiple follow-up directions are possible, prefer using the built-in `OptionSelector` component to ask for intent instead of asking the user to type a free-form clarification.",
     "Common built-in components you should actively consider when useful: `OptionSelector`, `LineChartCard`, `BarChartCard`, `AreaChartCard`, `PieChartCard`, `ImageCover`, `ImageAlbum`, `ImageCarousel`, `ComfyUIImageCard`, `VideoCover`, `VideoGallery`, `VideoCarousel`, `ComfyUIVideoCard`, `WebViewCard`, `MarkdownPreviewCard`, `OfficePreviewCard`, `AgentManagementConfirmCard`.",
     "For disambiguation, intent routing, next-step choices, or asking what the user wants to do next, `OptionSelector` is preferred over plain text questions whenever the options are clear.",
-    "Component-first preference order for chat UI: 1) `OptionSelector` for intent clarification and next-step choice, 2) ordinary image answers including `image_generate` and `image_edit` results should prefer `ImageCover` / `ImageAlbum` / `ImageCarousel` with visible cover in chat, 3) ordinary video answers should prefer `VideoCover` / `VideoGallery` / `VideoCarousel` with visible cover in chat, 4) component-generated image outputs must use `ComfyUIImageCard`, 5) component-generated video outputs must use `ComfyUIVideoCard`, 6) trend/comparison/numeric answers should prefer chart components such as `LineChartCard` / `BarChartCard` / `AreaChartCard` / `PieChartCard`.",
+    "Within built-in system components only, the preference order is: 1) `OptionSelector` for intent clarification and next-step choice, 2) ordinary image answers including `image_generate` and `image_edit` results should prefer `ImageCover` / `ImageAlbum` / `ImageCarousel` with visible cover in chat, 3) ordinary video answers should prefer `VideoCover` / `VideoGallery` / `VideoCarousel` with visible cover in chat, 4) component-generated image outputs must use `ComfyUIImageCard`, 5) component-generated video outputs must use `ComfyUIVideoCard`, 6) trend/comparison/numeric answers should prefer chart components such as `LineChartCard` / `BarChartCard` / `AreaChartCard` / `PieChartCard`.",
     "Critical distinction: `ComfyUIImageCard` is a component execution card, not a generic image preview card.",
     "Use `ComfyUIImageCard` only when you are intentionally invoking a known image component/skill and you know its exact `componentName`.",
     'The minimum valid `ComfyUIImageCard` is `<UI_JSON>{"type":"ComfyUIImageCard","props":{"componentName":"exact-component-name"}}</UI_JSON>`.',
@@ -1246,7 +1344,20 @@ async function buildUiEnvironmentSystemPrompt(
     "When comparing data or describing trends, prefer chart visualization over plain prose when valid data is available.",
     "Prefer图文布局 and text-with-cover layout when it improves clarity, scanability, and user decision making.",
     "Built-in components follow ui-skill. Custom dynamic components must follow the corresponding skill-local specification and manifest.",
+    "Component-skill parameter contracts are stricter than ordinary skill advice. If another skill suggests a different field naming style, ignore it and obey the component manifest plus component local context.",
     "For custom dynamic components, always use the exact manifest type name declared by the skill, preferably PascalCase as-is.",
+    "Custom component capability has two distinct channels: 1) Render channel: directly output the manifest-declared custom component in <UI_JSON> so it renders in chat. 2) Invoke channel: output `ComponentInvokeAction` in <UI_JSON> so the client calls the component like an interface/tool and captures returned text/image/video results.",
+    "For custom dynamic components that accept runtime form inputs, place the user-supplied values under `props.initialValues`; when the request is already ready to execute immediately, set `props.autoRun` to `true`.",
+    'The invoke-channel action format is `<UI_JSON>{"type":"ComponentInvokeAction","props":{"componentName":"exact-component-name","params":{"key":"value"},"renderResult":false,"exposeToAgent":true}}</UI_JSON>`.',
+    "Use the render channel when the user should directly see and interact with the custom component itself in chat.",
+    "Use `ComponentInvokeAction` when you need to call a component as an ability/interface and consume its returned text/image/video outputs, even if no visible component entry or button was clicked.",
+    "If `ComponentInvokeAction.props.renderResult` is true, the returned image/video result may be rendered back into chat automatically; if false, treat it primarily as callable ability output and keep it available to later reasoning.",
+    "If a custom component can satisfy the request directly, prefer the custom render channel over built-in cards. Only after custom render is not appropriate should you consider built-in system components. Markdown is the last fallback.",
+    "Do not downgrade to a built-in component or Markdown if a higher-priority custom dynamic component is available and you already have enough information to render it correctly.",
+    "Do not claim that a custom component has no入口 or no调用方式 merely because the user did not click a visible button. If the component is listed in the available manifest set for this session, you may invoke it directly with valid UI_JSON.",
+    "If a custom component's required parameters are already satisfied by the current user request, you MUST use that component instead of replying with process explanation or saying the component is unavailable.",
+    "Do not refuse to use a custom component merely because the user also mentioned extra unsupported fields. Keep only declared parameters, ignore unsupported extras, and omit optional parameters when necessary.",
+    "For media-generation custom components such as image/video/audio generation, if the user clearly asks to directly generate now and the required parameters are available, prefer `ComponentInvokeAction` with `renderResult=true`.",
     "The reply must follow exactly one of these formats only:",
     "A) Pure Markdown only, with no <UI_JSON> block at all.",
     "B) Mixed content made from Markdown and one or more <UI_JSON>...</UI_JSON> blocks in any order.",
@@ -1258,6 +1369,7 @@ async function buildUiEnvironmentSystemPrompt(
     "If the answer is mostly prose, keep it as Markdown instead of forcing SpecStream patches.",
     "Each <UI_JSON> block must contain exactly one complete valid JSON object and nothing else.",
     "Never output response envelopes, result JSON, tool_call XML, YAML, comments, explanations about the schema, or any wrapper object around the UI object.",
+    "Never output legacy XML component tags such as <image2video ...></image2video>; custom components must be emitted only as <UI_JSON>{\"type\":\"ExactManifestType\",\"props\":{...}}</UI_JSON>.",
     "If you output UI_JSON, it must be directly parseable by JSON.parse without any preprocessing.",
     'JSON strings must use escaped double quotes inside values, for example: "value":"A \\"quoted\\" word".',
     "JSON punctuation must use ASCII characters only. Never use full-width punctuation such as ： ， （ ） 【 】.",
@@ -1354,6 +1466,10 @@ async function buildUiEnvironmentSystemPrompt(
       ? "[system:skill-component-manifests]"
       : "",
     ...injectedManifestContexts,
+    injectedComponentInvokeContexts.length > 0
+      ? "[system:component-invoke-params]"
+      : "",
+    ...injectedComponentInvokeContexts,
     injectedSkillContexts.length > 0
       ? "[system:skill-local-component-context]"
       : "",
@@ -1497,6 +1613,7 @@ async function loadSkillComponentManifest(
   description: string;
   propsSchema: unknown;
   example: unknown;
+  invokeExample: unknown;
 } | null> {
   const normalized = componentName.trim();
   if (!normalized) return null;
@@ -1515,6 +1632,8 @@ async function loadSkillComponentManifest(
       props_schema?: unknown;
       propsSchema?: unknown;
       example?: unknown;
+      invoke_example?: unknown;
+      invokeExample?: unknown;
     };
     const manifest = {
       description:
@@ -1523,11 +1642,124 @@ async function loadSkillComponentManifest(
           : "",
       propsSchema: payload?.propsSchema ?? payload?.props_schema ?? null,
       example: payload?.example ?? null,
+      invokeExample: payload?.invokeExample ?? payload?.invoke_example ?? null,
     };
     skillComponentManifestCache.set(cacheKey, manifest);
     return manifest;
   } catch {
     return null;
+  }
+}
+
+function resolveManifestInvokeComponentName(
+  componentType: string,
+  manifest:
+    | {
+        invokeExample: unknown;
+      }
+    | null,
+): string {
+  if (
+    manifest
+    && isRecord(manifest.invokeExample)
+    && isRecord(manifest.invokeExample.props)
+  ) {
+    const invokeName = toStringValue(
+      manifest.invokeExample.props.componentName,
+    ).trim();
+    if (invokeName) {
+      return invokeName;
+    }
+  }
+  return componentType.trim();
+}
+
+async function loadManagementComponentInvokeContext(
+  componentName: string,
+): Promise<string> {
+  const normalized = componentName.trim();
+  if (!normalized) return "";
+  const cached = managementComponentInvokeContextCache.get(normalized);
+  if (cached != null) {
+    return cached;
+  }
+
+  try {
+    const payload = await requestJson<unknown>(
+      `/api/management/components/${encodeURIComponent(normalized)}`,
+    );
+    const item = isRecord(payload) && isRecord(payload.item) ? payload.item : null;
+    const workflow = item && isRecord(item.workflow) ? item.workflow : null;
+    const returnType = toStringValue(item?.returnType).trim().toLowerCase();
+    const parameterMappings = Array.isArray(workflow?.parameterMappings)
+      ? workflow.parameterMappings.filter(isRecord)
+      : [];
+    if (parameterMappings.length === 0) {
+      managementComponentInvokeContextCache.set(normalized, "");
+      return "";
+    }
+    const requiredParams = parameterMappings
+      .filter((mapping) => Boolean(mapping.required))
+      .map((mapping) => toStringValue(mapping.parameterName).trim())
+      .filter(Boolean);
+    const descriptiveParams = parameterMappings
+      .filter((mapping) =>
+        toStringValue(mapping.valueType).trim().toLowerCase() === "string"
+        && isDescriptiveComponentMapping(mapping),
+      )
+      .map((mapping) => toStringValue(mapping.parameterName).trim())
+      .filter(Boolean);
+    const strictSourceParams = parameterMappings
+      .filter((mapping) => isStrictSourceComponentMapping(mapping))
+      .map((mapping) => toStringValue(mapping.parameterName).trim())
+      .filter(Boolean);
+    const hasImageLikeSource = strictSourceParams.some((name) =>
+      /image|photo|avatar|portrait|mask|reference|src|url|path/i.test(name),
+    );
+    const capabilityLine = returnType
+      ? `Component capability for ${normalized}: returnType=${returnType}.`
+      : "";
+    const videoRoutingLine = returnType === "video"
+      ? (strictSourceParams.length > 0
+        ? `Video routing for ${normalized}: this is a source-conditioned video component. A scene description alone does NOT satisfy source params [${strictSourceParams.join(", ")}]. If those source inputs are missing, ask for them or render the component instead of direct invoke.`
+        : `Video routing for ${normalized}: this component can generate video directly from descriptive parameters when required params are satisfied, so prefer direct invoke for immediate generation.`)
+      : "";
+    const lines = parameterMappings.map((mapping) =>
+      JSON.stringify({
+        parameterName: toStringValue(mapping.parameterName).trim(),
+        fieldName: toStringValue(mapping.fieldName).trim(),
+        valueType: toStringValue(mapping.valueType).trim(),
+        required: Boolean(mapping.required),
+        description: toStringValue(mapping.description).trim(),
+        defaultValue: mapping.defaultValue ?? null,
+      }),
+    );
+    const context = [
+      `[component-invoke:${normalized}]`,
+      capabilityLine,
+      `When emitting ComponentInvokeAction for ${normalized}, use these exact parameter mappings as the primary source of truth. Do not rename a declared parameter unless the component context explicitly says an alias is acceptable.`,
+      requiredParams.length > 0
+        ? `Direct invoke gate for ${normalized}: if the current user request already provides enough information to fill required params [${requiredParams.join(", ")}], invoke immediately. Do not fall back to a prose explanation just because optional params are missing.`
+        : `Direct invoke gate for ${normalized}: there are no required params, so you may invoke it directly whenever the user intent matches.`,
+      strictSourceParams.length > 0
+        ? `Strict source gate for ${normalized}: params [${strictSourceParams.join(", ")}] are source/content inputs. Only direct invoke when the user has explicitly provided the real source value for them, such as an actual image/url/path/lyrics body. A scene description alone does not satisfy these params. If they are missing, render the component or ask for the missing source input instead of invoking.`
+        : "",
+      videoRoutingLine,
+      hasImageLikeSource
+        ? `Local workspace media paths such as agent_profile/portrait/xxx.png are valid source values for ${normalized}. Pass that path as-is under the declared source parameter instead of inventing a new URL or placeholder text.`
+        : "",
+      "Only include declared parameterName keys in ComponentInvokeAction.props.params. Unsupported extra user fields must be ignored instead of becoming a reason to refuse the invocation.",
+      descriptiveParams.length > 0
+        ? `If the user provides extra stylistic constraints without an exact same parameter name, you may merge them into the nearest descriptive string parameter among [${descriptiveParams.join(", ")}].`
+        : "If the user provides extra stylistic constraints without an exact matching parameter, ignore those extra fields and continue with the declared params.",
+      `Never say that ${normalized} has no usable entry, no callable route, or no safe schema when this prompt block is present.`,
+      ...lines,
+    ].join("\n");
+    managementComponentInvokeContextCache.set(normalized, context);
+    return context;
+  } catch {
+    managementComponentInvokeContextCache.set(normalized, "");
+    return "";
   }
 }
 

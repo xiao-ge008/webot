@@ -41,6 +41,7 @@ import {
   FileText,
   Server,
   UploadCloud,
+  Volume2,
 } from 'lucide-react';
 import type { SkillItem } from '@/main/skills-mcp-types';
 import { ProvidersTab } from '@/components/settings/ProvidersTab';
@@ -49,6 +50,7 @@ import { MemoryEnhancementTab } from '@/components/settings/MemoryEnhancementTab
 import { Live2DTab } from '@/components/settings/Live2DTab';
 import { ComponentProvidersTab } from '@/components/settings/ComponentProvidersTab';
 import { ImageGenerationTab } from '@/components/settings/ImageGenerationTab';
+import { TtsTab } from '@/components/settings/TtsTab';
 import { VisionAnalysisTab } from '@/components/settings/VisionAnalysisTab';
 import {
   clearGlobalMcpConfig,
@@ -94,6 +96,7 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
           { id: 'providers', label: t('settings.menu.providers'), icon: Cpu },
           { id: 'models', label: t('settings.menu.models'), icon: Sparkles },
           { id: 'imageGeneration', label: t('settings.menu.imageGeneration'), icon: ImageIcon },
+          { id: 'tts', label: t('settings.menu.tts', { defaultValue: '语音 / TTS' }), icon: Volume2 },
           { id: 'visionAnalysis', label: t('settings.menu.visionAnalysis', { defaultValue: '视觉分析' }), icon: ImageIcon },
           { id: 'memoryEnhancement', label: t('settings.menu.memoryEnhancement'), icon: BrainCircuit },
         ],
@@ -192,6 +195,7 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
           {activeTab === 'providers' && <ProvidersTab />}
           {activeTab === 'models' && <ModelsTab />}
           {activeTab === 'imageGeneration' && <ImageGenerationTab />}
+          {activeTab === 'tts' && <TtsTab />}
           {activeTab === 'visionAnalysis' && <VisionAnalysisTab />}
           {activeTab === 'memoryEnhancement' && <MemoryEnhancementTab />}
           {activeTab === 'componentProviders' && <ComponentProvidersTab />}
@@ -202,6 +206,7 @@ export function SettingsContent({ onBack }: { onBack: () => void }) {
             activeTab !== 'providers' &&
             activeTab !== 'models' &&
             activeTab !== 'imageGeneration' &&
+            activeTab !== 'tts' &&
             activeTab !== 'visionAnalysis' &&
             activeTab !== 'memoryEnhancement' &&
             activeTab !== 'componentProviders' &&

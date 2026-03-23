@@ -40,6 +40,7 @@ import {
   type WorkflowNode,
   type WorkflowNodeField,
 } from '@/services/component-client';
+import { invalidateComponentSkillRuntimeCaches } from '@/services/agent-client';
 import {
   Boxes,
   BrainCircuit,
@@ -133,13 +134,128 @@ function formatDefaultValueText(value: unknown): string {
   return toPrettyJson(value);
 }
 
+function isLikelyLongPromptLikeField(fieldName: string): boolean {
+  const key = fieldName.trim().toLowerCase();
+  return /lyrics|lyric|tag|tags|prompt|style|theme|mood|desc|description|text|message|content|story|script/.test(key);
+}
+
+function sanitizeImportedDefaultValue(fieldName: string, value: unknown): unknown {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return '';
+  }
+  const compact = trimmed.replace(/\s+/g, ' ');
+  if (isLikelyLongPromptLikeField(fieldName) && (trimmed.includes('\n') || compact.length > 48)) {
+    return '';
+  }
+  if (compact.length > 180) {
+    return '';
+  }
+  return trimmed;
+}
+
+function inferFieldDescription(fieldName: string, valueType: ComponentParamValueType, existing = ''): string {
+  if (existing.trim()) {
+    return existing.trim();
+  }
+  const key = fieldName.trim().toLowerCase();
+  if (key.includes('lyrics') || key.includes('lyric')) return '真正歌词正文，支持分段换行。';
+  if (key === 'tags' || key.includes('style') || key.includes('mood') || key.includes('theme') || key.includes('prompt')) {
+    return '风格、情绪、乐器、节奏、主题等描述信息。';
+  }
+  if (key.includes('language') || key === 'lang') return '语言代码，例如 zh、en、ja。';
+  if (key.includes('second') || key.includes('duration')) return '生成时长，单位秒。';
+  if (key.includes('seed')) return '随机种子；留空或修改可得到不同结果。';
+  if (key.includes('image') || key.includes('photo') || key.includes('cover')) return '图片 URL、上传资源 URL 或本地可访问路径。';
+  if (key.includes('audio') || key.includes('music')) return '音频 URL 或音频相关输入。';
+  if (key.includes('video')) return '视频 URL 或视频相关输入。';
+  return valueType === 'json' ? 'JSON 结构化参数。' : '';
+}
+
+function inferFieldRequired(fieldName: string, currentDefaultValue: unknown, existing?: boolean): boolean {
+  if (typeof existing === 'boolean') {
+    return existing;
+  }
+  const key = fieldName.trim().toLowerCase();
+  if (typeof currentDefaultValue === 'string' && currentDefaultValue.trim()) {
+    return false;
+  }
+  return /lyrics|lyric|tags|tag|prompt|text|message|content|image|image_url|imageurl|src|url|path/.test(key);
+}
+
+type MappingRole = 'content' | 'descriptive' | 'language' | 'duration' | 'asset' | 'generic';
+
+function getMappingRole(fieldName: string): MappingRole {
+  const key = fieldName.trim().toLowerCase();
+  if (key.includes('lyrics') || key.includes('lyric')) return 'content';
+  if (key.includes('language') || key === 'lang') return 'language';
+  if (key.includes('second') || key.includes('duration')) return 'duration';
+  if (key.includes('image') || key.includes('photo') || key.includes('cover') || key === 'src' || key === 'url' || key === 'path') {
+    return 'asset';
+  }
+  if (key.includes('tag') || key.includes('prompt') || key.includes('style') || key.includes('theme') || key.includes('mood') || key.includes('desc') || key.includes('text') || key.includes('message') || key.includes('content')) {
+    return 'descriptive';
+  }
+  return 'generic';
+}
+
+function getMappingRoleLabel(fieldName: string): string {
+  switch (getMappingRole(fieldName)) {
+    case 'content':
+      return '核心内容';
+    case 'descriptive':
+      return '描述承接';
+    case 'language':
+      return '语言控制';
+    case 'duration':
+      return '时长控制';
+    case 'asset':
+      return '资源输入';
+    default:
+      return '通用参数';
+  }
+}
+
+function getMappingRoleHint(fieldName: string): string {
+  switch (getMappingRole(fieldName)) {
+    case 'content':
+      return '这里应该传真实内容本身，例如歌词正文，不能只传主题简介。';
+    case 'descriptive':
+      return '这里适合承接风格、氛围、乐器、节奏、主题等额外要求。';
+    case 'language':
+      return '这里控制生成语言，建议只传语言代码。';
+    case 'duration':
+      return '这里控制长度或秒数，建议保持数字类型。';
+    case 'asset':
+      return '这里应该传 URL、上传资源地址或本地可访问路径。';
+    default:
+      return '保持命名清晰，避免让 AI 误判字段用途。';
+  }
+}
+
+function wasLongDefaultValueIgnored(fieldName: string, value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return sanitizeImportedDefaultValue(fieldName, value) === '';
+}
+
 function createNodeField(fieldName: string, value: unknown, extra?: Partial<WorkflowNodeField>): WorkflowNodeField {
+  const valueType = extra?.valueType || guessValueType(value);
+  const defaultValue = sanitizeImportedDefaultValue(fieldName, readDefaultValue(extra?.defaultValue, value));
   return {
     fieldName,
     label: extra?.label || fieldName,
-    valueType: extra?.valueType || guessValueType(value),
-    description: extra?.description || '',
-    defaultValue: readDefaultValue(extra?.defaultValue, value),
+    valueType,
+    description: inferFieldDescription(fieldName, valueType, extra?.description || ''),
+    defaultValue,
     options: extra?.options ?? normalizeFieldOptions(value),
   };
 }
@@ -277,7 +393,7 @@ function parseRunninghubWorkflow(rawText: string): ParsedWorkflowResult {
 }
 
 function createMappingDraft(field: WorkflowNodeField, node: WorkflowNode, existing?: ComponentParameterMapping): MappingDraft {
-  const defaultValue = existing ? existing.defaultValue : field.defaultValue;
+  const defaultValue = existing ? existing.defaultValue : sanitizeImportedDefaultValue(field.fieldName, field.defaultValue);
   return {
     id: existing?.id || `${node.nodeId}__${field.fieldName}`,
     nodeId: node.nodeId,
@@ -285,11 +401,78 @@ function createMappingDraft(field: WorkflowNodeField, node: WorkflowNode, existi
     parameterName: existing?.parameterName || normalizeEnglishName(field.fieldName),
     label: existing?.label || field.label || field.fieldName,
     valueType: existing?.valueType || field.valueType || 'string',
-    description: existing?.description || field.description || '',
+    description: existing?.description || inferFieldDescription(field.fieldName, existing?.valueType || field.valueType || 'string', field.description || ''),
     defaultValue,
     defaultValueText: formatDefaultValueText(defaultValue),
-    required: existing?.required ?? false,
+    required: inferFieldRequired(existing?.parameterName || field.fieldName, defaultValue, existing?.required),
     options: existing?.options || field.options || [],
+  };
+}
+
+function summarizeInlinePreview(value: string, max = 72): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (compact.length <= max) {
+    return compact;
+  }
+  return `${compact.slice(0, max)}...`;
+}
+
+function buildMappingExampleValue(mapping: ComponentParameterMapping): unknown {
+  const key = mapping.parameterName.trim().toLowerCase();
+  if (mapping.valueType === 'number') {
+    if (typeof mapping.defaultValue === 'number') return mapping.defaultValue;
+    if (key.includes('duration') || key.includes('second')) return 120;
+    return 1;
+  }
+  if (mapping.valueType === 'boolean') {
+    return typeof mapping.defaultValue === 'boolean' ? mapping.defaultValue : true;
+  }
+  if (mapping.valueType === 'json') {
+    return mapping.defaultValue ?? {};
+  }
+  if (
+    typeof mapping.defaultValue === 'string'
+    && mapping.defaultValue.trim()
+    && !isLikelyLongPromptLikeField(mapping.parameterName)
+    && mapping.defaultValue.trim().length <= 48
+  ) {
+    return summarizeInlinePreview(mapping.defaultValue, 72);
+  }
+  if (key.includes('lyrics')) return '请填写歌词正文，支持分段换行';
+  if (key.includes('tag') || key.includes('prompt') || key.includes('style') || key.includes('desc')) {
+    return '请填写风格、情绪、乐器、节奏与演唱方式等描述';
+  }
+  if (key.includes('language')) return 'zh';
+  return `请填写${mapping.label || mapping.parameterName}`;
+}
+
+function buildPreviewExampleValues(draft: ComponentDefinition): Record<string, unknown> {
+  const requiredMappings = draft.workflow.parameterMappings.filter((mapping) => mapping.required);
+  const chosen = requiredMappings.length > 0
+    ? requiredMappings
+    : draft.workflow.parameterMappings.slice(0, 3);
+  return Object.fromEntries(chosen.map((mapping) => [mapping.parameterName, buildMappingExampleValue(mapping)]));
+}
+
+function buildRenderPreview(draft: ComponentDefinition): Record<string, unknown> {
+  return {
+    type: draft.componentType || 'ExactComponentType',
+    props: {
+      autoRun: false,
+      initialValues: buildPreviewExampleValues(draft),
+    },
+  };
+}
+
+function buildInvokePreview(draft: ComponentDefinition): Record<string, unknown> {
+  return {
+    type: 'ComponentInvokeAction',
+    props: {
+      componentName: draft.englishName || 'exact-component-name',
+      params: buildPreviewExampleValues(draft),
+      renderResult: draft.returnType !== 'text',
+      exposeToAgent: true,
+    },
   };
 }
 
@@ -377,6 +560,22 @@ export function ComponentCenterPage() {
       totalMappings,
     };
   }, [items]);
+
+  const aiUsagePreview = useMemo(() => {
+    const renderPreview = toPrettyJson(buildRenderPreview(draft));
+    const invokePreview = toPrettyJson(buildInvokePreview(draft));
+    const requiredParams = draft.workflow.parameterMappings
+      .filter((mapping) => mapping.required)
+      .map((mapping) => mapping.parameterName);
+    return {
+      renderType: draft.componentType || 'ExactComponentType',
+      invokeName: draft.englishName || 'exact-component-name',
+      requiredParams,
+      renderPreview,
+      invokePreview,
+      preferInvoke: draft.returnType !== 'text',
+    };
+  }, [draft]);
 
   const openCreate = (providerType: ComponentProviderType) => {
     setEditingKey(null);
@@ -501,6 +700,14 @@ export function ComponentCenterPage() {
       alert(t('components.editor.workflowRequired'));
       return;
     }
+    const requiredMappings = draft.workflow.parameterMappings.filter((mapping) => mapping.required);
+    if (
+      draft.returnType !== 'text'
+      && requiredMappings.length === 0
+      && !window.confirm('当前组件没有标记任何必填参数。媒体生成类组件如果没有必填参数，AI 很容易乱补字段并错误调用。确定仍然保存吗？')
+    ) {
+      return;
+    }
     setSaving(true);
     try {
       const payload: ComponentDefinition = {
@@ -512,6 +719,7 @@ export function ComponentCenterPage() {
       } else {
         await createComponentDefinition(payload);
       }
+      invalidateComponentSkillRuntimeCaches();
       setDialogOpen(false);
       await load();
     } catch (error) {
@@ -527,6 +735,7 @@ export function ComponentCenterPage() {
     }
     try {
       await deleteComponentDefinition(englishName);
+      invalidateComponentSkillRuntimeCaches();
       await load();
     } catch (error) {
       alert(error instanceof Error ? error.message : t('components.deleteFailed'));
@@ -583,6 +792,11 @@ export function ComponentCenterPage() {
                   <span>{t('components.labels.componentType')}: {item.componentType}</span>
                   <span>{t('components.labels.nodeCount', { count: item.workflow.nodes.length })}</span>
                   <span>{t('components.labels.mappingCount', { count: item.workflow.parameterMappings.length })}</span>
+                </div>
+                <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 px-3 py-2 text-xs text-foreground-secondary">
+                  AI 渲染 type: <span className="font-mono text-foreground">{item.componentType}</span>
+                  {' · '}
+                  AI 调用 componentName: <span className="font-mono text-foreground">{item.englishName}</span>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -678,6 +892,40 @@ export function ComponentCenterPage() {
                   <div className="grid gap-2 md:col-span-2">
                     <Label>{t('components.editor.descriptionLabel')}</Label>
                     <Textarea value={draft.description} onChange={(event) => setDraft((prev) => ({ ...prev, description: event.target.value }))} className="min-h-[88px]" />
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="border-border-light/40 shadow-none">
+                <CardHeader>
+                  <CardTitle className="text-base">AI 使用预览</CardTitle>
+                </CardHeader>
+                <CardContent className="grid gap-4">
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 p-4">
+                      <div className="text-xs font-medium uppercase tracking-[0.18em] text-foreground-tertiary">渲染通道</div>
+                      <div className="mt-2 text-sm text-foreground-secondary">当参数还不完整，或者你想让 AI 先把组件卡片展示出来时使用。</div>
+                      <div className="mt-3 text-sm text-foreground">type 必须精确写成 <span className="font-mono">{aiUsagePreview.renderType}</span></div>
+                    </div>
+                    <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 p-4">
+                      <div className="text-xs font-medium uppercase tracking-[0.18em] text-foreground-tertiary">调用通道</div>
+                      <div className="mt-2 text-sm text-foreground-secondary">当参数已经齐全，且希望 AI 直接发起生成并把结果回填聊天时使用。</div>
+                      <div className="mt-3 text-sm text-foreground">componentName 必须精确写成 <span className="font-mono">{aiUsagePreview.invokeName}</span></div>
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-4 text-sm leading-6 text-emerald-900">
+                    推荐策略：{aiUsagePreview.preferInvoke ? '图片 / 视频 / 音频组件在参数齐全时优先走调用通道，并设置 renderResult=true；参数不全时再走渲染通道。' : '文本类组件通常可以直接调用；如果需要用户补参或想先展示表单，再走渲染通道。'}
+                    {aiUsagePreview.requiredParams.length > 0 ? ` 当前必填参数：${aiUsagePreview.requiredParams.join('、')}` : ' 当前还没有标记必填参数，这会显著增加 AI 乱补字段和错误调用的概率。'}
+                  </div>
+                  <div className="grid gap-4 xl:grid-cols-2">
+                    <div className="grid gap-2">
+                      <Label>渲染通道 UI_JSON 示例</Label>
+                      <Textarea value={aiUsagePreview.renderPreview} readOnly className="min-h-[220px] font-mono text-xs" />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label>调用通道 UI_JSON 示例</Label>
+                      <Textarea value={aiUsagePreview.invokePreview} readOnly className="min-h-[220px] font-mono text-xs" />
+                    </div>
                   </div>
                 </CardContent>
               </Card>
@@ -927,6 +1175,8 @@ export function ComponentCenterPage() {
                       <div className="grid gap-3">
                         {(selectedNode?.fields || []).map((field) => {
                           const mapping = draft.workflow.parameterMappings.find((item) => item.nodeId === selectedNode?.nodeId && item.fieldName === field.fieldName);
+                          const recommendedRequired = inferFieldRequired(field.fieldName, sanitizeImportedDefaultValue(field.fieldName, field.defaultValue));
+                          const ignoredLongDefault = wasLongDefaultValueIgnored(field.fieldName, field.defaultValue);
                           return (
                             <div key={field.fieldName} className="rounded-2xl border border-border-light/50 bg-background p-4">
                               <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -936,6 +1186,18 @@ export function ComponentCenterPage() {
                                   <div className="flex flex-wrap items-center gap-2 text-[11px] text-foreground-tertiary">
                                     <span>{t('components.editor.fieldType')}: {field.valueType}</span>
                                     {field.options.length > 0 ? <span>{t('components.editor.fieldOptions', { count: field.options.length })}</span> : null}
+                                    <span>角色: {getMappingRoleLabel(field.fieldName)}</span>
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    {recommendedRequired ? (
+                                      <Badge variant="secondary" className="text-[10px]">建议必填</Badge>
+                                    ) : null}
+                                    {ignoredLongDefault ? (
+                                      <Badge variant="outline" className="text-[10px]">长默认值已忽略</Badge>
+                                    ) : null}
+                                  </div>
+                                  <div className="text-[11px] leading-5 text-foreground-tertiary">
+                                    {getMappingRoleHint(field.fieldName)}
                                   </div>
                                 </div>
                                 <div className="flex items-center gap-2">
@@ -966,6 +1228,17 @@ export function ComponentCenterPage() {
                                 {mapping.nodeId} / {mapping.fieldName} → {mapping.parameterName}
                               </div>
                               <div className="text-xs text-foreground-tertiary">{mapping.description || t('components.editor.noMappingDescription')}</div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge variant={mapping.required ? 'default' : 'outline'} className="text-[10px]">
+                                  {mapping.required ? '必填' : '可选'}
+                                </Badge>
+                                <Badge variant="secondary" className="text-[10px]">
+                                  {getMappingRoleLabel(mapping.parameterName || mapping.fieldName)}
+                                </Badge>
+                                {wasLongDefaultValueIgnored(mapping.parameterName || mapping.fieldName, mapping.defaultValue) ? (
+                                  <Badge variant="outline" className="text-[10px]">长默认值已忽略</Badge>
+                                ) : null}
+                              </div>
                             </div>
                             <div className="flex items-center gap-2">
                               <Badge variant="outline">{mapping.valueType}</Badge>
@@ -1065,6 +1338,13 @@ export function ComponentCenterPage() {
                 />
                 <div className="rounded-2xl border border-amber-200/70 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
                   {t('components.editor.defaultValueLockedDesc')}
+                </div>
+                <div className="rounded-2xl border border-sky-200/70 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">
+                  <div>字段角色：{getMappingRoleLabel(mappingDraft.parameterName || mappingDraft.fieldName)}</div>
+                  <div>{getMappingRoleHint(mappingDraft.parameterName || mappingDraft.fieldName)}</div>
+                  {wasLongDefaultValueIgnored(mappingDraft.parameterName || mappingDraft.fieldName, mappingDraft.defaultValue) ? (
+                    <div>检测到工作流里带了长默认提示词，组件中心已自动忽略，避免技能生成时把默认文案误当成用户输入。</div>
+                  ) : null}
                 </div>
               </div>
               <div className="flex items-center justify-between rounded-2xl border border-border-light/50 bg-background-secondary/20 px-4 py-3">

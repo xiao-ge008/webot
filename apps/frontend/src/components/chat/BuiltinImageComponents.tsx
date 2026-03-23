@@ -22,7 +22,8 @@ import {
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
-import { getApiBaseUrl } from '@/services/transport';
+import { normalizeRuntimeAssetSource } from '@/lib/runtime-asset-url';
+import { getApiBaseUrl, getOpenFangBaseUrl } from '@/services/transport';
 import { requestJson } from '@/services/transport';
 
 interface GalleryImageItem {
@@ -60,7 +61,7 @@ function formatDurationLabel(totalSeconds: number): string {
 }
 
 function normalizeFileLikeUrl(raw: string): string {
-  const source = raw.trim();
+  const source = normalizeRuntimeAssetSource(raw);
   if (!source) return '';
   if (/^(https?:|data:|blob:|file:)/i.test(source)) {
     return source;
@@ -111,56 +112,87 @@ function buildOpenFangUploadProxyUrl(apiBaseUrl: string, source: string): string
   return `${normalizedBase}/api/management/media/openfang-upload?source=${encodeURIComponent(source)}`;
 }
 
-function useResolvedImageSrc(src: string): string {
-  const [resolved, setResolved] = React.useState(src);
+function buildOpenFangDirectImageUrl(openFangBaseUrl: string, source: string): string {
+  const normalizedBase = openFangBaseUrl.replace(/\/+$/, '');
+  if (/^https?:\/\/.+\/api\/uploads\//i.test(source.trim())) {
+    return source.trim();
+  }
+  const normalizedPath = source.startsWith('/') ? source : `/${source}`;
+  return `${normalizedBase}${normalizedPath}`;
+}
+
+function dedupeImageCandidates(candidates: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
+}
+
+function useResolvedImageCandidates(src: string): string[] {
+  const [resolved, setResolved] = React.useState<string[]>(() => dedupeImageCandidates([src]));
 
   React.useEffect(() => {
     let cancelled = false;
     const raw = src.trim();
+    const fallbackCandidates = dedupeImageCandidates([src]);
     if (!raw) {
-      setResolved(src);
+      setResolved(fallbackCandidates);
       return () => {
         cancelled = true;
       };
     }
 
     if (!shouldProxyRemoteImage(raw) && !shouldResolveBackendRelativeImage(raw)) {
-      setResolved(src);
+      setResolved(fallbackCandidates);
       return () => {
         cancelled = true;
       };
     }
 
-    if (shouldUseOpenFangBaseForImage(raw)) {
-      getApiBaseUrl()
-        .then((apiBaseUrl) => {
+    const resolveCandidates = async () => {
+      try {
+        if (shouldUseOpenFangBaseForImage(raw)) {
+          const [apiBaseUrl, openFangBaseUrl] = await Promise.all([
+            getApiBaseUrl(),
+            getOpenFangBaseUrl().catch(() => ''),
+          ]);
           if (cancelled) return;
-          // OpenFang uploads are more stable through the local management relay.
-          setResolved(buildOpenFangUploadProxyUrl(apiBaseUrl, raw));
-        })
-        .catch(() => {
-          if (cancelled) return;
-          setResolved(src);
-        });
-
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    getApiBaseUrl()
-      .then((baseUrl) => {
-        if (cancelled) return;
-        if (shouldResolveBackendRelativeImage(raw)) {
-          setResolved(buildBackendImageUrl(baseUrl, raw));
+          setResolved(dedupeImageCandidates([
+            buildOpenFangUploadProxyUrl(apiBaseUrl, raw),
+            openFangBaseUrl ? buildOpenFangDirectImageUrl(openFangBaseUrl, raw) : '',
+            shouldResolveBackendRelativeImage(raw) ? buildBackendImageUrl(apiBaseUrl, raw) : '',
+            src,
+          ]));
           return;
         }
-        setResolved(buildImageProxyUrl(baseUrl, raw));
-      })
-      .catch(() => {
+
+        const baseUrl = await getApiBaseUrl();
         if (cancelled) return;
-        setResolved(src);
-      });
+        if (shouldResolveBackendRelativeImage(raw)) {
+          setResolved(dedupeImageCandidates([
+            buildBackendImageUrl(baseUrl, raw),
+            src,
+          ]));
+          return;
+        }
+        setResolved(dedupeImageCandidates([
+          buildImageProxyUrl(baseUrl, raw),
+          src,
+        ]));
+      } catch {
+        if (cancelled) return;
+        setResolved(fallbackCandidates);
+      }
+    };
+
+    void resolveCandidates();
 
     return () => {
       cancelled = true;
@@ -172,8 +204,23 @@ function useResolvedImageSrc(src: string): string {
 
 function ProxyImage(props: React.ImgHTMLAttributes<HTMLImageElement>) {
   const src = typeof props.src === 'string' ? props.src : '';
-  const resolvedSrc = useResolvedImageSrc(src);
-  return <img {...props} src={resolvedSrc} />;
+  const resolvedCandidates = useResolvedImageCandidates(src);
+  const [activeIndex, setActiveIndex] = React.useState(0);
+  const joinedCandidates = resolvedCandidates.join('\n');
+
+  React.useEffect(() => {
+    setActiveIndex(0);
+  }, [joinedCandidates]);
+
+  const activeSrc = resolvedCandidates[Math.min(activeIndex, Math.max(0, resolvedCandidates.length - 1))] || src;
+  const handleError = React.useCallback((event: React.SyntheticEvent<HTMLImageElement, Event>) => {
+    props.onError?.(event);
+    setActiveIndex((current) => (
+      current + 1 < resolvedCandidates.length ? current + 1 : current
+    ));
+  }, [props, resolvedCandidates.length]);
+
+  return <img {...props} src={activeSrc} onError={handleError} />;
 }
 
 function normalizeGalleryItems(props: Record<string, unknown>): GalleryImageItem[] {
@@ -211,7 +258,7 @@ function normalizeGalleryItems(props: Record<string, unknown>): GalleryImageItem
         src: normalizeFileLikeUrl(rawSrc),
         rawSrc,
         title: toSafeText(record.title),
-        description: toSafeText(record.description) || toSafeText(record.subtitle),
+        description: toSafeText(record.description) || toSafeText(record.caption) || toSafeText(record.subtitle),
         alt: toSafeText(record.alt) || toSafeText(record.title) || `image-${index + 1}`,
       };
     })
@@ -230,7 +277,7 @@ function normalizeGalleryItems(props: Record<string, unknown>): GalleryImageItem
     src: normalizeFileLikeUrl(rawSingle),
     rawSrc: rawSingle,
     title: toSafeText(props.title),
-    description: toSafeText(props.description),
+    description: toSafeText(props.description) || toSafeText(props.caption),
     alt: toSafeText(props.alt) || toSafeText(props.title) || 'image',
   }];
 }
@@ -1354,8 +1401,12 @@ export function GenUIImageCover(ctx: any) {
   const hasMultiple = images.length > 1;
   const height = toNumber(props.height, hasMultiple ? 132 : 156);
   const width = toNumber(props.width, 0);
+  const explicitHeight = typeof props.height === 'number' && Number.isFinite(props.height) && props.height > 0;
+  const explicitWidth = typeof props.width === 'number' && Number.isFinite(props.width) && props.width > 0;
   const itemWidth = clamp(toNumber(props.itemWidth, 168), 96, 280);
+  const maxWidth = clamp(toNumber(props.maxWidth, 360), 180, 640);
   const radius = toNumber(props.radius, 16);
+  const singleAspectRatio = resolveAspectRatio(props.aspectRatio, 3 / 4);
   const fit = toSafeText(props.fit, 'cover') || 'cover';
   const showCaption = props.showCaption !== false;
   const {
@@ -1447,23 +1498,40 @@ export function GenUIImageCover(ctx: any) {
 
   return (
     <div className="w-full space-y-2">
-      <button
-        type="button"
-        className="group relative w-full overflow-hidden border border-border/60 bg-card/40 hover:border-border transition-all"
-        style={{
-          height: `${Math.max(92, height)}px`,
-          width: width > 0 ? `${width}px` : '100%',
-          borderRadius: `${Math.max(6, radius)}px`,
-        }}
-        onClick={() => handleClick(item, 0)}
+      <div
+        className="group relative overflow-hidden border border-border/60 bg-card/40 shadow-sm hover:border-border transition-all"
+        style={(() => {
+          const nextStyle: React.CSSProperties = {
+            width: explicitWidth ? `${width}px` : `min(100%, ${maxWidth}px)`,
+            maxWidth: '100%',
+            borderRadius: `${Math.max(6, radius)}px`,
+          };
+
+          if (explicitHeight) {
+            nextStyle.height = `${Math.max(92, height)}px`;
+          } else {
+            nextStyle.aspectRatio = `${singleAspectRatio}`;
+            nextStyle.minHeight = '220px';
+          }
+
+          return nextStyle;
+        })()}
       >
-        <ProxyImage
-          src={item.src}
-          alt={item.alt}
-          className="h-full w-full transition-transform duration-300 group-hover:scale-[1.02]"
-          style={{ objectFit: fit as any }}
-        />
-        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/45 via-black/5 to-transparent opacity-90" />
+        <button
+          type="button"
+          className="absolute inset-0 block h-full w-full overflow-hidden"
+          style={{ borderRadius: `${Math.max(6, radius)}px` }}
+          onClick={() => handleClick(item, 0)}
+          aria-label={item.title || item.alt || '打开图片'}
+        >
+          <ProxyImage
+            src={item.src}
+            alt={item.alt}
+            className="h-full w-full transition-transform duration-500 group-hover:scale-[1.025]"
+            style={{ objectFit: fit as any }}
+          />
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/70 via-black/12 to-transparent opacity-95" />
+        </button>
         <div className="absolute right-2 top-2 flex items-center gap-2">
           <Button
             type="button"
@@ -1492,12 +1560,12 @@ export function GenUIImageCover(ctx: any) {
           </Button>
         </div>
         {(item.title || item.description) && showCaption ? (
-          <div className="absolute left-0 right-0 bottom-0 px-3 py-2 text-left">
-            {item.title ? <div className="text-xs font-semibold text-white truncate">{item.title}</div> : null}
-            {item.description ? <div className="text-[11px] text-white/80 truncate">{item.description}</div> : null}
+          <div className="absolute left-0 right-0 bottom-0 px-3 py-3 text-left">
+            {item.title ? <div className="text-sm font-semibold leading-5 text-white line-clamp-2">{item.title}</div> : null}
+            {item.description ? <div className="mt-1 text-xs leading-5 text-white/82 line-clamp-2">{item.description}</div> : null}
           </div>
         ) : null}
-      </button>
+      </div>
 
       <ImagePreviewDialog
         open={open}

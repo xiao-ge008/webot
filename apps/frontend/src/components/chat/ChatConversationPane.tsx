@@ -21,11 +21,14 @@ import {
   Trash2,
   ListChecks,
   Gauge,
+  Volume2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
+  cleanupAssistantText,
   containsUiJsonTag,
   extractAgentSelfAppearanceActionFromSpec,
+  extractComponentInvokeActionFromSpec,
   extractUiRawText,
   getBestEffortUiJsonBlocks,
   looksLikeProtocolOnlyText,
@@ -36,17 +39,20 @@ import {
 } from '@/components/chat/chat-page-helpers';
 import { ChatMessageList } from '@/components/chat/ChatMessageList';
 import { ChatAttachmentDeck } from '@/components/chat/ChatAttachmentDeck';
+import { GenUIAudioPlayer } from '@/components/chat/BuiltinAudioComponents';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Agent } from '@/types';
 import type { ChatAttachment, Message, MessageTrace } from '@/data/mock-chats';
 import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task';
 import type { A2AWorkCardData } from '@/types/a2a';
+import type { AgentTtsSynthesisResult } from '@/types/tts';
 import { DynamicUIRenderer } from '@/components/chat/DynamicUIRenderer';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { uploadManagementAgentChatAsset } from '@/services/management-client';
+import { getTtsStatus, synthesizeAgentTts } from '@/services/tts-client';
 import { analyzeAndCacheChatImageWithLocalVision } from '@/services/local-vision-service';
 import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 import { canOpenAttachmentWithSystem, isDesktopFileOpenSupported, openAttachmentWithSystem } from '@/services/desktop-file-client';
@@ -238,6 +244,36 @@ interface ComposerAttachmentDraft {
   localVisionModel?: string;
   previewUrl?: string;
   error?: string;
+}
+
+interface MessageTtsPlaybackState {
+  status: 'loading' | 'ready' | 'error';
+  result?: AgentTtsSynthesisResult;
+  error?: string;
+  playing?: boolean;
+  playSignal?: number;
+  stopSignal?: number;
+}
+
+interface MessageTtsTriggerState {
+  tagged: boolean;
+  cleanText: string;
+}
+
+function normalizeMessageTtsTag(value: string | undefined): string {
+  const normalized = (value || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  return normalized || 'speaker';
+}
+
+function parseMessageTtsTrigger(text: string, tagName: string): MessageTtsTriggerState {
+  const normalizedTag = normalizeMessageTtsTag(tagName);
+  const pattern = new RegExp(`</?${normalizedTag}\\s*/?>`, 'gi');
+  const tagged = pattern.test(text);
+  const cleanText = text.replace(pattern, ' ').replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim();
+  return {
+    tagged,
+    cleanText,
+  };
 }
 
 function estimateAttachmentPromptChars(attachments: ComposerAttachmentDraft[]): number {
@@ -591,6 +627,8 @@ export function ChatConversationPane({
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
   const [localVisionResolving, setLocalVisionResolving] = useState(false);
   const [apiBaseUrl, setApiBaseUrl] = useState<string>('');
+  const [messageTtsMap, setMessageTtsMap] = useState<Record<string, MessageTtsPlaybackState>>({});
+  const [globalTtsEnabled, setGlobalTtsEnabled] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const autoStickToBottomRef = useRef(true);
@@ -599,6 +637,8 @@ export function ChatConversationPane({
   const imageInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerAttachmentsRef = useRef<ComposerAttachmentDraft[]>([]);
+  const messageTtsAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const autoTriggeredTtsMessageIdsRef = useRef<Set<string>>(new Set());
   const isDesktopRuntime = isTauriRuntime();
   const desktopFileOpenSupported = isDesktopFileOpenSupported();
 
@@ -619,6 +659,37 @@ export function ChatConversationPane({
       active = false;
     };
   }, []);
+  useEffect(() => {
+    setMessageTtsMap({});
+    autoTriggeredTtsMessageIdsRef.current.clear();
+    for (const controller of messageTtsAbortControllersRef.current.values()) {
+      controller.abort();
+    }
+    messageTtsAbortControllersRef.current.clear();
+  }, [agent.id, conversationKey]);
+  useEffect(() => () => {
+    for (const controller of messageTtsAbortControllersRef.current.values()) {
+      controller.abort();
+    }
+    messageTtsAbortControllersRef.current.clear();
+  }, []);
+  useEffect(() => {
+    let active = true;
+    getTtsStatus()
+      .then((next) => {
+        if (active) {
+          setGlobalTtsEnabled(Boolean(next.config.enabled));
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setGlobalTtsEnabled(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [agent.id]);
   const draftCharCount = useMemo(
     () => inputValue.trim().length + estimateAttachmentPromptChars(composerAttachments),
     [composerAttachments, inputValue],
@@ -1278,14 +1349,22 @@ export function ChatConversationPane({
     );
   }, []);
 
-  const renderLoadingCard = useCallback((uiRawText?: string, uiStreamState?: 'idle' | 'streaming' | 'ready') => {
-    const stageText = uiStreamState === 'streaming'
-      ? '正在接收 UI 数据流…'
-      : uiStreamState === 'ready'
-        ? '正在渲染卡片组件…'
-        : uiRawText
-          ? '正在解析卡片结构…'
-          : '等待卡片数据…';
+  const renderLoadingCard = useCallback((msg: Message) => {
+    const stageText = msg.pendingComponentName
+      ? (
+        msg.pendingComponentKind === 'video'
+          ? `组件 ${msg.pendingComponentName} 正在生成视频…`
+          : `组件 ${msg.pendingComponentName} 正在执行中…`
+      )
+      : msg.uiStreamState === 'streaming'
+        ? '正在接收 UI 数据流…'
+        : msg.uiStreamState === 'ready'
+          ? '正在渲染卡片组件…'
+          : msg.uiRawText
+            ? '正在解析卡片结构…'
+            : '等待卡片数据…';
+    const previewUrl = normalizeLocalManagementAssetUrl(apiBaseUrl, msg.pendingComponentPreviewUrl);
+    const elapsedMs = msg.generationStartedAt != null ? Math.max(0, nowMs - msg.generationStartedAt) : 0;
     return (
       <Card className="mt-2 border-border/60 shadow-none bg-muted/10">
         <CardHeader className="pb-2">
@@ -1295,16 +1374,37 @@ export function ChatConversationPane({
           </CardTitle>
         </CardHeader>
         <CardContent className="pt-0 space-y-3">
-          <div className="chat-card-loading-shell">
-            <div className="chat-card-loading-shimmer" />
-            <div className="chat-card-loading-line w-[86%]" />
-            <div className="chat-card-loading-line w-[64%]" />
-            <div className="chat-card-loading-line w-[72%]" />
+          {previewUrl ? (
+            <div className="relative overflow-hidden rounded-xl border border-border/60 bg-black/85">
+              <img
+                src={previewUrl}
+                alt={msg.pendingComponentName || 'pending-preview'}
+                className="h-44 w-full object-cover opacity-70"
+              />
+              <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <div className="flex items-center gap-2 rounded-full border border-white/20 bg-black/45 px-4 py-2 text-sm text-white shadow-sm backdrop-blur-sm">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span>{msg.pendingComponentKind === 'video' ? '视频生成中' : '处理中'}</span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="chat-card-loading-shell">
+              <div className="chat-card-loading-shimmer" />
+              <div className="chat-card-loading-line w-[86%]" />
+              <div className="chat-card-loading-line w-[64%]" />
+              <div className="chat-card-loading-line w-[72%]" />
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+            <span>{msg.pendingComponentKind === 'video' ? '任务已提交到组件服务，结果会异步回填。' : '任务正在后台执行，结果会自动回填。'}</span>
+            {elapsedMs > 0 ? <span>已等待 {formatElapsed(elapsedMs)}</span> : null}
           </div>
         </CardContent>
       </Card>
     );
-  }, []);
+  }, [apiBaseUrl, formatElapsed, nowMs]);
 
   const taskStageLabel = useCallback((stage: ChatTaskCardData['stage']): string => {
     if (stage === 'proposal') return '待确认';
@@ -1871,6 +1971,12 @@ export function ChatConversationPane({
       .flatMap((item) => buildRuntimeLogRows(item))
       .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime()), [buildRuntimeLogRows]);
 
+  const ttsTriggerTag = normalizeMessageTtsTag(agent.ttsConfig?.messageTag);
+  const agentTtsAvailable = globalTtsEnabled && Boolean(agent.ttsConfig?.enabled);
+  const getMessageTtsTrigger = useCallback((msg: Message): MessageTtsTriggerState => {
+    return parseMessageTtsTrigger(cleanupAssistantText(msg.text || '', msg.spec), ttsTriggerTag);
+  }, [ttsTriggerTag]);
+
   const renderProcessPanel = useCallback((key: string, items: Message[]) => {
     if (!items.some((item) => hasRuntimeLogData(item))) {
       return null;
@@ -1879,7 +1985,7 @@ export function ChatConversationPane({
   }, [buildRuntimeLogRowsForMessages, renderTraceBlock]);
 
   const hasMeaningfulMarkdownText = useCallback((msg: Message): boolean => {
-    const text = (msg.text || '').trim();
+    const text = getMessageTtsTrigger(msg).cleanText;
     if (!text) return false;
     if (
       msg.spec != null
@@ -1888,11 +1994,18 @@ export function ChatConversationPane({
       return false;
     }
     return !looksLikeProtocolOnlyText(text);
-  }, []);
+  }, [getMessageTtsTrigger]);
+
+  const getDisplayMarkdownText = useCallback((msg: Message): string => {
+    return getMessageTtsTrigger(msg).cleanText;
+  }, [getMessageTtsTrigger]);
 
   const getRenderableUiSpec = useCallback((spec: unknown): unknown | undefined => {
-    const appearanceAction = extractAgentSelfAppearanceActionFromSpec(spec);
-    return appearanceAction ? appearanceAction.strippedSpec : spec;
+    const normalizedSpec = normalizeIncomingSpec(spec);
+    const appearanceAction = extractAgentSelfAppearanceActionFromSpec(normalizedSpec);
+    const withoutAppearance = appearanceAction ? appearanceAction.strippedSpec : normalizedSpec;
+    const componentAction = extractComponentInvokeActionFromSpec(withoutAppearance);
+    return componentAction ? componentAction.strippedSpec : withoutAppearance;
   }, []);
 
   const hasRenderableMessageContent = useCallback((msg: Message): boolean => {
@@ -1917,9 +2030,8 @@ export function ChatConversationPane({
     if (isUser) return false;
     if (msg.spec != null) return false;
     if (!(msg.cardPending || msg.uiStreamState === 'streaming')) return false;
-    if (hasMeaningfulMarkdownText(msg)) return false;
     return true;
-  }, [hasMeaningfulMarkdownText]);
+  }, []);
 
   type MixedRenderSegment =
     | { kind: 'markdown'; content: string }
@@ -1946,7 +2058,7 @@ export function ChatConversationPane({
       const jsonBlock = block.payload;
       if (jsonBlock) {
         const parsed = parseJsonSafely<unknown>(repairUiJsonString(jsonBlock));
-        const spec = getRenderableUiSpec(normalizeIncomingSpec(parsed));
+        const spec = getRenderableUiSpec(parsed ?? jsonBlock);
         if (spec != null) {
           segments.push({ kind: 'ui', spec });
           matchedUiCount += 1;
@@ -2023,7 +2135,7 @@ export function ChatConversationPane({
     const hasMarkdown = hasMeaningfulMarkdownText(msg);
     const markdownContent = isUser
       ? (msg.text || '')
-      : (hasMarkdown ? (msg.text || '') : '');
+      : (hasMarkdown ? getDisplayMarkdownText(msg) : '');
 
     return Boolean(
       markdownContent
@@ -2031,6 +2143,7 @@ export function ChatConversationPane({
       || (!isUser && (msg.a2aCards?.length ?? 0) > 0),
     );
   }, [
+    getDisplayMarkdownText,
     getMessageMixedSegments,
     hasMeaningfulMarkdownText,
     shouldRenderCardForMessage,
@@ -2079,6 +2192,148 @@ export function ChatConversationPane({
     return resolved ?? attachments;
   }, [agent.id, apiBaseUrl]);
 
+  const resolveMessageTtsAssetUrl = useCallback((msg: Message, result: AgentTtsSynthesisResult): string | undefined => {
+    const normalizedExistingAssetUrl = normalizeLocalManagementAssetUrl(apiBaseUrl, result.assetUrl);
+    const fallbackStableAssetUrl = buildStableChatAttachmentAssetUrl(
+      apiBaseUrl,
+      msg.agentId || agent.id,
+      result.relativePath,
+    );
+    return normalizedExistingAssetUrl || fallbackStableAssetUrl;
+  }, [agent.id, apiBaseUrl]);
+
+  const handleSynthesizeMessage = useCallback(async (msg: Message, options?: { autoPlay?: boolean }) => {
+    const targetAgentId = (msg.agentId || agent.id || '').trim();
+    const text = getDisplayMarkdownText(msg).trim();
+    if (!targetAgentId || !text) {
+      showAlert('当前消息没有可朗读的正文内容。', '生成语音失败');
+      return;
+    }
+
+    messageTtsAbortControllersRef.current.get(msg.id)?.abort();
+    const controller = new AbortController();
+    messageTtsAbortControllersRef.current.set(msg.id, controller);
+
+    setMessageTtsMap((prev) => ({
+      ...prev,
+      [msg.id]: {
+        status: 'loading',
+        result: prev[msg.id]?.result,
+        playSignal: prev[msg.id]?.playSignal ?? 0,
+        stopSignal: prev[msg.id]?.stopSignal ?? 0,
+      },
+    }));
+
+    try {
+      const result = await synthesizeAgentTts(targetAgentId, {
+        text,
+        speakerProfileId: msg.agentId && msg.agentId !== agent.id ? undefined : agent.ttsConfig?.speakerProfileId,
+        format: 'wav',
+        messageId: msg.id,
+        signal: controller.signal,
+      });
+      messageTtsAbortControllersRef.current.delete(msg.id);
+      setMessageTtsMap((prev) => ({
+        ...prev,
+        [msg.id]: {
+          status: 'ready',
+          result,
+          playing: Boolean(options?.autoPlay),
+          playSignal: (prev[msg.id]?.playSignal ?? 0) + 1,
+          stopSignal: prev[msg.id]?.stopSignal ?? 0,
+        },
+      }));
+    } catch (error) {
+      messageTtsAbortControllersRef.current.delete(msg.id);
+      if (controller.signal.aborted) {
+        setMessageTtsMap((prev) => {
+          const next = { ...prev };
+          delete next[msg.id];
+          return next;
+        });
+        return;
+      }
+      const message = error instanceof Error ? error.message : '生成语音失败，请稍后重试。';
+      setMessageTtsMap((prev) => ({
+        ...prev,
+        [msg.id]: {
+          status: 'error',
+          error: message,
+          playSignal: prev[msg.id]?.playSignal ?? 0,
+          stopSignal: prev[msg.id]?.stopSignal ?? 0,
+        },
+      }));
+      showAlert(message, '生成语音失败');
+    }
+  }, [agent.id, agent.ttsConfig?.speakerProfileId, getDisplayMarkdownText, showAlert]);
+
+  const stopMessageTtsGeneration = useCallback((messageId: string) => {
+    const controller = messageTtsAbortControllersRef.current.get(messageId);
+    if (controller) {
+      controller.abort();
+      messageTtsAbortControllersRef.current.delete(messageId);
+    }
+  }, []);
+
+  const toggleMessagePlayback = useCallback((msg: Message) => {
+    const state = messageTtsMap[msg.id];
+    if (state?.status === 'loading') {
+      stopMessageTtsGeneration(msg.id);
+      return;
+    }
+    if (state?.status === 'ready') {
+      if (state.playing) {
+        setMessageTtsMap((prev) => ({
+          ...prev,
+          [msg.id]: {
+            ...prev[msg.id],
+            status: 'ready',
+            playing: false,
+            stopSignal: (prev[msg.id]?.stopSignal ?? 0) + 1,
+          },
+        }));
+        return;
+      }
+      setMessageTtsMap((prev) => ({
+        ...prev,
+        [msg.id]: {
+          ...prev[msg.id],
+          status: 'ready',
+          playing: true,
+          playSignal: (prev[msg.id]?.playSignal ?? 0) + 1,
+        },
+      }));
+      return;
+    }
+    void handleSynthesizeMessage(msg, { autoPlay: true });
+  }, [handleSynthesizeMessage, messageTtsMap, stopMessageTtsGeneration]);
+
+  useEffect(() => {
+    if (!agentTtsAvailable) {
+      return;
+    }
+    for (const msg of messages) {
+      if (msg.streaming || !hasRenderableMessageContent(msg)) {
+        continue;
+      }
+      if (msg.role !== 'agent') {
+        continue;
+      }
+      const trigger = getMessageTtsTrigger(msg);
+      if (!trigger.tagged || !trigger.cleanText) {
+        continue;
+      }
+      if (messageTtsMap[msg.id]) {
+        continue;
+      }
+      if (autoTriggeredTtsMessageIdsRef.current.has(msg.id)) {
+        continue;
+      }
+      autoTriggeredTtsMessageIdsRef.current.add(msg.id);
+      void handleSynthesizeMessage(msg, { autoPlay: true });
+    }
+  }, [agentTtsAvailable, getMessageTtsTrigger, handleSynthesizeMessage, hasRenderableMessageContent, messageTtsMap, messages]);
+
   const renderMessageAttachments = useCallback((msg: Message, isUser: boolean) => {
     if (!msg.attachments || msg.attachments.length === 0) {
       return null;
@@ -2100,6 +2355,116 @@ export function ChatConversationPane({
     resolveMessageAttachments,
   ]);
 
+  const renderMessageActions = useCallback((msg: Message, isUser: boolean) => {
+    if (isUser || msg.role !== 'agent') {
+      return null;
+    }
+    const state = messageTtsMap[msg.id];
+    if (!state || state.status !== 'error' || !state.error) {
+      return null;
+    }
+    return (
+      <div className="flex max-w-full flex-wrap items-center gap-2">
+        <span className="max-w-full text-[11px] text-rose-500">{state.error}</span>
+      </div>
+    );
+  }, [messageTtsMap]);
+
+  const renderMessageMetaControl = useCallback((msg: Message, isUser: boolean) => {
+    if (isUser || msg.role !== 'agent' || !agentTtsAvailable) {
+      return null;
+    }
+    const trigger = getMessageTtsTrigger(msg);
+    const state = messageTtsMap[msg.id];
+    const shouldShow = trigger.tagged || Boolean(state);
+    if (!shouldShow || !trigger.cleanText) {
+      return null;
+    }
+    const title = state?.status === 'loading'
+      ? '停止生成语音'
+      : state?.playing
+        ? '停止播放'
+        : state?.status === 'ready'
+          ? '播放语音'
+          : trigger.tagged
+            ? '生成语音'
+            : '生成语音';
+    return (
+      <button
+        type="button"
+        className={cn(
+          'inline-flex h-5 w-5 items-center justify-center rounded-full border transition-colors',
+          state?.status === 'error'
+            ? 'border-rose-500/40 text-rose-500 hover:bg-rose-500/10'
+            : state?.status === 'loading' || state?.playing
+              ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15'
+              : 'border-border/60 text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+        )}
+        onClick={() => toggleMessagePlayback(msg)}
+        title={title}
+        aria-label={title}
+      >
+        {state?.status === 'loading' ? (
+          <Loader2 className="h-3 w-3 animate-spin" />
+        ) : state?.playing ? (
+          <Square className="h-2.5 w-2.5 fill-current" />
+        ) : (
+          <Volume2 className="h-3 w-3" />
+        )}
+      </button>
+    );
+  }, [agentTtsAvailable, getMessageTtsTrigger, messageTtsMap, toggleMessagePlayback]);
+
+  const renderMessageFooter = useCallback((msg: Message, isUser: boolean) => {
+    if (isUser) {
+      return null;
+    }
+    const state = messageTtsMap[msg.id];
+    if (!state || state.status !== 'ready' || !state.result) {
+      return null;
+    }
+    const playbackUrl = resolveMessageTtsAssetUrl(msg, state.result);
+    if (!playbackUrl) {
+      return null;
+    }
+    return (
+      <div className="w-full max-w-[420px] space-y-2">
+        <GenUIAudioPlayer
+          props={{
+            src: playbackUrl,
+            title: '语音回复',
+            subtitle: state.result.speakerName || msg.agentName || agent.name,
+            duration: state.result.durationSecs,
+            minimal: true,
+            showMpv: false,
+            playSignal: state.playSignal ?? 0,
+            stopSignal: state.stopSignal ?? 0,
+            onPlaybackChange: (playing: boolean) => {
+              setMessageTtsMap((prev) => {
+                const current = prev[msg.id];
+                if (!current || current.status !== 'ready' || current.playing === playing) {
+                  return prev;
+                }
+                return {
+                  ...prev,
+                  [msg.id]: {
+                    ...current,
+                    playing,
+                  },
+                };
+              });
+            },
+          }}
+        />
+        {state.result.warnings.length > 0 ? (
+          <div className="rounded-xl border border-amber-500/20 bg-amber-500/8 px-3 py-2 text-[11px] leading-5 text-amber-700">
+            {state.result.warnings.join('；')}
+          </div>
+        ) : null}
+      </div>
+    );
+  }, [agent.name, messageTtsMap, resolveMessageTtsAssetUrl]);
+
   const renderMessageBody = useCallback((
     msg: Message,
     isUser: boolean,
@@ -2110,8 +2475,8 @@ export function ChatConversationPane({
         <>
           {renderTaskCard(msg, msg.taskCard)}
           {msg.a2aCards && msg.a2aCards.length > 0 ? renderA2aCards(msg, msg.a2aCards) : null}
-          {msg.text?.trim() ? (
-            <MarkdownBlock className={cn('chat-markdown chat-markdown-agent mt-2')} content={msg.text} />
+          {getDisplayMarkdownText(msg).trim() ? (
+            <MarkdownBlock className={cn('chat-markdown chat-markdown-agent mt-2')} content={getDisplayMarkdownText(msg)} />
           ) : null}
         </>
       ) : (
@@ -2152,7 +2517,7 @@ export function ChatConversationPane({
         const hasMarkdown = hasMeaningfulMarkdownText(msg);
         const markdownContent = isUser
           ? (msg.text || '')
-          : (hasMarkdown ? (msg.text || '') : '');
+          : (hasMarkdown ? getDisplayMarkdownText(msg) : '');
         return (
           <>
             {!isUser && options?.includeProcessPanel !== false ? renderProcessPanel(msg.id, [msg]) : null}
@@ -2182,7 +2547,7 @@ export function ChatConversationPane({
       })()
       )}
       {shouldShowLoadingCardForMessage(msg, isUser) ? (
-        <div className="mt-3">{renderLoadingCard(msg.uiRawText, msg.uiStreamState)}</div>
+        <div className="mt-3">{renderLoadingCard(msg)}</div>
       ) : null}
       {!isUser && msg.meta && !msg.meta.startsWith('auto_dispatch:')
         ? <div className="mt-2 text-[11px] text-muted-foreground">{msg.meta}</div>
@@ -2190,6 +2555,7 @@ export function ChatConversationPane({
     </>
   ), [
     agent.id,
+    getDisplayMarkdownText,
     getMessageMixedSegments,
     getRenderableUiSpec,
     handleUiAction,
@@ -2234,7 +2600,11 @@ export function ChatConversationPane({
         ? ((previousMessage.agentId || previousMessage.agentName) === (msg.agentId || msg.agentName))
         : false;
 
-      const shouldKeepSeparateGroups = hasRuntimeLogData(previousMessage) || hasRuntimeLogData(msg);
+      const shouldKeepSeparateGroups =
+        hasRuntimeLogData(previousMessage)
+        || hasRuntimeLogData(msg)
+        || getMessageTtsTrigger(previousMessage).tagged
+        || getMessageTtsTrigger(msg).tagged;
       if (!isUser && !previousGroup.isUser && sameAgent && withinWindow && !shouldKeepSeparateGroups) {
         previousGroup.messages.push(msg);
         continue;
@@ -2243,7 +2613,7 @@ export function ChatConversationPane({
       groups.push({ id: msg.id, isUser, messages: [msg] });
     }
     return groups;
-  }, [stableMessages]);
+  }, [getMessageTtsTrigger, stableMessages]);
   const activeStreaming = useMemo(
     () => streamingMessage ?? messages.find((msg) => msg.streaming) ?? null,
     [messages, streamingMessage],
@@ -2347,7 +2717,10 @@ export function ChatConversationPane({
             traceRenderToken={traceRenderToken}
             scrollContainerRef={scrollRef}
             renderMessageBody={renderMessageBody}
+            renderMessageMetaControl={renderMessageMetaControl}
             renderMessageAttachments={renderMessageAttachments}
+            renderMessageActions={renderMessageActions}
+            renderMessageFooter={renderMessageFooter}
             hasMessageBubbleContent={hasMessageBubbleContent}
             renderProcessPanel={renderProcessPanel}
             canRegenerateAt={canRegenerateAt}

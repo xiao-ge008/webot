@@ -70,6 +70,10 @@ const HTML_TAGS = new Set([
   'ol',
   'li',
 ]);
+const HIDDEN_ACTION_TYPES = new Set([
+  'componentinvokeaction',
+  'agentselfappearanceaction',
+]);
 
 let babelStandalonePromise: Promise<any> | null = null;
 
@@ -473,6 +477,9 @@ function DynamicComponent(
 
 const GenUIFallback = (props: ComponentRenderProps & { agentId?: string; onAction?: (actionId: string, payload?: any) => void; messageId?: string }) => {
   const componentName = (props.element.type as string) || 'unknown';
+  if (HIDDEN_ACTION_TYPES.has(componentName.toLowerCase())) {
+    return null;
+  }
   if (HTML_TAGS.has(componentName.toLowerCase()) && !genUiComponents[componentName]) {
     return null;
   }

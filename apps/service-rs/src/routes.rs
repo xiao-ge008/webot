@@ -30,6 +30,7 @@ use crate::error::ApiError;
 use crate::image_generation;
 use crate::media_index::{self, PhotoIndexRequest};
 use crate::path_resolver;
+use crate::tts_management;
 use crate::vision_analysis;
 use crate::AppState;
 
@@ -181,6 +182,8 @@ fn ensure_nuwa_profile_defaults(agent_id: &str) -> Result<(), ApiError> {
         Some(DEFAULT_NUWA_AGENT_PORTRAIT_URL.to_string()),
         None,
         Some(DEFAULT_NUWA_AGENT_NAME.to_string()),
+        None,
+        None,
     )
     .map_err(storage_error)
 }
@@ -484,6 +487,10 @@ pub fn management_router() -> Router<Arc<AppState>> {
             "/agents/{id}/chat-assets/upload-inline",
             post(upload_agent_chat_asset_inline),
         )
+        .route(
+            "/agents/{id}/tts/synthesize",
+            post(synthesize_agent_tts),
+        )
         .route("/agents/{id}/portrait/{filename}", get(get_agent_portrait))
         .route("/agents/{id}/portrait/upload", post(upload_agent_portrait))
         .route(
@@ -589,6 +596,15 @@ pub fn management_router() -> Router<Arc<AppState>> {
             "/vision-analysis/model/{vendor}/{repo}/{*path}",
             get(vision_analysis::get_vision_analysis_model_file),
         )
+        .route(
+            "/tts/config",
+            get(tts_management::get_tts_config).put(tts_management::set_tts_config),
+        )
+        .route("/tts/status", get(tts_management::get_tts_status))
+        .route("/tts/download", post(tts_management::start_tts_download))
+        .route("/tts/install-runtime", post(tts_management::install_tts_runtime))
+        .route("/tts/load", post(tts_management::load_tts_engine))
+        .route("/tts/unload", post(tts_management::unload_tts_engine))
         .route(
             "/components",
             get(component_center::list_component_definitions)
@@ -1976,6 +1992,8 @@ fn apply_group_collaboration_acl(group_member_ids: &[String]) -> Result<(), Stri
             None,
             None,
             None,
+            None,
+            None,
         )?;
         assignment_store::replace_agent_collaboration_acl(id, "private", &callee_ids)?;
     }
@@ -2324,6 +2342,8 @@ struct ProfileOverridePatch {
     portrait_url: Option<String>,
     english_name: Option<String>,
     nickname: Option<String>,
+    tts_config: Option<Value>,
+    speaker_profiles: Option<Value>,
 }
 
 const COLLAB_TAG_DISCOVERABLE: &str = "webot:collab_discoverable";
@@ -2518,6 +2538,26 @@ fn extract_profile_override_patch(payload: &Value) -> ProfileOverridePatch {
         None
     };
 
+    let tts_config = if let Some(raw) = object.get("tts_config") {
+        match raw {
+            Value::Object(_) => Some(raw.clone()),
+            Value::Null => Some(Value::Null),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let speaker_profiles = if let Some(raw) = object.get("speaker_profiles") {
+        match raw {
+            Value::Array(_) => Some(raw.clone()),
+            Value::Null => Some(Value::Null),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     ProfileOverridePatch {
         tags,
         description,
@@ -2528,6 +2568,8 @@ fn extract_profile_override_patch(payload: &Value) -> ProfileOverridePatch {
         portrait_url,
         english_name,
         nickname,
+        tts_config,
+        speaker_profiles,
     }
 }
 
@@ -2575,6 +2617,12 @@ fn merge_agent_profile_override(
             display_name_override = Some(nickname.clone());
         }
     }
+    if let Some(tts_config) = &profile.tts_config {
+        object.insert("tts_config".to_string(), tts_config.clone());
+    }
+    if let Some(speaker_profiles) = &profile.speaker_profiles {
+        object.insert("speaker_profiles".to_string(), speaker_profiles.clone());
+    }
     if let Some(display_name) = display_name_override {
         object.insert("name".to_string(), Value::String(display_name));
     }
@@ -2621,7 +2669,7 @@ const KNOWN_CONTEXT_FILES: [&str; 8] = [
 ];
 
 #[derive(Debug, Clone)]
-struct AgentWorkspaceBinding {
+pub(crate) struct AgentWorkspaceBinding {
     server_name: String,
     private_workspace: PathBuf,
     shared_workspace: PathBuf,
@@ -2629,7 +2677,7 @@ struct AgentWorkspaceBinding {
 }
 
 impl AgentWorkspaceBinding {
-    fn all_workspaces(&self) -> Vec<PathBuf> {
+    pub(crate) fn all_workspaces(&self) -> Vec<PathBuf> {
         let mut output = Vec::with_capacity(2 + self.extra_workspaces.len());
         output.push(self.private_workspace.clone());
         output.push(self.shared_workspace.clone());
@@ -3438,7 +3486,7 @@ async fn resolve_agent_workspace_segment(
     ))
 }
 
-async fn resolve_agent_workspace_binding(
+pub(crate) async fn resolve_agent_workspace_binding(
     state: &Arc<AppState>,
     agent_id: &str,
     upstream_hint: Option<&Value>,
@@ -4423,6 +4471,8 @@ pub async fn create_agent(
                 None,
                 Some(english_name),
                 None,
+                None,
+                None,
             );
         }
         let workspace_result =
@@ -4618,6 +4668,8 @@ pub async fn update_agent_config(
         object.remove("nickname");
         object.remove("collaboration");
         object.remove("channel_binding");
+        object.remove("tts_config");
+        object.remove("speaker_profiles");
         if let Some(tags) = overrides.tags.as_ref() {
             object.insert("tags".to_string(), json!(tags));
         }
@@ -4634,6 +4686,8 @@ pub async fn update_agent_config(
         || overrides.portrait_url.is_some()
         || overrides.english_name.is_some()
         || overrides.nickname.is_some()
+        || overrides.tts_config.is_some()
+        || overrides.speaker_profiles.is_some()
     {
         assignment_store::upsert_agent_profile_override(
             &agent_id,
@@ -4646,6 +4700,8 @@ pub async fn update_agent_config(
             overrides.portrait_url,
             overrides.english_name,
             overrides.nickname,
+            overrides.tts_config,
+            overrides.speaker_profiles,
         )
         .map_err(storage_error)?;
     }
@@ -5082,6 +5138,8 @@ async fn persist_agent_system_prompt(
         None,
         None,
         Some(system_prompt.to_string()),
+        None,
+        None,
         None,
         None,
         None,
@@ -6043,6 +6101,12 @@ fn merge_profile_override_patch(base: &mut ProfileOverridePatch, incoming: Profi
     if incoming.nickname.is_some() {
         base.nickname = incoming.nickname;
     }
+    if incoming.tts_config.is_some() {
+        base.tts_config = incoming.tts_config;
+    }
+    if incoming.speaker_profiles.is_some() {
+        base.speaker_profiles = incoming.speaker_profiles;
+    }
 }
 
 fn escape_toml_string(value: &str) -> String {
@@ -6299,6 +6363,8 @@ pub async fn import_agent_bundle_upload(
             None,
             profile_patch.english_name.clone(),
             profile_patch.nickname.clone(),
+            None,
+            None,
         )
         .map_err(storage_error)?;
 
@@ -6364,6 +6430,8 @@ pub async fn import_agent_bundle_upload(
             profile_patch.portrait_url.clone(),
             profile_patch.english_name.clone(),
             profile_patch.nickname.clone(),
+            None,
+            None,
         )
         .map_err(storage_error)?;
 
@@ -6635,6 +6703,18 @@ pub struct UploadInlineImageRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTtsSynthesisRequest {
+    pub text: String,
+    #[serde(default)]
+    pub speaker_profile_id: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct AgentChatAssetFileQuery {
     pub path: String,
 }
@@ -6806,6 +6886,112 @@ pub async fn upload_agent_chat_asset_inline(
         "kind": kind,
         "mime_type": mime_type,
         "size": size,
+        "upstream_file_id": upstream_file_id,
+        "sha256": sha256
+    })))
+}
+
+fn map_tts_plan_error(message: String) -> ApiError {
+    let status = if message.contains("不能为空")
+        || message.contains("不存在")
+        || message.contains("缺少")
+        || message.contains("WAV")
+        || message.contains("样本")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::CONFLICT
+    };
+    ApiError::new(status, message)
+}
+
+pub async fn synthesize_agent_tts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<AgentTtsSynthesisRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let resolved = resolve_agent_id_alias(&state, &id).await?;
+    let agent_id = resolved.resolved;
+    let public_id = resolved.requested;
+    let output_format = payload
+        .format
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("wav");
+    if !output_format.eq_ignore_ascii_case("wav") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "当前本地 F5-TTS-ONNX 仅支持 WAV 输出，请将 format 设为 wav 或留空",
+        ));
+    }
+
+    let detail_path = format!("/api/agents/{agent_id}");
+    let detail = state.openfang.get_json(&detail_path).await?;
+    let binding = resolve_agent_workspace_binding(&state, &agent_id, Some(&detail)).await?;
+    let data_root = binding.private_workspace.join("data");
+    let plan = tts_management::build_local_f5_synthesis_plan(
+        &agent_id,
+        &data_root,
+        &payload.text,
+        payload.speaker_profile_id.as_deref(),
+    )
+    .await
+    .map_err(map_tts_plan_error)?;
+    let synthesis = tts_management::synthesize_local_f5(&plan)
+        .await
+        .map_err(|message| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+
+    let filename_hint = payload
+        .message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("tts-{value}.wav"))
+        .unwrap_or_else(|| "tts-reply.wav".to_string());
+
+    let (
+        mut asset_url,
+        filename,
+        relative_path,
+        saved_path,
+        _kind,
+        mime_type,
+        size,
+        upstream_file_id,
+        sha256,
+    ) = save_agent_chat_asset_bytes(
+        &state,
+        &agent_id,
+        Some(&filename_hint),
+        &synthesis.audio_bytes,
+        Some(&detail),
+    )
+    .await?;
+    if resolved.alias_used {
+        asset_url = build_agent_chat_asset_url(&public_id, &relative_path);
+    }
+
+    Ok(Json(json!({
+        "status": "ok",
+        "asset_url": asset_url,
+        "filename": filename,
+        "relative_path": relative_path,
+        "saved_path": saved_path,
+        "mime_type": mime_type,
+        "size": size,
+        "duration_secs": synthesis.duration_secs,
+        "sample_rate": synthesis.sample_rate,
+        "provider": synthesis.provider,
+        "engine": synthesis.engine,
+        "speaker_profile_id": synthesis.speaker_profile_id,
+        "speaker_name": synthesis.speaker_name,
+        "message_id": payload.message_id,
+        "requested_text": synthesis.requested_text,
+        "warnings": synthesis.warnings,
+        "device": synthesis.device,
+        "chunk_count": synthesis.chunk_count,
         "upstream_file_id": upstream_file_id,
         "sha256": sha256
     })))
@@ -7342,25 +7528,35 @@ pub async fn get_agent_skills(
         openfang_known_skill_names(&state, &agent_id).await?,
         &skill_aliases,
     );
-    let mut custom_available =
-        canonicalize_skill_names(global_custom_skill_names()?, &skill_aliases);
+    let (global_custom_skills, global_component_skills) = global_skill_name_groups()?;
+    let mut custom_available = canonicalize_skill_names(global_custom_skills, &skill_aliases);
+    let mut component_available =
+        canonicalize_skill_names(global_component_skills, &skill_aliases);
     let custom_available_set = custom_available
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let component_available_set = component_available
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
     custom_available.sort();
     custom_available.dedup();
+    component_available.sort();
+    component_available.dedup();
 
     let mut builtin_available: Vec<String> = runtime_available
         .iter()
         .filter(|name| !name.eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME))
         .filter(|name| !custom_available_set.contains(&name.to_ascii_lowercase()))
+        .filter(|name| !component_available_set.contains(&name.to_ascii_lowercase()))
         .cloned()
         .collect();
     builtin_available.sort();
     builtin_available.dedup();
 
     let mut available = custom_available.clone();
+    available.extend(component_available.iter().cloned());
     available.extend(builtin_available.iter().cloned());
     available.extend(runtime_available.iter().cloned());
     let mut assigned = canonicalize_skill_names(
@@ -7378,6 +7574,7 @@ pub async fn get_agent_skills(
         "mode": "allowlist",
         "runtime_available": runtime_available,
         "custom_available": custom_available,
+        "component_available": component_available,
         "builtin_available": builtin_available,
         "source": "assignment_store"
     })))
@@ -7410,7 +7607,12 @@ pub async fn set_agent_skills(
     let skill_aliases = skill_name_alias_map()?;
     desired = canonicalize_skill_names(desired, &skill_aliases);
 
-    let mut available = canonicalize_skill_names(global_custom_skill_names()?, &skill_aliases);
+    let (global_custom_skills, global_component_skills) = global_skill_name_groups()?;
+    let mut available = canonicalize_skill_names(global_custom_skills, &skill_aliases);
+    available.extend(canonicalize_skill_names(
+        global_component_skills,
+        &skill_aliases,
+    ));
     available.extend(canonicalize_skill_names(
         openfang_known_skill_names(&state, &agent_id).await?,
         &skill_aliases,
@@ -7728,7 +7930,12 @@ pub async fn set_agent_skill_toggle(
     };
 
     if payload.enabled {
-        let mut available = canonicalize_skill_names(global_custom_skill_names()?, &skill_aliases);
+        let (global_custom_skills, global_component_skills) = global_skill_name_groups()?;
+        let mut available = canonicalize_skill_names(global_custom_skills, &skill_aliases);
+        available.extend(canonicalize_skill_names(
+            global_component_skills,
+            &skill_aliases,
+        ));
         available.extend(canonicalize_skill_names(
             openfang_known_skill_names(&state, &agent_id).await?,
             &skill_aliases,
@@ -7985,6 +8192,11 @@ pub async fn list_global_skills(
             || local
                 .display_name
                 .eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME);
+        let is_component_skill = if is_ui_skill {
+            false
+        } else {
+            component_center::is_component_skill_dir(&local.path).unwrap_or(false)
+        };
         let source_type = runtime_entry
             .as_ref()
             .map(|entry| entry.source_type.clone())
@@ -8012,6 +8224,8 @@ pub async fn list_global_skills(
         let item_path = local.path.to_string_lossy().to_string();
         let item_source_type = if is_ui_skill {
             "ui".to_string()
+        } else if is_component_skill {
+            "component".to_string()
         } else {
             source_type.clone()
         };
@@ -8022,7 +8236,13 @@ pub async fn list_global_skills(
             "description": description,
             "path": item_path,
             "sourceType": item_source_type,
-            "category": if is_ui_skill { "system_ui" } else { "custom" },
+            "category": if is_ui_skill {
+                "system_ui"
+            } else if is_component_skill {
+                "component"
+            } else {
+                "custom"
+            },
             "isSystem": is_ui_skill,
             "isImported": imported_entry.is_some(),
             "canDelete": !is_ui_skill
@@ -10138,7 +10358,9 @@ async fn resolve_collaboration_prompt(
             "你当前可调用的员工白名单（仅以下对象允许委派）：",
             &lines.join("\n"),
             "严格规则：仅允许调用白名单中的智能体；禁止调用未授权对象。",
-            "结果要求：最终答复汇总每个子任务状态（工作中 / 已完成 / 失败）。",
+            "只有在你本轮确实调用了其他智能体进行委派时，最终答复才需要汇总各个子任务状态（工作中 / 已完成 / 失败）。",
+            "如果本轮没有实际发生任何委派，就禁止伪造“子任务状态”“子智能体状态”“协作状态汇总”等措辞。",
+            "普通单智能体回答、组件直接调用、组件异步执行回填、视频/音频/图片生成都不属于子任务委派；这类场景应直接描述组件执行状态，不要包装成子任务。",
         ]
         .join("\n"),
     ))
@@ -10973,6 +11195,8 @@ async fn apply_agent_self_appearance_update_from_text(
         None,
         avatar_url.clone(),
         portrait_url.clone(),
+        None,
+        None,
         None,
         None,
     )
@@ -13721,8 +13945,9 @@ async fn openfang_known_mcp_server_names(
     Ok(names)
 }
 
-fn global_custom_skill_names() -> Result<Vec<String>, ApiError> {
-    let mut names = Vec::new();
+fn global_skill_name_groups() -> Result<(Vec<String>, Vec<String>), ApiError> {
+    let mut custom_names = Vec::new();
+    let mut component_names = Vec::new();
     let skills_root = assignment_store::skills_root().map_err(storage_error)?;
     if skills_root.exists() {
         let dirs = list_child_dirs(&skills_root)
@@ -13739,13 +13964,19 @@ fn global_custom_skill_names() -> Result<Vec<String>, ApiError> {
             if display_name.eq_ignore_ascii_case(DEFAULT_UI_SKILL_NAME) {
                 continue;
             }
-            names.push(display_name);
+            if component_center::is_component_skill_dir(&skill_dir).unwrap_or(false) {
+                component_names.push(display_name);
+            } else {
+                custom_names.push(display_name);
+            }
         }
     }
 
-    names.sort();
-    names.dedup();
-    Ok(names)
+    custom_names.sort();
+    custom_names.dedup();
+    component_names.sort();
+    component_names.dedup();
+    Ok((custom_names, component_names))
 }
 
 fn skill_name_alias_map() -> Result<HashMap<String, String>, ApiError> {

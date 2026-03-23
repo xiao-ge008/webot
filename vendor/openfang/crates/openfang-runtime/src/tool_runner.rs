@@ -417,7 +417,9 @@ pub async fn execute_tool(
         }
 
         // TTS/STT tools
-        "text_to_speech" => tool_text_to_speech(input, tts_engine, workspace_root).await,
+            "text_to_speech" => {
+                tool_text_to_speech(input, tts_engine, workspace_root, caller_agent_id).await
+            }
         "speech_to_text" => tool_speech_to_text(input, media_engine, workspace_root).await,
 
         // Docker sandbox tool
@@ -1343,13 +1345,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- TTS/STT tools ---
         ToolDefinition {
             name: "text_to_speech".to_string(),
-            description: "Convert text to speech audio. Auto-selects OpenAI or ElevenLabs. Saves audio to workspace output/ directory.".to_string(),
+            description: "Convert text to speech audio. Prefers Webot local TTS when available, otherwise falls back to configured OpenAI/ElevenLabs runtime TTS. Local F5-TTS-ONNX currently outputs WAV and returns a playable asset URL.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "The text to convert to speech (max 4096 chars)" },
-                    "voice": { "type": "string", "description": "Voice name: 'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer' (default: 'alloy')" },
-                    "format": { "type": "string", "description": "Output format: 'mp3', 'opus', 'aac', 'flac' (default: 'mp3')" }
+                    "voice": { "type": "string", "description": "Voice name for remote providers, or local speaker profile ID when Webot local TTS is enabled. If omitted, the agent default voice/sample is used." },
+                    "format": { "type": "string", "description": "Preferred output format. Webot local F5-TTS-ONNX will automatically coerce unsupported formats to 'wav'." }
                 },
                 "required": ["text"]
             }),
@@ -4321,14 +4323,38 @@ async fn tool_text_to_speech(
     input: &serde_json::Value,
     tts_engine: Option<&crate::tts::TtsEngine>,
     workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
-    let engine =
-        tts_engine.ok_or("TTS engine not available. Ensure tts.enabled=true in config.")?;
     let text = input["text"].as_str().ok_or("Missing 'text' parameter")?;
     let voice = input["voice"].as_str();
     let format = input["format"].as_str();
 
-    let result = engine.synthesize(text, voice, format).await?;
+    let local_tts_error = match synthesize_via_webot_local_tts(input, caller_agent_id).await {
+        Ok(Some(result)) => return Ok(result),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+
+    let engine = tts_engine.ok_or_else(|| {
+        if let Some(local_error) = local_tts_error.as_ref() {
+            format!(
+                "Webot local TTS failed and runtime TTS engine is unavailable: {local_error}"
+            )
+        } else {
+            "TTS engine not available. Configure Webot local TTS or enable runtime tts.enabled/provider.".to_string()
+        }
+    })?;
+    let result = match engine.synthesize(text, voice, format).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(local_error) = local_tts_error {
+                return Err(format!(
+                    "Webot local TTS failed: {local_error}; runtime TTS fallback failed: {error}"
+                ));
+            }
+            return Err(error);
+        }
+    };
 
     // Save audio to workspace
     let saved_path = if let Some(workspace) = workspace_root {
@@ -4359,6 +4385,146 @@ async fn tool_text_to_speech(
     });
 
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
+fn webot_service_base_url() -> Option<String> {
+    let raw = std::env::var("WEBOT_SERVICE_BASE_URL").ok()?;
+    let trimmed = raw.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+async fn synthesize_via_webot_local_tts(
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let service_base = match webot_service_base_url() {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let agent_id = caller_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "WEBOT_SERVICE_BASE_URL 已配置，但当前 text_to_speech 调用缺少 agent id".to_string()
+        })?;
+
+    let text = input["text"].as_str().ok_or("Missing 'text' parameter")?;
+    let requested_voice = input["voice"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let requested_format = input["format"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("wav");
+
+    let mut warnings = Vec::new();
+    let local_format = if requested_format.eq_ignore_ascii_case("wav") {
+        "wav"
+    } else {
+        warnings.push(format!(
+            "本地 F5-TTS-ONNX 仅支持 wav，已将请求格式 `{requested_format}` 自动改为 `wav`"
+        ));
+        "wav"
+    };
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "text".to_string(),
+        serde_json::Value::String(text.to_string()),
+    );
+    payload.insert(
+        "format".to_string(),
+        serde_json::Value::String(local_format.to_string()),
+    );
+    if let Some(voice) = requested_voice {
+        payload.insert(
+            "speakerProfileId".to_string(),
+            serde_json::Value::String(voice.to_string()),
+        );
+    }
+
+    let endpoint = format!("{service_base}/api/management/agents/{agent_id}/tts/synthesize");
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&endpoint)
+        .json(&serde_json::Value::Object(payload))
+        .timeout(std::time::Duration::from_secs(180))
+        .send()
+        .await
+        .map_err(|error| format!("调用 Webot 本地 TTS 接口失败: {error}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let err = response.text().await.unwrap_or_default();
+        let truncated = crate::str_utils::safe_truncate_str(&err, 500);
+        return Err(format!("Webot 本地 TTS 失败 (HTTP {status}): {truncated}"));
+    }
+
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("解析 Webot 本地 TTS 响应失败: {error}"))?;
+
+    if let Some(items) = payload.get("warnings").and_then(|value| value.as_array()) {
+        for item in items {
+            if let Some(value) = item.as_str() {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    warnings.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+
+    let asset_url = payload
+        .get("asset_url")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let saved_path = payload
+        .get("saved_path")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let saved_to = asset_url
+        .clone()
+        .or_else(|| saved_path.clone())
+        .ok_or_else(|| "Webot 本地 TTS 未返回可播放音频地址".to_string())?;
+    let duration_estimate_ms = payload
+        .get("duration_secs")
+        .and_then(|value| value.as_f64())
+        .map(|value| (value.max(0.0) * 1000.0).round() as u64)
+        .unwrap_or(0);
+
+    let response = serde_json::json!({
+        "saved_to": saved_to,
+        "asset_url": asset_url,
+        "saved_path": saved_path,
+        "format": "wav",
+        "provider": payload.get("provider").and_then(|value| value.as_str()).unwrap_or("local"),
+        "engine": payload.get("engine").and_then(|value| value.as_str()).unwrap_or("f5-tts-onnx"),
+        "duration_estimate_ms": duration_estimate_ms,
+        "size_bytes": payload.get("size").and_then(|value| value.as_u64()).unwrap_or(0),
+        "speaker_profile_id": payload.get("speaker_profile_id").and_then(|value| value.as_str()),
+        "speaker_name": payload.get("speaker_name").and_then(|value| value.as_str()),
+        "device": payload.get("device").and_then(|value| value.as_str()),
+        "chunk_count": payload.get("chunk_count").and_then(|value| value.as_u64()),
+        "warnings": warnings,
+    });
+
+    serde_json::to_string_pretty(&response)
+        .map(Some)
+        .map_err(|error| format!("Serialize error: {error}"))
 }
 
 async fn tool_speech_to_text(

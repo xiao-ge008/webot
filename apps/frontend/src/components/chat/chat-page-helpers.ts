@@ -2,7 +2,11 @@ import { compileSpecStream } from '@json-render/core';
 import type { MessageTrace, Message } from '@/data/mock-chats';
 import type { Agent } from '@/types';
 import type { AgentChatMessage, AgentChatStreamChunk } from '@/main/types';
-import type { ManagementAgentDetail, ManagementAgentSummary } from '@/services/management-client';
+import type {
+  ManagementAgentDetail,
+  ManagementAgentSummary,
+  ManagementComponentInvokeResult,
+} from '@/services/management-client';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 
 const HIDDEN_COLLAB_TAGS = new Set(['webot:collab_discoverable', 'webot:collab_dispatcher']);
@@ -21,6 +25,22 @@ export interface AgentSelfAppearanceActionPayload {
   avatarUrl?: string;
   portraitUrl?: string;
   reason?: string;
+}
+
+export interface ComponentInvokeActionPayload {
+  componentName: string;
+  params: Record<string, unknown>;
+  renderResult?: boolean;
+  exposeToAgent?: boolean;
+  resultTitle?: string;
+  reason?: string;
+}
+
+interface ComponentInvokeNormalizedItem {
+  kind: string;
+  url: string;
+  text: string;
+  mimeType: string;
 }
 
 const NON_UI_TYPES = new Set([
@@ -76,6 +96,74 @@ const COMPONENT_TYPE_ALIASES: Record<string, string> = {
 const RESPONSE_WRAPPER_TYPES = new Set(['response', 'done', 'response_fallback', 'response_tool_fallback', 'response_retry_fallback']);
 const UI_JSON_OPEN_TAG_PATTERN = /<ui[-_]json>/i;
 const UI_JSON_BLOCK_PATTERN = /<ui[-_]json>\s*([\s\S]*?)\s*<\/ui[-_]json>/gi;
+const TOOL_CALL_TAG_PATTERN = /<\/?(?:[a-z0-9_.-]+:)?tool_call\b[^>]*>/gi;
+const TOOL_CALL_OPEN_WITH_CONTENT_PATTERN = /<(?:[a-z0-9_.-]+:)?tool_call>\s*=?\s*[^\n\r]*/gi;
+const LEGACY_COMPONENT_TAG_PATTERN = /<([a-z][a-z0-9_-]*)(\s+[\s\S]*?)(?:>|(?=\s*<\/\1>))\s*<\/\1>/gi;
+const LEGACY_COMPONENT_ATTRIBUTE_PATTERN = /([A-Za-z_:][\w:.-]*)\s*=\s*("([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s"'=<>`]+))/g;
+const COMMON_HTML_TAG_NAMES = new Set([
+  'a',
+  'article',
+  'audio',
+  'blockquote',
+  'body',
+  'br',
+  'button',
+  'code',
+  'details',
+  'div',
+  'em',
+  'figcaption',
+  'figure',
+  'footer',
+  'form',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hr',
+  'iframe',
+  'img',
+  'input',
+  'label',
+  'li',
+  'main',
+  'mark',
+  'nav',
+  'ol',
+  'p',
+  'picture',
+  'pre',
+  'section',
+  'select',
+  'small',
+  'source',
+  'span',
+  'strong',
+  'sub',
+  'summary',
+  'sup',
+  'table',
+  'tbody',
+  'td',
+  'textarea',
+  'tfoot',
+  'th',
+  'thead',
+  'tr',
+  'ul',
+  'video',
+]);
+
+type LegacyComponentTagMatch = {
+  attributesText: string;
+  end: number;
+  fullMatch: string;
+  start: number;
+  tagName: string;
+};
 
 export function isRecordValue(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -85,12 +173,161 @@ export function containsUiJsonTag(raw: string): boolean {
   return UI_JSON_OPEN_TAG_PATTERN.test(raw);
 }
 
-function normalizeAppearanceActionType(value: string): string {
+function isLikelyLegacyComponentTagName(tagName: string): boolean {
+  const normalized = tagName.trim().toLowerCase();
+  if (!normalized) return false;
+  if (COMMON_HTML_TAG_NAMES.has(normalized)) return false;
+  return /^[a-z][a-z0-9_-]*$/.test(normalized);
+}
+
+function decodeLegacyAttributeValue(raw: string): string {
+  return raw
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\(["'\\])/g, '$1');
+}
+
+function coerceLegacyAttributeValue(raw: string): unknown {
+  const trimmed = decodeLegacyAttributeValue(raw.trim());
+  if (/^(?:true|false)$/i.test(trimmed)) {
+    return trimmed.toLowerCase() === 'true';
+  }
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+  return trimmed;
+}
+
+function parseLegacyComponentAttributes(attributesText: string): Record<string, unknown> {
+  const attributes: Record<string, unknown> = {};
+  let match: RegExpExecArray | null;
+  LEGACY_COMPONENT_ATTRIBUTE_PATTERN.lastIndex = 0;
+
+  while ((match = LEGACY_COMPONENT_ATTRIBUTE_PATTERN.exec(attributesText)) !== null) {
+    const rawName = (match[1] || '').trim();
+    if (!rawName) continue;
+
+    const attributeName = rawName.replace(/[:.-]+([a-zA-Z0-9])/g, (_, char: string) => char.toUpperCase());
+    const attributeValue = match[3] ?? match[4] ?? match[5] ?? '';
+    attributes[attributeName] = coerceLegacyAttributeValue(attributeValue);
+  }
+
+  return attributes;
+}
+
+function legacyTagNameToComponentType(tagName: string): string {
+  const segments = tagName
+    .trim()
+    .split(/[^a-zA-Z0-9]+/)
+    .filter(Boolean);
+
+  if (segments.length === 0) return '';
+  if (segments.length === 1) {
+    const [single] = segments;
+    return `${single[0]?.toUpperCase() || ''}${single.slice(1)}`;
+  }
+
+  return segments
+    .map((segment) => `${segment[0]?.toUpperCase() || ''}${segment.slice(1)}`)
+    .join('');
+}
+
+function normalizeLegacyInitialValues(attributes: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...attributes };
+  if (next.text == null && typeof next.prompt === 'string' && next.prompt.trim()) {
+    next.text = next.prompt.trim();
+  }
+  if (next.image == null && typeof next.src === 'string' && next.src.trim()) {
+    next.image = next.src.trim();
+  }
+  delete next.prompt;
+  delete next.src;
+  return next;
+}
+
+function findLegacyComponentTagMatches(raw: string): LegacyComponentTagMatch[] {
+  const matches: LegacyComponentTagMatch[] = [];
+  let match: RegExpExecArray | null;
+  LEGACY_COMPONENT_TAG_PATTERN.lastIndex = 0;
+
+  while ((match = LEGACY_COMPONENT_TAG_PATTERN.exec(raw)) !== null) {
+    const tagName = (match[1] || '').trim();
+    if (!isLikelyLegacyComponentTagName(tagName)) {
+      continue;
+    }
+    const fullMatch = match[0] || '';
+    const start = match.index;
+    matches.push({
+      attributesText: match[2] || '',
+      end: start + fullMatch.length,
+      fullMatch,
+      start,
+      tagName,
+    });
+  }
+
+  return matches;
+}
+
+function buildLegacyComponentSpec(tagName: string, attributesText: string): unknown | undefined {
+  const type = canonicalizeComponentType(legacyTagNameToComponentType(tagName));
+  if (!type || NON_UI_TYPES.has(type.toLowerCase())) {
+    return undefined;
+  }
+
+  const initialValues = normalizeLegacyInitialValues(parseLegacyComponentAttributes(attributesText));
+  return {
+    type,
+    props: {
+      autoRun: true,
+      initialValues,
+    },
+  };
+}
+
+function extractLegacyComponentSpecs(raw: string): { matches: LegacyComponentTagMatch[]; specs: unknown[] } {
+  const matches = findLegacyComponentTagMatches(raw);
+  if (matches.length === 0) {
+    return { matches: [], specs: [] };
+  }
+
+  const specs = matches
+    .map((match) => normalizeUiSpecCandidate(buildLegacyComponentSpec(match.tagName, match.attributesText)))
+    .filter((item): item is unknown => item !== undefined);
+
+  return { matches, specs };
+}
+
+function stripLegacyComponentTags(raw: string): string {
+  const matches = findLegacyComponentTagMatches(raw);
+  if (matches.length === 0) {
+    return raw;
+  }
+
+  let cursor = 0;
+  let output = '';
+  for (const match of matches) {
+    output += raw.slice(cursor, match.start);
+    cursor = match.end;
+  }
+  output += raw.slice(cursor);
+  return output;
+}
+
+function normalizeHiddenActionType(value: string): string {
   return value.trim().toLowerCase().replace(/[\s_.-]+/g, '');
 }
 
 export function isAgentSelfAppearanceActionType(value: unknown): boolean {
-  return typeof value === 'string' && normalizeAppearanceActionType(value) === 'agentselfappearanceaction';
+  return typeof value === 'string' && normalizeHiddenActionType(value) === 'agentselfappearanceaction';
+}
+
+export function isComponentInvokeActionType(value: unknown): boolean {
+  return typeof value === 'string' && normalizeHiddenActionType(value) === 'componentinvokeaction';
 }
 
 export function normalizeAgentSelfAppearanceActionPayload(raw: unknown): AgentSelfAppearanceActionPayload | null {
@@ -118,6 +355,102 @@ export function normalizeAgentSelfAppearanceActionPayload(raw: unknown): AgentSe
   return {
     avatarUrl: avatarUrl || undefined,
     portraitUrl: portraitUrl || undefined,
+    reason: reason || undefined,
+  };
+}
+
+export function normalizeComponentInvokeActionPayload(raw: unknown): ComponentInvokeActionPayload | null {
+  if (!isRecordValue(raw)) {
+    return null;
+  }
+
+  const componentName = typeof raw.componentName === 'string'
+    ? raw.componentName.trim()
+    : typeof raw.component_name === 'string'
+      ? raw.component_name.trim()
+      : typeof raw.name === 'string'
+        ? raw.name.trim()
+        : typeof raw.component === 'string'
+          ? raw.component.trim()
+          : '';
+  if (!componentName) {
+    return null;
+  }
+
+  const readParamsCandidate = (value: unknown): Record<string, unknown> | null => {
+    if (!isRecordValue(value)) {
+      return null;
+    }
+    return { ...value };
+  };
+
+  const params = readParamsCandidate(raw.params)
+    ?? readParamsCandidate(raw.parameters)
+    ?? readParamsCandidate(raw.arguments)
+    ?? readParamsCandidate(raw.input)
+    ?? readParamsCandidate(raw.values)
+    ?? readParamsCandidate(raw.initialValues)
+    ?? (() => {
+      const reserved = new Set([
+        'componentName',
+        'component_name',
+        'name',
+        'component',
+        'params',
+        'parameters',
+        'arguments',
+        'input',
+        'values',
+        'initialValues',
+        'initial_values',
+        'renderResult',
+        'render_result',
+        'exposeToAgent',
+        'expose_to_agent',
+        'resultTitle',
+        'result_title',
+        'title',
+        'reason',
+        'description',
+      ]);
+      const collected = Object.entries(raw).reduce<Record<string, unknown>>((acc, [key, value]) => {
+        if (!reserved.has(key)) {
+          acc[key] = value;
+        }
+        return acc;
+      }, {});
+      return Object.keys(collected).length > 0 ? collected : {};
+    })();
+
+  const renderResult = typeof raw.renderResult === 'boolean'
+    ? raw.renderResult
+    : typeof raw.render_result === 'boolean'
+      ? raw.render_result
+      : false;
+  const exposeToAgent = typeof raw.exposeToAgent === 'boolean'
+    ? raw.exposeToAgent
+    : typeof raw.expose_to_agent === 'boolean'
+      ? raw.expose_to_agent
+      : true;
+  const resultTitle = typeof raw.resultTitle === 'string'
+    ? raw.resultTitle.trim()
+    : typeof raw.result_title === 'string'
+      ? raw.result_title.trim()
+      : typeof raw.title === 'string'
+        ? raw.title.trim()
+        : '';
+  const reason = typeof raw.reason === 'string'
+    ? raw.reason.trim()
+    : typeof raw.description === 'string'
+      ? raw.description.trim()
+      : '';
+
+  return {
+    componentName,
+    params,
+    renderResult,
+    exposeToAgent,
+    resultTitle: resultTitle || undefined,
     reason: reason || undefined,
   };
 }
@@ -229,6 +562,64 @@ function escapeBareQuotesInJsonStrings(value: string): string {
   return result;
 }
 
+function escapeRawControlCharsInJsonStrings(value: string): string {
+  let result = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const current = value[index];
+
+    if (!inString) {
+      result += current;
+      if (current === '"') {
+        inString = true;
+      }
+      continue;
+    }
+
+    if (escaped) {
+      result += current;
+      escaped = false;
+      continue;
+    }
+
+    if (current === '\\') {
+      result += current;
+      escaped = true;
+      continue;
+    }
+
+    if (current === '"') {
+      result += current;
+      inString = false;
+      continue;
+    }
+
+    if (current === '\r') {
+      if (value[index + 1] === '\n') {
+        index += 1;
+      }
+      result += '\\n';
+      continue;
+    }
+
+    if (current === '\n') {
+      result += '\\n';
+      continue;
+    }
+
+    if (current === '\t') {
+      result += '\\t';
+      continue;
+    }
+
+    result += current;
+  }
+
+  return result;
+}
+
 export function repairUiJsonString(raw: string): string {
   let repaired = normalizeCommonJsonPunctuation(raw.trim());
   repaired = repaired
@@ -236,6 +627,7 @@ export function repairUiJsonString(raw: string): string {
     .replace(/:\s*'([^'\r\n]*?)'(?=\s*[,}\]])/g, ': "$1"')
     .replace(/,\s*([}\]])/g, '$1');
 
+  repaired = escapeRawControlCharsInJsonStrings(repaired);
   repaired = escapeBareQuotesInJsonStrings(repaired);
   return repaired;
 }
@@ -676,6 +1068,33 @@ export function buildInitialMessages(_agentName: string): Message[] {
   return [];
 }
 
+function buildComponentInvokeHistorySupplement(message: Message): string {
+  if (message.role !== 'agent' || !message.toolTrace || message.toolTrace.length === 0) {
+    return '';
+  }
+  for (let index = message.toolTrace.length - 1; index >= 0; index -= 1) {
+    const detail = (message.toolTrace[index]?.detail || '').trim();
+    const payload = parseToolLogPayload(detail);
+    if (!payload || getToolNameFromLogPayload(payload).toLowerCase() !== 'component_invoke') {
+      continue;
+    }
+    const componentName = typeof payload.component_name === 'string'
+      ? payload.component_name.trim()
+      : typeof payload.componentName === 'string'
+        ? payload.componentName.trim()
+        : '组件';
+    const summary = buildComponentInvokeSummaryText(componentName, payload.result, { includeUrls: true });
+    if (!summary) {
+      continue;
+    }
+    return [
+      '组件调用结果摘要：',
+      summary,
+    ].join('\n');
+  }
+  return '';
+}
+
 export function buildHistory(messages: Message[]): AgentChatMessage[] {
   return messages
     .filter((msg) => msg.role === 'user' || msg.role === 'agent')
@@ -683,7 +1102,13 @@ export function buildHistory(messages: Message[]): AgentChatMessage[] {
       role: msg.role === 'user' ? 'user' : 'assistant',
       content: (() => {
         const text = (msg.text || '').trim();
-        if (msg.role !== 'user' || !msg.attachments || msg.attachments.length === 0) {
+        if (msg.role === 'agent') {
+          const componentSupplement = buildComponentInvokeHistorySupplement(msg);
+          return [text, componentSupplement]
+            .filter((item) => item.trim().length > 0)
+            .join('\n\n');
+        }
+        if (!msg.attachments || msg.attachments.length === 0) {
           return text;
         }
         const attachmentLines = msg.attachments.map((attachment, index) => {
@@ -772,7 +1197,8 @@ export function sanitizeAssistantText(text: string): string {
   return text
     .replace(/<\/?think>/gi, '')
     .replace(/<\|im_end\|>/gi, '')
-    .replace(/<tool_call>\s*=?\s*[^\n\r]*/gi, '')
+    .replace(TOOL_CALL_OPEN_WITH_CONTENT_PATTERN, '')
+    .replace(TOOL_CALL_TAG_PATTERN, '')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -824,7 +1250,7 @@ export function extractToolCallTitles(delta: string): string[] {
   const lines = delta.split(/\r?\n/);
   const hits: string[] = [];
   for (const line of lines) {
-    const matched = line.match(/<tool_call>\s*=?\s*(.+)$/i);
+    const matched = line.match(/<(?:[a-z0-9_.-]+:)?tool_call>\s*=?\s*(.+)$/i);
     if (matched?.[1]) {
       hits.push(matched[1].trim().slice(0, 160));
     }
@@ -841,6 +1267,11 @@ export function findUiBoundary(raw: string): number {
     raw.search(/\{\s*"type"\s*:/),
     raw.search(/\{\s*"root"\s*:/),
   ].filter((idx) => idx >= 0);
+
+  const legacyMatches = findLegacyComponentTagMatches(raw);
+  if (legacyMatches.length > 0) {
+    implicitCandidates.push(legacyMatches[0].start);
+  }
 
   if (implicitCandidates.length === 0) return -1;
   const best = Math.min(...implicitCandidates);
@@ -1255,7 +1686,7 @@ export function cleanupAssistantText(rawText: string, spec?: unknown): string {
   const withoutUiBlock = withoutThinking
     .replace(/<ui[-_]json>[\s\S]*?<\/ui[-_]json>/gi, '')
     .replace(/<ui[-_]json>[\s\S]*$/gi, '');
-  const slicedByBoundary = withoutUiBlock;
+  const slicedByBoundary = spec ? stripLegacyComponentTags(withoutUiBlock) : withoutUiBlock;
   const text = sanitizeAssistantText(slicedByBoundary);
   if (!text) return '';
   if (!spec) return text;
@@ -1267,7 +1698,26 @@ export function cleanupAssistantText(rawText: string, spec?: unknown): string {
 
   const fencedJsonPattern = /```(?:json)?\s*[\s\S]*?\{[\s\S]*?"type"\s*:\s*"[^"]+"[\s\S]*?\}\s*```/g;
   const cleaned = sanitizeAssistantText(slicedByBoundary.replace(fencedJsonPattern, ''));
-  return cleaned;
+  if (!cleaned) return '';
+  const normalizedSpec = normalizeUiSpecCandidate(spec);
+  const specType = isRecordValue(normalizedSpec) && typeof normalizedSpec.type === 'string'
+    ? normalizedSpec.type.trim().toLowerCase()
+    : '';
+  if (specType !== 'audioplayer' && specType !== 'audioplaylist') {
+    return cleaned;
+  }
+  const filtered = cleaned
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => {
+      const normalizedLine = line.trim().toLowerCase();
+      if (!normalizedLine) return false;
+      if (normalizedLine.includes('/api/management/agents/')) return false;
+      if (/^(音频在这|音频地址|语音地址)\s*[:：]/i.test(normalizedLine)) return false;
+      return true;
+    })
+    .join('\n');
+  return sanitizeAssistantText(filtered);
 }
 
 export function tryParseInlineSpecFromText(rawText: string): unknown | undefined {
@@ -1297,6 +1747,14 @@ export function tryParseInlineSpecFromText(rawText: string): unknown | undefined
       if (parsed) {
         return parsed;
       }
+    }
+  }
+
+  const legacyComponents = extractLegacyComponentSpecs(segment);
+  if (legacyComponents.specs.length > 0) {
+    const mergedLegacy = mergeUiSpecs(legacyComponents.specs);
+    if (mergedLegacy) {
+      return mergedLegacy;
     }
   }
 
@@ -1343,11 +1801,14 @@ export function normalizeIncomingSpec(spec: unknown): unknown | undefined {
   return tryParseInlineSpecFromText(text);
 }
 
-export function extractAgentSelfAppearanceActionFromSpec(spec: unknown): {
-  payload: AgentSelfAppearanceActionPayload;
+function extractHiddenActionFromSpec<T>(spec: unknown, options: {
+  isActionType: (value: unknown) => boolean;
+  normalizePayload: (raw: unknown) => T | null;
+}): {
+  payload: T;
   strippedSpec: unknown | undefined;
 } | null {
-  let payload: AgentSelfAppearanceActionPayload | null = null;
+  let payload: T | null = null;
 
   const stripFlatRefValue = (
     value: unknown,
@@ -1387,11 +1848,11 @@ export function extractAgentSelfAppearanceActionFromSpec(spec: unknown): {
     const removedIds = new Set<string>();
     const sourceElements = node.elements as Record<string, unknown>;
     for (const [key, element] of Object.entries(sourceElements)) {
-      if (!isRecordValue(element) || !isAgentSelfAppearanceActionType(element.type)) {
+      if (!isRecordValue(element) || !options.isActionType(element.type)) {
         continue;
       }
       if (!payload) {
-        payload = normalizeAgentSelfAppearanceActionPayload(element.props);
+        payload = options.normalizePayload(element.props);
       }
       removedIds.add(key);
     }
@@ -1472,9 +1933,9 @@ export function extractAgentSelfAppearanceActionFromSpec(spec: unknown): {
       return strippedFlatSpec;
     }
 
-    if (isAgentSelfAppearanceActionType(node.type)) {
+    if (options.isActionType(node.type)) {
       if (!payload) {
-        payload = normalizeAgentSelfAppearanceActionPayload(node.props);
+        payload = options.normalizePayload(node.props);
       }
       return undefined;
     }
@@ -1503,6 +1964,33 @@ export function extractAgentSelfAppearanceActionFromSpec(spec: unknown): {
     payload,
     strippedSpec,
   };
+}
+
+export function mergeRenderableUiSpecs(...specs: Array<unknown | undefined | null>): unknown | undefined {
+  const normalized = specs
+    .map((item) => normalizeIncomingSpec(item))
+    .filter((item): item is unknown => item !== undefined);
+  return mergeUiSpecs(normalized);
+}
+
+export function extractAgentSelfAppearanceActionFromSpec(spec: unknown): {
+  payload: AgentSelfAppearanceActionPayload;
+  strippedSpec: unknown | undefined;
+} | null {
+  return extractHiddenActionFromSpec(spec, {
+    isActionType: isAgentSelfAppearanceActionType,
+    normalizePayload: normalizeAgentSelfAppearanceActionPayload,
+  });
+}
+
+export function extractComponentInvokeActionFromSpec(spec: unknown): {
+  payload: ComponentInvokeActionPayload;
+  strippedSpec: unknown | undefined;
+} | null {
+  return extractHiddenActionFromSpec(spec, {
+    isActionType: isComponentInvokeActionType,
+    normalizePayload: normalizeComponentInvokeActionPayload,
+  });
 }
 
 export function extractReadableText(value: unknown): string | undefined {
@@ -1560,6 +2048,245 @@ function pickStringArray(value: unknown): string[] {
     .filter((item): item is string => typeof item === 'string')
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function pickStringCandidates(value: unknown): string[] {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  return pickStringArray(value);
+}
+
+function normalizeComponentInvokeItems(result: unknown): ComponentInvokeNormalizedItem[] {
+  if (!isRecordValue(result) || !Array.isArray(result.items)) {
+    return [];
+  }
+  return result.items
+    .filter(isRecordValue)
+    .map((item) => {
+      const kind = typeof item.kind === 'string' ? item.kind.trim().toLowerCase() : '';
+      const url = typeof item.url === 'string'
+        ? item.url.trim()
+        : typeof item.src === 'string'
+          ? item.src.trim()
+          : typeof item.path === 'string'
+            ? item.path.trim()
+            : '';
+      const text = typeof item.text === 'string'
+        ? item.text.trim()
+        : typeof item.title === 'string'
+          ? item.title.trim()
+          : '';
+      const mimeType = typeof item.mimeType === 'string'
+        ? item.mimeType.trim()
+        : typeof item.mime_type === 'string'
+          ? item.mime_type.trim()
+          : '';
+      return {
+        kind,
+        url,
+        text,
+        mimeType,
+      };
+    })
+    .filter((item) => item.url.length > 0);
+}
+
+function normalizeComponentInvokeResult(result: unknown): ManagementComponentInvokeResult | null {
+  if (!isRecordValue(result)) {
+    return null;
+  }
+  return {
+    outputType: typeof result.outputType === 'string'
+      ? result.outputType.trim()
+      : typeof result.output_type === 'string'
+        ? result.output_type.trim()
+        : undefined,
+    text: typeof result.text === 'string' ? result.text.trim() : undefined,
+    items: normalizeComponentInvokeItems(result),
+    raw: result.raw,
+  };
+}
+
+function formatComponentInvokeKindLabel(kind: string): string {
+  switch (kind) {
+    case 'image':
+      return '图片';
+    case 'video':
+      return '视频';
+    case 'audio':
+      return '音频';
+    case 'text':
+      return '文本';
+    default:
+      return kind || '结果';
+  }
+}
+
+export function buildComponentInvokeSummaryText(
+  componentName: string,
+  result: unknown,
+  options?: { includeUrls?: boolean },
+): string | undefined {
+  const normalized = normalizeComponentInvokeResult(result);
+  if (!normalized) {
+    return undefined;
+  }
+  const items = Array.isArray(normalized.items) ? normalized.items : [];
+  const lines: string[] = [];
+  const header = componentName.trim() || '组件';
+  const mediaItems = items.filter((item) => item.kind !== 'text');
+  if (mediaItems.length > 0) {
+    const counts = mediaItems.reduce<Record<string, number>>((acc, item) => {
+      const key = item.kind || 'result';
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    const summary = Object.entries(counts)
+      .map(([kind, count]) => `${count} 个${formatComponentInvokeKindLabel(kind)}`)
+      .join('，');
+    if (summary) {
+      lines.push(`组件 ${header} 已返回 ${summary}。`);
+    }
+  }
+  if (normalized.text) {
+    lines.push(normalized.text);
+  }
+  if (options?.includeUrls) {
+    items.slice(0, 4).forEach((item, index) => {
+      lines.push(`${index + 1}. ${formatComponentInvokeKindLabel(item.kind || 'file')}：${item.url}`);
+      if (item.text) {
+        lines.push(`- 说明：${item.text}`);
+      }
+    });
+  }
+  const joined = lines
+    .map((line) => sanitizeAssistantText(line))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+  return joined || undefined;
+}
+
+export function buildRenderableSpecFromComponentInvokeResult(
+  result: unknown,
+  fallbackTitle = '组件结果',
+  options?: { posterUrl?: string },
+): unknown | undefined {
+  const normalized = normalizeComponentInvokeResult(result);
+  if (!normalized) {
+    return undefined;
+  }
+  const items = Array.isArray(normalized.items) ? normalized.items : [];
+  const title = (normalized.text || fallbackTitle || '组件结果').trim().slice(0, 48) || '组件结果';
+  const images = items.filter((item) => item.kind === 'image' || (item.mimeType || '').startsWith('image/'));
+  const preferredPosterUrl = options?.posterUrl?.trim() || images[0]?.url || undefined;
+  const videos = items.filter((item) => item.kind === 'video' || (item.mimeType || '').startsWith('video/'));
+  if (videos.length > 0) {
+    const videoItems = videos.map((item, index) => ({
+      src: item.url,
+      poster: preferredPosterUrl,
+      title: item.text || `${title} ${index + 1}`,
+      description: normalized.text || undefined,
+    }));
+    if (videoItems.length === 1) {
+      return {
+        type: 'VideoCover',
+        props: {
+          src: videoItems[0].src,
+          poster: videoItems[0].poster,
+          title: videoItems[0].title,
+          description: videoItems[0].description,
+        },
+      };
+    }
+    return {
+      type: 'VideoGallery',
+      props: {
+        items: videoItems,
+        title,
+        compact: true,
+      },
+    };
+  }
+  const audios = items.filter((item) => item.kind === 'audio' || (item.mimeType || '').startsWith('audio/'));
+  if (audios.length > 0) {
+    const audioItems = audios.map((item, index) => ({
+      src: item.url,
+      title: item.text || `${title} ${index + 1}`,
+      subtitle: normalized.text || undefined,
+    }));
+    if (audioItems.length === 1) {
+      return {
+        type: 'AudioPlayer',
+        props: {
+          src: audioItems[0].src,
+          title: audioItems[0].title,
+          subtitle: audioItems[0].subtitle,
+        },
+      };
+    }
+    return {
+      type: 'AudioPlaylist',
+      props: {
+        items: audioItems,
+        title,
+        description: normalized.text || undefined,
+        showQueue: true,
+      },
+    };
+  }
+  if (images.length > 0) {
+    const imageItems = images.map((item, index) => ({
+      src: item.url,
+      alt: item.text || `${title} ${index + 1}`,
+      title: item.text || `${title} ${index + 1}`,
+      description: normalized.text || undefined,
+    }));
+    if (imageItems.length === 1) {
+      return {
+        type: 'ImageCover',
+        props: {
+          src: imageItems[0].src,
+          alt: imageItems[0].alt,
+          title: imageItems[0].title,
+          description: imageItems[0].description,
+        },
+      };
+    }
+    return {
+      type: 'ImageCarousel',
+      props: {
+        images: imageItems.map((item) => ({
+          src: item.src,
+          alt: item.alt,
+          title: item.title,
+          description: item.description,
+        })),
+        title,
+        showThumbs: true,
+      },
+    };
+  }
+
+  return undefined;
+}
+
+function buildComponentInvokeFallbackSpec(payload: Record<string, unknown>): unknown | undefined {
+  if (getToolNameFromLogPayload(payload).toLowerCase() !== 'component_invoke' || payload.is_error === true) {
+    return undefined;
+  }
+  const componentName = typeof payload.component_name === 'string'
+    ? payload.component_name.trim()
+    : typeof payload.componentName === 'string'
+      ? payload.componentName.trim()
+      : '组件';
+  const resultPayload = parseNestedToolPayload(payload.result) || payload.result;
+  const title = typeof payload.summary === 'string' && payload.summary.trim()
+    ? payload.summary.trim()
+    : componentName;
+  return buildRenderableSpecFromComponentInvokeResult(resultPayload, title);
 }
 
 function getToolNameFromLogPayload(payload: Record<string, unknown> | undefined): string {
@@ -1649,16 +2376,99 @@ function buildImageFallbackSpec(payload: Record<string, unknown>): unknown | und
   };
 }
 
+function buildTextToSpeechFallbackSpec(payload: Record<string, unknown>): unknown | undefined {
+  const toolName = getToolNameFromLogPayload(payload).toLowerCase();
+  if (toolName !== 'text_to_speech' || payload.is_error === true) {
+    return undefined;
+  }
+
+  const resultPayload = parseNestedToolPayload(payload.result) || payload;
+  const sources = [
+    ...pickStringCandidates(resultPayload.asset_url ?? resultPayload.assetUrl),
+    ...pickStringCandidates(resultPayload.saved_to ?? resultPayload.savedTo),
+  ];
+  const uniqueSources = Array.from(new Set(sources));
+  if (uniqueSources.length === 0) {
+    return undefined;
+  }
+
+  const inputPayload = parseNestedToolPayload(payload.input);
+  const rawText = typeof inputPayload?.text === 'string'
+    ? inputPayload.text.trim()
+    : typeof resultPayload.requested_text === 'string'
+      ? resultPayload.requested_text.trim()
+      : '';
+  const title = rawText
+    ? `语音: ${rawText.slice(0, 32)}${rawText.length > 32 ? '…' : ''}`
+    : '语音合成结果';
+  const engine = typeof resultPayload.engine === 'string' ? resultPayload.engine.trim() : '';
+  const provider = typeof resultPayload.provider === 'string' ? resultPayload.provider.trim() : '';
+  const device = typeof resultPayload.device === 'string' ? resultPayload.device.trim() : '';
+  const subtitle = [engine, provider, device].filter(Boolean).join(' · ') || undefined;
+  const durationEstimateMs = typeof resultPayload.duration_estimate_ms === 'number'
+    ? resultPayload.duration_estimate_ms
+    : typeof resultPayload.durationEstimateMs === 'number'
+      ? resultPayload.durationEstimateMs
+      : typeof resultPayload.duration_secs === 'number'
+        ? resultPayload.duration_secs * 1000
+        : typeof resultPayload.durationSecs === 'number'
+          ? resultPayload.durationSecs * 1000
+          : undefined;
+  const durationSeconds = typeof durationEstimateMs === 'number' && Number.isFinite(durationEstimateMs)
+    ? Math.max(0, durationEstimateMs / 1000)
+    : undefined;
+
+  if (uniqueSources.length === 1) {
+    return {
+      type: 'AudioPlayer',
+      props: {
+        src: uniqueSources[0],
+        title,
+        subtitle,
+        duration: durationSeconds,
+      },
+    };
+  }
+
+  return {
+    type: 'AudioPlaylist',
+    props: {
+      items: uniqueSources.map((src, index) => ({
+        src,
+        title: `${title} ${index + 1}`,
+        subtitle,
+        duration: durationSeconds,
+      })),
+      title,
+      description: subtitle,
+      showQueue: true,
+    },
+  };
+}
+
 export function buildRenderableSpecFromToolLog(raw: string): unknown | undefined {
   const payload = parseToolLogPayload(raw);
   if (!payload) {
     return undefined;
   }
-  return buildImageFallbackSpec(payload);
+  return buildTextToSpeechFallbackSpec(payload)
+    ?? buildImageFallbackSpec(payload)
+    ?? buildComponentInvokeFallbackSpec(payload);
 }
 
 export function buildFallbackSpecFromToolTrace(rows: MessageTrace[] | undefined): unknown | undefined {
   if (!rows || rows.length === 0) return undefined;
+
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const detail = (rows[index]?.detail || '').trim();
+    if (!detail) {
+      continue;
+    }
+    const renderableSpec = buildRenderableSpecFromToolLog(detail);
+    if (renderableSpec != null) {
+      return renderableSpec;
+    }
+  }
 
   const latestTool = [...rows]
     .reverse()
@@ -1680,7 +2490,7 @@ ${row.detail || ''}`));
   const readable = extractReadableTextFromLog(detail);
 
   const queryMatch = detail.match(/(?:^|\n)\s*query\s*:\s*(.+)$/im);
-  const toolMatch = detail.match(/<tool_call>\s*=?\s*([^\n\r]+)/i);
+  const toolMatch = detail.match(/<(?:[a-z0-9_.-]+:)?tool_call>\s*=?\s*([^\n\r]+)/i);
 
   const query = queryMatch?.[1]?.trim();
   const toolName = toolMatch?.[1]?.trim() || payloadToolName;
@@ -1688,7 +2498,7 @@ ${row.detail || ''}`));
     return undefined;
   }
   const fallbackDetail = hasMeaningfulToolLogContent(payload || {})
-    ? detail.replace(/<tool_call>\s*=?\s*/gi, '').trim()
+    ? detail.replace(TOOL_CALL_OPEN_WITH_CONTENT_PATTERN, '').replace(TOOL_CALL_TAG_PATTERN, '').trim()
     : '';
 
   const weatherLike = query && /天气|气温|温度|降雨|下雨|预报/i.test(query);
@@ -1727,7 +2537,7 @@ export function looksLikeProtocolOnlyText(text: string): boolean {
   const normalized = unwrapResponseEnvelopeText(text).trim();
   if (!normalized) return true;
   if (isHiddenSystemPromptText(normalized)) return true;
-  if (/^<tool_call>/im.test(normalized)) return true;
+  if (/^<(?:[a-z0-9_.-]+:)?tool_call\b/im.test(normalized)) return true;
   if (/^```(?:json)?[\s\S]*```$/i.test(normalized) && /"type"\s*:|"root"\s*:/i.test(normalized)) return true;
   if (/^\{[\s\S]*\}$/i.test(normalized) && /"type"\s*:|"root"\s*:/i.test(normalized)) return true;
   const lines = normalized.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);

@@ -31,6 +31,10 @@ import type { StoredChatSession } from '@/services/chat-session-store';
 import { chatRuntimeStore, useChatRuntimeSelector } from '@/services/chat-runtime-store';
 import { ensureChatRuntimeStreamPump } from '@/services/chat-runtime-stream-pump';
 import {
+    enqueueComponentInvokeForMessage,
+    prepareMessageForComponentInvokeAction,
+} from '@/services/component-invoke-runtime';
+import {
     buildIdentityBundle,
     executeAgentManagementAction,
     type AgentManagementProgressEvent,
@@ -57,9 +61,12 @@ import {
     updateTaskReportDeliveryStatus,
 } from '@/services/task-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
+import { useResolvedRuntimeAssetSrc } from '@/lib/runtime-asset-url';
 import {
     type AgentSelfAppearanceActionPayload,
+    type ComponentInvokeActionPayload,
     extractAgentSelfAppearanceActionFromSpec,
+    extractComponentInvokeActionFromSpec,
     appendThinkingStream,
     buildHistory,
     buildInitialMessages,
@@ -397,6 +404,7 @@ function parseEmbeddedChatAttachments(text: string, ownerAgentId?: string): {
 
 const IMAGE_EDIT_ROUTING_TAG = '[system:image-edit-routing]';
 const IMAGE_EDIT_META_DISCUSSION_PATTERN = /(?:图片服务|图片生成|图片编辑|图像服务|图像生成|图像编辑|配置|设置|工作流|workflow|工具链|能力|逻辑|功能|provider|模型服务|comfyui|modelscope)/i;
+const CURRENT_APPEARANCE_QUERY_PATTERN = /(?:现在|当前|此刻|这会儿)?(?:穿什么|穿的什么|什么衣服|什么装扮|什么穿搭|什么造型|什么服饰)|(?:现在|当前|此刻|这会儿).{0,8}(?:衣服|装扮|穿搭|服饰|造型|外观|形象)|(?:看看|显示|发一下|给我看).{0,8}(?:当前|现在)?(?:立绘|外观|穿搭|服饰|造型)|(?:立绘|外观|形象).{0,8}(?:衣服|装扮|穿搭|服饰|造型)/i;
 
 interface EditableImageCandidate {
     key: string;
@@ -677,6 +685,27 @@ function buildImageEditRoutingPreamble(message: string, sessionMessages: Message
     });
     lines.push('如果用户说“改下图 / 原图 / 这张图 / 刚才那张图”，默认优先使用上面最新且最匹配的候选源图。');
     return lines.join('\n');
+}
+
+function buildCurrentAppearancePreamble(message: string, currentAgent: Agent, targetAgentId: string): string {
+    if (targetAgentId.trim() !== currentAgent.id.trim()) {
+        return '';
+    }
+    const normalizedMessage = message.trim();
+    const portraitUrl = currentAgent.portraitUrl?.trim() || '';
+    if (!normalizedMessage || !portraitUrl || !CURRENT_APPEARANCE_QUERY_PATTERN.test(normalizedMessage)) {
+        return '';
+    }
+
+    const avatarUrl = currentAgent.avatarUrl?.trim() || '';
+    return [
+        '[system:current-appearance]',
+        '当前智能体已经有正式立绘可直接复用。用户询问你现在穿什么、当前装扮、服饰、穿搭、造型或外观时，必须以当前立绘为准，不要虚构，也不要改用临时 /api/uploads/... 会话图。',
+        `当前立绘 URL：${portraitUrl}`,
+        avatarUrl ? `当前头像 URL：${avatarUrl}` : '',
+        '如果需要展示图片，请优先输出 `<UI_JSON>{"type":"ImageCover","props":{"src":"当前立绘 URL","title":"当前装扮"}}...</UI_JSON>`，并把上面的当前立绘 URL 原样写入 `src`。',
+        '如果需要先确认服饰细节，可先基于当前立绘做图片分析，再回答；最终仍优先返回当前立绘图片组件。',
+    ].filter(Boolean).join('\n');
 }
 
 function normalizeBackendMessage(role: Message['role'], raw: string, ownerAgentId?: string): {
@@ -2878,6 +2907,7 @@ export function ChatPage({
     const { t } = useTranslation();
 
     const [agent, setAgent] = useState<Agent>(() => buildFallbackAgent(id));
+    const resolvedAgentPortraitUrl = useResolvedRuntimeAssetSrc(agent.portraitUrl);
 
     // UI state
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -3066,7 +3096,8 @@ export function ChatPage({
             message,
             getSessionMessagesSnapshot(activeSessionIdRef.current),
         );
-        const combined = [basePreamble, imageEditPreamble].filter(Boolean).join('\n\n').trim();
+        const currentAppearancePreamble = buildCurrentAppearancePreamble(message, agent, agentId);
+        const combined = [basePreamble, imageEditPreamble, currentAppearancePreamble].filter(Boolean).join('\n\n').trim();
         return combined || undefined;
     };
     const messages = useMemo(() => activeSession?.messages ?? [], [activeSession]);
@@ -4006,6 +4037,27 @@ export function ChatPage({
         const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
         const session = runtimeState.sessions.find((item) => item.id === sid);
         return session?.messages ?? messagesRef.current;
+    };
+
+    const scheduleComponentInvokeForMessage = (
+        payload: ComponentInvokeActionPayload,
+        ctx?: { sessionId?: string; messageId?: string; agentId?: string },
+    ): void => {
+        const runtimeAgentId = runtimeAgentIdRef.current.trim();
+        const sessionId = (ctx?.sessionId || activeSessionIdRef.current || '').trim();
+        const messageId = (ctx?.messageId || '').trim();
+        if (!runtimeAgentId || !sessionId || !messageId) {
+            return;
+        }
+        window.setTimeout(() => {
+            void enqueueComponentInvokeForMessage({
+                runtimeAgentId,
+                sessionId,
+                messageId,
+                payload,
+                agentId: ctx?.agentId,
+            });
+        }, 0);
     };
 
     const appendLocalAgentMessage = (text: string) => {
@@ -5256,6 +5308,10 @@ export function ChatPage({
                     next.spec = autoAppearanceAction.strippedSpec;
                     next.uiRawText = '';
                 }
+                const autoComponentInvokeAction = extractComponentInvokeActionFromSpec(next.spec);
+                if (autoComponentInvokeAction) {
+                    Object.assign(next, prepareMessageForComponentInvokeAction(next, autoComponentInvokeAction.payload));
+                }
                 next.text = cleanupAssistantText(next.text || '', next.spec);
                 next.thinking = false;
                 next.streaming = false;
@@ -5294,7 +5350,16 @@ export function ChatPage({
                         messageId: next.id,
                     });
                 }
-                next.cardPending = false;
+                if (autoComponentInvokeAction) {
+                    const targetSessionId = activeRequestSessionIdRef.current || undefined;
+                    const targetMessageId = next.id;
+                    scheduleComponentInvokeForMessage(autoComponentInvokeAction.payload, {
+                        sessionId: targetSessionId,
+                        messageId: targetMessageId,
+                        agentId: next.agentId || chatAgentId,
+                    });
+                }
+                next.cardPending = autoComponentInvokeAction ? true : false;
 
             } else if (chunk.kind === 'error') {
                 next.debugReceivedError = true;
@@ -5673,7 +5738,7 @@ export function ChatPage({
                 );
             }
 
-            const finalDraft = streamingDraftRef.current
+            let finalDraft = streamingDraftRef.current
                 ? { ...streamingDraftRef.current }
                 : {
                     id: generateId(),
@@ -5811,6 +5876,12 @@ export function ChatPage({
                 finalDraft.uiRawText = '';
                 finalDraft.uiStreamState = finalDraft.spec != null ? 'ready' : 'idle';
             }
+            const autoComponentInvokeAction = result.success
+                ? extractComponentInvokeActionFromSpec(finalDraft.spec)
+                : null;
+            if (autoComponentInvokeAction) {
+                finalDraft = prepareMessageForComponentInvokeAction(finalDraft, autoComponentInvokeAction.payload);
+            }
             const protocolOnly = looksLikeProtocolOnlyText(finalDraft.text || '');
             const hasRenderable = Boolean(autoAppearanceAction) || Boolean(finalDraft.spec) || (!protocolOnly && Boolean(finalDraft.text));
             if (!hasRenderable && doneReceivedRef.current) {
@@ -5832,11 +5903,11 @@ export function ChatPage({
             }
             // sendAgentChat(stream=true) 只有在流结束后才 resolve；这里不应再进入 waiting 收尾。
             keepWaiting = false;
-            finalDraft.cardPending = false;
+            finalDraft.cardPending = autoComponentInvokeAction ? true : false;
 
             const draftId = pendingMessageIdRef.current;
             const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
-            const suppressDuplicate = result.success && shouldSuppressConsecutiveAgentDuplicate(
+            const suppressDuplicate = result.success && !autoComponentInvokeAction && shouldSuppressConsecutiveAgentDuplicate(
                 getSessionMessagesSnapshot(requestSessionId),
                 draftId || finalDraft.id,
                 dispatchAgentId,
@@ -5851,9 +5922,23 @@ export function ChatPage({
                     );
                 } else {
                     patchSessionMessageById(requestSessionId, draftId, finalDraft);
+                    if (autoComponentInvokeAction) {
+                        scheduleComponentInvokeForMessage(autoComponentInvokeAction.payload, {
+                            sessionId: requestSessionId,
+                            messageId: draftId,
+                            agentId: dispatchAgentId,
+                        });
+                    }
                 }
             } else if (!suppressDuplicate) {
                 commitMessages((prev) => [...prev, finalDraft]);
+                if (autoComponentInvokeAction) {
+                    scheduleComponentInvokeForMessage(autoComponentInvokeAction.payload, {
+                        sessionId: requestSessionId,
+                        messageId: finalDraft.id,
+                        agentId: dispatchAgentId,
+                    });
+                }
             }
             const committedMessageId = suppressDuplicate ? '' : (draftId || finalDraft.id);
             if (appearanceUpdated) {
@@ -6439,10 +6524,10 @@ export function ChatPage({
                         const autoAppearanceAction = spec
                             ? extractAgentSelfAppearanceActionFromSpec(spec)
                             : null;
-                        const renderSpec = autoAppearanceAction
+                        let renderSpec = autoAppearanceAction
                             ? autoAppearanceAction.strippedSpec
                             : (spec ?? undefined);
-                        const uiRawText = autoAppearanceAction
+                        let uiRawText = autoAppearanceAction
                             ? ''
                             : (raw ? extractUiRawText(raw) : '');
                         const fallbackText = result.success
@@ -6450,11 +6535,37 @@ export function ChatPage({
                             : (result.error?.trim()
                                 ? '该成员当前不可用，已跳过。'
                                 : '该成员当前不可用，已跳过。');
-                        const finalText = raw
+                        const autoComponentInvokeAction = result.success
+                            ? extractComponentInvokeActionFromSpec(renderSpec)
+                            : null;
+                        if (autoComponentInvokeAction) {
+                            renderSpec = autoComponentInvokeAction.strippedSpec;
+                            uiRawText = '';
+                        }
+                        let finalText = raw
                             ? cleanupAssistantText(raw, renderSpec)
                             : (result.success ? '' : fallbackText);
+                        let resolvedMessage: Message = {
+                            ...draft,
+                            thinking: false,
+                            streaming: false,
+                            spec: renderSpec,
+                            uiRawText,
+                            uiStreamState: renderSpec != null || uiRawText ? 'ready' : 'idle',
+                            text: finalText,
+                            generationElapsedMs: Math.max(0, Date.now() - startedAt),
+                        };
+                        if (autoComponentInvokeAction) {
+                            resolvedMessage = prepareMessageForComponentInvokeAction(
+                                resolvedMessage,
+                                autoComponentInvokeAction.payload,
+                            );
+                            renderSpec = resolvedMessage.spec;
+                            uiRawText = resolvedMessage.uiRawText || '';
+                            finalText = resolvedMessage.text || '';
+                        }
 
-                        if (result.success && finalText && isNearDuplicate(finalText, baselineTexts)) {
+                        if (result.success && !autoComponentInvokeAction && finalText && isNearDuplicate(finalText, baselineTexts)) {
                             updateGroupQueueItem(activeSessionIdRef.current, queueItemId, 'skipped', {
                                 speakerId: targetId,
                                 note: '与本轮已有回复高度重复，已跳过',
@@ -6465,17 +6576,15 @@ export function ChatPage({
 
                         commitMessages((prev) => prev.map((row) => {
                             if (row.id !== draftId) return row;
-                            return {
-                                ...row,
-                                thinking: false,
-                                streaming: false,
-                                spec: renderSpec,
-                                uiRawText,
-                                uiStreamState: renderSpec != null || uiRawText ? 'ready' : 'idle',
-                                text: finalText,
-                                generationElapsedMs: Math.max(0, Date.now() - startedAt),
-                            };
+                            return resolvedMessage;
                         }));
+                        if (autoComponentInvokeAction) {
+                            scheduleComponentInvokeForMessage(autoComponentInvokeAction.payload, {
+                                sessionId: activeSessionIdRef.current || undefined,
+                                messageId: draftId,
+                                agentId: targetId,
+                            });
+                        }
                         if (appearanceUpdated) {
                             syncCurrentAgentAppearance(appearanceUpdated, {
                                 sessionId: activeSessionIdRef.current || undefined,
@@ -6700,10 +6809,10 @@ export function ChatPage({
                 const autoAppearanceAction = spec
                     ? extractAgentSelfAppearanceActionFromSpec(spec)
                     : null;
-                const renderSpec = autoAppearanceAction
+                let renderSpec = autoAppearanceAction
                     ? autoAppearanceAction.strippedSpec
                     : (spec ?? undefined);
-                const uiRawText = autoAppearanceAction
+                let uiRawText = autoAppearanceAction
                     ? ''
                     : (raw ? extractUiRawText(raw) : '');
                 const fallbackText = result.success
@@ -6711,15 +6820,41 @@ export function ChatPage({
                     : (result.error?.trim()
                         ? '该成员当前不可用，已跳过。'
                         : '该成员当前不可用，已跳过。');
-                const finalText = raw
+                const autoComponentInvokeAction = result.success
+                    ? extractComponentInvokeActionFromSpec(renderSpec)
+                    : null;
+                if (autoComponentInvokeAction) {
+                    renderSpec = autoComponentInvokeAction.strippedSpec;
+                    uiRawText = '';
+                }
+                let finalText = raw
                     ? cleanupAssistantText(raw, renderSpec)
                     : (result.success ? '' : fallbackText);
+                let resolvedMessage: Message = {
+                    ...draft,
+                    thinking: false,
+                    streaming: false,
+                    spec: renderSpec,
+                    uiRawText,
+                    uiStreamState: renderSpec != null || uiRawText ? 'ready' : 'idle',
+                    text: finalText,
+                    generationElapsedMs: Math.max(0, Date.now() - startedAt),
+                };
+                if (autoComponentInvokeAction) {
+                    resolvedMessage = prepareMessageForComponentInvokeAction(
+                        resolvedMessage,
+                        autoComponentInvokeAction.payload,
+                    );
+                    renderSpec = resolvedMessage.spec;
+                    uiRawText = resolvedMessage.uiRawText || '';
+                    finalText = resolvedMessage.text || '';
+                }
 
                 if (!result.success && budget.consumedNew) {
                     refundTurnBudget(extraId);
                 }
 
-                if (result.success && finalText && isNearDuplicate(finalText, baselineTexts)) {
+                if (result.success && !autoComponentInvokeAction && finalText && isNearDuplicate(finalText, baselineTexts)) {
                     if (budget.consumedNew) {
                         refundTurnBudget(extraId);
                     }
@@ -6733,17 +6868,15 @@ export function ChatPage({
 
                 commitMessages((prev) => prev.map((msg) => {
                     if (msg.id !== draftId) return msg;
-                    return {
-                        ...msg,
-                        thinking: false,
-                        streaming: false,
-                        spec: renderSpec,
-                        uiRawText,
-                        uiStreamState: renderSpec != null || uiRawText ? 'ready' : 'idle',
-                        text: finalText,
-                        generationElapsedMs: Math.max(0, Date.now() - startedAt),
-                    };
+                    return resolvedMessage;
                 }));
+                if (autoComponentInvokeAction) {
+                    scheduleComponentInvokeForMessage(autoComponentInvokeAction.payload, {
+                        sessionId: activeSessionIdRef.current || undefined,
+                        messageId: draftId,
+                        agentId: extraId,
+                    });
+                }
                 if (appearanceUpdated) {
                     syncCurrentAgentAppearance(appearanceUpdated, {
                         sessionId: activeSessionIdRef.current || undefined,
@@ -8189,10 +8322,10 @@ export function ChatPage({
                     </div>
                 </div>
                     <div className="chat-info-panel">
-                        {agent.portraitUrl ? (
+                        {resolvedAgentPortraitUrl ? (
                         <div className="chat-info-portrait-card group relative overflow-hidden">
                             <img
-                                src={agent.portraitUrl}
+                                src={resolvedAgentPortraitUrl}
                                 alt={`${agent.name} portrait`}
                                 className="chat-info-portrait-img"
                                 loading="lazy"

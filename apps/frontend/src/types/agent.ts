@@ -1,4 +1,6 @@
 /** 智能体角色定义 */
+import type { AgentSpeakerProfile, AgentTtsConfig } from '@/types/tts';
+
 export interface Agent {
   id: string;
   name: string;
@@ -17,6 +19,8 @@ export interface Agent {
   ttsVoice?: string; // 音色参数
   ttsSpeed?: number; // 语速 (例如 0.5 - 2.0)
   ttsPitch?: number; // 音调
+  ttsConfig?: AgentTtsConfig;
+  speakerProfiles?: AgentSpeakerProfile[];
   createdAt: string;
   messagesCount: number;
   color: string;
@@ -34,6 +38,8 @@ export interface CreateAgentForm {
   ttsVoice?: string;
   ttsSpeed?: number;
   ttsPitch?: number;
+  ttsConfig?: AgentTtsConfig;
+  speakerProfiles?: AgentSpeakerProfile[];
   avatarUrl?: string;
   color: string;
 }

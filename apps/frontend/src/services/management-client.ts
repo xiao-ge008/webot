@@ -1,5 +1,12 @@
 import { saveOfficeBinaryAs } from '@/services/office-file-client';
 import { getApiBaseUrl, getOpenFangBaseUrl, requestJson } from '@/services/transport';
+import {
+  DEFAULT_AGENT_TTS_CONFIG,
+  type AgentSpeakerProfile,
+  type AgentTtsConfig,
+  type RemoteTtsServiceMode,
+  type TtsSplitStrategy,
+} from '@/types/tts';
 
 interface JsonRecord {
   [key: string]: unknown;
@@ -46,6 +53,70 @@ function asStringArrayLoose(value: unknown): string[] {
     }
   }
   return output;
+}
+
+function normalizeAgentTtsConfig(value: unknown): AgentTtsConfig {
+  const record = isRecord(value) ? value : {};
+  const serviceModeValue = asString(record.serviceMode, DEFAULT_AGENT_TTS_CONFIG.serviceMode);
+  const serviceMode: RemoteTtsServiceMode = (
+    [
+      'inherit_global',
+      'local_f5',
+      'remote_openai',
+      'remote_cosyvoice3',
+      'remote_indextts',
+      'remote_qwen_tts',
+    ] as const
+  ).includes(serviceModeValue as RemoteTtsServiceMode)
+    ? (serviceModeValue as RemoteTtsServiceMode)
+    : DEFAULT_AGENT_TTS_CONFIG.serviceMode;
+  const splitStrategyValue = asString(record.splitStrategy, DEFAULT_AGENT_TTS_CONFIG.splitStrategy);
+  const splitStrategy: TtsSplitStrategy = (
+    ['auto', 'sentence', 'paragraph'] as const
+  ).includes(splitStrategyValue as TtsSplitStrategy)
+    ? (splitStrategyValue as TtsSplitStrategy)
+    : (DEFAULT_AGENT_TTS_CONFIG.splitStrategy as TtsSplitStrategy);
+  const playbackModeValue = asString(record.playbackMode, DEFAULT_AGENT_TTS_CONFIG.playbackMode);
+  return {
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : DEFAULT_AGENT_TTS_CONFIG.enabled,
+    serviceMode,
+    speakerProfileId: asString(record.speakerProfileId) || undefined,
+    messageTag: asString(record.messageTag, DEFAULT_AGENT_TTS_CONFIG.messageTag).trim() || DEFAULT_AGENT_TTS_CONFIG.messageTag,
+    playbackMode:
+      playbackModeValue === 'auto' || playbackModeValue === 'manual'
+        ? playbackModeValue
+        : DEFAULT_AGENT_TTS_CONFIG.playbackMode,
+    speed: typeof record.speed === 'number' ? asNumber(record.speed) : DEFAULT_AGENT_TTS_CONFIG.speed,
+    pitch: typeof record.pitch === 'number' ? asNumber(record.pitch) : DEFAULT_AGENT_TTS_CONFIG.pitch,
+    splitStrategy,
+    maxChunkChars:
+      typeof record.maxChunkChars === 'number'
+        ? Math.trunc(asNumber(record.maxChunkChars))
+        : DEFAULT_AGENT_TTS_CONFIG.maxChunkChars,
+  };
+}
+
+function normalizeSpeakerProfile(value: unknown): AgentSpeakerProfile | null {
+  const record = isRecord(value) ? value : null;
+  if (!record) {
+    return null;
+  }
+  const id = asString(record.id).trim();
+  const name = asString(record.name).trim();
+  if (!id || !name) {
+    return null;
+  }
+  return {
+    id,
+    name,
+    engine: 'f5-tts-onnx',
+    refAudioPath: asString(record.refAudioPath) || undefined,
+    refText: asString(record.refText) || undefined,
+    language: asString(record.language) || undefined,
+    notes: asString(record.notes) || undefined,
+    createdAt: asString(record.createdAt),
+    updatedAt: asString(record.updatedAt),
+  };
 }
 
 function isSemanticMemoryUnsupportedError(error: unknown): boolean {
@@ -994,6 +1065,8 @@ export interface ManagementAgentDetail {
     selectedWorkers: string[];
   };
   channel_binding?: ManagementChannelBinding;
+  tts_config?: AgentTtsConfig;
+  speaker_profiles?: AgentSpeakerProfile[];
   model: {
     provider: string;
     model: string;
@@ -1021,6 +1094,8 @@ export interface ManagementAgentSummary {
     dispatchEnabled: boolean;
     selectedWorkers: string[];
   };
+  tts_config?: AgentTtsConfig;
+  speaker_profiles?: AgentSpeakerProfile[];
   model: {
     provider: string;
     model: string;
@@ -1065,6 +1140,11 @@ export async function listManagementAgents(): Promise<ManagementAgentSummary[]> 
       const model = isRecord(row.model) ? row.model : {};
       const identity = isRecord(row.identity) ? row.identity : {};
       const collaboration = isRecord(row.collaboration) ? row.collaboration : {};
+      const speakerProfiles = Array.isArray(row.speaker_profiles)
+        ? row.speaker_profiles
+            .map(normalizeSpeakerProfile)
+            .filter((item): item is AgentSpeakerProfile => Boolean(item))
+        : [];
       return {
         id: asString(row.id),
         name: asString(row.name, asString(row.id)),
@@ -1082,6 +1162,8 @@ export async function listManagementAgents(): Promise<ManagementAgentSummary[]> 
               selectedWorkers: asStringArray(collaboration.selectedWorkers ?? collaboration.selected_workers),
             }
           : undefined,
+        tts_config: isRecord(row.tts_config) ? normalizeAgentTtsConfig(row.tts_config) : undefined,
+        speaker_profiles: speakerProfiles.length > 0 ? speakerProfiles : undefined,
         model: {
           provider: asString(model.provider, asString(row.model_provider, 'unknown')),
           model: asString(model.model, asString(row.model_name)),
@@ -1133,6 +1215,11 @@ export async function getManagementAgentDetail(agentId: string): Promise<Managem
   const identity = isRecord(payload.identity) ? payload.identity : {};
   const collaboration = isRecord(payload.collaboration) ? payload.collaboration : {};
   const channelBinding = parseManagementChannelBinding(payload.channel_binding);
+  const speakerProfiles = Array.isArray(payload.speaker_profiles)
+    ? payload.speaker_profiles
+        .map(normalizeSpeakerProfile)
+        .filter((item): item is AgentSpeakerProfile => Boolean(item))
+    : [];
   // 尝试从多个字段路径读取 system_prompt（兼容不同版本后端的字段命名）
   const configObj = isRecord(payload.config) ? payload.config : payload;
   const systemPrompt =
@@ -1159,6 +1246,8 @@ export async function getManagementAgentDetail(agentId: string): Promise<Managem
         }
       : undefined,
     channel_binding: channelBinding,
+    tts_config: isRecord(payload.tts_config) ? normalizeAgentTtsConfig(payload.tts_config) : undefined,
+    speaker_profiles: speakerProfiles.length > 0 ? speakerProfiles : undefined,
     model: {
       provider: asString(model.provider, 'unknown'),
       model: asString(model.model),
@@ -1747,6 +1836,8 @@ export interface AgentConfigPatchInput {
     selectedWorkers: string[];
   };
   channel_binding?: ManagementChannelBinding | null;
+  tts_config?: AgentTtsConfig | null;
+  speaker_profiles?: AgentSpeakerProfile[] | null;
   model?: string;
   provider?: string;
   avatar_url?: string;
@@ -2693,6 +2784,9 @@ function normalizeGlobalSkillCategory(row: JsonRecord): GlobalSkillCategory {
   if (sourceType === 'bundled' || sourceType === 'builtin' || sourceType === 'system') {
     return 'builtin';
   }
+  if (sourceType === 'component') {
+    return 'component';
+  }
 
   const canDelete =
     typeof row.canDelete === 'boolean' ? row.canDelete : !Boolean(row.isSystem);
@@ -2939,6 +3033,56 @@ export async function deleteGlobalSkill(name: string): Promise<unknown> {
   return requestJson(`/api/management/global/skills/${encodeURIComponent(name)}`, {
     method: 'DELETE',
   });
+}
+
+export interface ManagementComponentInvokeItem {
+  kind?: string;
+  url?: string;
+  text?: string;
+  mimeType?: string;
+}
+
+export interface ManagementComponentInvokeResult {
+  outputType?: string;
+  text?: string;
+  items?: ManagementComponentInvokeItem[];
+  raw?: unknown;
+}
+
+export async function invokeManagementComponent(
+  componentName: string,
+  params: Record<string, unknown>,
+  options?: { agentId?: string },
+): Promise<ManagementComponentInvokeResult> {
+  const payload = await requestJson<unknown>(
+    `/api/management/components/${encodeURIComponent(componentName)}/invoke`,
+    {
+      method: 'POST',
+      body: {
+        params,
+        ...(options?.agentId ? { agentId: options.agentId } : {}),
+      },
+    },
+  );
+  if (!isRecord(payload)) {
+    return {};
+  }
+  const items = Array.isArray(payload.items)
+    ? payload.items
+      .filter(isRecord)
+      .map((item) => ({
+        kind: asString(item.kind) || undefined,
+        url: asString(item.url) || undefined,
+        text: asString(item.text) || undefined,
+        mimeType: asString(item.mimeType, asString(item.mime_type)) || undefined,
+      }))
+    : [];
+  return {
+    outputType: asString(payload.outputType, asString(payload.output_type)) || undefined,
+    text: asString(payload.text) || undefined,
+    items,
+    raw: payload.raw,
+  };
 }
 
 export interface McpServerSummary {

@@ -1,10 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::Path as AxumPath;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::Json;
+use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -12,6 +14,7 @@ use tokio::time::sleep;
 
 use crate::error::ApiError;
 use crate::path_resolver;
+use crate::AppState;
 
 const COMPONENT_DEFINITION_FILE: &str = "component-center.definition.json";
 const COMPONENT_MANIFEST_FILE: &str = "components.manifest.json";
@@ -208,6 +211,8 @@ pub struct ComponentDefinition {
 pub struct ComponentInvokeRequest {
     #[serde(default)]
     pub params: Map<String, Value>,
+    #[serde(default, alias = "agentId")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,9 +267,9 @@ pub async fn list_component_definitions() -> Result<Json<Value>, ApiError> {
 }
 
 pub async fn get_component_definition(
-    AxumPath(english_name): AxumPath<String>,
+    AxumPath(component_key): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let item = load_component_definition_by_name(&english_name)?
+    let item = load_component_definition_by_lookup_key(&component_key)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "组件不存在"))?;
     Ok(Json(json!({ "item": item })))
 }
@@ -293,15 +298,23 @@ pub async fn delete_component_definition(
 }
 
 pub async fn invoke_component_definition(
-    AxumPath(english_name): AxumPath<String>,
+    State(state): State<Arc<AppState>>,
+    AxumPath(component_key): AxumPath<String>,
     Json(payload): Json<ComponentInvokeRequest>,
 ) -> Result<Json<ComponentInvokeResult>, ApiError> {
-    let item = load_component_definition_by_name(&english_name)?
+    let item = load_component_definition_by_lookup_key(&component_key)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "组件不存在"))?;
     let configs = read_component_provider_configs().map_err(internal_error)?;
     let result = match item.provider_type {
         ComponentProviderType::Comfyui => {
-            invoke_comfyui_component(&item, &configs.comfyui, &payload.params).await?
+            invoke_comfyui_component(
+                &state,
+                &item,
+                &configs.comfyui,
+                &payload.params,
+                payload.agent_id.as_deref(),
+            )
+            .await?
         }
         ComponentProviderType::Runninghub => {
             invoke_runninghub_component(&item, &configs.runninghub, &payload.params).await?
@@ -429,7 +442,33 @@ fn load_component_definition_by_name(
     load_component_definition_from_dir(&dir).map_err(internal_error)
 }
 
-fn is_component_skill_dir(dir: &Path) -> Result<bool, String> {
+fn load_component_definition_by_lookup_key(
+    component_key: &str,
+) -> Result<Option<ComponentDefinition>, ApiError> {
+    let trimmed = component_key.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "组件标识不能为空",
+        ));
+    }
+
+    if let Ok(validated) = validate_english_name(trimmed) {
+        if let Some(item) = load_component_definition_by_name(&validated)? {
+            return Ok(Some(item));
+        }
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    let items = load_all_component_definitions().map_err(internal_error)?;
+    Ok(items.into_iter().find(|item| {
+        item.english_name.eq_ignore_ascii_case(trimmed)
+            || item.component_type.eq_ignore_ascii_case(trimmed)
+            || item.name.to_ascii_lowercase() == lowered
+    }))
+}
+
+pub(crate) fn is_component_skill_dir(dir: &Path) -> Result<bool, String> {
     if dir.join(COMPONENT_DEFINITION_FILE).is_file() {
         return Ok(true);
     }
@@ -468,7 +507,9 @@ fn read_skill_tags(dir: &Path) -> Result<Option<Vec<String>>, String> {
     Ok(tags)
 }
 
-fn load_component_definition_from_dir(dir: &Path) -> Result<Option<ComponentDefinition>, String> {
+fn load_component_definition_from_dir_internal(
+    dir: &Path,
+) -> Result<Option<ComponentDefinition>, String> {
     let definition_path = dir.join(COMPONENT_DEFINITION_FILE);
     if definition_path.is_file() {
         let content = fs::read_to_string(&definition_path)
@@ -480,6 +521,21 @@ fn load_component_definition_from_dir(dir: &Path) -> Result<Option<ComponentDefi
         return Ok(Some(item));
     }
     load_legacy_component_definition(dir)
+}
+
+pub fn refresh_component_skill_artifacts_for_dir(dir: &Path) -> Result<(), String> {
+    if let Some(item) = load_component_definition_from_dir_internal(dir)? {
+        persist_component_definition(&item, dir, None)?;
+    }
+    Ok(())
+}
+
+fn load_component_definition_from_dir(dir: &Path) -> Result<Option<ComponentDefinition>, String> {
+    let item = load_component_definition_from_dir_internal(dir)?;
+    if let Some(ref component) = item {
+        persist_component_definition(component, dir, None)?;
+    }
+    Ok(item)
 }
 
 fn load_legacy_component_definition(dir: &Path) -> Result<Option<ComponentDefinition>, String> {
@@ -1081,20 +1137,24 @@ fn build_manifest_value(item: &ComponentDefinition) -> Value {
         } else {
             "可选".to_string()
         });
-        if !mapping.default_value.is_null() {
+        if should_expose_default_value(mapping) {
             parts.push(format!(
                 "默认值：{}",
-                stringify_value_compact(&mapping.default_value)
+                stringify_value_preview(&mapping.default_value, 96)
             ));
         }
         if !mapping.description.trim().is_empty() {
-            parts.push(format!("说明：{}", mapping.description.trim()));
+            parts.push(format!(
+                "说明：{}",
+                summarize_inline_text(mapping.description.trim(), 120)
+            ));
         }
         initial_values.insert(
             mapping.parameter_name.clone(),
             Value::String(parts.join("；")),
         );
     }
+    let render_example = build_component_render_example(item);
     json!({
         "version": "1.0",
         "components": [
@@ -1107,26 +1167,290 @@ fn build_manifest_value(item: &ComponentDefinition) -> Value {
                     "description": "string，可选，自定义补充说明",
                     "submitLabel": "string，可选，提交按钮文案",
                     "autoRun": "boolean，可选，值齐备后自动调用",
-                    "initialValues": Value::Object(initial_values)
+                "initialValues": Value::Object(initial_values)
                 },
-                "example": {
-                    "type": item.component_type,
-                    "props": {
-                        "initialValues": {}
-                    }
+                "example": render_example,
+                "invokeExample": build_component_invoke_example(item),
+                "invokeGuide": {
+                    "renderType": item.component_type,
+                    "componentName": item.english_name,
+                    "requiredParams": build_required_parameter_names(item),
+                    "strictSourceParams": item.workflow.parameter_mappings.iter().filter(|mapping| is_strict_source_parameter(mapping)).map(|mapping| mapping.parameter_name.clone()).collect::<Vec<_>>(),
+                    "descriptiveParams": item.workflow.parameter_mappings.iter().filter(|mapping| is_descriptive_parameter(mapping)).map(|mapping| mapping.parameter_name.clone()).collect::<Vec<_>>(),
+                    "ignoreUnsupportedExtras": true,
+                    "optionalMissingDoesNotBlock": true,
+                    "directInvokeRule": "当必填参数已满足且用户要求直接执行时，必须直接输出 ComponentInvokeAction。"
                 }
             }
         ]
     })
 }
 
+fn summarize_inline_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn stringify_value_preview(value: &Value, max_chars: usize) -> String {
+    match value {
+        Value::String(text) => summarize_inline_text(text, max_chars),
+        _ => summarize_inline_text(&stringify_value_compact(value), max_chars),
+    }
+}
+
+fn is_prompt_like_parameter_name(name: &str) -> bool {
+    let lowered = name.trim().to_ascii_lowercase();
+    lowered.contains("lyrics")
+        || lowered.contains("lyric")
+        || lowered.contains("tag")
+        || lowered.contains("prompt")
+        || lowered.contains("style")
+        || lowered.contains("theme")
+        || lowered.contains("mood")
+        || lowered.contains("desc")
+        || lowered.contains("description")
+        || lowered.contains("text")
+        || lowered.contains("message")
+        || lowered.contains("content")
+        || lowered.contains("story")
+        || lowered.contains("script")
+}
+
+fn should_expose_default_value(mapping: &ComponentParameterMapping) -> bool {
+    match &mapping.default_value {
+        Value::Null => false,
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            if is_prompt_like_parameter_name(&mapping.parameter_name) {
+                return false;
+            }
+            !trimmed.contains('\n') && trimmed.chars().count() <= 48
+        }
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
+fn is_strict_source_parameter(mapping: &ComponentParameterMapping) -> bool {
+    let lowered = mapping.parameter_name.trim().to_ascii_lowercase();
+    lowered.contains("lyrics")
+        || lowered.contains("lyric")
+        || lowered == "image"
+        || lowered == "image_url"
+        || lowered == "imageurl"
+        || lowered == "src"
+        || lowered == "url"
+        || lowered == "path"
+}
+
+fn is_descriptive_parameter(mapping: &ComponentParameterMapping) -> bool {
+    let lowered = mapping.parameter_name.trim().to_ascii_lowercase();
+    lowered.contains("tag")
+        || lowered.contains("prompt")
+        || lowered.contains("style")
+        || lowered.contains("theme")
+        || lowered.contains("mood")
+        || lowered.contains("desc")
+        || lowered.contains("description")
+}
+
+fn parameter_role_label(mapping: &ComponentParameterMapping) -> &'static str {
+    if is_strict_source_parameter(mapping) {
+        "核心内容/源数据"
+    } else if is_descriptive_parameter(mapping) {
+        "描述承接"
+    } else if mapping.parameter_name.trim().eq_ignore_ascii_case("language")
+        || mapping.parameter_name.trim().eq_ignore_ascii_case("lang")
+    {
+        "语言控制"
+    } else if mapping
+        .parameter_name
+        .trim()
+        .to_ascii_lowercase()
+        .contains("duration")
+        || mapping
+            .parameter_name
+            .trim()
+            .to_ascii_lowercase()
+            .contains("second")
+    {
+        "时长控制"
+    } else {
+        "通用参数"
+    }
+}
+
+fn parameter_role_guidance(mapping: &ComponentParameterMapping) -> &'static str {
+    if is_strict_source_parameter(mapping) {
+        "应直接传入真实内容本身，不要用主题简介、情绪概述或自动生成占位来代替。"
+    } else if is_descriptive_parameter(mapping) {
+        "适合承接风格、氛围、乐器、节奏、主题等额外要求；组件未声明的同类要求可合并到这里。"
+    } else if mapping.parameter_name.trim().eq_ignore_ascii_case("language")
+        || mapping.parameter_name.trim().eq_ignore_ascii_case("lang")
+    {
+        "只建议传语言代码，例如 zh、en、ja。"
+    } else if mapping
+        .parameter_name
+        .trim()
+        .to_ascii_lowercase()
+        .contains("duration")
+        || mapping
+            .parameter_name
+            .trim()
+            .to_ascii_lowercase()
+            .contains("second")
+    {
+        "优先传数字秒数，不要传自然语言描述。"
+    } else {
+        "保持命名与实际用途一致，避免让 AI 猜错字段语义。"
+    }
+}
+
+fn build_mapping_example_value(mapping: &ComponentParameterMapping) -> Value {
+    let parameter_name = mapping.parameter_name.trim().to_lowercase();
+    let label = if mapping.label.trim().is_empty() {
+        mapping.parameter_name.trim()
+    } else {
+        mapping.label.trim()
+    };
+    match mapping.value_type {
+        ComponentParamValueType::String => {
+            if should_expose_default_value(mapping) {
+                if let Some(default_text) = mapping.default_value.as_str() {
+                    let preview = summarize_inline_text(default_text, 72);
+                    if !preview.is_empty() {
+                        return Value::String(preview);
+                    }
+                }
+            }
+            let placeholder = if parameter_name.contains("lyrics") {
+                "请填写真正的歌词正文，支持分段换行".to_string()
+            } else if parameter_name.contains("tag")
+                || parameter_name.contains("prompt")
+                || parameter_name.contains("desc")
+                || parameter_name.contains("style")
+                || parameter_name.contains("theme")
+                || parameter_name.contains("mood")
+            {
+                "请填写风格、情绪、乐器、节奏、主题与演唱方式等描述".to_string()
+            } else if parameter_name.contains("language") {
+                "zh".to_string()
+            } else {
+                format!("请填写{label}")
+            };
+            Value::String(placeholder)
+        }
+        ComponentParamValueType::Number => {
+            if mapping.default_value.is_number() {
+                mapping.default_value.clone()
+            } else if parameter_name.contains("duration") || parameter_name.contains("second") {
+                json!(120)
+            } else {
+                json!(1)
+            }
+        }
+        ComponentParamValueType::Boolean => {
+            if mapping.default_value.is_boolean() {
+                mapping.default_value.clone()
+            } else {
+                Value::Bool(true)
+            }
+        }
+        ComponentParamValueType::Json => {
+            if mapping.default_value.is_null() {
+                json!({})
+            } else {
+                mapping.default_value.clone()
+            }
+        }
+    }
+}
+
+fn build_component_example_values(item: &ComponentDefinition) -> Map<String, Value> {
+    let mut output = Map::new();
+    let mut picked: Vec<&ComponentParameterMapping> = item
+        .workflow
+        .parameter_mappings
+        .iter()
+        .filter(|mapping| mapping.required)
+        .collect();
+    if picked.is_empty() {
+        picked.extend(item.workflow.parameter_mappings.iter().take(3));
+    }
+    for mapping in picked {
+        output.insert(
+            mapping.parameter_name.clone(),
+            build_mapping_example_value(mapping),
+        );
+    }
+    output
+}
+
+fn build_component_render_example(item: &ComponentDefinition) -> Value {
+    json!({
+        "type": item.component_type.clone(),
+        "props": {
+            "autoRun": false,
+            "initialValues": Value::Object(build_component_example_values(item))
+        }
+    })
+}
+
+fn build_component_invoke_example(item: &ComponentDefinition) -> Value {
+    json!({
+        "type": "ComponentInvokeAction",
+        "props": {
+            "componentName": item.english_name.clone(),
+            "params": Value::Object(build_component_example_values(item)),
+            "renderResult": !matches!(item.return_type, ComponentReturnType::Text),
+            "exposeToAgent": true
+        }
+    })
+}
+
+fn build_required_parameter_names(item: &ComponentDefinition) -> Vec<String> {
+    item.workflow
+        .parameter_mappings
+        .iter()
+        .filter(|mapping| mapping.required && !mapping.parameter_name.trim().is_empty())
+        .map(|mapping| mapping.parameter_name.trim().to_string())
+        .collect()
+}
+
+fn build_required_parameters_line(item: &ComponentDefinition) -> String {
+    let required = build_required_parameter_names(item);
+    if required.is_empty() {
+        "当前组件没有必填参数，可按用户意图直接调用。".to_string()
+    } else {
+        format!(
+            "当前组件可直接执行的最小必填参数集合：`{}`。只要这些参数已经能从当前用户请求中得到，就直接调用，不要因为缺少可选参数或用户额外提到别的字段而退回成纯解释。",
+            required.join("`, `")
+        )
+    }
+}
+
 fn build_skill_markdown(item: &ComponentDefinition) -> String {
+    let render_example = serde_json::to_string(&build_component_render_example(item))
+        .unwrap_or_else(|_| "{}".to_string());
+    let invoke_example = serde_json::to_string(&build_component_invoke_example(item))
+        .unwrap_or_else(|_| "{}".to_string());
     let mut lines = vec![
         format!("# {}", item.name),
         String::new(),
         format!("- 组件类型：`{}`", provider_type_label(&item.provider_type)),
         format!("- 返回类型：`{}`", return_type_label(&item.return_type)),
         format!("- 渲染组件类型名：`{}`", item.component_type),
+        format!("- 直接调用组件名：`{}`", item.english_name),
         format!("- 组件描述：{}", item.description),
         String::new(),
         "## 参数映射".to_string(),
@@ -1134,28 +1458,33 @@ fn build_skill_markdown(item: &ComponentDefinition) -> String {
     ];
     for mapping in &item.workflow.parameter_mappings {
         let required = if mapping.required { "必填" } else { "可选" };
-        let default_text = if mapping.default_value.is_null() {
-            String::new()
-        } else {
+        let default_text = if should_expose_default_value(mapping) {
             format!(
                 "；默认值：{}",
-                stringify_value_compact(&mapping.default_value)
+                stringify_value_preview(&mapping.default_value, 96)
             )
+        } else {
+            String::new()
         };
         let description = if mapping.description.trim().is_empty() {
             String::new()
         } else {
-            format!("；说明：{}", mapping.description.trim())
+            format!(
+                "；说明：{}",
+                summarize_inline_text(mapping.description.trim(), 120)
+            )
         };
         lines.push(format!(
-            "- `{}`（{}） [{}]：{}，{}{}{}",
+            "- `{}`（{}） [{}]：{}，{}；角色：{}{}{}；提示：{}",
             mapping.parameter_name,
             mapping.field_name,
             mapping.label,
             value_type_label(&mapping.value_type),
             required,
+            parameter_role_label(mapping),
             default_text,
-            description
+            description,
+            parameter_role_guidance(mapping)
         ));
     }
     lines.push(String::new());
@@ -1163,23 +1492,31 @@ fn build_skill_markdown(item: &ComponentDefinition) -> String {
     lines.push(String::new());
     lines.push("- 这是 UI 组件 skill，不是 tool，也不是 MCP 调用；不要因为工具列表里没有同名 tool 就回答“找不到”。".to_string());
     lines.push("- 只在 GUI / App / Web 等可渲染 UI 的上下文里输出 `<UI_JSON>`。".to_string());
+    lines.push("- 渲染通道使用组件类型名：`type` 必须等于上面的“渲染组件类型名”。".to_string());
+    lines.push("- 调用通道使用组件目录名：`ComponentInvokeAction.props.componentName` 必须等于上面的“直接调用组件名”。".to_string());
     lines.push("- 参数名必须使用参数映射中的 parameter_name。".to_string());
-    lines.push("- 用户明确要求立即执行时，可设置 `props.autoRun=true`。".to_string());
+    lines.push(format!("- {}", build_required_parameters_line(item)));
+    lines.push("- 已知参数不完整，或需要用户继续编辑时，优先输出渲染通道，把已知值写进 `props.initialValues`。".to_string());
+    lines.push("- 已知参数已经齐全，且用户要求马上生成时，优先输出 `ComponentInvokeAction`；图片/视频/音频组件把 `renderResult` 设为 `true`，让结果直接回填聊天。".to_string());
+    lines.push("- 当用户明确说“直接调用 / 直接生成 / 直接执行”时，如果必填参数已满足，必须直接输出 `ComponentInvokeAction`；不要回答“没有入口”“不会用组件”“当前上下文没有安全规范”。".to_string());
+    lines.push("- `params` 里只保留组件声明过的参数；用户多给的字段不要原样塞进去，也不要因为存在额外字段就拒绝调用。".to_string());
+    lines.push("- 可选参数缺失不会阻止调用；只要必填参数齐了就可以执行。".to_string());
+    lines.push("- 如果用户给了额外的风格、氛围、约束、主题等要求，但组件没有同名字段，可把这类要求合并进最接近的描述型字符串参数（例如 `tags` / `prompt` / `description` / `text`）；若没有合适字段，就忽略这些额外字段，不要因此拒绝。".to_string());
+    lines.push("- 如果仍然走渲染通道并且参数已齐，可设置 `props.autoRun=true` 让组件打开后自动执行。".to_string());
+    lines.push("- 不要把 `english_name` 写进渲染 `type`，也不要把 `component_type` 写进 `componentName`。".to_string());
     lines.push(String::new());
     lines.push("## 输出示例".to_string());
     lines.push(String::new());
-    lines.push(format!(
-        "- 打开组件：`<UI_JSON>{{\"type\":\"{}\"}}</UI_JSON>`",
-        item.component_type
-    ));
-    lines.push(format!(
-        "- 直接执行：`<UI_JSON>{{\"type\":\"{}\",\"props\":{{\"autoRun\":true,\"initialValues\":{{}}}}}}</UI_JSON>`",
-        item.component_type
-    ));
+    lines.push(format!("- 打开组件：`<UI_JSON>{render_example}</UI_JSON>`"));
+    lines.push(format!("- 直接调用并回填结果：`<UI_JSON>{invoke_example}</UI_JSON>`"));
     lines.join("\n")
 }
 
 fn build_prompt_context_markdown(item: &ComponentDefinition) -> String {
+    let render_example = serde_json::to_string(&build_component_render_example(item))
+        .unwrap_or_else(|_| "{}".to_string());
+    let invoke_example = serde_json::to_string(&build_component_invoke_example(item))
+        .unwrap_or_else(|_| "{}".to_string());
     let capability_tag = component_capability_tag(&item.return_type);
     let capability_label = component_capability_label(&item.return_type);
     let mut lines = vec![
@@ -1187,6 +1524,7 @@ fn build_prompt_context_markdown(item: &ComponentDefinition) -> String {
         String::new(),
         format!("- 组件标识：`{}`", item.component_type),
         format!("- 技能目录：`{}`", item.english_name),
+        format!("- 直接调用名：`{}`", item.english_name),
         format!("- 描述：{}", item.description),
         format!(
             "- Provider：`provider:{}`",
@@ -1200,28 +1538,33 @@ fn build_prompt_context_markdown(item: &ComponentDefinition) -> String {
     ];
     for mapping in &item.workflow.parameter_mappings {
         let required = if mapping.required { "必填" } else { "可选" };
-        let default_text = if mapping.default_value.is_null() {
-            String::new()
-        } else {
+        let default_text = if should_expose_default_value(mapping) {
             format!(
                 "；默认值：{}",
-                stringify_value_compact(&mapping.default_value)
+                stringify_value_preview(&mapping.default_value, 96)
             )
+        } else {
+            String::new()
         };
         let description = if mapping.description.trim().is_empty() {
             String::new()
         } else {
-            format!("；说明：{}", mapping.description.trim())
+            format!(
+                "；说明：{}",
+                summarize_inline_text(mapping.description.trim(), 120)
+            )
         };
         lines.push(format!(
-            "- `{}`（{}） [{}]：{}，{}{}{}",
+            "- `{}`（{}） [{}]：{}，{}；角色：{}{}{}；提示：{}",
             mapping.parameter_name,
             mapping.field_name,
             mapping.label,
             value_type_label(&mapping.value_type),
             required,
+            parameter_role_label(mapping),
             default_text,
-            description
+            description,
+            parameter_role_guidance(mapping)
         ));
     }
     lines.push(String::new());
@@ -1229,21 +1572,22 @@ fn build_prompt_context_markdown(item: &ComponentDefinition) -> String {
     lines.push(String::new());
     lines.push("- 这是组件 skill / UI 能力，不是 OpenFang function tool。".to_string());
     lines.push("- 当用户明确请求使用该组件时，输出 `<UI_JSON>`。".to_string());
-    lines.push("- 若用户已提供有效参数，优先写入 `props.initialValues`。".to_string());
-    lines.push(
-        "- 若用户要求直接执行，并且必填参数已满足，可设置 `props.autoRun=true`。".to_string(),
-    );
+    lines.push("- 渲染通道：直接输出组件卡片，`type` 必须精确等于 `组件标识`，已知参数写进 `props.initialValues`。".to_string());
+    lines.push("- 调用通道：输出 `ComponentInvokeAction`，其中 `props.componentName` 必须精确等于 `直接调用名`。".to_string());
+    lines.push(format!("- {}", build_required_parameters_line(item)));
+    lines.push("- 对图片/视频/音频这类直接产出媒体结果的请求，只要参数已经齐全，就优先走调用通道，并设置 `renderResult=true`。".to_string());
+    lines.push("- 对参数还不完整、需要用户补充或希望用户手动确认的请求，优先走渲染通道。".to_string());
+    lines.push("- 当用户已经明确要求“直接生成 / 直接调用 / 直接执行”时，只要必填参数齐了，就必须直接输出 `ComponentInvokeAction`，不要解释自己不会用组件，也不要说当前上下文没有入口。".to_string());
+    lines.push("- `params` 中只能放当前组件声明过的参数；用户额外提到的 title / style / prompt / note 等字段，如果组件未声明，不要原样塞进去，也不要因为它们不存在映射就拒绝调用。".to_string());
+    lines.push("- 可选参数缺失不会阻止执行；判断是否能直调时，只看必填参数是否已满足。".to_string());
+    lines.push("- 若用户多给的是风格、氛围、主题、补充要求，而组件存在描述型字符串参数（如 `tags` / `prompt` / `description` / `text`），可把这些额外要求合并进去；否则忽略这些额外字段，继续调用。".to_string());
+    lines.push("- 若用户要求直接执行，并且你仍选择渲染通道，可设置 `props.autoRun=true`。".to_string());
+    lines.push("- 不要混淆 `component_type` 与 `english_name`：前者只用于渲染 `type`，后者只用于 `componentName`。".to_string());
     lines.push(String::new());
     lines.push("## 输出规范".to_string());
     lines.push(String::new());
-    lines.push(format!(
-        "- 仅打开组件：`<UI_JSON>{{\"type\":\"{}\"}}</UI_JSON>`",
-        item.component_type
-    ));
-    lines.push(format!(
-        "- 直接执行：`<UI_JSON>{{\"type\":\"{}\",\"props\":{{\"autoRun\":true,\"initialValues\":{{}}}}}}</UI_JSON>`",
-        item.component_type
-    ));
+    lines.push(format!("- 仅打开组件：`<UI_JSON>{render_example}</UI_JSON>`"));
+    lines.push(format!("- 直接调用并回填结果：`<UI_JSON>{invoke_example}</UI_JSON>`"));
     lines.join("\n")
 }
 
@@ -1333,6 +1677,32 @@ function buildInitialValues(item, presetValues) {
   return output;
 }
 
+function hasMeaningfulValue(raw, valueType) {
+  if (valueType === 'boolean') return typeof raw === 'boolean';
+  if (valueType === 'number') return raw !== '' && raw !== null && raw !== undefined && Number.isFinite(Number(raw));
+  if (valueType === 'json') return raw !== '' && raw !== null && raw !== undefined;
+  return typeof raw === 'string' ? raw.trim().length > 0 : raw !== null && raw !== undefined;
+}
+
+function hasAllRequiredValues(item, values) {
+  const mappings = Array.isArray(item?.workflow?.parameterMappings) ? item.workflow.parameterMappings : [];
+  return mappings
+    .filter((mapping) => mapping?.required)
+    .every((mapping) => hasMeaningfulValue(values?.[mapping.parameterName], mapping?.valueType || 'string'));
+}
+
+function formatHintLine(mapping) {
+  const parts = [];
+  parts.push(mapping?.required ? '必填' : '可选');
+  if (typeof mapping?.valueType === 'string' && mapping.valueType) {
+    parts.push(mapping.valueType);
+  }
+  if (typeof mapping?.description === 'string' && mapping.description.trim()) {
+    parts.push(mapping.description.trim());
+  }
+  return parts.join(' · ');
+}
+
 function ResultView({ outputType, result }) {
   const items = Array.isArray(result?.items) ? result.items : [];
   const text = typeof result?.text === 'string' ? result.text : '';
@@ -1350,6 +1720,7 @@ function RuntimeCard({ element }) {
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState('');
   const [result, setResult] = React.useState(null);
+  const autoRunStateRef = React.useRef('');
 
   React.useEffect(() => {
     let active = true;
@@ -1389,6 +1760,24 @@ function RuntimeCard({ element }) {
     }
   }, [definition, values]);
 
+  const autoRunEnabled = props.autoRun === true;
+  const autoRunStateKey = React.useMemo(() => JSON.stringify({
+    autoRun: autoRunEnabled,
+    initialValues: props.initialValues || null,
+  }), [autoRunEnabled, props.initialValues]);
+
+  React.useEffect(() => {
+    autoRunStateRef.current = '';
+  }, [autoRunStateKey]);
+
+  React.useEffect(() => {
+    if (!autoRunEnabled || !definition || loading || submitting) return;
+    if (!hasAllRequiredValues(definition, values)) return;
+    if (autoRunStateRef.current === autoRunStateKey) return;
+    autoRunStateRef.current = autoRunStateKey;
+    void invoke();
+  }, [autoRunEnabled, autoRunStateKey, definition, invoke, loading, submitting, values]);
+
   if (loading) return <div className="rounded-3xl border border-slate-200 bg-white/80 p-5 text-sm text-slate-500">组件初始化中...</div>;
   if (error && !definition) return <div className="rounded-3xl border border-rose-200 bg-rose-50 p-5 text-sm text-rose-700">{error}</div>;
 
@@ -1406,14 +1795,18 @@ function RuntimeCard({ element }) {
           const key = mapping.parameterName;
           const currentValue = values[key] ?? (mapping.valueType === 'boolean' ? false : '');
           if (mapping.valueType === 'boolean') {
-            return <label key={mapping.id || key} className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-700"><input type="checkbox" checked={Boolean(currentValue)} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.checked }))} disabled={submitting} /><span>{mapping.label || key}</span></label>;
+            return <label key={mapping.id || key} className="grid gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700"><div className="inline-flex items-center gap-2"><input type="checkbox" checked={Boolean(currentValue)} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.checked }))} disabled={submitting} /><span>{mapping.label || key}</span></div><div className="text-xs text-slate-500">{formatHintLine(mapping)}</div></label>;
           }
-          return <label key={mapping.id || key} className="grid gap-2"><div className="text-sm font-medium text-slate-800">{mapping.label || key}</div><textarea value={typeof currentValue === 'string' ? currentValue : JSON.stringify(currentValue ?? '', null, 2)} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.value }))} disabled={submitting} rows={mapping.valueType === 'json' ? 4 : 3} className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-700 outline-none" /></label>;
+          if (mapping.valueType === 'number') {
+            return <label key={mapping.id || key} className="grid gap-2"><div className="flex items-center gap-2"><div className="text-sm font-medium text-slate-800">{mapping.label || key}</div>{mapping.required ? <span className="rounded-full bg-rose-50 px-2 py-0.5 text-[11px] text-rose-600">必填</span> : null}</div><div className="text-xs text-slate-500">{formatHintLine(mapping)}</div><input type="number" value={currentValue === '' ? '' : Number(currentValue)} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.value }))} disabled={submitting} className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-700 outline-none" /></label>;
+          }
+          return <label key={mapping.id || key} className="grid gap-2"><div className="flex items-center gap-2"><div className="text-sm font-medium text-slate-800">{mapping.label || key}</div>{mapping.required ? <span className="rounded-full bg-rose-50 px-2 py-0.5 text-[11px] text-rose-600">必填</span> : null}</div><div className="text-xs text-slate-500">{formatHintLine(mapping)}</div><textarea value={typeof currentValue === 'string' ? currentValue : JSON.stringify(currentValue ?? '', null, 2)} onChange={(event) => setValues((prev) => ({ ...prev, [key]: event.target.value }))} disabled={submitting} rows={mapping.valueType === 'json' ? 4 : (String(mapping.parameterName || '').toLowerCase().includes('lyrics') ? 8 : 3)} className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-700 outline-none" /></label>;
         })}
       </div>
       <div className="mt-5 flex items-center gap-3">
-        <button type="button" onClick={() => void invoke()} disabled={submitting} className="inline-flex h-11 items-center justify-center rounded-full bg-slate-900 px-5 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">{submitting ? '执行中...' : '立即执行'}</button>
+        <button type="button" onClick={() => void invoke()} disabled={submitting} className="inline-flex h-11 items-center justify-center rounded-full bg-slate-900 px-5 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">{submitting ? '执行中...' : (typeof props.submitLabel === 'string' && props.submitLabel.trim() ? props.submitLabel.trim() : '立即执行')}</button>
         <div className="text-xs text-slate-500">返回类型：{outputType}</div>
+        {autoRunEnabled ? <div className="text-xs text-emerald-600">已启用自动执行</div> : null}
       </div>
       {error ? <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</div> : null}
       {result ? <div className="mt-5 grid gap-4"><ResultView outputType={outputType} result={result} /></div> : null}
@@ -1501,11 +1894,119 @@ fn stringify_value_compact(value: &Value) -> String {
     }
 }
 
+fn is_effectively_empty_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+fn collect_allowed_component_param_keys(mappings: &[ComponentParameterMapping]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for mapping in mappings {
+        let exact = mapping.parameter_name.trim();
+        if !exact.is_empty() && !keys.iter().any(|item| item == exact) {
+            keys.push(exact.to_string());
+        }
+        for alias in infer_component_param_aliases(mapping) {
+            if !keys.iter().any(|item| item == alias) {
+                keys.push(alias.to_string());
+            }
+        }
+    }
+    keys.sort();
+    keys
+}
+
+fn validate_component_invoke_params(
+    item: &ComponentDefinition,
+    params: &Map<String, Value>,
+) -> Result<(), ApiError> {
+    let allowed_keys = collect_allowed_component_param_keys(&item.workflow.parameter_mappings);
+    let unknown_keys = params
+        .keys()
+        .filter(|key| {
+            let normalized = key.trim();
+            !normalized.is_empty() && !allowed_keys.iter().any(|allowed| allowed == normalized)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_keys.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "组件 {} 收到未声明参数: {}。允许参数: {}",
+                item.english_name,
+                unknown_keys.join(", "),
+                if allowed_keys.is_empty() {
+                    "无".to_string()
+                } else {
+                    allowed_keys.join(", ")
+                }
+            ),
+        ));
+    }
+
+    let missing_required = item
+        .workflow
+        .parameter_mappings
+        .iter()
+        .filter(|mapping| mapping.required)
+        .filter_map(|mapping| match resolve_component_param_value(mapping, params) {
+            Some(value) if !is_effectively_empty_value(&value) => None,
+            _ => Some(mapping.parameter_name.clone()),
+        })
+        .collect::<Vec<_>>();
+    if !missing_required.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "组件 {} 缺少必填参数: {}",
+                item.english_name,
+                missing_required.join(", ")
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_runtime_component_param_value(
+    mapping: &ComponentParameterMapping,
+    params: &Map<String, Value>,
+) -> Result<Option<Value>, ApiError> {
+    if let Some(value) = resolve_component_param_value(mapping, params) {
+        if mapping.required && is_effectively_empty_value(&value) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("组件缺少必填参数: {}", mapping.parameter_name),
+            ));
+        }
+        return Ok(Some(value));
+    }
+    if mapping.required {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("组件缺少必填参数: {}", mapping.parameter_name),
+        ));
+    }
+    if !mapping.default_value.is_null() {
+        return Ok(Some(mapping.default_value.clone()));
+    }
+    Ok(None)
+}
+
 async fn invoke_comfyui_component(
+    state: &Arc<AppState>,
     item: &ComponentDefinition,
     config: &ComponentServiceConfig,
     params: &Map<String, Value>,
+    agent_id: Option<&str>,
 ) -> Result<ComponentInvokeResult, ApiError> {
+    validate_component_invoke_params(item, params)?;
     if item
         .workflow
         .raw_payload
@@ -1524,9 +2025,6 @@ async fn invoke_comfyui_component(
             "组件缺少原始 ComfyUI 工作流，请重新在组件中心导入并保存工作流",
         ));
     }
-    let mut prompt = normalize_comfy_prompt_payload(&item.workflow.raw_payload)?;
-    apply_component_params_to_prompt(&mut prompt, &item.workflow.parameter_mappings, params, true)?;
-
     let base_url = normalize_url_or_default(&config.server_url, &default_comfyui_server_url());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -1538,6 +2036,20 @@ async fn invoke_comfyui_component(
             )
         })?;
     let headers = build_provider_headers(config)?;
+    let mut prompt = normalize_comfy_prompt_payload(&item.workflow.raw_payload)?;
+    apply_component_params_to_prompt(
+        &mut prompt,
+        &item.workflow.parameter_mappings,
+        params,
+        true,
+        state,
+        &client,
+        &headers,
+        &base_url,
+        agent_id,
+    )
+    .await?;
+
     let enqueue_response = client
         .post(format!("{base_url}/prompt"))
         .headers(headers.clone())
@@ -1580,7 +2092,14 @@ async fn invoke_comfyui_component(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "ComfyUI 未返回 prompt_id"))?;
 
-    let history = poll_comfyui_history(&client, &headers, &base_url, prompt_id).await?;
+    let history = poll_comfyui_history(
+        &client,
+        &headers,
+        &base_url,
+        prompt_id,
+        comfyui_poll_attempts_for_component(item),
+    )
+    .await?;
     let items = extract_comfyui_items(&base_url, &history, &item.return_type);
     let text = if items.is_empty() {
         "ComfyUI 已完成，但未发现可展示输出".to_string()
@@ -1636,11 +2155,16 @@ fn normalize_comfy_prompt_payload(raw_payload: &Value) -> Result<Value, ApiError
     Ok(raw_payload.clone())
 }
 
-fn apply_component_params_to_prompt(
+async fn apply_component_params_to_prompt(
     prompt: &mut Value,
     mappings: &[ComponentParameterMapping],
     params: &Map<String, Value>,
     require_raw_workflow: bool,
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    headers: &HeaderMap,
+    comfyui_base_url: &str,
+    agent_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let Some(prompt_object) = prompt.as_object_mut() else {
         return Err(ApiError::new(
@@ -1649,10 +2173,7 @@ fn apply_component_params_to_prompt(
         ));
     };
     for mapping in mappings {
-        let chosen = params
-            .get(&mapping.parameter_name)
-            .cloned()
-            .or_else(|| (!mapping.default_value.is_null()).then(|| mapping.default_value.clone()));
+        let chosen = resolve_runtime_component_param_value(mapping, params)?;
         let Some(value) = chosen else {
             continue;
         };
@@ -1668,18 +2189,612 @@ fn apply_component_params_to_prompt(
         let Some(node_object) = node_value.as_object_mut() else {
             continue;
         };
+        let node_class_type = node_object
+            .get("class_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let coerced = coerce_value_for_mapping(value, &mapping.value_type)?;
+        let normalized_value = maybe_normalize_comfyui_asset_value(
+            state,
+            client,
+            headers,
+            comfyui_base_url,
+            &node_class_type,
+            mapping,
+            coerced,
+            agent_id,
+        )
+        .await?;
         let inputs = node_object
             .entry("inputs".to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         let Some(input_object) = inputs.as_object_mut() else {
             continue;
         };
-        input_object.insert(
-            mapping.field_name.clone(),
-            coerce_value_for_mapping(value, &mapping.value_type)?,
-        );
+        input_object.insert(mapping.field_name.clone(), normalized_value);
     }
     Ok(())
+}
+
+fn resolve_component_param_value(
+    mapping: &ComponentParameterMapping,
+    params: &Map<String, Value>,
+) -> Option<Value> {
+    let exact_key = mapping.parameter_name.trim();
+    if !exact_key.is_empty() {
+        if let Some(value) = params.get(exact_key).cloned() {
+            return Some(value);
+        }
+    }
+
+    for alias in infer_component_param_aliases(mapping) {
+        if let Some(value) = params.get(alias).cloned() {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn infer_component_param_aliases(mapping: &ComponentParameterMapping) -> Vec<&'static str> {
+    let mut aliases = Vec::new();
+    if is_component_image_mapping(mapping) {
+        aliases.extend([
+            "image",
+            "image_url",
+            "imageUrl",
+            "image_path",
+            "imagePath",
+            "src",
+            "url",
+            "path",
+            "photo",
+            "photo_url",
+            "photoUrl",
+        ]);
+    }
+    if is_component_text_mapping(mapping) {
+        aliases.extend(["prompt", "text", "message", "description"]);
+    }
+    if is_component_width_mapping(mapping) {
+        aliases.extend(["width", "w"]);
+    }
+    if is_component_height_mapping(mapping) {
+        aliases.extend(["height", "h"]);
+    }
+
+    let mut unique = Vec::new();
+    for alias in aliases {
+        if mapping.parameter_name == alias || unique.contains(&alias) {
+            continue;
+        }
+        unique.push(alias);
+    }
+    unique
+}
+
+fn is_component_image_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    combined.contains("image")
+        || combined.contains("photo")
+        || mapping.parameter_name.contains('图')
+        || mapping.label.contains('图')
+        || mapping.description.contains('图')
+}
+
+fn is_component_text_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    if combined.contains("negative") || mapping.label.contains("负") || mapping.description.contains("负") {
+        return false;
+    }
+    combined.contains("prompt")
+        || combined.contains("text")
+        || combined.contains("message")
+        || mapping.label.contains("提示词")
+        || mapping.description.contains("提示词")
+}
+
+fn is_component_width_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    combined.contains("width") || mapping.label.contains('宽') || mapping.description.contains('宽')
+}
+
+fn is_component_height_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    combined.contains("height") || mapping.label.contains('高') || mapping.description.contains('高')
+}
+
+fn comfyui_poll_attempts_for_component(item: &ComponentDefinition) -> u32 {
+    if is_video_like_component(item) {
+        600
+    } else {
+        180
+    }
+}
+
+fn is_video_like_component(item: &ComponentDefinition) -> bool {
+    if matches!(item.return_type, ComponentReturnType::Video) {
+        return true;
+    }
+    let summary = format!(
+        "{} {} {}",
+        item.english_name, item.name, item.component_type
+    )
+    .to_ascii_lowercase();
+    if summary.contains("video") || item.name.contains("视频") || item.description.contains("视频") {
+        return true;
+    }
+    stringify_value_compact(&item.workflow.raw_payload)
+        .to_ascii_lowercase()
+        .contains("video")
+}
+
+async fn maybe_normalize_comfyui_asset_value(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    headers: &HeaderMap,
+    comfyui_base_url: &str,
+    node_class_type: &str,
+    mapping: &ComponentParameterMapping,
+    value: Value,
+    agent_id: Option<&str>,
+) -> Result<Value, ApiError> {
+    let Value::String(text) = value else {
+        return Ok(value);
+    };
+    if !should_upload_value_to_comfyui(mapping, node_class_type, &text) {
+        return Ok(Value::String(text));
+    }
+
+    let (bytes, mime_type) =
+        resolve_component_image_source(state, client, agent_id, &text).await?;
+    let uploaded_name =
+        upload_image_to_comfyui(client, headers, comfyui_base_url, &bytes, &mime_type).await?;
+    Ok(Value::String(uploaded_name))
+}
+
+fn should_upload_value_to_comfyui(
+    mapping: &ComponentParameterMapping,
+    node_class_type: &str,
+    value: &str,
+) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !looks_like_image_source(trimmed) {
+        return false;
+    }
+
+    let field_name = mapping.field_name.trim().to_ascii_lowercase();
+    let parameter_name = mapping.parameter_name.trim().to_ascii_lowercase();
+    let label = mapping.label.trim().to_ascii_lowercase();
+    let node_type = node_class_type.trim().to_ascii_lowercase();
+
+    field_name.contains("image")
+        || field_name.contains("mask")
+        || parameter_name.contains("image")
+        || parameter_name.contains("photo")
+        || mapping.parameter_name.contains('图')
+        || label.contains("image")
+        || label.contains("photo")
+        || mapping.label.contains('图')
+        || node_type.contains("loadimage")
+        || node_type.contains("image")
+}
+
+fn looks_like_image_source(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("data:image/")
+        || trimmed.starts_with("/api/uploads/")
+        || trimmed.starts_with("api/uploads/")
+        || trimmed.starts_with("/api/management/agents/")
+        || trimmed.contains("/api/uploads/")
+        || trimmed.contains("/api/management/agents/")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || looks_like_relative_image_source_path(trimmed)
+        || Path::new(trimmed).is_file()
+}
+
+fn looks_like_relative_image_source_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() || path.components().count() == 0 {
+        return false;
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let has_image_extension = normalize_image_mime_type(extension).is_some();
+    has_image_extension
+        && (trimmed.contains('/') || trimmed.contains('\\'))
+}
+
+fn resolve_relative_component_image_path(
+    roots: &[PathBuf],
+    source: &str,
+) -> Option<PathBuf> {
+    let trimmed = source.trim();
+    if !looks_like_relative_image_source_path(trimmed) {
+        return None;
+    }
+    let relative = Path::new(trimmed);
+    roots.iter()
+        .map(|root| root.join(relative))
+        .find(|candidate| candidate.is_file())
+}
+
+async fn resolve_component_workspace_image_path(
+    state: &Arc<AppState>,
+    agent_id: Option<&str>,
+    source: &str,
+) -> Result<Option<PathBuf>, ApiError> {
+    let normalized_agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
+    let Some(agent_id) = normalized_agent_id else {
+        return Ok(None);
+    };
+    let binding = crate::routes::resolve_agent_workspace_binding(state, agent_id, None).await?;
+    Ok(resolve_relative_component_image_path(
+        &binding.all_workspaces(),
+        source,
+    ))
+}
+
+async fn resolve_component_image_source(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    agent_id: Option<&str>,
+    source: &str,
+) -> Result<(Vec<u8>, String), ApiError> {
+    if let Some(decoded) = decode_image_data_url(source)? {
+        return Ok(decoded);
+    }
+
+    let trimmed = source.trim();
+    if Path::new(trimmed).is_file() {
+        let bytes = tokio::fs::read(trimmed).await.map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("读取组件图片参数失败({trimmed}): {err}"),
+            )
+        })?;
+        let mime_type = detect_image_mime_from_path_or_bytes(Some(trimmed), &bytes).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("无法识别组件图片格式: {trimmed}"),
+            )
+        })?;
+        return Ok((bytes, mime_type.to_string()));
+    }
+
+    if let Some(path) = resolve_component_workspace_image_path(state, agent_id, trimmed).await? {
+        let bytes = tokio::fs::read(&path).await.map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("读取组件工作区图片参数失败({}): {err}", path.display()),
+            )
+        })?;
+        let mime_type = detect_image_mime_from_path_or_bytes(
+            path.to_str(),
+            &bytes,
+        )
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("无法识别组件工作区图片格式: {}", path.display()),
+            )
+        })?;
+        return Ok((bytes, mime_type.to_string()));
+    }
+
+    if looks_like_relative_image_source_path(trimmed) {
+        let detail = if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+            format!("无法在智能体 {agent_id} 的工作区中找到图片文件: {trimmed}")
+        } else {
+            format!("组件图片参数是相对工作区路径，但缺少 agentId 无法解析: {trimmed}")
+        };
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, detail));
+    }
+
+    let (request_url, requires_openfang_auth) = build_component_asset_request_url(state, trimmed)?;
+    let mut request = client.get(&request_url);
+    if requires_openfang_auth {
+        if let Some(api_key) = state
+            .config
+            .openfang_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            request = request.bearer_auth(api_key);
+        }
+    }
+    let response = request.send().await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("下载组件图片资源失败({request_url}): {err}"),
+        )
+    })?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let body = response.bytes().await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("读取组件图片资源响应失败({request_url}): {err}"),
+        )
+    })?;
+    if !status.is_success() {
+        let snippet = String::from_utf8_lossy(&body);
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "下载组件图片资源返回错误({status}, {request_url}): {}",
+                snippet.trim()
+            ),
+        ));
+    }
+
+    let mime_type = content_type
+        .as_deref()
+        .and_then(normalize_image_mime_type)
+        .or_else(|| detect_image_mime_from_path_or_bytes(Some(trimmed), &body))
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("无法识别组件图片资源格式: {trimmed}"),
+            )
+        })?;
+    Ok((body.to_vec(), mime_type.to_string()))
+}
+
+fn build_component_asset_request_url(
+    state: &Arc<AppState>,
+    source: &str,
+) -> Result<(String, bool), ApiError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "组件图片参数不能为空",
+        ));
+    }
+
+    let openfang_base = state.config.openfang_base_url.trim_end_matches('/');
+    let service_base = local_service_base_url(state);
+
+    if trimmed.starts_with("/api/uploads/") {
+        return Ok((format!("{openfang_base}{trimmed}"), true));
+    }
+    if trimmed.starts_with("api/uploads/") {
+        return Ok((format!("{openfang_base}/{trimmed}"), true));
+    }
+    if trimmed.starts_with("/api/management/") {
+        return Ok((format!("{service_base}{trimmed}"), false));
+    }
+    if trimmed.starts_with("api/management/") {
+        return Ok((format!("{service_base}/{trimmed}"), false));
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let requires_openfang_auth = trimmed.starts_with(openfang_base)
+            && trimmed[openfang_base.len()..].starts_with("/api/uploads/");
+        return Ok((trimmed.to_string(), requires_openfang_auth));
+    }
+
+    Err(ApiError::new(
+        StatusCode::BAD_REQUEST,
+        format!("不支持的组件图片参数: {trimmed}"),
+    ))
+}
+
+fn local_service_base_url(state: &AppState) -> String {
+    let listen_addr = state.config.listen_addr;
+    let host = if listen_addr.ip().is_unspecified() {
+        if listen_addr.is_ipv4() {
+            "127.0.0.1".to_string()
+        } else {
+            "[::1]".to_string()
+        }
+    } else if listen_addr.is_ipv6() {
+        format!("[{}]", listen_addr.ip())
+    } else {
+        listen_addr.ip().to_string()
+    };
+    format!("http://{}:{}", host, listen_addr.port())
+}
+
+fn decode_image_data_url(source: &str) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let trimmed = source.trim();
+    if !trimmed.starts_with("data:image/") {
+        return Ok(None);
+    }
+
+    let (header, encoded) = trimmed.split_once(',').ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "data:image 参数格式无效")
+    })?;
+    if !header.to_ascii_lowercase().contains(";base64") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "data:image 参数必须使用 base64 编码",
+        ));
+    }
+    let mime_type = if header.to_ascii_lowercase().starts_with("data:image/png") {
+        "image/png"
+    } else if header.to_ascii_lowercase().starts_with("data:image/jpeg")
+        || header.to_ascii_lowercase().starts_with("data:image/jpg")
+    {
+        "image/jpeg"
+    } else if header.to_ascii_lowercase().starts_with("data:image/webp") {
+        "image/webp"
+    } else if header.to_ascii_lowercase().starts_with("data:image/gif") {
+        "image/gif"
+    } else if header.to_ascii_lowercase().starts_with("data:image/bmp") {
+        "image/bmp"
+    } else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "暂不支持该 data:image 类型",
+        ));
+    };
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("解析 data:image 参数失败: {err}"),
+            )
+        })?;
+    Ok(Some((bytes, mime_type.to_string())))
+}
+
+async fn upload_image_to_comfyui(
+    client: &reqwest::Client,
+    headers: &HeaderMap,
+    base_url: &str,
+    bytes: &[u8],
+    mime_type: &str,
+) -> Result<String, ApiError> {
+    let ext = extension_from_mime_type(mime_type).unwrap_or("png");
+    let file_name = format!(
+        "webot-component-{}.{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().to_string())
+            .unwrap_or_else(|_| "0".to_string()),
+        ext
+    );
+    let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+        .file_name(file_name.clone())
+        .mime_str(mime_type)
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("组件图片 MIME 类型无效({mime_type}): {err}"),
+            )
+        })?;
+    let form = reqwest::multipart::Form::new()
+        .text("type", "input")
+        .text("overwrite", "true")
+        .part("image", part);
+    let response = client
+        .post(format!(
+            "{}/upload/image",
+            base_url.trim_end_matches('/')
+        ))
+        .headers(headers.clone())
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("上传组件图片到 ComfyUI 失败: {err}"),
+            )
+        })?;
+    let status = response.status();
+    let text = response.text().await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("读取 ComfyUI 图片上传响应失败: {err}"),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("ComfyUI 图片上传失败({status}): {}", text.trim()),
+        ));
+    }
+    let payload = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+    let uploaded_name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("filename").and_then(Value::as_str))
+        .unwrap_or(&file_name)
+        .trim()
+        .to_string();
+    if uploaded_name.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "ComfyUI 上传组件图片成功但未返回文件名",
+        ));
+    }
+    Ok(uploaded_name)
+}
+
+fn normalize_image_mime_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "image/png" | "png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" | "jpg" | "jpeg" => Some("image/jpeg"),
+        "image/webp" | "webp" => Some("image/webp"),
+        "image/gif" | "gif" => Some("image/gif"),
+        "image/bmp" | "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn extension_from_mime_type(mime_type: &str) -> Option<&'static str> {
+    match normalize_image_mime_type(mime_type)? {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        _ => None,
+    }
+}
+
+fn detect_image_mime_from_path_or_bytes(path: Option<&str>, bytes: &[u8]) -> Option<&'static str> {
+    if let Some(path) = path {
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if let Some(mime_type) = normalize_image_mime_type(extension) {
+            return Some(mime_type);
+        }
+    }
+
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    None
 }
 
 fn coerce_value_for_mapping(
@@ -1733,10 +2848,11 @@ async fn poll_comfyui_history(
     headers: &HeaderMap,
     base_url: &str,
     prompt_id: &str,
+    max_attempts: u32,
 ) -> Result<Value, ApiError> {
     let history_url = format!("{base_url}/history/{prompt_id}");
     let mut last_body = Value::Null;
-    for _ in 0..90 {
+    for _ in 0..max_attempts.max(1) {
         let response = client
             .get(&history_url)
             .headers(headers.clone())
@@ -1872,6 +2988,7 @@ async fn invoke_runninghub_component(
     config: &ComponentServiceConfig,
     params: &Map<String, Value>,
 ) -> Result<ComponentInvokeResult, ApiError> {
+    validate_component_invoke_params(item, params)?;
     if item
         .workflow
         .raw_payload
@@ -1906,10 +3023,7 @@ async fn invoke_runninghub_component(
             )
         })?;
     for mapping in &item.workflow.parameter_mappings {
-        let chosen = params
-            .get(&mapping.parameter_name)
-            .cloned()
-            .or_else(|| (!mapping.default_value.is_null()).then(|| mapping.default_value.clone()));
+        let chosen = resolve_runtime_component_param_value(mapping, params)?;
         let Some(value) = chosen else {
             continue;
         };
@@ -2125,5 +3239,29 @@ mod tests {
             Value::String("一个古装美女".to_string())
         );
         assert_eq!(mapping.description, "中文提示词");
+    }
+
+    #[test]
+    fn hide_long_prompt_defaults_from_skill_context() {
+        let mapping = ComponentParameterMapping {
+            id: "1".to_string(),
+            node_id: "node".to_string(),
+            field_name: "lyrics".to_string(),
+            parameter_name: "lyrics".to_string(),
+            label: "歌词".to_string(),
+            value_type: ComponentParamValueType::String,
+            description: "真正歌词正文".to_string(),
+            default_value: Value::String(
+                "[en]\n[Verse]\nThis is a very long default lyric template that should not leak into generated skill prompts."
+                    .to_string(),
+            ),
+            required: true,
+            options: Vec::new(),
+        };
+        assert!(!should_expose_default_value(&mapping));
+        assert_eq!(
+            build_mapping_example_value(&mapping),
+            Value::String("请填写真正的歌词正文，支持分段换行".to_string())
+        );
     }
 }

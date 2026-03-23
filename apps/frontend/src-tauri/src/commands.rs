@@ -154,6 +154,7 @@ pub struct SkillComponentManifestPayload {
     pub description: String,
     pub props_schema: serde_json::Value,
     pub example: serde_json::Value,
+    pub invoke_example: serde_json::Value,
     pub file_path: String,
 }
 
@@ -175,6 +176,8 @@ struct SkillManifestComponent {
     props_schema: serde_json::Value,
     #[serde(default)]
     example: serde_json::Value,
+    #[serde(default, rename = "invokeExample")]
+    invoke_example: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,6 +374,7 @@ pub fn load_skill_prompt_context(
     let skill_dir = file_path
         .parent()
         .ok_or_else(|| format!("Invalid component directory: {}", file_path.display()))?;
+    webot_service_rs::component_center::refresh_component_skill_artifacts_for_dir(skill_dir)?;
 
     let candidates = [
         skill_dir.join("prompt_context.md"),
@@ -420,6 +424,9 @@ pub fn list_available_skill_components(
         for root in &roots {
             let skill_dir = root.join(normalized);
             if skill_dir.is_dir() {
+                webot_service_rs::component_center::refresh_component_skill_artifacts_for_dir(
+                    &skill_dir,
+                )?;
                 components.extend(read_manifest_components(&skill_dir)?);
                 break;
             }
@@ -446,6 +453,7 @@ pub fn load_skill_component_manifest(
     let skill_dir = file_path
         .parent()
         .ok_or_else(|| format!("Invalid component directory: {}", file_path.display()))?;
+    webot_service_rs::component_center::refresh_component_skill_artifacts_for_dir(skill_dir)?;
     let manifest_path = skill_dir.join("components.manifest.json");
     let raw = fs::read_to_string(&manifest_path).map_err(|err| {
         format!(
@@ -475,6 +483,7 @@ pub fn load_skill_component_manifest(
         description: item.description,
         props_schema: item.props_schema,
         example: item.example,
+        invoke_example: item.invoke_example,
         file_path: manifest_path.to_string_lossy().to_string(),
     })
 }

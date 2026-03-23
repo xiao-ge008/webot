@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
+import { useResolvedRuntimeAssetSrc } from '@/lib/runtime-asset-url';
 
 interface AgentVisualEditorProps {
   agentName: string;
@@ -36,9 +37,10 @@ export function AgentVisualEditor({
   uploadingPortrait,
   uploadDisabled,
 }: AgentVisualEditorProps) {
+  const resolvedPortraitUrl = useResolvedRuntimeAssetSrc(portraitUrl);
   const previewMode = live2dEnabled
     ? 'live2d'
-    : portraitEnabled && portraitUrl
+    : portraitEnabled && resolvedPortraitUrl
       ? 'portrait'
       : avatarUrl
         ? 'avatar'
@@ -61,7 +63,7 @@ export function AgentVisualEditor({
                   </p>
                 </div>
               ) : previewMode === 'portrait' ? (
-                <img src={portraitUrl} alt={agentName} className="w-full h-full object-cover" />
+                <img src={resolvedPortraitUrl} alt={agentName} className="w-full h-full object-cover" />
               ) : previewMode === 'avatar' ? (
                 <div className="w-full h-full flex flex-col items-center justify-center gap-6 bg-linear-to-b from-muted/5 to-muted/20">
                   <AgentAvatar

@@ -31,7 +31,10 @@ interface ChatMessageListProps {
     isUser: boolean,
     options?: { deferHeavyUi?: boolean; includeProcessPanel?: boolean },
   ) => ReactNode;
+  renderMessageMetaControl?: (msg: Message, isUser: boolean) => ReactNode;
   renderMessageAttachments: (msg: Message, isUser: boolean) => ReactNode;
+  renderMessageActions?: (msg: Message, isUser: boolean) => ReactNode;
+  renderMessageFooter?: (msg: Message, isUser: boolean) => ReactNode;
   hasMessageBubbleContent: (msg: Message, isUser: boolean) => boolean;
   renderProcessPanel: (key: string, items: Message[]) => ReactNode;
   canRegenerateAt: (index: number) => boolean;
@@ -55,7 +58,10 @@ function ChatMessageRow({
   onHeightChange,
   onRegenerateMessage,
   renderMessageBody,
+  renderMessageMetaControl,
   renderMessageAttachments,
+  renderMessageActions,
+  renderMessageFooter,
   renderProcessPanel,
   hasMessageBubbleContent,
   canRegenerateAt,
@@ -72,7 +78,10 @@ function ChatMessageRow({
   onHeightChange?: (groupId: string, height: number) => void;
   onRegenerateMessage: (messageId: string) => void;
   renderMessageBody: ChatMessageListProps['renderMessageBody'];
+  renderMessageMetaControl?: ChatMessageListProps['renderMessageMetaControl'];
   renderMessageAttachments: ChatMessageListProps['renderMessageAttachments'];
+  renderMessageActions?: ChatMessageListProps['renderMessageActions'];
+  renderMessageFooter?: ChatMessageListProps['renderMessageFooter'];
   renderProcessPanel: ChatMessageListProps['renderProcessPanel'];
   hasMessageBubbleContent: ChatMessageListProps['hasMessageBubbleContent'];
   canRegenerateAt: (index: number) => boolean;
@@ -129,6 +138,7 @@ function ChatMessageRow({
           <div className="chat-message-meta flex items-center justify-between">
             <div className="chat-message-meta-left">
               <span className="text-xs font-bold text-muted-foreground">{messageAgentName}</span>
+              {renderMessageMetaControl?.(msg, isUser)}
               <span className="text-[10px] text-muted-foreground/60">
                 {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
               </span>
@@ -157,6 +167,8 @@ function ChatMessageRow({
         <div className={cn(groupMessages.length > 1 ? 'space-y-4' : '')}>
           {groupMessages.map((item, itemIndex) => {
             const attachmentNode = renderMessageAttachments(item, isUser);
+            const actionNode = renderMessageActions?.(item, isUser);
+            const footerNode = renderMessageFooter?.(item, isUser);
             const showBubble = hasMessageBubbleContent(item, isUser);
 
             return (
@@ -189,6 +201,16 @@ function ChatMessageRow({
                     </div>
                   </div>
                 ) : null}
+                {actionNode ? (
+                  <div className={cn('mt-2 flex w-full', isUser ? 'justify-end' : 'justify-start')}>
+                    {actionNode}
+                  </div>
+                ) : null}
+                {footerNode ? (
+                  <div className={cn('mt-2 flex w-full', isUser ? 'justify-end' : 'justify-start')}>
+                    {footerNode}
+                  </div>
+                ) : null}
               </div>
             );
           })}
@@ -209,7 +231,10 @@ function ChatMessageListInner({
   traceRenderToken,
   scrollContainerRef,
   renderMessageBody,
+  renderMessageMetaControl,
   renderMessageAttachments,
+  renderMessageActions,
+  renderMessageFooter,
   renderProcessPanel,
   hasMessageBubbleContent,
   canRegenerateAt,
@@ -349,7 +374,10 @@ function ChatMessageListInner({
             messageIndexMap={messageIndexMap}
             onRegenerateMessage={onRegenerateMessage}
             renderMessageBody={renderMessageBody}
+            renderMessageMetaControl={renderMessageMetaControl}
             renderMessageAttachments={renderMessageAttachments}
+            renderMessageActions={renderMessageActions}
+            renderMessageFooter={renderMessageFooter}
             renderProcessPanel={renderProcessPanel}
             hasMessageBubbleContent={hasMessageBubbleContent}
             canRegenerateAt={canRegenerateAt}
@@ -383,7 +411,10 @@ function ChatMessageListInner({
             onHeightChange={handleHeightChange}
             onRegenerateMessage={onRegenerateMessage}
             renderMessageBody={renderMessageBody}
+            renderMessageMetaControl={renderMessageMetaControl}
             renderMessageAttachments={renderMessageAttachments}
+            renderMessageActions={renderMessageActions}
+            renderMessageFooter={renderMessageFooter}
             renderProcessPanel={renderProcessPanel}
             hasMessageBubbleContent={hasMessageBubbleContent}
             canRegenerateAt={canRegenerateAt}

@@ -7,6 +7,7 @@ pub mod media_index;
 pub mod openfang;
 pub mod path_resolver;
 pub mod routes;
+pub mod tts_management;
 pub mod vision_analysis;
 
 use std::fs;

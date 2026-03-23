@@ -1,6 +1,11 @@
 import type { ChatAttachment, Message, MessageToolCall, MessageTrace } from '@/data/mock-chats';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import type { ChatTaskLifecycleItem } from '@/types/chat-task';
+import {
+  cleanupAssistantText,
+  normalizeIncomingSpec,
+  tryParseInlineSpecFromText,
+} from '@/components/chat/chat-page-helpers';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 import type { GroupAgentContextDigest, GroupMemoryDigest, GroupQueueItem, GroupSessionRuntime } from '@/types/group';
 
@@ -426,11 +431,22 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
   if (typeof item.thinking === 'boolean') {
     message.thinking = item.thinking;
   }
-  if (item.spec !== undefined) {
-    message.spec = item.spec;
+  const rawUiText = typeof item.uiRawText === 'string' ? item.uiRawText : '';
+  let resolvedSpec = normalizeIncomingSpec(item.spec);
+  if (resolvedSpec === undefined && rawUiText.trim()) {
+    resolvedSpec = tryParseInlineSpecFromText(rawUiText);
   }
-  if (typeof item.uiRawText === 'string') {
-    message.uiRawText = item.uiRawText;
+  if (resolvedSpec === undefined && text.trim()) {
+    resolvedSpec = tryParseInlineSpecFromText(text);
+  }
+  if (resolvedSpec !== undefined) {
+    message.spec = resolvedSpec;
+    if (role === 'agent') {
+      message.text = cleanupAssistantText(message.text, resolvedSpec);
+    }
+  }
+  if (rawUiText) {
+    message.uiRawText = rawUiText;
   }
   if (item.uiStreamState === 'idle' || item.uiStreamState === 'streaming' || item.uiStreamState === 'ready') {
     message.uiStreamState = item.uiStreamState;

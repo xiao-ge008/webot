@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::path_resolver;
 
 const APP_PREF_KEY_PROVIDER_MODEL_STATE_NORMALIZED_V1: &str = "provider_model_state_normalized_v2";
+const APP_PREF_KEY_TTS_CONFIG: &str = "tts_config";
 static PROVIDER_MODEL_STATE_MIGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PROVIDER_MODEL_STATE_MIGRATED_IN_PROCESS: OnceLock<()> = OnceLock::new();
 
@@ -62,6 +63,8 @@ pub struct AgentProfileOverrideRecord {
     pub portrait_url: Option<String>,
     pub english_name: Option<String>,
     pub nickname: Option<String>,
+    pub tts_config: Option<Value>,
+    pub speaker_profiles: Option<Value>,
     pub updated_at: String,
 }
 
@@ -905,6 +908,8 @@ fn ensure_agent_profile_override_columns(conn: &Connection) -> Result<(), String
         "nickname",
         "collaboration_json",
         "channel_binding_json",
+        "tts_config_json",
+        "speaker_profiles_json",
     ] {
         if columns.contains(column) {
             continue;
@@ -914,6 +919,42 @@ fn ensure_agent_profile_override_columns(conn: &Connection) -> Result<(), String
             .map_err(|e| format!("为 agent_profile_overrides 增加字段 {column} 失败: {e}"))?;
     }
     Ok(())
+}
+
+pub fn set_tts_config(config: &Value) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        INSERT INTO app_prefs(key, value, updated_at)
+        VALUES (?1, ?2, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![APP_PREF_KEY_TTS_CONFIG, config.to_string()],
+    )
+    .map_err(|e| format!("写入 TTS 配置失败: {e}"))?;
+    Ok(())
+}
+
+pub fn get_tts_config() -> Result<Option<Value>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM app_prefs WHERE key = ?1")
+        .map_err(|e| format!("查询 TTS 配置失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![APP_PREF_KEY_TTS_CONFIG])
+        .map_err(|e| format!("读取 TTS 配置失败: {e}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| format!("读取 TTS 配置行失败: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let value: String = row.get(0).map_err(|e| format!("解析 TTS 配置失败: {e}"))?;
+    let config =
+        serde_json::from_str::<Value>(&value).map_err(|e| format!("反序列化 TTS 配置失败: {e}"))?;
+    Ok(Some(config))
 }
 
 fn ensure_chat_group_columns(conn: &Connection) -> Result<(), String> {
@@ -1685,7 +1726,7 @@ pub fn get_agent_profile_override(
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT agent_id, tags_json, description, system_prompt, collaboration_json, channel_binding_json, avatar_url, portrait_url, english_name, nickname, updated_at
+            SELECT agent_id, tags_json, description, system_prompt, collaboration_json, channel_binding_json, avatar_url, portrait_url, english_name, nickname, tts_config_json, speaker_profiles_json, updated_at
             FROM agent_profile_overrides
             WHERE agent_id = ?1
             "#,
@@ -1717,7 +1758,13 @@ pub fn get_agent_profile_override(
     let portrait_url: Option<String> = row.get(7).map_err(|e| format!("解析立绘地址失败: {e}"))?;
     let english_name: Option<String> = row.get(8).map_err(|e| format!("解析英文昵称失败: {e}"))?;
     let nickname: Option<String> = row.get(9).map_err(|e| format!("解析昵称失败: {e}"))?;
-    let updated_at: String = row.get(10).map_err(|e| format!("解析更新时间失败: {e}"))?;
+    let tts_config_json: Option<String> = row
+        .get(10)
+        .map_err(|e| format!("解析 TTS 配置 JSON 失败: {e}"))?;
+    let speaker_profiles_json: Option<String> = row
+        .get(11)
+        .map_err(|e| format!("解析音色样本 JSON 失败: {e}"))?;
+    let updated_at: String = row.get(12).map_err(|e| format!("解析更新时间失败: {e}"))?;
 
     let tags = match tags_json {
         Some(raw) => Some(
@@ -1740,6 +1787,20 @@ pub fn get_agent_profile_override(
         ),
         None => None,
     };
+    let tts_config = match tts_config_json {
+        Some(raw) => Some(
+            serde_json::from_str::<Value>(&raw)
+                .map_err(|e| format!("反序列化 TTS 配置 JSON 失败: {e}"))?,
+        ),
+        None => None,
+    };
+    let speaker_profiles = match speaker_profiles_json {
+        Some(raw) => Some(
+            serde_json::from_str::<Value>(&raw)
+                .map_err(|e| format!("反序列化音色样本 JSON 失败: {e}"))?,
+        ),
+        None => None,
+    };
 
     Ok(Some(AgentProfileOverrideRecord {
         agent_id,
@@ -1752,6 +1813,8 @@ pub fn get_agent_profile_override(
         portrait_url,
         english_name,
         nickname,
+        tts_config,
+        speaker_profiles,
         updated_at,
     }))
 }
@@ -1762,7 +1825,7 @@ pub fn list_agent_profile_overrides() -> Result<HashMap<String, AgentProfileOver
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT agent_id, tags_json, description, system_prompt, collaboration_json, channel_binding_json, avatar_url, portrait_url, english_name, nickname, updated_at
+            SELECT agent_id, tags_json, description, system_prompt, collaboration_json, channel_binding_json, avatar_url, portrait_url, english_name, nickname, tts_config_json, speaker_profiles_json, updated_at
             FROM agent_profile_overrides
             ORDER BY agent_id ASC
             "#,
@@ -1782,7 +1845,9 @@ pub fn list_agent_profile_overrides() -> Result<HashMap<String, AgentProfileOver
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
-                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, String>(12)?,
             ))
         })
         .map_err(|e| format!("读取智能体资料覆盖列表失败: {e}"))?;
@@ -1800,6 +1865,8 @@ pub fn list_agent_profile_overrides() -> Result<HashMap<String, AgentProfileOver
             portrait_url,
             english_name,
             nickname,
+            tts_config_json,
+            speaker_profiles_json,
             updated_at,
         ) = row.map_err(|e| format!("解析智能体资料覆盖记录失败: {e}"))?;
         let tags = match tags_json {
@@ -1823,6 +1890,20 @@ pub fn list_agent_profile_overrides() -> Result<HashMap<String, AgentProfileOver
             ),
             None => None,
         };
+        let tts_config = match tts_config_json {
+            Some(raw) => Some(
+                serde_json::from_str::<Value>(&raw)
+                    .map_err(|e| format!("反序列化 TTS 配置 JSON 失败: {e}"))?,
+            ),
+            None => None,
+        };
+        let speaker_profiles = match speaker_profiles_json {
+            Some(raw) => Some(
+                serde_json::from_str::<Value>(&raw)
+                    .map_err(|e| format!("反序列化音色样本 JSON 失败: {e}"))?,
+            ),
+            None => None,
+        };
         output.insert(
             agent_id.clone(),
             AgentProfileOverrideRecord {
@@ -1836,6 +1917,8 @@ pub fn list_agent_profile_overrides() -> Result<HashMap<String, AgentProfileOver
                 portrait_url,
                 english_name,
                 nickname,
+                tts_config,
+                speaker_profiles,
                 updated_at,
             },
         );
@@ -1854,6 +1937,8 @@ pub fn upsert_agent_profile_override(
     portrait_url: Option<String>,
     english_name: Option<String>,
     nickname: Option<String>,
+    tts_config: Option<Value>,
+    speaker_profiles: Option<Value>,
 ) -> Result<(), String> {
     let current = get_agent_profile_override(agent_id)?;
     let merged_tags = if tags.is_some() {
@@ -1903,6 +1988,18 @@ pub fn upsert_agent_profile_override(
     } else {
         current.as_ref().and_then(|item| item.nickname.clone())
     };
+    let merged_tts_config = if tts_config.is_some() {
+        tts_config.and_then(normalize_nullable_json)
+    } else {
+        current.as_ref().and_then(|item| item.tts_config.clone())
+    };
+    let merged_speaker_profiles = if speaker_profiles.is_some() {
+        speaker_profiles.and_then(normalize_nullable_json)
+    } else {
+        current
+            .as_ref()
+            .and_then(|item| item.speaker_profiles.clone())
+    };
 
     if merged_tags.is_none()
         && merged_description.is_none()
@@ -1913,6 +2010,8 @@ pub fn upsert_agent_profile_override(
         && merged_portrait_url.is_none()
         && merged_english_name.is_none()
         && merged_nickname.is_none()
+        && merged_tts_config.is_none()
+        && merged_speaker_profiles.is_none()
     {
         return delete_agent_profile_override(agent_id);
     }
@@ -1935,14 +2034,27 @@ pub fn upsert_agent_profile_override(
         ),
         None => None,
     };
+    let tts_config_json = match merged_tts_config {
+        Some(value) => Some(
+            serde_json::to_string(&value).map_err(|e| format!("序列化 TTS 配置 JSON 失败: {e}"))?,
+        ),
+        None => None,
+    };
+    let speaker_profiles_json = match merged_speaker_profiles {
+        Some(value) => Some(
+            serde_json::to_string(&value)
+                .map_err(|e| format!("序列化音色样本 JSON 失败: {e}"))?,
+        ),
+        None => None,
+    };
 
     let conn = open_conn()?;
     conn.execute(
         r#"
         INSERT INTO agent_profile_overrides(
-            agent_id, tags_json, description, system_prompt, collaboration_json, channel_binding_json, avatar_url, portrait_url, english_name, nickname, updated_at
+            agent_id, tags_json, description, system_prompt, collaboration_json, channel_binding_json, avatar_url, portrait_url, english_name, nickname, tts_config_json, speaker_profiles_json, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, CURRENT_TIMESTAMP)
         ON CONFLICT(agent_id) DO UPDATE SET
             tags_json = excluded.tags_json,
             description = excluded.description,
@@ -1953,6 +2065,8 @@ pub fn upsert_agent_profile_override(
             portrait_url = excluded.portrait_url,
             english_name = excluded.english_name,
             nickname = excluded.nickname,
+            tts_config_json = excluded.tts_config_json,
+            speaker_profiles_json = excluded.speaker_profiles_json,
             updated_at = CURRENT_TIMESTAMP
         "#,
         params![
@@ -1965,7 +2079,9 @@ pub fn upsert_agent_profile_override(
             merged_avatar_url,
             merged_portrait_url,
             merged_english_name,
-            merged_nickname
+            merged_nickname,
+            tts_config_json,
+            speaker_profiles_json
         ],
     )
     .map_err(|e| format!("写入智能体资料覆盖失败: {e}"))?;

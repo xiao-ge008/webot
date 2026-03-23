@@ -50,6 +50,9 @@ export interface Message {
     streaming?: boolean;
     spec?: unknown;
     cardPending?: boolean;
+    pendingComponentName?: string;
+    pendingComponentKind?: 'video' | 'image' | 'audio' | 'text' | 'generic';
+    pendingComponentPreviewUrl?: string;
     uiRawText?: string;
     uiStreamState?: 'idle' | 'streaming' | 'ready';
     debugRawStream?: string;

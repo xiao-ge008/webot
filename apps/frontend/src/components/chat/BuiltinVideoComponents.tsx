@@ -20,13 +20,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+import { normalizeRuntimeAssetSource } from '@/lib/runtime-asset-url';
 import {
   isDesktopMediaRuntime,
   launchMpvPlayer,
   openMediaExternal,
   openMediaWebviewWindow,
 } from '@/services/media-player-client';
-import { getApiBaseUrl, requestJson } from '@/services/transport';
+import { getApiBaseUrl, getOpenFangBaseUrl, requestJson } from '@/services/transport';
 
 interface VideoItem {
   src: string;
@@ -66,7 +67,7 @@ function formatDurationLabel(totalSeconds: number): string {
 }
 
 function normalizeFileLikeUrl(raw: string): string {
-  const source = raw.trim();
+  const source = normalizeRuntimeAssetSource(raw);
   if (!source) return '';
   if (/^(https?:|data:|blob:|file:)/i.test(source)) {
     return source;
@@ -88,10 +89,45 @@ function shouldResolveBackendRelativeMedia(url: string): boolean {
   return source.startsWith('/') || source.startsWith('api/');
 }
 
+function shouldUseOpenFangBaseForPoster(url: string): boolean {
+  const value = url.trim().toLowerCase();
+  return value.startsWith('/api/uploads/')
+    || value.startsWith('api/uploads/')
+    || /^https?:\/\/.+\/api\/uploads\//.test(value);
+}
+
 function buildBackendMediaUrl(baseUrl: string, rawPath: string): string {
   const normalizedBase = baseUrl.replace(/\/+$/, '');
   const normalizedPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
   return `${normalizedBase}${normalizedPath}`;
+}
+
+function buildOpenFangUploadProxyUrl(apiBaseUrl: string, source: string): string {
+  const normalizedBase = apiBaseUrl.replace(/\/+$/, '');
+  return `${normalizedBase}/api/management/media/openfang-upload?source=${encodeURIComponent(source)}`;
+}
+
+function buildOpenFangDirectImageUrl(openFangBaseUrl: string, source: string): string {
+  const normalizedBase = openFangBaseUrl.replace(/\/+$/, '');
+  if (/^https?:\/\/.+\/api\/uploads\//i.test(source.trim())) {
+    return source.trim();
+  }
+  const normalizedPath = source.startsWith('/') ? source : `/${source}`;
+  return `${normalizedBase}${normalizedPath}`;
+}
+
+function dedupeMediaCandidates(candidates: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
 }
 
 function useResolvedMediaSrc(src: string): string {
@@ -116,6 +152,71 @@ function useResolvedMediaSrc(src: string): string {
         if (cancelled) return;
         setResolved(src);
       });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [src]);
+
+  return resolved;
+}
+
+function useResolvedPosterCandidates(src: string): string[] {
+  const [resolved, setResolved] = React.useState<string[]>(() => dedupeMediaCandidates([src]));
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const raw = src.trim();
+    const fallbackCandidates = dedupeMediaCandidates([src]);
+    if (!raw) {
+      setResolved(fallbackCandidates);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!shouldResolveBackendRelativeMedia(raw) && !/^https?:\/\//i.test(raw)) {
+      setResolved(fallbackCandidates);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const resolveCandidates = async () => {
+      try {
+        if (shouldUseOpenFangBaseForPoster(raw)) {
+          const [apiBaseUrl, openFangBaseUrl] = await Promise.all([
+            getApiBaseUrl(),
+            getOpenFangBaseUrl().catch(() => ''),
+          ]);
+          if (cancelled) return;
+          setResolved(dedupeMediaCandidates([
+            buildOpenFangUploadProxyUrl(apiBaseUrl, raw),
+            openFangBaseUrl ? buildOpenFangDirectImageUrl(openFangBaseUrl, raw) : '',
+            shouldResolveBackendRelativeMedia(raw) ? buildBackendMediaUrl(apiBaseUrl, raw) : '',
+            src,
+          ]));
+          return;
+        }
+
+        if (shouldResolveBackendRelativeMedia(raw)) {
+          const apiBaseUrl = await getApiBaseUrl();
+          if (cancelled) return;
+          setResolved(dedupeMediaCandidates([
+            buildBackendMediaUrl(apiBaseUrl, raw),
+            src,
+          ]));
+          return;
+        }
+
+        setResolved(fallbackCandidates);
+      } catch {
+        if (cancelled) return;
+        setResolved(fallbackCandidates);
+      }
+    };
+
+    void resolveCandidates();
 
     return () => {
       cancelled = true;
@@ -757,9 +858,23 @@ function VideoPoster({
   item: VideoItem;
   className?: string;
 }) {
-  const posterSrc = useResolvedMediaSrc(item.poster);
+  const posterCandidates = useResolvedPosterCandidates(item.poster);
+  const [activeIndex, setActiveIndex] = React.useState(0);
+  const joinedCandidates = posterCandidates.join('\n');
+
+  React.useEffect(() => {
+    setActiveIndex(0);
+  }, [joinedCandidates]);
+
+  const posterSrc = posterCandidates[Math.min(activeIndex, Math.max(0, posterCandidates.length - 1))] || item.poster;
+  const handlePosterError = React.useCallback(() => {
+    setActiveIndex((current) => (
+      current + 1 < posterCandidates.length ? current + 1 : current
+    ));
+  }, [posterCandidates.length]);
+
   if (item.poster) {
-    return <img src={posterSrc} alt={item.title || 'video-poster'} className={className} />;
+    return <img src={posterSrc} alt={item.title || 'video-poster'} className={className} onError={handlePosterError} />;
   }
   return (
     <div className={cn('bg-gradient-to-br from-zinc-800 via-zinc-700 to-zinc-900', className)}>
