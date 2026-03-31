@@ -9,7 +9,6 @@ import {
   cleanupAssistantText,
   extractComponentInvokeActionFromSpec,
   generateId,
-  mergeRenderableUiSpecs,
   pushTrace,
   type ComponentInvokeActionPayload,
 } from '@/components/chat/chat-page-helpers';
@@ -247,13 +246,48 @@ function pickPreviewUrlFromPayload(payload: ComponentInvokeActionPayload): strin
   return undefined;
 }
 
-function inferPendingComponentKind(payload: ComponentInvokeActionPayload): Message['pendingComponentKind'] {
+function inferPendingJobType(payload: ComponentInvokeActionPayload): string {
   const name = payload.componentName.trim().toLowerCase();
   if (name.includes('video')) return 'video';
   if (name.includes('image') || name.includes('img')) return 'image';
   if (name.includes('audio') || name.includes('voice') || name.includes('speech')) return 'audio';
   if (name.includes('text') || name.includes('markdown')) return 'text';
   return 'generic';
+}
+
+function buildComponentInvokeJobSpec(
+  messageId: string,
+  payload: ComponentInvokeActionPayload,
+  options?: {
+    status?: string;
+    stage?: string;
+    summary?: string;
+  },
+): unknown {
+  const componentName = payload.componentName.trim() || '组件任务';
+  const previewUrl = pickPreviewUrlFromPayload(payload);
+  return {
+    type: 'JobProgressCard',
+    props: {
+      title: componentName,
+      summary: options?.summary || `${componentName} 已提交，正在处理中。`,
+      status: options?.status || 'running',
+      stage: options?.stage || 'submitting',
+      jobType: inferPendingJobType(payload),
+      jobId: `component-invoke:${messageId.trim() || 'pending'}`,
+      capabilityKey: 'component_invoke',
+      capabilityScope: 'generic',
+      providerType: 'component_skill',
+      route: 'component_invoke',
+      ...(previewUrl ? { previewUrl } : {}),
+      ...(previewUrl ? { resultPayload: { previewUrl } } : {}),
+      metadata: {
+        componentName: payload.componentName,
+        localOnly: true,
+        ...(previewUrl ? { previewUrl } : {}),
+      },
+    },
+  };
 }
 
 function buildTaskKey(
@@ -356,9 +390,6 @@ function mergeComponentInvokeOutcomeIntoMessage(
     thinking: false,
     streaming: false,
     cardPending: false,
-    pendingComponentName: undefined,
-    pendingComponentKind: undefined,
-    pendingComponentPreviewUrl: undefined,
     toolTrace: pushTrace(message.toolTrace, outcome.trace),
   };
   const lingeringAction = extractComponentInvokeActionFromSpec(next.spec);
@@ -367,8 +398,14 @@ function mergeComponentInvokeOutcomeIntoMessage(
     next.uiRawText = '';
   }
   if (outcome.ok && payload.renderResult && outcome.renderSpec != null) {
-    next.spec = mergeRenderableUiSpecs(next.spec, outcome.renderSpec);
+    next.spec = outcome.renderSpec;
     next.debugSpecSource = next.debugSpecSource === 'none' ? 'tool_result' : next.debugSpecSource;
+  } else if (outcome.summaryText) {
+    next.spec = buildComponentInvokeJobSpec(next.id, payload, {
+      status: outcome.ok ? 'completed' : 'failed',
+      stage: outcome.ok ? 'completed' : 'failed',
+      summary: outcome.summaryText,
+    });
   }
   if ((!(next.text || '').trim() || (next.text || '').trim() === COMPONENT_INVOKE_PENDING_TEXT) && outcome.summaryText) {
     next.text = outcome.summaryText;
@@ -428,10 +465,7 @@ export function prepareMessageForComponentInvokeAction(
     ...message,
     thinking: false,
     streaming: false,
-    cardPending: true,
-    pendingComponentName: payload.componentName.trim() || undefined,
-    pendingComponentKind: inferPendingComponentKind(payload),
-    pendingComponentPreviewUrl: pickPreviewUrlFromPayload(payload),
+    cardPending: false,
     generationStartedAt: message.generationStartedAt ?? Date.now(),
   };
   const lingeringAction = extractComponentInvokeActionFromSpec(next.spec);
@@ -439,17 +473,14 @@ export function prepareMessageForComponentInvokeAction(
     next.spec = lingeringAction.strippedSpec;
     next.uiRawText = '';
   }
+  next.spec = buildComponentInvokeJobSpec(message.id, payload);
   next.text = cleanupAssistantText(next.text || '', next.spec);
   if (!(next.text || '').trim() && next.spec == null) {
     next.text = COMPONENT_INVOKE_PENDING_TEXT;
   }
-  if (payload.renderResult && next.spec == null) {
-    next.uiStreamState = 'idle';
-  } else {
-    next.uiStreamState = next.spec != null || (next.uiRawText || '').trim()
-      ? 'ready'
-      : 'idle';
-  }
+  next.uiStreamState = next.spec != null || (next.uiRawText || '').trim()
+    ? 'ready'
+    : 'idle';
   return next;
 }
 

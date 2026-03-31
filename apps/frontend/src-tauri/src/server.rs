@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -77,15 +79,15 @@ fn resolve_bundled_openfang() -> Option<(PathBuf, PathBuf)> {
     let resource_roots = bundled_resource_roots();
 
     for root in resource_roots {
+        let candidate = root.join("openfang").join(binary_name);
+        if candidate.is_file() {
+            return Some((candidate, root.join("openfang")));
+        }
         for alias in &aliases {
             let candidate = root.join("openfang").join(alias).join(binary_name);
             if candidate.is_file() {
                 return Some((candidate, root.join("openfang").join(alias)));
             }
-        }
-        let candidate = root.join("openfang").join(binary_name);
-        if candidate.is_file() {
-            return Some((candidate, root.join("openfang")));
         }
     }
 
@@ -364,6 +366,7 @@ pub fn bootstrap() -> Result<DesktopState, String> {
     let openfang_base_url = config.openfang_base_url.clone();
     let handle = webot_service_rs::start_embedded(config)
         .map_err(|err| format!("启动内嵌 webot-service-rs 失败: {err}"))?;
+    wait_for_embedded_service_ready(handle.listen_addr)?;
 
     let port = handle.listen_addr.port();
     let api_base_url = format!("http://127.0.0.1:{port}");
@@ -399,4 +402,62 @@ pub fn shutdown(state: &DesktopState) {
             handle.shutdown();
         }
     }
+}
+
+fn wait_for_embedded_service_ready(listen_addr: SocketAddr) -> Result<(), String> {
+    let url = format!("http://{listen_addr}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    let request = b"GET /api/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    let mut last_error = String::new();
+
+    while std::time::Instant::now() < deadline {
+        match TcpStream::connect_timeout(&listen_addr, std::time::Duration::from_millis(400)) {
+            Ok(mut stream) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(800)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(800)));
+                match stream.write_all(request) {
+                    Ok(()) => {
+                        let mut buffer = Vec::new();
+                        match stream.read_to_end(&mut buffer) {
+                            Ok(_) => {
+                                let response = String::from_utf8_lossy(&buffer);
+                                if response.starts_with("HTTP/1.1 200")
+                                    || response.starts_with("HTTP/1.0 200")
+                                {
+                                    return Ok(());
+                                }
+                                if !response.trim().is_empty() {
+                                    let first_line =
+                                        response.lines().next().unwrap_or("未知 HTTP 响应");
+                                    last_error = format!("服务返回异常响应: {first_line}");
+                                } else {
+                                    last_error = "服务未返回任何 HTTP 内容".to_string();
+                                }
+                            }
+                            Err(err) => {
+                                last_error = format!("读取服务响应失败: {err}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        last_error = format!("发送服务探针失败: {err}");
+                    }
+                }
+            }
+            Err(err) => {
+                last_error = format!("连接服务失败: {err}");
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    Err(format!(
+        "等待 service-rs HTTP 就绪超时({url}): {}",
+        if last_error.is_empty() {
+            "未知错误"
+        } else {
+            &last_error
+        }
+    ))
 }

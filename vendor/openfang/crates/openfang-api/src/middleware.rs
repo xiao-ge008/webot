@@ -21,6 +21,13 @@ pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Bod
     let uri = request.uri().path().to_string();
     let start = Instant::now();
 
+    info!(
+        request_id = %request_id,
+        method = %method,
+        path = %uri,
+        "API request started"
+    );
+
     let mut response = next.run(request).await;
 
     let elapsed = start.elapsed();

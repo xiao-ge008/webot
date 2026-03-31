@@ -68,11 +68,22 @@ export async function analyzeAndCacheChatImageWithLocalVision(
 
   const task = (async () => {
     const status = await readStatus(true);
-    if (!status.config.enabled || !status.config.autoAnalyzeChatImages) {
+    const visionEnabled = status.config.enabled;
+    const ocrEnabled = status.config.ocrEnabled;
+    const autoAnalyzeEnabled =
+      status.config.autoAnalyzeChatImages && (visionEnabled || ocrEnabled);
+    if (!autoAnalyzeEnabled) {
       return null;
     }
-    if (!status.modelReady) {
-      if (status.config.autoDownloadOnEnable && !status.downloadActive) {
+    const hasReadyLocalProvider = status.modelReady || status.ocrModelReady;
+    if (!hasReadyLocalProvider) {
+      const shouldTriggerDownload =
+        (visionEnabled && status.config.autoDownloadOnEnable && !status.modelReady)
+        || (ocrEnabled
+          && status.config.ocrProvider !== "sidecar_http"
+          && status.config.ocrAutoDownloadOnEnable
+          && !status.ocrModelReady);
+      if (shouldTriggerDownload && !status.downloadActive && !status.ocrDownloadActive) {
         try {
           await startVisionAnalysisDownload();
           statusPromise = null;

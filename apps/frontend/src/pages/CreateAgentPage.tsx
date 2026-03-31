@@ -91,9 +91,9 @@ function buildPromptWithNickname(prompt: string, nickname: string): string {
   }
   const nicknameBlock = [
     '[WEBOT_NICKNAME_BEGIN]',
-    `你的显示称呼是「${trimmedNickname}」。`,
-    `当用户询问你是谁、你叫什么时，优先使用「${trimmedNickname}」回答。`,
-    '回答身份问题时不要使用智能体ID、英文昵称或模型名。',
+    `display_name=${JSON.stringify(trimmedNickname)}`,
+    'identity_reply.preferred_field=display_name',
+    'identity_reply.forbid=["agent_id","english_name","model_name"]',
     '[WEBOT_NICKNAME_END]',
   ].join('\n');
   return `${nicknameBlock}\n\n${base}`.trim();

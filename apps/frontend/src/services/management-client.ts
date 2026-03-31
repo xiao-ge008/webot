@@ -1,5 +1,5 @@
 import { saveOfficeBinaryAs } from '@/services/office-file-client';
-import { getApiBaseUrl, getOpenFangBaseUrl, requestJson } from '@/services/transport';
+import { getApiBaseUrl, getOpenFangBaseUrl, requestJson, requestOpenFangJson } from '@/services/transport';
 import {
   DEFAULT_AGENT_TTS_CONFIG,
   type AgentSpeakerProfile,
@@ -7,6 +7,12 @@ import {
   type RemoteTtsServiceMode,
   type TtsSplitStrategy,
 } from '@/types/tts';
+import type {
+  AgentEmbodimentConfig,
+  EmbodimentAssetKind,
+  EmbodimentAssetRef,
+  EmbodimentVoiceRef,
+} from '@/main/types';
 
 interface JsonRecord {
   [key: string]: unknown;
@@ -57,6 +63,11 @@ function asStringArrayLoose(value: unknown): string[] {
 
 function normalizeAgentTtsConfig(value: unknown): AgentTtsConfig {
   const record = isRecord(value) ? value : {};
+  const hasSpeakerProfileId = Boolean(asString(record.speakerProfileId).trim());
+  const enabled =
+    typeof record.enabled === 'boolean'
+      ? record.enabled
+      : (hasSpeakerProfileId ? true : DEFAULT_AGENT_TTS_CONFIG.enabled);
   const serviceModeValue = asString(record.serviceMode, DEFAULT_AGENT_TTS_CONFIG.serviceMode);
   const serviceMode: RemoteTtsServiceMode = (
     [
@@ -78,7 +89,7 @@ function normalizeAgentTtsConfig(value: unknown): AgentTtsConfig {
     : (DEFAULT_AGENT_TTS_CONFIG.splitStrategy as TtsSplitStrategy);
   const playbackModeValue = asString(record.playbackMode, DEFAULT_AGENT_TTS_CONFIG.playbackMode);
   return {
-    enabled: typeof record.enabled === 'boolean' ? record.enabled : DEFAULT_AGENT_TTS_CONFIG.enabled,
+    enabled,
     serviceMode,
     speakerProfileId: asString(record.speakerProfileId) || undefined,
     messageTag: asString(record.messageTag, DEFAULT_AGENT_TTS_CONFIG.messageTag).trim() || DEFAULT_AGENT_TTS_CONFIG.messageTag,
@@ -162,8 +173,107 @@ export const MANAGEMENT_CONTEXT_FILE_NAMES = [
   'BOOTSTRAP.md',
   'IDENTITY.md',
   'HEARTBEAT.md',
+  'EMBODIMENT.json',
 ] as const;
 export type ManagementContextFileName = typeof MANAGEMENT_CONTEXT_FILE_NAMES[number];
+
+function asStringRecord(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
+}
+
+function normalizeEmbodimentAssetKind(value: unknown, fallback: EmbodimentAssetKind): EmbodimentAssetKind {
+  const raw = asString(value, fallback).trim();
+  return (
+    ['avatar', 'portrait', 'self_photo', 'video_source'] as const
+  ).includes(raw as EmbodimentAssetKind)
+    ? (raw as EmbodimentAssetKind)
+    : fallback;
+}
+
+function normalizeEmbodimentAssetRef(
+  value: unknown,
+  baseUrl: string,
+  fallbackKind: EmbodimentAssetKind,
+): EmbodimentAssetRef | undefined {
+  const record = isRecord(value) ? value : null;
+  if (!record) {
+    return undefined;
+  }
+  const url = normalizeManagementAssetUrl(record.url, baseUrl) || asString(record.url).trim();
+  if (!url) {
+    return undefined;
+  }
+  const source = asString(record.source, 'external_url').trim();
+  const normalizedSource =
+    source === 'managed_asset' || source === 'managed_identity' || source === 'external_url'
+      ? source
+      : 'external_url';
+  return {
+    source: normalizedSource,
+    kind: normalizeEmbodimentAssetKind(record.kind, fallbackKind),
+    assetId: asString(record.assetId).trim() || undefined,
+    url,
+    label: asString(record.label).trim() || undefined,
+    mimeType: asString(record.mimeType).trim() || undefined,
+    metadata: asStringRecord(record.metadata),
+  };
+}
+
+function normalizeEmbodimentVoiceRef(value: unknown): EmbodimentVoiceRef | undefined {
+  const record = isRecord(value) ? value : null;
+  if (!record) {
+    return undefined;
+  }
+  const mode = asString(record.mode, 'speaker_profile').trim();
+  const normalizedMode = mode === 'provider_voice' ? 'provider_voice' : 'speaker_profile';
+  const speakerProfileId = asString(record.speakerProfileId).trim() || undefined;
+  const provider = asString(record.provider).trim() || undefined;
+  const voice = asString(record.voice).trim() || undefined;
+  if (!speakerProfileId && !voice && !provider) {
+    return undefined;
+  }
+  return {
+    mode: normalizedMode,
+    speakerProfileId,
+    provider,
+    voice,
+    label: asString(record.label).trim() || undefined,
+    metadata: asStringRecord(record.metadata),
+  };
+}
+
+export function normalizeAgentEmbodimentConfig(
+  value: unknown,
+  baseUrl: string,
+): AgentEmbodimentConfig | undefined {
+  const record = isRecord(value) ? value : null;
+  if (!record) {
+    return undefined;
+  }
+  const assets = isRecord(record.assets) ? record.assets : {};
+  const voice = isRecord(record.voice) ? record.voice : {};
+  const selfPhotos = Array.isArray(assets.selfPhotos)
+    ? assets.selfPhotos
+        .map((item) => normalizeEmbodimentAssetRef(item, baseUrl, 'self_photo'))
+        .filter((item): item is EmbodimentAssetRef => Boolean(item))
+    : [];
+
+  return {
+    version: 1,
+    assets: {
+      defaultAvatar: normalizeEmbodimentAssetRef(assets.defaultAvatar, baseUrl, 'avatar'),
+      defaultPortrait: normalizeEmbodimentAssetRef(assets.defaultPortrait, baseUrl, 'portrait'),
+      defaultVideoSource: normalizeEmbodimentAssetRef(assets.defaultVideoSource, baseUrl, 'video_source'),
+      selfPhotos: selfPhotos.length > 0 ? selfPhotos : undefined,
+    },
+    voice:
+      Object.keys(voice).length > 0
+        ? {
+            defaultVoice: normalizeEmbodimentVoiceRef(voice.defaultVoice),
+          }
+        : undefined,
+  };
+}
 
 function normalizeManagementAssetUrl(raw: unknown, baseUrl: string): string | undefined {
   const value = asString(raw).trim();
@@ -1077,6 +1187,7 @@ export interface ManagementAgentDetail {
     portrait_url?: string;
     color?: string;
   };
+  embodiment?: AgentEmbodimentConfig;
 }
 
 export interface ManagementAgentSummary {
@@ -1106,6 +1217,7 @@ export interface ManagementAgentSummary {
     portrait_url?: string;
     color?: string;
   };
+  embodiment?: AgentEmbodimentConfig;
 }
 
 export interface ManagementAgentContextFile {
@@ -1130,53 +1242,70 @@ export interface ManagementA2aAgentCard {
   skills: ManagementA2aAgentSkill[];
 }
 
+function withTimeoutSignal(timeoutMs: number): AbortSignal {
+  const controller = new AbortController();
+  window.setTimeout(() => controller.abort(), timeoutMs);
+  return controller.signal;
+}
+
+function mapManagementAgentSummaryRow(row: JsonRecord, baseUrl: string): ManagementAgentSummary {
+  const model = isRecord(row.model) ? row.model : {};
+  const identity = isRecord(row.identity) ? row.identity : {};
+  const collaboration = isRecord(row.collaboration) ? row.collaboration : {};
+  const speakerProfiles = Array.isArray(row.speaker_profiles)
+    ? row.speaker_profiles
+        .map(normalizeSpeakerProfile)
+        .filter((item): item is AgentSpeakerProfile => Boolean(item))
+    : [];
+
+  return {
+    id: asString(row.id),
+    name: asString(row.name, asString(row.id)),
+    english_name: asString(row.english_name) || undefined,
+    nickname: asString(row.nickname) || undefined,
+    description: pickDescription(row.description, row.profile, row.summary),
+    tags: asStringArray(row.tags),
+    state: asString(row.state, 'offline'),
+    authStatus: asString(row.auth_status) || undefined,
+    ready: typeof row.ready === 'boolean' ? row.ready : undefined,
+    collaboration: isRecord(row.collaboration)
+      ? {
+          discoverable: Boolean(collaboration.discoverable),
+          dispatchEnabled: Boolean(collaboration.dispatchEnabled ?? collaboration.dispatch_enabled),
+          selectedWorkers: asStringArray(collaboration.selectedWorkers ?? collaboration.selected_workers),
+        }
+      : undefined,
+    tts_config: isRecord(row.tts_config) ? normalizeAgentTtsConfig(row.tts_config) : undefined,
+    speaker_profiles: speakerProfiles.length > 0 ? speakerProfiles : undefined,
+    model: {
+      provider: asString(model.provider, asString(row.model_provider, 'unknown')),
+      model: asString(model.model, asString(row.model_name)),
+      apiKeyEnv: asString(model.api_key_env, asString(row.model_api_key_env)) || undefined,
+    },
+    identity: {
+      avatar_url: normalizeManagementAssetUrl(identity.avatar_url, baseUrl),
+      portrait_url: normalizeManagementAssetUrl(identity.portrait_url, baseUrl),
+      color: asString(identity.color) || undefined,
+    },
+    embodiment: normalizeAgentEmbodimentConfig(row.embodiment, baseUrl),
+  };
+}
+
 export async function listManagementAgents(): Promise<ManagementAgentSummary[]> {
   const baseUrl = await getApiBaseUrl();
-  const payload = await requestJson<unknown>('/api/management/agents');
-  const rows = Array.isArray(payload) ? payload : [];
-  return rows
-    .filter(isRecord)
-    .map((row) => {
-      const model = isRecord(row.model) ? row.model : {};
-      const identity = isRecord(row.identity) ? row.identity : {};
-      const collaboration = isRecord(row.collaboration) ? row.collaboration : {};
-      const speakerProfiles = Array.isArray(row.speaker_profiles)
-        ? row.speaker_profiles
-            .map(normalizeSpeakerProfile)
-            .filter((item): item is AgentSpeakerProfile => Boolean(item))
-        : [];
-      return {
-        id: asString(row.id),
-        name: asString(row.name, asString(row.id)),
-        english_name: asString(row.english_name) || undefined,
-        nickname: asString(row.nickname) || undefined,
-        description: pickDescription(row.description, row.profile, row.summary),
-        tags: asStringArray(row.tags),
-        state: asString(row.state, 'offline'),
-        authStatus: asString(row.auth_status) || undefined,
-        ready: typeof row.ready === 'boolean' ? row.ready : undefined,
-        collaboration: isRecord(row.collaboration)
-          ? {
-              discoverable: Boolean(collaboration.discoverable),
-              dispatchEnabled: Boolean(collaboration.dispatchEnabled ?? collaboration.dispatch_enabled),
-              selectedWorkers: asStringArray(collaboration.selectedWorkers ?? collaboration.selected_workers),
-            }
-          : undefined,
-        tts_config: isRecord(row.tts_config) ? normalizeAgentTtsConfig(row.tts_config) : undefined,
-        speaker_profiles: speakerProfiles.length > 0 ? speakerProfiles : undefined,
-        model: {
-          provider: asString(model.provider, asString(row.model_provider, 'unknown')),
-          model: asString(model.model, asString(row.model_name)),
-          apiKeyEnv: asString(model.api_key_env, asString(row.model_api_key_env)) || undefined,
-        },
-        identity: {
-          avatar_url: normalizeManagementAssetUrl(identity.avatar_url, baseUrl),
-          portrait_url: normalizeManagementAssetUrl(identity.portrait_url, baseUrl),
-          color: asString(identity.color) || undefined,
-        },
-      };
-    })
-    .filter((item) => item.id.length > 0);
+  try {
+    const payload = await requestJson<unknown>('/api/management/agents', {
+      signal: withTimeoutSignal(4_000),
+    });
+    const rows = Array.isArray(payload) ? payload : [];
+    return rows
+      .filter(isRecord)
+      .map((row) => mapManagementAgentSummaryRow(row, baseUrl))
+      .filter((item) => item.id.length > 0);
+  } catch (error) {
+    console.warn('[Management] listManagementAgents failed:', error);
+    return [];
+  }
 }
 
 export async function listManagementA2aAgents(): Promise<ManagementA2aAgentCard[]> {
@@ -1258,6 +1387,7 @@ export async function getManagementAgentDetail(agentId: string): Promise<Managem
       portrait_url: normalizeManagementAssetUrl(identity.portrait_url, baseUrl),
       color: asString(identity.color) || undefined,
     },
+    embodiment: normalizeAgentEmbodimentConfig(payload.embodiment, baseUrl),
   };
 }
 
@@ -1843,6 +1973,7 @@ export interface AgentConfigPatchInput {
   avatar_url?: string;
   portrait_url?: string;
   color?: string;
+  embodiment?: AgentEmbodimentConfig | null;
 }
 
 export async function patchManagementAgentConfig(
@@ -3047,6 +3178,8 @@ export interface ManagementComponentInvokeResult {
   text?: string;
   items?: ManagementComponentInvokeItem[];
   raw?: unknown;
+  presentableResult?: unknown;
+  providerMeta?: unknown;
 }
 
 export async function invokeManagementComponent(
@@ -3082,7 +3215,493 @@ export async function invokeManagementComponent(
     text: asString(payload.text) || undefined,
     items,
     raw: payload.raw,
+    presentableResult: payload.presentableResult ?? payload.presentable_result,
+    providerMeta: payload.providerMeta ?? payload.provider_meta,
   };
+}
+
+export interface ManagementCapabilityDescriptor {
+  key: string;
+  scope: 'generic' | 'self' | string;
+}
+
+export interface ManagementCapabilityProviderRecord {
+  provider_id: string;
+  provider_type: string;
+  display_name?: string;
+  capabilities: ManagementCapabilityDescriptor[];
+  supported_scopes: string[];
+  priority: number;
+  requirements: unknown;
+  supports_job: boolean;
+  enabled: boolean;
+  health_state: string;
+  input_contract: unknown;
+  output_contract: unknown;
+  metadata: unknown;
+  is_removed?: boolean;
+  updated_at?: string;
+}
+
+export interface ManagementCapabilityProviderBindingRecord {
+  capability_key: string;
+  capability_scope: string;
+  provider_id: string;
+  enabled: boolean;
+  updated_at?: string;
+}
+
+export interface ManagementAgentCapabilityBindingRecord {
+  agent_id: string;
+  capability_key: string;
+  capability_scope: string;
+  provider_id?: string;
+  binding_type: 'capability' | 'provider' | string;
+  enabled: boolean;
+  updated_at?: string;
+}
+
+export interface ManagementRendererBindingRecord {
+  channel: string;
+  result_kind: string;
+  media_type?: string;
+  document_type?: string;
+  renderer_key: string;
+  enabled: boolean;
+  fallback_channel?: string;
+  updated_at?: string;
+}
+
+export interface ManagementProviderHealthStateRecord {
+  provider_id: string;
+  health_state: string;
+  message?: string;
+  checked_at?: string;
+  updated_at?: string;
+}
+
+export interface ManagementCapabilityAuditLogRecord {
+  id: string;
+  event_type: string;
+  provider_id?: string;
+  agent_id?: string;
+  capability_key?: string;
+  capability_scope?: string;
+  payload: unknown;
+  created_at: string;
+}
+
+export interface ManagementCapabilityJobRecord {
+  job_id: string;
+  owner_agent_id: string;
+  capability_key: string;
+  capability_scope: string;
+  provider_id?: string;
+  provider_type?: string;
+  route?: string;
+  title?: string;
+  summary?: string;
+  status: string;
+  progress_percent?: number;
+  stage?: string;
+  job_type?: string;
+  input_payload: unknown;
+  result_payload: unknown;
+  error_message?: string;
+  metadata: unknown;
+  created_at?: string;
+  updated_at?: string;
+  started_at?: string;
+  finished_at?: string;
+  last_heartbeat_at?: string;
+}
+
+export interface ManagementCapabilityProvidersPayload {
+  providers: ManagementCapabilityProviderRecord[];
+  bindings: ManagementCapabilityProviderBindingRecord[];
+  healthStates: ManagementProviderHealthStateRecord[];
+}
+
+function normalizeCapabilityDescriptor(value: unknown): ManagementCapabilityDescriptor | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const key = asString(value.key).trim();
+  const scope = asString(value.scope, 'generic').trim() || 'generic';
+  if (!key) {
+    return null;
+  }
+  return { key, scope };
+}
+
+function normalizeCapabilityProviderRecord(value: unknown): ManagementCapabilityProviderRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const providerId = asString(value.provider_id, asString(value.providerId)).trim();
+  const providerType = asString(value.provider_type, asString(value.providerType)).trim();
+  if (!providerId || !providerType) {
+    return null;
+  }
+  const capabilities = Array.isArray(value.capabilities)
+    ? value.capabilities
+      .map(normalizeCapabilityDescriptor)
+      .filter((item): item is ManagementCapabilityDescriptor => Boolean(item))
+    : [];
+  return {
+    provider_id: providerId,
+    provider_type: providerType,
+    display_name: asString(value.display_name, asString(value.displayName)) || undefined,
+    capabilities,
+    supported_scopes: asStringArrayLoose(value.supported_scopes ?? value.supportedScopes),
+    priority: asNumber(value.priority, 100),
+    requirements: value.requirements ?? {},
+    supports_job: asBool(value.supports_job ?? value.supportsJob),
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : true,
+    health_state: asString(value.health_state, asString(value.healthState, 'unknown')) || 'unknown',
+    input_contract: value.input_contract ?? value.inputContract ?? {},
+    output_contract: value.output_contract ?? value.outputContract ?? {},
+    metadata: value.metadata ?? {},
+    is_removed: typeof value.is_removed === 'boolean' ? value.is_removed : undefined,
+    updated_at: asString(value.updated_at, asString(value.updatedAt)) || undefined,
+  };
+}
+
+function normalizeCapabilityProviderBindingRecord(
+  value: unknown,
+): ManagementCapabilityProviderBindingRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const capabilityKey = asString(value.capability_key, asString(value.capabilityKey)).trim();
+  const capabilityScope = asString(value.capability_scope, asString(value.capabilityScope)).trim();
+  const providerId = asString(value.provider_id, asString(value.providerId)).trim();
+  if (!capabilityKey || !capabilityScope || !providerId) {
+    return null;
+  }
+  return {
+    capability_key: capabilityKey,
+    capability_scope: capabilityScope,
+    provider_id: providerId,
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : true,
+    updated_at: asString(value.updated_at, asString(value.updatedAt)) || undefined,
+  };
+}
+
+function normalizeProviderHealthStateRecord(value: unknown): ManagementProviderHealthStateRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const providerId = asString(value.provider_id, asString(value.providerId)).trim();
+  if (!providerId) {
+    return null;
+  }
+  return {
+    provider_id: providerId,
+    health_state: asString(value.health_state, asString(value.healthState, 'unknown')) || 'unknown',
+    message: asString(value.message) || undefined,
+    checked_at: asString(value.checked_at, asString(value.checkedAt)) || undefined,
+    updated_at: asString(value.updated_at, asString(value.updatedAt)) || undefined,
+  };
+}
+
+function normalizeAgentCapabilityBindingRecord(
+  value: unknown,
+): ManagementAgentCapabilityBindingRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const agentId = asString(value.agent_id, asString(value.agentId)).trim();
+  const capabilityKey = asString(value.capability_key, asString(value.capabilityKey)).trim();
+  const capabilityScope = asString(value.capability_scope, asString(value.capabilityScope, 'generic')).trim() || 'generic';
+  if (!agentId || !capabilityKey) {
+    return null;
+  }
+  return {
+    agent_id: agentId,
+    capability_key: capabilityKey,
+    capability_scope: capabilityScope,
+    provider_id: asString(value.provider_id, asString(value.providerId)) || undefined,
+    binding_type: asString(value.binding_type, asString(value.bindingType, 'capability')) || 'capability',
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : true,
+    updated_at: asString(value.updated_at, asString(value.updatedAt)) || undefined,
+  };
+}
+
+function normalizeRendererBindingRecord(value: unknown): ManagementRendererBindingRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const channel = asString(value.channel).trim();
+  const resultKind = asString(value.result_kind, asString(value.resultKind)).trim();
+  const rendererKey = asString(value.renderer_key, asString(value.rendererKey)).trim();
+  if (!channel || !resultKind || !rendererKey) {
+    return null;
+  }
+  return {
+    channel,
+    result_kind: resultKind,
+    media_type: asString(value.media_type, asString(value.mediaType)) || undefined,
+    document_type: asString(value.document_type, asString(value.documentType)) || undefined,
+    renderer_key: rendererKey,
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : true,
+    fallback_channel: asString(value.fallback_channel, asString(value.fallbackChannel)) || undefined,
+    updated_at: asString(value.updated_at, asString(value.updatedAt)) || undefined,
+  };
+}
+
+function normalizeCapabilityAuditLogRecord(value: unknown): ManagementCapabilityAuditLogRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = asString(value.id).trim();
+  const eventType = asString(value.event_type, asString(value.eventType)).trim();
+  const createdAt = asString(value.created_at, asString(value.createdAt)).trim();
+  if (!id || !eventType || !createdAt) {
+    return null;
+  }
+  return {
+    id,
+    event_type: eventType,
+    provider_id: asString(value.provider_id, asString(value.providerId)) || undefined,
+    agent_id: asString(value.agent_id, asString(value.agentId)) || undefined,
+    capability_key: asString(value.capability_key, asString(value.capabilityKey)) || undefined,
+    capability_scope: asString(value.capability_scope, asString(value.capabilityScope)) || undefined,
+    payload: value.payload ?? {},
+    created_at: createdAt,
+  };
+}
+
+function normalizeCapabilityJobRecord(value: unknown): ManagementCapabilityJobRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const jobId = asString(value.job_id, asString(value.jobId)).trim();
+  const ownerAgentId = asString(value.owner_agent_id, asString(value.ownerAgentId)).trim();
+  const capabilityKey = asString(value.capability_key, asString(value.capabilityKey)).trim();
+  if (!jobId || !ownerAgentId || !capabilityKey) {
+    return null;
+  }
+  return {
+    job_id: jobId,
+    owner_agent_id: ownerAgentId,
+    capability_key: capabilityKey,
+    capability_scope: asString(value.capability_scope, asString(value.capabilityScope, 'generic')).trim() || 'generic',
+    provider_id: asString(value.provider_id, asString(value.providerId)) || undefined,
+    provider_type: asString(value.provider_type, asString(value.providerType)) || undefined,
+    route: asString(value.route) || undefined,
+    title: asString(value.title) || undefined,
+    summary: asString(value.summary) || undefined,
+    status: asString(value.status, 'queued').trim() || 'queued',
+    progress_percent:
+      typeof value.progress_percent === 'number'
+        ? value.progress_percent
+        : typeof value.progressPercent === 'number'
+          ? value.progressPercent
+          : undefined,
+    stage: asString(value.stage) || undefined,
+    job_type: asString(value.job_type, asString(value.jobType)) || undefined,
+    input_payload: value.input_payload ?? value.inputPayload ?? {},
+    result_payload: value.result_payload ?? value.resultPayload ?? {},
+    error_message: asString(value.error_message, asString(value.errorMessage)) || undefined,
+    metadata: value.metadata ?? {},
+    created_at: asString(value.created_at, asString(value.createdAt)) || undefined,
+    updated_at: asString(value.updated_at, asString(value.updatedAt)) || undefined,
+    started_at: asString(value.started_at, asString(value.startedAt)) || undefined,
+    finished_at: asString(value.finished_at, asString(value.finishedAt)) || undefined,
+    last_heartbeat_at: asString(value.last_heartbeat_at, asString(value.lastHeartbeatAt)) || undefined,
+  };
+}
+
+export async function listManagementCapabilityProviders(): Promise<ManagementCapabilityProvidersPayload> {
+  const payload = await requestJson<unknown>('/api/management/capabilities/providers');
+  if (!isRecord(payload)) {
+    return { providers: [], bindings: [], healthStates: [] };
+  }
+  const providers = Array.isArray(payload.providers)
+    ? payload.providers
+      .map(normalizeCapabilityProviderRecord)
+      .filter((item): item is ManagementCapabilityProviderRecord => Boolean(item))
+    : [];
+  const bindings = Array.isArray(payload.bindings)
+    ? payload.bindings
+      .map(normalizeCapabilityProviderBindingRecord)
+      .filter((item): item is ManagementCapabilityProviderBindingRecord => Boolean(item))
+    : [];
+  const healthStates = Array.isArray(payload.health_states)
+    ? payload.health_states
+      .map(normalizeProviderHealthStateRecord)
+      .filter((item): item is ManagementProviderHealthStateRecord => Boolean(item))
+    : [];
+  return { providers, bindings, healthStates };
+}
+
+export async function registerManagementCapabilityProvider(
+  input: Omit<ManagementCapabilityProviderRecord, 'updated_at'>,
+): Promise<ManagementCapabilityProviderRecord | null> {
+  const payload = await requestJson<unknown>('/api/management/capabilities/providers/register', {
+    method: 'POST',
+    body: input,
+  });
+  return isRecord(payload) ? normalizeCapabilityProviderRecord(payload.provider) : null;
+}
+
+export async function disableManagementCapabilityProvider(
+  providerId: string,
+  disabled = true,
+): Promise<ManagementCapabilityProviderRecord | null> {
+  const payload = await requestJson<unknown>(
+    `/api/management/capabilities/providers/${encodeURIComponent(providerId)}/disable`,
+    {
+      method: 'POST',
+      body: { disabled },
+    },
+  );
+  return isRecord(payload) ? normalizeCapabilityProviderRecord(payload.provider) : null;
+}
+
+export async function removeManagementCapabilityProvider(
+  providerId: string,
+): Promise<ManagementCapabilityProviderRecord | null> {
+  const payload = await requestJson<unknown>(
+    `/api/management/capabilities/providers/${encodeURIComponent(providerId)}`,
+    {
+      method: 'DELETE',
+    },
+  );
+  return isRecord(payload) ? normalizeCapabilityProviderRecord(payload.provider) : null;
+}
+
+export async function bindManagementAgentCapability(
+  input: ManagementAgentCapabilityBindingRecord,
+): Promise<ManagementAgentCapabilityBindingRecord | null> {
+  const payload = await requestJson<unknown>('/api/management/capabilities/bindings/agent', {
+    method: 'POST',
+    body: input,
+  });
+  return isRecord(payload) ? normalizeAgentCapabilityBindingRecord(payload.binding) : null;
+}
+
+export async function unbindManagementAgentCapability(
+  input: Pick<
+    ManagementAgentCapabilityBindingRecord,
+    'agent_id' | 'capability_key' | 'capability_scope' | 'provider_id' | 'binding_type'
+  >,
+): Promise<void> {
+  await requestJson('/api/management/capabilities/bindings/agent', {
+    method: 'DELETE',
+    body: input,
+  });
+}
+
+export async function bindManagementRenderer(
+  input: ManagementRendererBindingRecord,
+): Promise<ManagementRendererBindingRecord | null> {
+  const payload = await requestJson<unknown>('/api/management/renderers/bind', {
+    method: 'POST',
+    body: input,
+  });
+  return isRecord(payload) ? normalizeRendererBindingRecord(payload.binding) : null;
+}
+
+export async function listManagementRendererBindings(): Promise<ManagementRendererBindingRecord[]> {
+  const payload = await requestJson<unknown>('/api/management/renderers/bind');
+  if (!isRecord(payload) || !Array.isArray(payload.bindings)) {
+    return [];
+  }
+  return payload.bindings
+    .map(normalizeRendererBindingRecord)
+    .filter((item): item is ManagementRendererBindingRecord => Boolean(item));
+}
+
+export async function unbindManagementRenderer(input: {
+  channel: string;
+  result_kind: string;
+  media_type?: string;
+  document_type?: string;
+}): Promise<ManagementRendererBindingRecord | null> {
+  const payload = await requestJson<unknown>('/api/management/renderers/bind', {
+    method: 'DELETE',
+    body: input,
+  });
+  return isRecord(payload) ? normalizeRendererBindingRecord(payload.binding) : null;
+}
+
+export async function listManagementDocumentProviders(): Promise<{
+  providers: ManagementCapabilityProviderRecord[];
+  mimeRoutes: unknown;
+}> {
+  const payload = await requestJson<unknown>('/api/management/documents/providers');
+  if (!isRecord(payload)) {
+    return { providers: [], mimeRoutes: {} };
+  }
+  const providers = Array.isArray(payload.providers)
+    ? payload.providers
+      .map(normalizeCapabilityProviderRecord)
+      .filter((item): item is ManagementCapabilityProviderRecord => Boolean(item))
+    : [];
+  return {
+    providers,
+    mimeRoutes: payload.mime_routes ?? {},
+  };
+}
+
+export async function listManagementCapabilityAuditLogs(
+  limit = 200,
+): Promise<ManagementCapabilityAuditLogRecord[]> {
+  const payload = await requestJson<unknown>(
+    `/api/management/audit/capabilities?limit=${encodeURIComponent(String(limit))}`,
+  );
+  if (!isRecord(payload) || !Array.isArray(payload.logs)) {
+    return [];
+  }
+  return payload.logs
+    .map(normalizeCapabilityAuditLogRecord)
+    .filter((item): item is ManagementCapabilityAuditLogRecord => Boolean(item));
+}
+
+export async function listManagementCapabilityJobs(input?: {
+  agentId?: string;
+  status?: string;
+  limit?: number;
+}): Promise<ManagementCapabilityJobRecord[]> {
+  const query = new URLSearchParams();
+  if (input?.agentId?.trim()) {
+    query.set('agent_id', input.agentId.trim());
+  }
+  if (input?.status?.trim()) {
+    query.set('status', input.status.trim());
+  }
+  if (typeof input?.limit === 'number' && Number.isFinite(input.limit)) {
+    query.set('limit', String(Math.max(1, Math.min(500, Math.trunc(input.limit)))));
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : '';
+  const payload = await requestJson<unknown>(`/api/management/capabilities/jobs${suffix}`);
+  if (!isRecord(payload) || !Array.isArray(payload.jobs)) {
+    return [];
+  }
+  return payload.jobs
+    .map(normalizeCapabilityJobRecord)
+    .filter((item): item is ManagementCapabilityJobRecord => Boolean(item));
+}
+
+export async function getManagementCapabilityJob(
+  jobId: string,
+): Promise<ManagementCapabilityJobRecord | null> {
+  const payload = await requestJson<unknown>(
+    `/api/management/capabilities/jobs/${encodeURIComponent(jobId)}`,
+  );
+  return isRecord(payload) ? normalizeCapabilityJobRecord(payload.job) : null;
+}
+
+export async function upsertManagementCapabilityJob(
+  input: Omit<ManagementCapabilityJobRecord, 'updated_at'>,
+): Promise<ManagementCapabilityJobRecord | null> {
+  const payload = await requestJson<unknown>('/api/management/capabilities/jobs', {
+    method: 'POST',
+    body: input,
+  });
+  return isRecord(payload) ? normalizeCapabilityJobRecord(payload.job) : null;
 }
 
 export interface McpServerSummary {

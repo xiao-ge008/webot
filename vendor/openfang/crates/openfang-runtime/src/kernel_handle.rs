@@ -298,6 +298,26 @@ pub trait KernelHandle: Send + Sync {
         Err("Current agent model image editing is not available".to_string())
     }
 
+    /// Generate a video with the caller agent's current model when that model supports it.
+    async fn generate_video_with_agent_model(
+        &self,
+        agent_id: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (agent_id, request);
+        Err("Current agent model video generation is not available".to_string())
+    }
+
+    /// Edit a video with the caller agent's current model when that model supports it.
+    async fn edit_video_with_agent_model(
+        &self,
+        agent_id: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (agent_id, request);
+        Err("Current agent model video editing is not available".to_string())
+    }
+
     /// Spawn an agent with capability inheritance enforcement.
     /// `parent_caps` are the parent's granted capabilities. The kernel MUST verify
     /// that every capability in the child manifest is covered by `parent_caps`.

@@ -107,6 +107,12 @@ async fn execute_python(
             cmd.env("TEMP", tmp);
         }
     }
+    if let Ok(service_base) = std::env::var("WEBOT_SERVICE_BASE_URL") {
+        let trimmed = service_base.trim();
+        if !trimmed.is_empty() {
+            cmd.env("WEBOT_SERVICE_BASE_URL", trimmed);
+        }
+    }
     // Python needs PYTHONIOENCODING for UTF-8 output
     cmd.env("PYTHONIOENCODING", "utf-8");
 
@@ -209,6 +215,12 @@ async fn execute_node(
             cmd.env("TEMP", tmp);
         }
     }
+    if let Ok(service_base) = std::env::var("WEBOT_SERVICE_BASE_URL") {
+        let trimmed = service_base.trim();
+        if !trimmed.is_empty() {
+            cmd.env("WEBOT_SERVICE_BASE_URL", trimmed);
+        }
+    }
     // Node needs NODE_PATH sometimes
     cmd.env("NODE_NO_WARNINGS", "1");
 
@@ -232,9 +244,10 @@ async fn execute_node(
         .map_err(|e| SkillError::ExecutionFailed(format!("Wait for Node.js: {e}")))?;
 
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Ok(SkillToolResult {
-            output: serde_json::json!({ "error": stderr.to_string() }),
+            output: build_failed_node_output(&stdout, &stderr),
             is_error: true,
         });
     }
@@ -250,6 +263,26 @@ async fn execute_node(
             is_error: false,
         }),
     }
+}
+
+fn build_failed_node_output(stdout: &str, stderr: &str) -> serde_json::Value {
+    let stdout_trimmed = stdout.trim();
+    if !stdout_trimmed.is_empty() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
+            if value.get("error").is_some() || value.get("message").is_some() {
+                return value;
+            }
+        }
+    }
+
+    let stderr_trimmed = stderr.trim();
+    if !stderr_trimmed.is_empty() {
+        return serde_json::json!({ "error": stderr_trimmed });
+    }
+    if !stdout_trimmed.is_empty() {
+        return serde_json::json!({ "error": stdout_trimmed });
+    }
+    serde_json::json!({ "error": "Node.js skill exited with a non-zero status." })
 }
 
 /// Find Python 3 binary.
@@ -295,6 +328,22 @@ mod tests {
     #[test]
     fn test_find_node() {
         let _ = find_node();
+    }
+
+    #[test]
+    fn test_build_failed_node_output_prefers_json_stdout() {
+        let value = build_failed_node_output(
+            r#"{"error":"missing image input","details":{"field":"image"}}"#,
+            "",
+        );
+        assert_eq!(value["error"], "missing image input");
+        assert_eq!(value["details"]["field"], "image");
+    }
+
+    #[test]
+    fn test_build_failed_node_output_falls_back_to_stderr() {
+        let value = build_failed_node_output("", "fatal: missing prompt");
+        assert_eq!(value["error"], "fatal: missing prompt");
     }
 
     #[tokio::test]

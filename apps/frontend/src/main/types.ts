@@ -1,5 +1,41 @@
 import type { AgentSpeakerProfile, AgentTtsConfig } from '@/types/tts';
 
+export type EmbodimentAssetSource = 'managed_asset' | 'managed_identity' | 'external_url';
+export type EmbodimentAssetKind = 'avatar' | 'portrait' | 'self_photo' | 'video_source';
+export type EmbodimentVoiceMode = 'speaker_profile' | 'provider_voice';
+
+export interface EmbodimentAssetRef {
+  source: EmbodimentAssetSource;
+  kind: EmbodimentAssetKind;
+  assetId?: string;
+  url: string;
+  label?: string;
+  mimeType?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface EmbodimentVoiceRef {
+  mode: EmbodimentVoiceMode;
+  speakerProfileId?: string;
+  provider?: string;
+  voice?: string;
+  label?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentEmbodimentConfig {
+  version: 1;
+  assets: {
+    defaultAvatar?: EmbodimentAssetRef;
+    defaultPortrait?: EmbodimentAssetRef;
+    defaultVideoSource?: EmbodimentAssetRef;
+    selfPhotos?: EmbodimentAssetRef[];
+  };
+  voice?: {
+    defaultVoice?: EmbodimentVoiceRef;
+  };
+}
+
 export interface ModelProviderTemplate {
   id: string;
   displayName: string;
@@ -261,8 +297,10 @@ export interface AgentProfile {
   };
   appearance: {
     avatarUrl?: string;
+    portraitUrl?: string;
     color?: string;
   };
+  embodiment?: AgentEmbodimentConfig;
   voice?: {
     ttsModel?: string;
     ttsVoice?: string;
@@ -423,6 +461,7 @@ export interface AgentChatInput {
   requestOrigin?: 'group_auto';
   systemPreamble?: string;
   homeDirOverride?: string;
+  currentTaskDraft?: unknown;
 }
 
 export interface AgentAppearanceUpdated {
@@ -440,9 +479,16 @@ export interface AgentChatResult {
   text?: string;
   uiRawText?: string;
   spec?: unknown;
+  taskCard?: unknown;
+  taskDraftState?: unknown;
+  taskDraftMatched?: boolean;
+  taskDraftCancelled?: boolean;
+  taskDraftReadyToConfirm?: boolean;
   appearanceUpdated?: AgentAppearanceUpdated;
   error?: string;
   usedFallback?: boolean;
+  sessionId?: string;
+  sessionLabel?: string;
   recoveredSessionLabel?: string;
   recoveredRemoteSessionId?: string;
   recoveryReason?: 'session_conflict' | 'context_overflow' | 'quota_exceeded';
@@ -457,6 +503,11 @@ export interface AgentChatStreamChunk {
   event?: string;
   meta?: (Record<string, unknown> & {
     appearanceUpdated?: AgentAppearanceUpdated;
+    taskCard?: unknown;
+    taskDraftState?: unknown;
+    taskDraftMatched?: boolean;
+    taskDraftCancelled?: boolean;
+    taskDraftReadyToConfirm?: boolean;
   });
 }
 

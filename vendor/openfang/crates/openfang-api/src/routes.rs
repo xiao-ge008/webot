@@ -324,11 +324,12 @@ pub async fn send_message(
     let quota_scope = resolve_scheduler_quota_scope(req.request_origin.as_deref());
     match state
         .kernel
-        .send_message_with_handle_and_quota_scope(
+        .send_message_with_handle_and_quota_scope_and_blocked_tools(
             agent_id,
             &req.message,
             Some(kernel_handle),
             quota_scope,
+            req.blocked_tools.clone(),
         )
         .await
     {
@@ -1069,12 +1070,15 @@ pub async fn send_message_stream(
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     let quota_scope = resolve_scheduler_quota_scope(req.request_origin.as_deref());
-    let (rx, _handle) = match state.kernel.send_message_streaming_with_quota_scope(
-        agent_id,
-        &req.message,
-        Some(kernel_handle),
-        quota_scope,
-    ) {
+    let (rx, _handle) = match state
+        .kernel
+        .send_message_streaming_with_quota_scope_and_blocked_tools(
+            agent_id,
+            &req.message,
+            Some(kernel_handle),
+            quota_scope,
+            req.blocked_tools.clone(),
+        ) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Streaming message failed for agent {id}: {e}");
@@ -1147,17 +1151,23 @@ pub async fn send_message_stream(
                     StreamEvent::ToolExecutionResult {
                         name,
                         result_preview,
+                        structured_result,
                         is_error,
                         input,
-                    } => Event::default()
-                        .event("tool_result")
-                        .json_data(serde_json::json!({
-                            "tool": name,
-                            "result": result_preview,
-                            "is_error": is_error,
-                            "input": input,
-                        }))
-                        .unwrap_or_else(|_| Event::default().data("error")),
+                    } => {
+                        let mut payload = serde_json::Map::new();
+                        payload.insert("tool".to_string(), serde_json::json!(name));
+                        payload.insert("result".to_string(), serde_json::json!(result_preview));
+                        payload.insert("is_error".to_string(), serde_json::json!(is_error));
+                        payload.insert("input".to_string(), serde_json::json!(input));
+                        if let Some(serde_json::Value::Object(extra)) = structured_result {
+                            payload.extend(extra);
+                        }
+                        Event::default()
+                            .event("tool_result")
+                            .json_data(serde_json::Value::Object(payload))
+                            .unwrap_or_else(|_| Event::default().data("error"))
+                    }
                     StreamEvent::Error { message } => Event::default()
                         .event("error")
                         .json_data(serde_json::json!({
@@ -8440,6 +8450,257 @@ pub async fn run_schedule(
 }
 
 // ---------------------------------------------------------------------------
+// Managed task center endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/tasks — List managed tasks.
+pub async fn list_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ManagedTaskListQuery>,
+) -> impl IntoResponse {
+    match state.kernel.list_managed_tasks(query.agent_id.as_deref()) {
+        Ok(tasks) => (StatusCode::OK, Json(serde_json::json!(tasks))),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// POST /api/tasks — Create a managed task.
+pub async fn create_task(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<openfang_types::tasks::ManagedTaskCreateRequest>,
+) -> impl IntoResponse {
+    match state.kernel.create_managed_task(req).await {
+        Ok(task) => (StatusCode::CREATED, Json(serde_json::json!(task))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// GET /api/tasks/{id} — Get one managed task.
+pub async fn get_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.get_managed_task(&id) {
+        Ok(Some(task)) => (StatusCode::OK, Json(serde_json::json!(task))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Task not found" })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// POST /api/tasks/{id}/publish — Publish a managed task.
+pub async fn publish_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.publish_managed_task(&id) {
+        Ok(task) => (StatusCode::OK, Json(serde_json::json!(task))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// POST /api/tasks/{id}/pause — Pause a managed task.
+pub async fn pause_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.pause_managed_task(&id) {
+        Ok(task) => (StatusCode::OK, Json(serde_json::json!(task))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// POST /api/tasks/{id}/run-once — Trigger a managed task immediately.
+pub async fn run_task_once(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.run_managed_task_once(&id).await {
+        Ok(task) => (StatusCode::OK, Json(serde_json::json!(task))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// DELETE /api/tasks/{id} — Delete a managed task.
+pub async fn delete_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.delete_managed_task(&id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "deleted" })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// GET /api/tasks/{id}/runs — List run records for a managed task.
+pub async fn list_task_runs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.list_managed_task_runs(&id) {
+        Ok(runs) => (StatusCode::OK, Json(serde_json::json!(runs))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// GET /api/tasks/{id}/events — List events for a managed task.
+pub async fn list_task_events(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.list_managed_task_events(&id) {
+        Ok(events) => (StatusCode::OK, Json(serde_json::json!(events))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// GET /api/tasks/{id}/deliveries — List deliveries for a managed task.
+pub async fn list_task_deliveries(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.list_managed_task_deliveries(&id) {
+        Ok(deliveries) => (StatusCode::OK, Json(serde_json::json!(deliveries))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// GET /api/tasks/{id}/delivery-attempts — List delivery attempts for a managed task.
+pub async fn list_task_delivery_attempts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.list_managed_task_delivery_attempts(&id) {
+        Ok(attempts) => (StatusCode::OK, Json(serde_json::json!(attempts))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// GET /api/tasks/{id}/timeline — List timeline projection for a managed task.
+pub async fn list_task_timeline(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.list_managed_task_timeline(&id) {
+        Ok(timeline) => (StatusCode::OK, Json(serde_json::json!(timeline))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// GET /api/tasks/deliveries/pending — List pending deliveries for consumers.
+pub async fn list_pending_task_deliveries(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ManagedTaskPendingDeliveriesQuery>,
+) -> impl IntoResponse {
+    match state.kernel.list_pending_managed_task_deliveries(
+        query.target_kind.as_deref(),
+        query.origin_chat_session_id.as_deref(),
+    ) {
+        Ok(deliveries) => (StatusCode::OK, Json(serde_json::json!(deliveries))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// POST /api/tasks/deliveries/{id}/status — Update one delivery status.
+pub async fn update_task_delivery_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ManagedTaskDeliveryStatusUpdateRequest>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .update_managed_task_delivery_status(&id, req.status)
+    {
+        Ok(Some(delivery)) => (StatusCode::OK, Json(serde_json::json!(delivery))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Delivery not found" })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+/// POST /api/tasks/deliveries/{id}/attempts — Record one delivery attempt.
+pub async fn create_task_delivery_attempt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ManagedTaskDeliveryAttemptCreateRequest>,
+) -> impl IntoResponse {
+    let attempt = openfang_types::tasks::ManagedTaskDeliveryAttempt {
+        id: uuid::Uuid::new_v4().to_string(),
+        delivery_id: id,
+        task_id: req.task_id,
+        run_id: req.run_id,
+        event_id: req.event_id,
+        target_kind: req.target_kind,
+        consumer_kind: req.consumer_kind,
+        status: req.status,
+        error: req.error,
+        metadata_json: req.metadata_json,
+        started_at: req
+            .started_at
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        finished_at: req
+            .finished_at
+            .or_else(|| Some(chrono::Utc::now().to_rfc3339())),
+    };
+    match state.kernel.record_managed_task_delivery_attempt(attempt) {
+        Ok(attempt) => (StatusCode::CREATED, Json(serde_json::json!(attempt))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent Identity endpoint
 // ---------------------------------------------------------------------------
 
@@ -8448,6 +8709,7 @@ pub async fn run_schedule(
 pub struct UpdateIdentityRequest {
     pub emoji: Option<String>,
     pub avatar_url: Option<String>,
+    pub portrait_url: Option<String>,
     pub color: Option<String>,
     #[serde(default)]
     pub archetype: Option<String>,
@@ -8496,10 +8758,23 @@ pub async fn update_agent_identity(
             );
         }
     }
+    if let Some(ref url) = req.portrait_url {
+        if !url.is_empty()
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+            && !url.starts_with("data:")
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Portrait URL must be http/https or data URI"})),
+            );
+        }
+    }
 
     let identity = AgentIdentity {
         emoji: req.emoji,
         avatar_url: req.avatar_url,
+        portrait_url: req.portrait_url,
         color: req.color,
         archetype: req.archetype,
         vibe: req.vibe,
@@ -8536,6 +8811,7 @@ pub struct PatchAgentConfigRequest {
     pub system_prompt: Option<String>,
     pub emoji: Option<String>,
     pub avatar_url: Option<String>,
+    pub portrait_url: Option<String>,
     pub color: Option<String>,
     pub archetype: Option<String>,
     pub vibe: Option<String>,
@@ -8622,6 +8898,18 @@ pub async fn patch_agent_config(
             );
         }
     }
+    if let Some(ref url) = req.portrait_url {
+        if !url.is_empty()
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+            && !url.starts_with("data:")
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Portrait URL must be http/https or data URI"})),
+            );
+        }
+    }
 
     // Update name
     if let Some(ref new_name) = req.name {
@@ -8672,6 +8960,7 @@ pub async fn patch_agent_config(
     // Update identity fields (merge — only overwrite provided fields)
     let has_identity_field = req.emoji.is_some()
         || req.avatar_url.is_some()
+        || req.portrait_url.is_some()
         || req.color.is_some()
         || req.archetype.is_some()
         || req.vibe.is_some()
@@ -8688,6 +8977,7 @@ pub async fn patch_agent_config(
         let merged = AgentIdentity {
             emoji: req.emoji.or(current.emoji),
             avatar_url: req.avatar_url.or(current.avatar_url),
+            portrait_url: req.portrait_url.or(current.portrait_url),
             color: req.color.or(current.color),
             archetype: req.archetype.or(current.archetype),
             vibe: req.vibe.or(current.vibe),
@@ -8881,6 +9171,7 @@ const KNOWN_IDENTITY_FILES: &[&str] = &[
     "AGENTS.md",
     "BOOTSTRAP.md",
     "HEARTBEAT.md",
+    "EMBODIMENT.json",
 ];
 
 /// GET /api/agents/{id}/files — List workspace identity files.

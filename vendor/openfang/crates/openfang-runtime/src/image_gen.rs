@@ -1,6 +1,8 @@
 //! Image generation runtime helpers.
 
 use base64::Engine;
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImage, ImageBuffer, ImageFormat, Rgba};
 use openfang_types::media::{GeneratedImage, ImageEditRequest, ImageGenRequest, ImageGenResult};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
@@ -9,7 +11,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 const MAX_BASE64_BYTES: usize = 10 * 1024 * 1024;
@@ -26,6 +28,18 @@ struct ImageEditScope {
     changes_accessories: bool,
     changes_makeup: bool,
     changes_body: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageEditWorkflowKind {
+    SingleSourceEdit,
+    BaseWithReferenceMerge,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedImageEditSource {
+    bytes: Vec<u8>,
+    mime_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,7 +141,8 @@ pub async fn generate_openai_compatible_image_edit(
     }
 
     let client = build_http_client(120)?;
-    let (image_bytes, mime_type) = load_image_edit_source(&client, request).await?;
+    let (image_bytes, mime_type, workflow_kind) =
+        prepare_image_edit_source(&client, request).await?;
     let size = request.effective_size()?;
     let filename = format!(
         "image-edit-input.{}",
@@ -137,7 +152,7 @@ pub async fn generate_openai_compatible_image_edit(
         .file_name(filename)
         .mime_str(&mime_type)
         .map_err(|err| format!("Invalid image MIME type '{mime_type}': {err}"))?;
-    let prompt = build_image_edit_instruction_prompt(&request.prompt);
+    let prompt = build_image_edit_instruction_prompt(&request.prompt, workflow_kind);
 
     let mut form = reqwest::multipart::Form::new()
         .part("image", image_part)
@@ -282,6 +297,34 @@ pub async fn execute_configured_image_edit_tool(
     asset_metadata: Option<&Value>,
 ) -> Result<Option<String>, String> {
     let client = build_http_client(240)?;
+    let mut image_path = request.image_path.clone();
+    let mut image_url = request.image_url.clone();
+    let mut image_base64 = request.image_base64.clone();
+    let mut mime_type = request.mime_type.clone();
+    let mut reference_image_path = request.reference_image_path.clone();
+    let mut reference_image_url = request.reference_image_url.clone();
+    let reference_image_base64 = request.reference_image_base64.clone();
+    let reference_mime_type = request.reference_mime_type.clone();
+
+    if image_path.trim().is_empty() && image_base64.trim().is_empty() {
+        if let Some(materialized_path) =
+            materialize_local_management_image_source(&client, &image_url).await?
+        {
+            image_path = materialized_path;
+            image_url.clear();
+            image_base64.clear();
+            mime_type.clear();
+        }
+    }
+    if reference_image_path.trim().is_empty() && reference_image_base64.trim().is_empty() {
+        if let Some(materialized_path) =
+            materialize_local_management_image_source(&client, &reference_image_url).await?
+        {
+            reference_image_path = materialized_path;
+            reference_image_url.clear();
+        }
+    }
+
     let mut payload = json!({
         "prompt": request.prompt,
         "negativePrompt": request.negative_prompt,
@@ -290,10 +333,14 @@ pub async fn execute_configured_image_edit_tool(
         "height": request.height,
         "quality": request.quality,
         "count": request.count,
-        "imagePath": request.image_path,
-        "imageUrl": request.image_url,
-        "imageBase64": request.image_base64,
-        "mimeType": request.mime_type,
+        "imagePath": image_path,
+        "imageUrl": image_url,
+        "imageBase64": image_base64,
+        "mimeType": mime_type,
+        "referenceImagePath": reference_image_path,
+        "referenceImageUrl": reference_image_url,
+        "referenceImageBase64": reference_image_base64,
+        "referenceMimeType": reference_mime_type,
         "workspaceRoot": workspace_root.map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
     });
     if let (Some(metadata), Some(object)) = (asset_metadata, payload.as_object_mut()) {
@@ -338,7 +385,128 @@ pub async fn execute_configured_image_edit_tool(
         .map_err(|err| format!("序列化图片修改结果失败: {err}"))
 }
 
-fn build_image_edit_instruction_prompt(prompt: &str) -> String {
+fn is_local_management_media_path(image_url: &str) -> bool {
+    let trimmed = image_url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let path_like = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let Some(index) = trimmed.find("/api/management/agents/") else {
+            return false;
+        };
+        &trimmed[index..]
+    } else {
+        trimmed
+    };
+    let path_only = path_like
+        .split('#')
+        .next()
+        .unwrap_or(path_like)
+        .split('?')
+        .next()
+        .unwrap_or(path_like);
+    let Some(rest) = path_only.strip_prefix("/api/management/agents/") else {
+        return false;
+    };
+    let Some((_, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    tail.starts_with("avatar/") || tail.starts_with("portrait/")
+}
+
+fn resolve_local_management_media_url(image_url: &str) -> Option<String> {
+    let trimmed = image_url.trim();
+    if !is_local_management_media_path(trimmed) {
+        return None;
+    }
+    if trimmed.starts_with("/api/management/agents/") {
+        return Some(format!("{}{}", local_image_service_base_url(), trimmed));
+    }
+    let base = local_image_service_base_url();
+    let prefixed = format!("{base}/api/management/agents/");
+    if trimmed.starts_with(&prefixed) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+async fn materialize_local_management_image_source(
+    client: &reqwest::Client,
+    image_url: &str,
+) -> Result<Option<String>, String> {
+    let Some(request_url) = resolve_local_management_media_url(image_url) else {
+        return Ok(None);
+    };
+
+    let response = client
+        .get(&request_url)
+        .header(USER_AGENT, crate::USER_AGENT)
+        .send()
+        .await
+        .map_err(|err| {
+            format!(
+                "Failed to fetch local management image URL '{}': {err}",
+                image_url.trim()
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Local management image URL fetch failed ({}): {}",
+            status,
+            body.trim()
+        ));
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_image_mime_type)
+        .map(str::to_string);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("Failed to read local management image URL bytes: {err}"))?
+        .to_vec();
+    let extension = content_type
+        .as_deref()
+        .and_then(extension_from_mime_type)
+        .or_else(|| {
+            detect_image_mime_from_path_or_bytes(None, &bytes).and_then(extension_from_mime_type)
+        })
+        .unwrap_or("png");
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let temp_dir = env::temp_dir().join("openfang_runtime_image_sources");
+    tokio::fs::create_dir_all(&temp_dir).await.map_err(|err| {
+        format!(
+            "Failed to create runtime image source cache '{}': {err}",
+            temp_dir.display()
+        )
+    })?;
+    let temp_path = temp_dir.join(format!(
+        "management-media-{}-{}.{}",
+        std::process::id(),
+        tick,
+        extension
+    ));
+    tokio::fs::write(&temp_path, &bytes).await.map_err(|err| {
+        format!(
+            "Failed to persist local management image source '{}': {err}",
+            temp_path.display()
+        )
+    })?;
+    Ok(Some(temp_path.to_string_lossy().to_string()))
+}
+
+fn build_image_edit_instruction_prompt(
+    prompt: &str,
+    workflow_kind: ImageEditWorkflowKind,
+) -> String {
     let user_prompt = prompt.trim();
     let scope = infer_image_edit_scope(user_prompt);
     let mut requested_change_groups = Vec::new();
@@ -380,9 +548,19 @@ fn build_image_edit_instruction_prompt(prompt: &str) -> String {
         )
     };
 
+    let workflow_instruction = match workflow_kind {
+        ImageEditWorkflowKind::SingleSourceEdit => {
+            "Edit the provided source image instead of creating a brand-new image. Preserve the same subject identity, face, recognizable person, hairstyle, body characteristics, lighting style, color palette, and overall visual language unless the user explicitly asked to change them.".to_string()
+        }
+        ImageEditWorkflowKind::BaseWithReferenceMerge => {
+            "The provided input image is a two-panel reference sheet. The LEFT panel is the base image to preserve and edit. The RIGHT panel is a reference image that only provides the requested transferable elements. The final result must be a single normal image based on the LEFT panel subject, identity, framing, pose, camera language, and scene ownership. Use the RIGHT panel only to copy or merge the requested clothing, object, material, accessory, makeup, hairstyle, or style cues. Do not output a collage, split screen, diptych, side-by-side comparison, or two people unless the user explicitly asked for that.".to_string()
+        }
+    };
+
     format!(
-        "{}\n\nEdit the provided source image instead of creating a brand-new image. Preserve the same subject identity, face, recognizable person, hairstyle, body characteristics, lighting style, color palette, and overall visual language unless the user explicitly asked to change them. {} Only modify the exact parts requested below. Do not add extra accessories, props, beautification, outfit redesigns, pose changes, background rewrites, or scene inventions beyond the user's request. Everything not explicitly requested must remain unchanged.\n\nRequested edit:\n{}",
+        "{}\n\n{} {} Only modify the exact parts requested below. Do not add extra accessories, props, beautification, outfit redesigns, pose changes, background rewrites, or scene inventions beyond the user's request. Everything not explicitly requested must remain unchanged.\n\nRequested edit:\n{}",
         FIXED_IMAGE_EDIT_INSTRUCTION_PREFIX,
+        workflow_instruction,
         requested_change_instruction,
         user_prompt
     )
@@ -536,32 +714,106 @@ fn contains_any_edit_keyword(value: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|keyword| value.contains(keyword))
 }
 
-async fn load_image_edit_source(
+async fn prepare_image_edit_source(
     client: &reqwest::Client,
     request: &ImageEditRequest,
-) -> Result<(Vec<u8>, String), String> {
-    if !request.image_base64.trim().is_empty() {
+) -> Result<(Vec<u8>, String, ImageEditWorkflowKind), String> {
+    let primary = load_named_image_edit_source(
+        client,
+        &request.image_path,
+        &request.image_url,
+        &request.image_base64,
+        &request.mime_type,
+        "primary",
+    )
+    .await?;
+    let reference = load_optional_named_image_edit_source(
+        client,
+        &request.reference_image_path,
+        &request.reference_image_url,
+        &request.reference_image_base64,
+        &request.reference_mime_type,
+        "reference",
+    )
+    .await?;
+    if let Some(reference) = reference {
+        let merged = compose_reference_sheet(&primary, &reference)?;
+        return Ok((
+            merged.bytes,
+            merged.mime_type,
+            ImageEditWorkflowKind::BaseWithReferenceMerge,
+        ));
+    }
+    Ok((
+        primary.bytes,
+        primary.mime_type,
+        ImageEditWorkflowKind::SingleSourceEdit,
+    ))
+}
+
+async fn load_optional_named_image_edit_source(
+    client: &reqwest::Client,
+    image_path: &str,
+    image_url: &str,
+    image_base64: &str,
+    mime_type: &str,
+    label: &str,
+) -> Result<Option<LoadedImageEditSource>, String> {
+    if image_path.trim().is_empty() && image_url.trim().is_empty() && image_base64.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    load_named_image_edit_source(
+        client,
+        image_path,
+        image_url,
+        image_base64,
+        mime_type,
+        label,
+    )
+    .await
+    .map(Some)
+}
+
+async fn load_named_image_edit_source(
+    client: &reqwest::Client,
+    image_path: &str,
+    image_url: &str,
+    image_base64: &str,
+    mime_type: &str,
+    label: &str,
+) -> Result<LoadedImageEditSource, String> {
+    if !image_base64.trim().is_empty() {
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(request.image_base64.trim())
-            .map_err(|err| format!("Failed to decode image_base64: {err}"))?;
-        let mime_type = normalize_image_mime_type(request.mime_type.trim())
-            .ok_or_else(|| format!("Unsupported image MIME type: {}", request.mime_type.trim()))?;
-        return Ok((bytes, mime_type.to_string()));
+            .decode(image_base64.trim())
+            .map_err(|err| format!("Failed to decode {label} image_base64: {err}"))?;
+        let mime_type = normalize_image_mime_type(mime_type.trim())
+            .ok_or_else(|| format!("Unsupported {label} image MIME type: {}", mime_type.trim()))?;
+        return Ok(LoadedImageEditSource {
+            bytes,
+            mime_type: mime_type.to_string(),
+        });
     }
 
-    if !request.image_path.trim().is_empty() {
-        let path = PathBuf::from(request.image_path.trim());
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|err| format!("Failed to read image file '{}': {err}", path.display()))?;
+    if !image_path.trim().is_empty() {
+        let path = PathBuf::from(image_path.trim());
+        let bytes = tokio::fs::read(&path).await.map_err(|err| {
+            format!(
+                "Failed to read {label} image file '{}': {err}",
+                path.display()
+            )
+        })?;
         let mime_type = detect_image_mime_from_path_or_bytes(path.to_str(), &bytes)
-            .ok_or_else(|| format!("Unsupported image format: {}", path.display()))?;
-        return Ok((bytes, mime_type.to_string()));
+            .ok_or_else(|| format!("Unsupported {label} image format: {}", path.display()))?;
+        return Ok(LoadedImageEditSource {
+            bytes,
+            mime_type: mime_type.to_string(),
+        });
     }
 
-    let image_url = request.image_url.trim();
+    let image_url = image_url.trim();
     if image_url.is_empty() {
-        return Err("Missing input image source".to_string());
+        return Err(format!("Missing {label} image source"));
     }
 
     if let Some(file_id) = extract_local_upload_id(image_url) {
@@ -571,13 +823,13 @@ async fn load_image_edit_source(
             Err(cache_err) => {
                 let restored_path = recover_persisted_upload_path(file_id).ok_or_else(|| {
                     format!(
-                        "Failed to read uploaded image '{}' from local cache: {cache_err}",
+                        "Failed to read uploaded {label} image '{}' from local cache: {cache_err}",
                         image_url
                     )
                 })?;
                 let restored_bytes = tokio::fs::read(&restored_path).await.map_err(|err| {
                     format!(
-                        "Failed to read restored uploaded image '{}' from '{}': {err}",
+                        "Failed to read restored uploaded {label} image '{}' from '{}': {err}",
                         image_url,
                         restored_path.display()
                     )
@@ -593,13 +845,16 @@ async fn load_image_edit_source(
             }
         };
         let mime_type = detect_image_mime_from_path_or_bytes(path_for_mime.to_str(), &bytes)
-            .ok_or_else(|| format!("Unsupported uploaded image format: {}", image_url))?;
-        return Ok((bytes, mime_type.to_string()));
+            .ok_or_else(|| format!("Unsupported uploaded {label} image format: {}", image_url))?;
+        return Ok(LoadedImageEditSource {
+            bytes,
+            mime_type: mime_type.to_string(),
+        });
     }
 
     if !(image_url.starts_with("http://") || image_url.starts_with("https://")) {
         return Err(format!(
-            "Unsupported image_url '{}'. Use image_path, /api/uploads/... or http(s) URL.",
+            "Unsupported {label} image_url '{}'. Use image_path, /api/uploads/... or http(s) URL.",
             image_url
         ));
     }
@@ -609,12 +864,12 @@ async fn load_image_edit_source(
         .header(USER_AGENT, crate::USER_AGENT)
         .send()
         .await
-        .map_err(|err| format!("Failed to fetch input image URL '{}': {err}", image_url))?;
+        .map_err(|err| format!("Failed to fetch {label} image URL '{}': {err}", image_url))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(format!(
-            "Input image URL fetch failed ({}): {}",
+            "{label} image URL fetch failed ({}): {}",
             status,
             body.trim()
         ));
@@ -628,12 +883,70 @@ async fn load_image_edit_source(
     let bytes = response
         .bytes()
         .await
-        .map_err(|err| format!("Failed to read input image URL bytes: {err}"))?
+        .map_err(|err| format!("Failed to read {label} image URL bytes: {err}"))?
         .to_vec();
-    let mime_type = content_type
+    let resolved_mime = content_type
         .or_else(|| detect_image_mime_from_path_or_bytes(None, &bytes).map(str::to_string))
-        .ok_or_else(|| format!("Unsupported remote image format: {}", image_url))?;
-    Ok((bytes, mime_type))
+        .ok_or_else(|| format!("Unsupported remote {label} image format: {}", image_url))?;
+    Ok(LoadedImageEditSource {
+        bytes,
+        mime_type: resolved_mime,
+    })
+}
+
+fn compose_reference_sheet(
+    primary: &LoadedImageEditSource,
+    reference: &LoadedImageEditSource,
+) -> Result<LoadedImageEditSource, String> {
+    let primary_image = decode_dynamic_image(&primary.bytes, "primary")?;
+    let reference_image = decode_dynamic_image(&reference.bytes, "reference")?;
+    let target_height = primary_image
+        .height()
+        .max(reference_image.height())
+        .max(512);
+
+    let resized_primary = primary_image.resize(u32::MAX, target_height, FilterType::Lanczos3);
+    let resized_reference = reference_image.resize(u32::MAX, target_height, FilterType::Lanczos3);
+
+    let gap = 24;
+    let padding = 24;
+    let canvas_width = resized_primary
+        .width()
+        .saturating_add(resized_reference.width())
+        .saturating_add(gap)
+        .saturating_add(padding * 2);
+    let canvas_height = target_height.saturating_add(padding * 2);
+    let mut canvas = DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+        canvas_width,
+        canvas_height,
+        Rgba([245, 245, 245, 255]),
+    ));
+
+    canvas
+        .copy_from(&resized_primary.to_rgba8(), padding, padding)
+        .map_err(|_| "Failed to place primary image into reference sheet".to_string())?;
+    canvas
+        .copy_from(
+            &resized_reference.to_rgba8(),
+            padding + resized_primary.width() + gap,
+            padding,
+        )
+        .map_err(|_| "Failed to place reference image into reference sheet".to_string())?;
+
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    canvas
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|err| format!("Failed to encode reference sheet PNG: {err}"))?;
+    Ok(LoadedImageEditSource {
+        bytes: encoded.into_inner(),
+        mime_type: "image/png".to_string(),
+    })
+}
+
+fn decode_dynamic_image(bytes: &[u8], label: &str) -> Result<DynamicImage, String> {
+    image::load_from_memory(bytes).map_err(|err| {
+        format!("Failed to decode {label} image for reference-sheet composition: {err}")
+    })
 }
 
 fn extract_local_upload_id(image_url: &str) -> Option<&str> {
@@ -957,12 +1270,26 @@ mod tests {
 
     #[test]
     fn test_build_image_edit_instruction_prompt_adds_preservation_rules() {
-        let prompt = build_image_edit_instruction_prompt("只把耳环换成细链款");
+        let prompt = build_image_edit_instruction_prompt(
+            "只把耳环换成细链款",
+            ImageEditWorkflowKind::SingleSourceEdit,
+        );
         assert!(
             prompt.contains("Edit the provided source image instead of creating a brand-new image")
         );
         assert!(prompt.contains("Everything not explicitly requested must remain unchanged"));
         assert!(prompt.contains("只把耳环换成细链款"));
+    }
+
+    #[test]
+    fn test_build_image_edit_instruction_prompt_for_reference_merge_marks_left_right_roles() {
+        let prompt = build_image_edit_instruction_prompt(
+            "以第一张图为主，把第二张图里的衣服穿到主图人物身上",
+            ImageEditWorkflowKind::BaseWithReferenceMerge,
+        );
+        assert!(prompt.contains("LEFT panel is the base image"));
+        assert!(prompt.contains("RIGHT panel is a reference image"));
+        assert!(prompt.contains("Do not output a collage"));
     }
 
     #[test]
@@ -976,6 +1303,19 @@ mod tests {
             Some("def-456")
         );
         assert_eq!(extract_local_upload_id("C:\\temp\\foo.png"), None);
+    }
+
+    #[test]
+    fn test_is_local_management_media_path_matches_management_avatar_and_portrait() {
+        assert!(is_local_management_media_path(
+            "/api/management/agents/demo-agent/portrait/portrait-1.png"
+        ));
+        assert!(is_local_management_media_path(
+            "http://127.0.0.1:4310/api/management/agents/demo-agent/avatar/avatar-1.png?x=1"
+        ));
+        assert!(!is_local_management_media_path(
+            "/api/management/agents/demo-agent/context-files/TOOLS.md"
+        ));
     }
 
     #[test]

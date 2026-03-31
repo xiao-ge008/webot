@@ -33,6 +33,13 @@ export interface VisionAnalysisConfig {
   cacheEnabled: boolean;
   autoAnalyzeChatImages: boolean;
   autoDownloadOnEnable: boolean;
+  ocrEnabled: boolean;
+  ocrProvider: string;
+  ocrServiceUrl: string;
+  ocrModelVariant: string;
+  ocrAutoDownloadOnEnable: boolean;
+  ocrMergeIntoSummary: boolean;
+  ocrPreferForTextHeavyImages: boolean;
 }
 
 export interface VisionModelFileStatus {
@@ -57,7 +64,28 @@ export interface VisionAnalysisStatus {
   cacheDir: string;
   missingFiles: string[];
   files: VisionModelFileStatus[];
+  ocrProviderAvailable: boolean;
+  ocrModelReady: boolean;
+  ocrDownloadActive: boolean;
+  ocrDownloadedBytes: number;
+  ocrTotalBytes: number;
+  ocrProgressPercent: number;
+  ocrCurrentFile?: string;
+  ocrLastError?: string;
+  ocrModelRootDir: string;
+  ocrModelDir: string;
+  ocrMissingFiles: string[];
+  ocrFiles: VisionModelFileStatus[];
   updatedAtMs: number;
+}
+
+export interface OcrLine {
+  text: string;
+  score: number;
+  boxScore: number;
+  angleIndex: number;
+  angleScore: number;
+  boxPoints: Array<{ x: number; y: number }>;
 }
 
 export interface UpsertVisionCacheInput {
@@ -97,6 +125,11 @@ export interface AnalyzeVisionImageResult {
   mimeType: string;
   width?: number;
   height?: number;
+  visionSummary?: string;
+  ocrSummary?: string;
+  ocrText?: string;
+  ocrLines: OcrLine[];
+  ocrEnabled: boolean;
   cached: boolean;
 }
 
@@ -111,6 +144,13 @@ export const DEFAULT_VISION_ANALYSIS_CONFIG: VisionAnalysisConfig = {
   cacheEnabled: true,
   autoAnalyzeChatImages: true,
   autoDownloadOnEnable: true,
+  ocrEnabled: false,
+  ocrProvider: "sidecar_local",
+  ocrServiceUrl: "",
+  ocrModelVariant: "ppocrv5_mobile",
+  ocrAutoDownloadOnEnable: true,
+  ocrMergeIntoSummary: true,
+  ocrPreferForTextHeavyImages: true,
 };
 
 function normalizeModelId(value: unknown): string {
@@ -145,6 +185,31 @@ function normalizeConfig(value: unknown): VisionAnalysisConfig {
       value.autoDownloadOnEnable,
       DEFAULT_VISION_ANALYSIS_CONFIG.autoDownloadOnEnable,
     ),
+    ocrEnabled: asBool(value.ocrEnabled),
+    ocrProvider: asString(
+      value.ocrProvider,
+      DEFAULT_VISION_ANALYSIS_CONFIG.ocrProvider,
+    ),
+    ocrServiceUrl: asString(
+      value.ocrServiceUrl,
+      DEFAULT_VISION_ANALYSIS_CONFIG.ocrServiceUrl,
+    ),
+    ocrModelVariant: asString(
+      value.ocrModelVariant,
+      DEFAULT_VISION_ANALYSIS_CONFIG.ocrModelVariant,
+    ),
+    ocrAutoDownloadOnEnable: asBool(
+      value.ocrAutoDownloadOnEnable,
+      DEFAULT_VISION_ANALYSIS_CONFIG.ocrAutoDownloadOnEnable,
+    ),
+    ocrMergeIntoSummary: asBool(
+      value.ocrMergeIntoSummary,
+      DEFAULT_VISION_ANALYSIS_CONFIG.ocrMergeIntoSummary,
+    ),
+    ocrPreferForTextHeavyImages: asBool(
+      value.ocrPreferForTextHeavyImages,
+      DEFAULT_VISION_ANALYSIS_CONFIG.ocrPreferForTextHeavyImages,
+    ),
   };
 }
 
@@ -178,6 +243,20 @@ function normalizeStatus(value: unknown): VisionAnalysisStatus {
     files: Array.isArray(record.files)
       ? record.files.map(normalizeFileStatus)
       : [],
+    ocrProviderAvailable: asBool(record.ocrProviderAvailable),
+    ocrModelReady: asBool(record.ocrModelReady),
+    ocrDownloadActive: asBool(record.ocrDownloadActive),
+    ocrDownloadedBytes: asNumber(record.ocrDownloadedBytes),
+    ocrTotalBytes: asNumber(record.ocrTotalBytes),
+    ocrProgressPercent: asNumber(record.ocrProgressPercent),
+    ocrCurrentFile: asString(record.ocrCurrentFile) || undefined,
+    ocrLastError: asString(record.ocrLastError) || undefined,
+    ocrModelRootDir: asString(record.ocrModelRootDir),
+    ocrModelDir: asString(record.ocrModelDir),
+    ocrMissingFiles: asStringArray(record.ocrMissingFiles),
+    ocrFiles: Array.isArray(record.ocrFiles)
+      ? record.ocrFiles.map(normalizeFileStatus)
+      : [],
     updatedAtMs: asNumber(record.updatedAtMs),
   };
 }
@@ -196,6 +275,29 @@ function normalizeAnalyzeResult(value: unknown): AnalyzeVisionImageResult {
     mimeType: asString(record.mimeType, "image/jpeg"),
     width: typeof record.width === "number" ? record.width : undefined,
     height: typeof record.height === "number" ? record.height : undefined,
+    visionSummary: asString(record.visionSummary) || undefined,
+    ocrSummary: asString(record.ocrSummary) || undefined,
+    ocrText: asString(record.ocrText) || undefined,
+    ocrLines: Array.isArray(record.ocrLines)
+      ? record.ocrLines
+          .filter((item): item is JsonRecord => isRecord(item))
+          .map((item) => ({
+            text: asString(item.text),
+            score: asNumber(item.score),
+            boxScore: asNumber(item.boxScore),
+            angleIndex: asNumber(item.angleIndex),
+            angleScore: asNumber(item.angleScore),
+            boxPoints: Array.isArray(item.boxPoints)
+              ? item.boxPoints
+                  .filter((point): point is JsonRecord => isRecord(point))
+                  .map((point) => ({
+                    x: asNumber(point.x),
+                    y: asNumber(point.y),
+                  }))
+              : [],
+          }))
+      : [],
+    ocrEnabled: asBool(record.ocrEnabled),
     cached: asBool(record.cached),
   };
 }

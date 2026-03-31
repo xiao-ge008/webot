@@ -26,6 +26,27 @@ export type ComponentProviderType = 'comfyui' | 'runninghub';
 export type ComponentReturnType = 'image' | 'text' | 'video' | 'audio';
 export type ComponentParamValueType = 'string' | 'number' | 'boolean' | 'json';
 
+export interface ComponentCapabilityBinding {
+  capabilityKey: string;
+  capabilityScope: string;
+  baseTool: string;
+  toolMode: string;
+  sourcePolicy: string;
+  fallbackPolicy: string;
+  enabled: boolean;
+  priority: number;
+}
+
+export interface ComponentSelectorMeta {
+  specialization: string;
+  intentTags: string[];
+  subjectPolicy: string;
+  supportsTextOnly: boolean;
+  requiresSlots: string[];
+  optionalSlots: string[];
+  preferredMimeTypes: string[];
+}
+
 export interface ComponentServiceConfig {
   serverUrl: string;
   apiKey: string;
@@ -83,6 +104,8 @@ export interface ComponentDefinition {
   componentType: string;
   description: string;
   returnType: ComponentReturnType;
+  capabilityBinding: ComponentCapabilityBinding;
+  selectorMeta: ComponentSelectorMeta;
   workflow: ComponentWorkflowConfig;
   createdAt: string;
   updatedAt: string;
@@ -167,6 +190,8 @@ function normalizeWorkflow(value: unknown): ComponentWorkflowConfig {
 
 function normalizeDefinition(value: unknown): ComponentDefinition {
   const row = isRecord(value) ? value : {};
+  const capabilityBinding = isRecord(row.capabilityBinding) ? row.capabilityBinding : {};
+  const selectorMeta = isRecord(row.selectorMeta) ? row.selectorMeta : {};
   return {
     providerType: (asString(row.providerType, 'comfyui') as ComponentProviderType) || 'comfyui',
     name: asString(row.name),
@@ -174,6 +199,25 @@ function normalizeDefinition(value: unknown): ComponentDefinition {
     componentType: asString(row.componentType),
     description: asString(row.description),
     returnType: (asString(row.returnType, 'image') as ComponentReturnType) || 'image',
+    capabilityBinding: {
+      capabilityKey: asString(capabilityBinding.capabilityKey),
+      capabilityScope: asString(capabilityBinding.capabilityScope, 'generic'),
+      baseTool: asString(capabilityBinding.baseTool),
+      toolMode: asString(capabilityBinding.toolMode, 'generate'),
+      sourcePolicy: asString(capabilityBinding.sourcePolicy, 'optional'),
+      fallbackPolicy: asString(capabilityBinding.fallbackPolicy, 'allow_generic_provider'),
+      enabled: typeof capabilityBinding.enabled === 'boolean' ? capabilityBinding.enabled : true,
+      priority: typeof capabilityBinding.priority === 'number' ? capabilityBinding.priority : 100,
+    },
+    selectorMeta: {
+      specialization: asString(selectorMeta.specialization, 'general'),
+      intentTags: asArray<string>(selectorMeta.intentTags).map((item) => asString(item)).filter(Boolean),
+      subjectPolicy: asString(selectorMeta.subjectPolicy, 'generic'),
+      supportsTextOnly: typeof selectorMeta.supportsTextOnly === 'boolean' ? selectorMeta.supportsTextOnly : false,
+      requiresSlots: asArray<string>(selectorMeta.requiresSlots).map((item) => asString(item)).filter(Boolean),
+      optionalSlots: asArray<string>(selectorMeta.optionalSlots).map((item) => asString(item)).filter(Boolean),
+      preferredMimeTypes: asArray<string>(selectorMeta.preferredMimeTypes).map((item) => asString(item)).filter(Boolean),
+    },
     workflow: normalizeWorkflow(row.workflow),
     createdAt: asString(row.createdAt),
     updatedAt: asString(row.updatedAt),
@@ -188,6 +232,25 @@ export function createEmptyComponentDefinition(providerType: ComponentProviderTy
     componentType: '',
     description: '',
     returnType: 'image',
+    capabilityBinding: {
+      capabilityKey: 'generate.image',
+      capabilityScope: 'generic',
+      baseTool: 'image_generate',
+      toolMode: 'generate',
+      sourcePolicy: 'optional',
+      fallbackPolicy: 'allow_generic_provider',
+      enabled: true,
+      priority: 100,
+    },
+    selectorMeta: {
+      specialization: 'general',
+      intentTags: [],
+      subjectPolicy: 'generic',
+      supportsTextOnly: true,
+      requiresSlots: ['prompt'],
+      optionalSlots: [],
+      preferredMimeTypes: ['image/*'],
+    },
     workflow: {
       requestUrl: '',
       appId: '',

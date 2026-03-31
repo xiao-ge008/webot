@@ -7,15 +7,18 @@ use crate::kernel_handle::KernelHandle;
 use crate::mcp;
 use crate::media_understanding::MediaEngine;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
+use calamine::{open_workbook_auto_from_rs, Reader};
 use openfang_skills::registry::SkillRegistry;
+use openfang_skills::InstalledSkill;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
+use zip::ZipArchive;
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
@@ -135,40 +138,4091 @@ where
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct RuntimeSkillSelectorMeta {
+    base_tool: Option<String>,
+    capability_key: Option<String>,
+    capability_scope: Option<String>,
+    source_policy: Option<String>,
+    specialization: Option<String>,
+    subject_policy: Option<String>,
+    intent_tags: Vec<String>,
+    requires_slots: Vec<String>,
+    supports_text_only: bool,
+    preferred_mime_types: Vec<String>,
+}
+
+fn runtime_skill_selector_meta(skill: &InstalledSkill) -> RuntimeSkillSelectorMeta {
+    let mut tag_map = BTreeMap::<String, Vec<String>>::new();
+    let mut supports_text_only = false;
+    for tag in &skill.manifest.skill.tags {
+        let trimmed = tag.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("supports-text-only") {
+            supports_text_only = true;
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once(':') {
+            tag_map
+                .entry(key.trim().to_ascii_lowercase())
+                .or_default()
+                .push(value.trim().to_string());
+        }
+    }
+    RuntimeSkillSelectorMeta {
+        base_tool: tag_map
+            .get("base-tool")
+            .and_then(|values| values.first().cloned()),
+        capability_key: tag_map
+            .get("capability-key")
+            .and_then(|values| values.first().cloned()),
+        capability_scope: tag_map
+            .get("capability-scope")
+            .and_then(|values| values.first().cloned()),
+        source_policy: tag_map
+            .get("source-policy")
+            .and_then(|values| values.first().cloned()),
+        specialization: tag_map
+            .get("specialization")
+            .and_then(|values| values.first().cloned()),
+        subject_policy: tag_map
+            .get("subject-policy")
+            .and_then(|values| values.first().cloned()),
+        intent_tags: tag_map.get("intent").cloned().unwrap_or_default(),
+        requires_slots: tag_map.get("requires-slot").cloned().unwrap_or_default(),
+        supports_text_only,
+        preferred_mime_types: tag_map.get("preferred-mime").cloned().unwrap_or_default(),
+    }
+}
+
+fn selector_slot_present(input: &serde_json::Value, slot: &str) -> bool {
+    let slot = slot.trim().to_ascii_lowercase();
+    match slot.as_str() {
+        "prompt" | "text" | "message" | "description" | "question" => has_any_non_empty_field(
+            input,
+            &["prompt", "text", "message", "description", "question"],
+        ),
+        "image" => has_any_non_empty_field(
+            input,
+            &[
+                "image_path",
+                "image_url",
+                "image_base64",
+                "image",
+                "source_image",
+                "reference_image",
+            ],
+        ),
+        "video" => has_any_non_empty_field(
+            input,
+            &[
+                "video_path",
+                "video_url",
+                "video_base64",
+                "source_video",
+                "video",
+            ],
+        ),
+        "audio" => has_any_non_empty_field(
+            input,
+            &[
+                "audio_path",
+                "audio_url",
+                "audio_base64",
+                "audio",
+                "path",
+                "url",
+            ],
+        ),
+        "voice" => has_any_non_empty_field(input, &["voice", "speaker", "speaker_profile_id"]),
+        other => input
+            .get(other)
+            .map(|value| !value.is_null())
+            .unwrap_or(false),
+    }
+}
+
+fn selector_input_prompt(input: &serde_json::Value) -> String {
+    ["prompt", "text", "message", "description", "question"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn selector_input_document_type(input: &serde_json::Value) -> String {
+    let explicit = [
+        "document_type",
+        "documentType",
+        "file_type",
+        "fileType",
+        "mime_type",
+        "mimeType",
+    ]
+    .iter()
+    .find_map(|key| input.get(*key).and_then(|value| value.as_str()))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    if !explicit.is_empty() {
+        if explicit.contains("pdf") {
+            return "pdf".to_string();
+        }
+        if explicit.contains("docx") {
+            return "docx".to_string();
+        }
+        if explicit == "doc" || explicit.contains("msword") {
+            return "doc".to_string();
+        }
+        if explicit.contains("xlsx") {
+            return "xlsx".to_string();
+        }
+        if explicit == "xls" {
+            return "xls".to_string();
+        }
+        if explicit.contains("csv") {
+            return "csv".to_string();
+        }
+        if explicit.contains("pptx") {
+            return "pptx".to_string();
+        }
+        if explicit == "ppt" {
+            return "ppt".to_string();
+        }
+        if explicit.contains("markdown") || explicit == "md" {
+            return "md".to_string();
+        }
+        if explicit.contains("json") {
+            return "json".to_string();
+        }
+        if explicit.contains("text") || explicit == "txt" {
+            return "txt".to_string();
+        }
+    }
+
+    let path = [
+        "path",
+        "url",
+        "source_path",
+        "source_url",
+        "file",
+        "file_path",
+    ]
+    .iter()
+    .find_map(|key| input.get(*key).and_then(|value| value.as_str()))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .unwrap_or_default();
+    let path_lower = path.to_ascii_lowercase();
+    for ext in [
+        "pdf", "docx", "doc", "xlsx", "xls", "csv", "pptx", "ppt", "txt", "md", "json",
+    ] {
+        if path_lower.ends_with(&format!(".{ext}")) {
+            return ext.to_string();
+        }
+    }
+    String::new()
+}
+
+fn selector_input_mime_type(input: &serde_json::Value) -> String {
+    ["mime_type", "mimeType", "content_type", "contentType"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn selector_input_media_kind(input: &serde_json::Value) -> &'static str {
+    let mime_type = selector_input_mime_type(input);
+    if mime_type.starts_with("image/") {
+        return "image";
+    }
+    if mime_type.starts_with("video/") {
+        return "video";
+    }
+    if mime_type.starts_with("audio/") {
+        return "audio";
+    }
+    let path_like = [
+        "path",
+        "url",
+        "source_path",
+        "source_url",
+        "file",
+        "file_path",
+    ]
+    .iter()
+    .find_map(|key| input.get(*key).and_then(|value| value.as_str()))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]
+        .iter()
+        .any(|ext| path_like.ends_with(ext))
+    {
+        return "image";
+    }
+    if [".mp4", ".mov", ".webm"]
+        .iter()
+        .any(|ext| path_like.ends_with(ext))
+    {
+        return "video";
+    }
+    if [".mp3", ".wav", ".ogg", ".flac", ".m4a"]
+        .iter()
+        .any(|ext| path_like.ends_with(ext))
+    {
+        return "audio";
+    }
+    "unknown"
+}
+
+fn selector_prompt_subject(prompt: &str) -> &'static str {
+    let lowered = prompt.to_ascii_lowercase();
+    if lowered.is_empty() {
+        return "general";
+    }
+    if [
+        "dance",
+        "girl",
+        "boy",
+        "woman",
+        "man",
+        "character",
+        "person",
+        "idol",
+    ]
+    .iter()
+    .any(|item| lowered.contains(item))
+        || prompt.contains("人物")
+        || prompt.contains("女孩")
+        || prompt.contains("男孩")
+        || prompt.contains("跳舞")
+    {
+        return "character";
+    }
+    if ["scene", "landscape", "city", "room", "environment"]
+        .iter()
+        .any(|item| lowered.contains(item))
+        || prompt.contains("场景")
+        || prompt.contains("风景")
+        || prompt.contains("城市")
+    {
+        return "scene";
+    }
+    "general"
+}
+
+fn selector_source_policy_matches(
+    meta: &RuntimeSkillSelectorMeta,
+    input: &serde_json::Value,
+) -> bool {
+    match meta
+        .source_policy
+        .as_deref()
+        .unwrap_or("optional")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "requires_image" => selector_slot_present(input, "image"),
+        "requires_video" => selector_slot_present(input, "video"),
+        "requires_audio" => selector_slot_present(input, "audio"),
+        "text_only" => {
+            !selector_slot_present(input, "image")
+                && !selector_slot_present(input, "video")
+                && !selector_slot_present(input, "audio")
+        }
+        _ => true,
+    }
+}
+
+fn selector_score_skill(
+    skill: &InstalledSkill,
+    tool_name: &str,
+    input: &serde_json::Value,
+    want_component_skill: bool,
+) -> i64 {
+    let meta = runtime_skill_selector_meta(skill);
+    if !selector_source_policy_matches(&meta, input) {
+        return i64::MIN / 4;
+    }
+    if meta
+        .requires_slots
+        .iter()
+        .any(|slot| !selector_slot_present(input, slot))
+    {
+        return i64::MIN / 4;
+    }
+    let has_image_source = selector_slot_present(input, "image");
+    let has_video_source = selector_slot_present(input, "video");
+    let has_audio_source = selector_slot_present(input, "audio");
+    let has_media_source = has_image_source || has_video_source || has_audio_source;
+    if !meta.supports_text_only && !has_media_source {
+        return i64::MIN / 4;
+    }
+
+    let prompt = selector_input_prompt(input);
+    let prompt_lower = prompt.to_ascii_lowercase();
+    let subject = selector_prompt_subject(&prompt);
+    let document_type = selector_input_document_type(input);
+    let mime_type = selector_input_mime_type(input);
+    let mut score = 0_i64;
+
+    if runtime_skill_is_component(skill) == want_component_skill {
+        score += 200;
+    }
+    if meta
+        .base_tool
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case(tool_name))
+        .unwrap_or(false)
+    {
+        score += 60;
+    }
+    if let Some((capability_key, capability_scope)) = capability_descriptor_for_tool(tool_name) {
+        if meta
+            .capability_key
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(capability_key))
+            .unwrap_or(false)
+        {
+            score += 40;
+        }
+        if meta
+            .capability_scope
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(capability_scope))
+            .unwrap_or(false)
+        {
+            score += 10;
+        }
+    }
+    match meta.specialization.as_deref().unwrap_or("general") {
+        "character" if subject == "character" => score += 80,
+        "scene" if subject == "scene" => score += 80,
+        "general" => score += 20,
+        specialization
+            if !document_type.is_empty() && specialization.eq_ignore_ascii_case(&document_type) =>
+        {
+            score += 90
+        }
+        "ocr"
+            if prompt_lower.contains("ocr")
+                || prompt.contains("文字")
+                || prompt.contains("表格") =>
+        {
+            score += 70
+        }
+        _ => {}
+    }
+    if meta
+        .subject_policy
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("person_first"))
+        .unwrap_or(false)
+        && subject == "character"
+    {
+        score += 30;
+    }
+    if meta.supports_text_only && !has_media_source {
+        score += 25;
+    }
+    if meta
+        .subject_policy
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("document_first"))
+        .unwrap_or(false)
+        && !document_type.is_empty()
+    {
+        score += 30;
+    }
+    score += meta
+        .preferred_mime_types
+        .iter()
+        .filter(|item| {
+            let expected = item.trim().to_ascii_lowercase();
+            !expected.is_empty()
+                && ((expected.ends_with("/*")
+                    && mime_type.starts_with(expected.trim_end_matches('*').trim_end_matches('/')))
+                    || (!mime_type.is_empty() && expected == mime_type))
+        })
+        .count() as i64
+        * 15;
+    score += meta
+        .intent_tags
+        .iter()
+        .filter(|tag| {
+            !tag.trim().is_empty() && prompt_lower.contains(&tag.trim().to_ascii_lowercase())
+        })
+        .count() as i64
+        * 20;
+    score
+}
+
+fn enrich_skill_input(
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
+) -> serde_json::Value {
+    let mut enriched = input.clone();
+    let Some(agent_id) = caller_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return enriched;
+    };
+    if let Some(map) = enriched.as_object_mut() {
+        map.entry("agentId".to_string())
+            .or_insert_with(|| serde_json::Value::String(agent_id.to_string()));
+        map.entry("callerAgentId".to_string())
+            .or_insert_with(|| serde_json::Value::String(agent_id.to_string()));
+    }
+    enriched
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RuntimeRegistryCapabilityDescriptor {
+    key: String,
+    scope: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RuntimeRegistryProviderRecord {
+    provider_id: String,
+    provider_type: String,
+    capabilities: Vec<RuntimeRegistryCapabilityDescriptor>,
+    enabled: bool,
+    health_state: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RuntimeRegistryProviderBinding {
+    capability_key: String,
+    capability_scope: String,
+    provider_id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RuntimeRegistryAgentBinding {
+    capability_key: String,
+    capability_scope: String,
+    provider_id: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RuntimeRegistryHealthState {
+    provider_id: String,
+    health_state: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct RuntimeCapabilityRegistrySnapshot {
+    providers: Vec<RuntimeRegistryProviderRecord>,
+    bindings: Vec<RuntimeRegistryProviderBinding>,
+    health_states: Vec<RuntimeRegistryHealthState>,
+    agent_bindings: Vec<RuntimeRegistryAgentBinding>,
+}
+
+fn capability_descriptor_for_tool(tool_name: &str) -> Option<(&'static str, &'static str)> {
+    match tool_name {
+        "image_generate" => Some(("generate.image", "generic")),
+        "image_edit" => Some(("edit.image", "generic")),
+        "video_generate" => Some(("generate.video", "generic")),
+        "video_edit" => Some(("edit.video", "generic")),
+        "text_to_speech" => Some(("generate.audio", "generic")),
+        "speech_to_text" => Some(("transcribe.audio", "generic")),
+        "image_analyze" | "media_describe" => Some(("analyze.media", "generic")),
+        "document_parse" => Some(("parse.document", "generic")),
+        "document_extract" => Some(("extract.document", "generic")),
+        "document_summarize" => Some(("summarize.document", "generic")),
+        "document_convert" => Some(("convert.document", "generic")),
+        "document_compare" => Some(("compare.document", "generic")),
+        "document_preview" => Some(("preview.document", "generic")),
+        "document_chunk" => Some(("chunk.document", "generic")),
+        "my_identity_patch" => Some(("patch.identity", "self")),
+        "my_memory_patch" => Some(("patch.memory", "self")),
+        "my_upgrade_review" => Some(("review.upgrade", "self")),
+        "my_upgrade_apply" => Some(("apply.upgrade", "self")),
+        _ => None,
+    }
+}
+
+async fn fetch_capability_registry_snapshot(
+    agent_id: Option<&str>,
+    capability_key: &str,
+    capability_scope: &str,
+) -> Option<RuntimeCapabilityRegistrySnapshot> {
+    let service_base = webot_service_base_url()?;
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!(
+            "{service_base}/api/management/capabilities/providers"
+        ))
+        .query(&[
+            ("capability_key", capability_key),
+            ("capability_scope", capability_scope),
+        ])
+        .timeout(std::time::Duration::from_secs(8));
+    if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+        request = request.query(&[("agent_id", agent_id)]);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response
+        .json::<RuntimeCapabilityRegistrySnapshot>()
+        .await
+        .ok()
+}
+
+async fn fetch_registry_snapshot_for_tool(
+    tool_name: &str,
+    agent_id: Option<&str>,
+) -> Option<RuntimeCapabilityRegistrySnapshot> {
+    let (capability_key, capability_scope) = capability_descriptor_for_tool(tool_name)?;
+    fetch_capability_registry_snapshot(agent_id, capability_key, capability_scope).await
+}
+
+fn pick_job_text<'a>(values: &[Option<&'a serde_json::Value>]) -> Option<String> {
+    values.iter().find_map(|value| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn pick_job_number(values: &[Option<&serde_json::Value>]) -> Option<f64> {
+    values
+        .iter()
+        .find_map(|value| value.and_then(serde_json::Value::as_f64))
+}
+
+fn extract_job_result_payload<'a>(
+    output: &'a serde_json::Value,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let object = output.as_object()?;
+    if object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("job_result"))
+    {
+        return Some(object);
+    }
+    [
+        "job_result",
+        "jobResult",
+        "presentable_result",
+        "presentableResult",
+    ]
+    .iter()
+    .find_map(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_object)
+            .filter(|presentable| {
+                presentable
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("job_result"))
+            })
+    })
+}
+
+fn value_has_kind(value: &serde_json::Value, expected: &str) -> bool {
+    value.as_object().is_some_and(|object| {
+        object
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case(expected))
+    })
+}
+
+fn normalize_component_skill_media_payload(
+    mut payload: serde_json::Value,
+    tool_name: &str,
+) -> serde_json::Value {
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+
+    object
+        .entry("tool".to_string())
+        .or_insert_with(|| serde_json::Value::String(tool_name.to_string()));
+
+    if let Some(output_type) = object.get("outputType").cloned() {
+        object
+            .entry("output_type".to_string())
+            .or_insert(output_type);
+    }
+    if let Some(output_type) = object.get("output_type").cloned() {
+        object
+            .entry("outputType".to_string())
+            .or_insert(output_type);
+    }
+    if let Some(provider_meta) = object.get("providerMeta").cloned() {
+        object
+            .entry("provider_meta".to_string())
+            .or_insert(provider_meta);
+    }
+    if let Some(provider_meta) = object.get("provider_meta").cloned() {
+        object
+            .entry("providerMeta".to_string())
+            .or_insert(provider_meta);
+    }
+
+    let presentable = object
+        .get("presentable_result")
+        .cloned()
+        .or_else(|| object.get("presentableResult").cloned());
+    if let Some(presentable) = presentable {
+        object
+            .entry("presentable_result".to_string())
+            .or_insert_with(|| presentable.clone());
+        object
+            .entry("presentableResult".to_string())
+            .or_insert_with(|| presentable.clone());
+        if value_has_kind(&presentable, "job_result") {
+            object
+                .entry("job_result".to_string())
+                .or_insert_with(|| presentable.clone());
+            object.entry("jobResult".to_string()).or_insert(presentable);
+        }
+    }
+
+    let job_result = object
+        .get("job_result")
+        .cloned()
+        .or_else(|| object.get("jobResult").cloned());
+    if let Some(job_result) = job_result {
+        object
+            .entry("job_result".to_string())
+            .or_insert_with(|| job_result.clone());
+        object
+            .entry("jobResult".to_string())
+            .or_insert_with(|| job_result.clone());
+        if value_has_kind(&job_result, "job_result") {
+            object
+                .entry("presentable_result".to_string())
+                .or_insert_with(|| job_result.clone());
+            object
+                .entry("presentableResult".to_string())
+                .or_insert(job_result);
+        }
+    }
+
+    payload
+}
+
+fn normalize_component_skill_media_output(
+    content: &str,
+    tool_name: &str,
+) -> Result<String, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content)
+        .map_err(|err| format!("Component skill returned invalid JSON: {err}"))?;
+    let normalized = normalize_component_skill_media_payload(parsed, tool_name);
+    serde_json::to_string_pretty(&normalized).map_err(|err| format!("Serialize error: {err}"))
+}
+
+async fn maybe_upsert_capability_job_from_tool_output(
+    tool_name: &str,
+    content: &str,
+    caller_agent_id: Option<&str>,
+) {
+    let service_base = match webot_service_base_url() {
+        Some(value) => value,
+        None => return,
+    };
+    let owner_agent_id = match caller_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => return,
+    };
+    let output = match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let Some(job_result) = extract_job_result_payload(&output) else {
+        return;
+    };
+    let job_id = pick_job_text(&[
+        job_result.get("job_id"),
+        job_result.get("jobId"),
+        job_result.get("id"),
+    ]);
+    let Some(job_id) = job_id else {
+        return;
+    };
+    let (default_capability_key, default_capability_scope) =
+        capability_descriptor_for_tool(tool_name).unwrap_or((tool_name, "generic"));
+    let capability_key = pick_job_text(&[
+        job_result.get("capability_key"),
+        job_result.get("capabilityKey"),
+    ])
+    .unwrap_or_else(|| default_capability_key.to_string());
+    let capability_scope = pick_job_text(&[
+        job_result.get("capability_scope"),
+        job_result.get("capabilityScope"),
+    ])
+    .unwrap_or_else(|| default_capability_scope.to_string());
+    let metadata = match job_result
+        .get("metadata")
+        .or_else(|| output.get("metadata"))
+    {
+        Some(serde_json::Value::Object(map)) => {
+            let mut merged = map.clone();
+            merged.insert(
+                "source_tool".to_string(),
+                serde_json::Value::String(tool_name.to_string()),
+            );
+            merged.insert(
+                "source".to_string(),
+                serde_json::Value::String("openfang_runtime".to_string()),
+            );
+            serde_json::Value::Object(merged)
+        }
+        _ => serde_json::json!({
+            "source_tool": tool_name,
+            "source": "openfang_runtime",
+        }),
+    };
+    let body = serde_json::json!({
+        "job_id": job_id,
+        "owner_agent_id": owner_agent_id,
+        "capability_key": capability_key,
+        "capability_scope": capability_scope,
+        "provider_id": pick_job_text(&[
+            output.get("provider_id"),
+            output.get("providerId"),
+            job_result.get("provider_id"),
+            job_result.get("providerId"),
+        ]),
+        "provider_type": pick_job_text(&[
+            output.get("provider_type"),
+            output.get("providerType"),
+            job_result.get("provider_type"),
+            job_result.get("providerType"),
+        ]),
+        "route": pick_job_text(&[
+            output.get("route"),
+            job_result.get("route"),
+        ]),
+        "title": pick_job_text(&[
+            job_result.get("title"),
+            output.get("title"),
+        ]),
+        "summary": pick_job_text(&[
+            job_result.get("summary"),
+            output.get("summary"),
+            output.get("text"),
+        ]),
+        "status": pick_job_text(&[
+            job_result.get("status"),
+            job_result.get("state"),
+            output.get("status"),
+            output.get("state"),
+        ]).unwrap_or_else(|| "queued".to_string()),
+        "progress_percent": pick_job_number(&[
+            job_result.get("progress_percent"),
+            job_result.get("progressPercent"),
+            job_result.get("progress"),
+            job_result.get("percent"),
+            output.get("progress_percent"),
+            output.get("progressPercent"),
+        ]),
+        "stage": pick_job_text(&[
+            job_result.get("stage"),
+            job_result.get("current_stage"),
+            job_result.get("currentStage"),
+            output.get("stage"),
+        ]),
+        "job_type": pick_job_text(&[
+            job_result.get("job_type"),
+            job_result.get("jobType"),
+            output.get("job_type"),
+            output.get("jobType"),
+        ]),
+        "result_payload": output,
+        "metadata": metadata,
+        "started_at": pick_job_text(&[
+            output.get("started_at"),
+            output.get("startedAt"),
+        ]),
+        "finished_at": pick_job_text(&[
+            output.get("finished_at"),
+            output.get("finishedAt"),
+        ]),
+        "last_heartbeat_at": pick_job_text(&[
+            output.get("last_heartbeat_at"),
+            output.get("lastHeartbeatAt"),
+        ]),
+    });
+
+    let client = reqwest::Client::new();
+    match client
+        .post(format!("{service_base}/api/management/capabilities/jobs"))
+        .timeout(std::time::Duration::from_secs(8))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            warn!(
+                tool = tool_name,
+                job_id = %job_id,
+                status = %response.status(),
+                "Failed to persist capability job from tool output"
+            );
+        }
+        Err(error) => {
+            warn!(
+                tool = tool_name,
+                job_id = %job_id,
+                error = %error,
+                "Failed to post capability job to Webot service"
+            );
+        }
+    }
+}
+
+fn registry_provider_health_state<'a>(
+    snapshot: &'a RuntimeCapabilityRegistrySnapshot,
+    provider: &'a RuntimeRegistryProviderRecord,
+) -> &'a str {
+    snapshot
+        .health_states
+        .iter()
+        .find(|item| item.provider_id == provider.provider_id)
+        .map(|item| item.health_state.as_str())
+        .unwrap_or(provider.health_state.as_str())
+}
+
+fn registry_health_allows(health_state: &str) -> bool {
+    let lowered = health_state.trim().to_ascii_lowercase();
+    !matches!(
+        lowered.as_str(),
+        "disabled" | "unavailable" | "removed" | "offline"
+    )
+}
+
+fn registry_provider_supports(
+    provider: &RuntimeRegistryProviderRecord,
+    capability_key: &str,
+    capability_scope: &str,
+) -> bool {
+    provider
+        .capabilities
+        .iter()
+        .any(|item| item.key == capability_key && item.scope == capability_scope)
+}
+
+fn registry_binding_allows_provider(
+    snapshot: &RuntimeCapabilityRegistrySnapshot,
+    provider_id: &str,
+    capability_key: &str,
+    capability_scope: &str,
+) -> bool {
+    let matches = snapshot
+        .bindings
+        .iter()
+        .filter(|item| {
+            item.provider_id == provider_id
+                && item.capability_key == capability_key
+                && item.capability_scope == capability_scope
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return true;
+    }
+    matches.iter().any(|item| item.enabled)
+}
+
+fn registry_agent_allows_provider(
+    snapshot: &RuntimeCapabilityRegistrySnapshot,
+    provider_id: &str,
+    capability_key: &str,
+    capability_scope: &str,
+) -> bool {
+    let matches = snapshot
+        .agent_bindings
+        .iter()
+        .filter(|item| {
+            item.capability_key == capability_key && item.capability_scope == capability_scope
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return true;
+    }
+    let capability_disabled = matches
+        .iter()
+        .any(|item| item.provider_id.is_none() && !item.enabled);
+    let capability_enabled = matches
+        .iter()
+        .any(|item| item.provider_id.is_none() && item.enabled);
+    if capability_disabled && !capability_enabled {
+        return false;
+    }
+    if matches
+        .iter()
+        .any(|item| item.provider_id.as_deref() == Some(provider_id) && !item.enabled)
+    {
+        return false;
+    }
+    let allowed_provider_ids = matches
+        .iter()
+        .filter(|item| item.enabled)
+        .filter_map(|item| item.provider_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    if !allowed_provider_ids.is_empty() {
+        return allowed_provider_ids.contains(provider_id);
+    }
+    true
+}
+
+fn registry_provider_is_enabled(
+    snapshot: &RuntimeCapabilityRegistrySnapshot,
+    provider_id: &str,
+    capability_key: &str,
+    capability_scope: &str,
+) -> bool {
+    let Some(provider) = snapshot
+        .providers
+        .iter()
+        .find(|item| item.provider_id == provider_id)
+    else {
+        let has_allow_list = snapshot.agent_bindings.iter().any(|item| {
+            item.capability_key == capability_key
+                && item.capability_scope == capability_scope
+                && item.enabled
+                && item.provider_id.is_some()
+        });
+        return if has_allow_list {
+            registry_agent_allows_provider(snapshot, provider_id, capability_key, capability_scope)
+        } else {
+            true
+        };
+    };
+    provider.enabled
+        && registry_health_allows(registry_provider_health_state(snapshot, provider))
+        && registry_provider_supports(provider, capability_key, capability_scope)
+        && registry_binding_allows_provider(snapshot, provider_id, capability_key, capability_scope)
+        && registry_agent_allows_provider(snapshot, provider_id, capability_key, capability_scope)
+}
+
+fn registry_has_enabled_provider_type(
+    snapshot: Option<&RuntimeCapabilityRegistrySnapshot>,
+    capability_key: &str,
+    capability_scope: &str,
+    provider_type: &str,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+    snapshot.providers.iter().any(|provider| {
+        provider.provider_type == provider_type
+            && registry_provider_is_enabled(
+                snapshot,
+                &provider.provider_id,
+                capability_key,
+                capability_scope,
+            )
+    })
+}
+
+fn runtime_skill_provider_id(skill: &InstalledSkill, want_component_skill: bool) -> String {
+    if want_component_skill {
+        format!("component_skill:{}", skill.manifest.skill.name.trim())
+    } else {
+        format!("generic_provider:{}", skill.manifest.skill.name.trim())
+    }
+}
+
+fn runtime_skill_allowed_by_registry(
+    skill: &InstalledSkill,
+    tool_name: &str,
+    want_component_skill: bool,
+    registry_snapshot: Option<&RuntimeCapabilityRegistrySnapshot>,
+) -> bool {
+    let Some(snapshot) = registry_snapshot else {
+        return true;
+    };
+    let Some((capability_key, capability_scope)) = capability_descriptor_for_tool(tool_name) else {
+        return true;
+    };
+    registry_provider_is_enabled(
+        snapshot,
+        &runtime_skill_provider_id(skill, want_component_skill),
+        capability_key,
+        capability_scope,
+    )
+}
+
+fn select_skill_provider_for_tool<'a>(
+    registry: &'a SkillRegistry,
+    tool_name: &str,
+    input: &serde_json::Value,
+    allowed_skills: Option<&[String]>,
+    want_component_skill: bool,
+    registry_snapshot: Option<&RuntimeCapabilityRegistrySnapshot>,
+) -> Option<&'a InstalledSkill> {
+    let mut candidates = registry
+        .visible_skills_for_agent(allowed_skills.unwrap_or(&[]))
+        .into_iter()
+        .filter(|skill| {
+            runtime_skill_is_component(skill) == want_component_skill
+                && runtime_skill_provides_tool(skill, tool_name)
+                && runtime_skill_allowed_by_registry(
+                    skill,
+                    tool_name,
+                    want_component_skill,
+                    registry_snapshot,
+                )
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
+    candidates.sort_by(|left, right| {
+        let left_score = selector_score_skill(left, tool_name, input, want_component_skill);
+        let right_score = selector_score_skill(right, tool_name, input, want_component_skill);
+        right_score
+            .cmp(&left_score)
+            .then_with(|| left.manifest.skill.name.cmp(&right.manifest.skill.name))
+    });
+    candidates.into_iter().find(|skill| {
+        selector_score_skill(skill, tool_name, input, want_component_skill) > i64::MIN / 8
+    })
+}
+
 async fn dispatch_skill_tool(
     registry: &SkillRegistry,
     tool_name: &str,
     input: &serde_json::Value,
     allowed_skills: Option<&[String]>,
+    caller_agent_id: Option<&str>,
 ) -> Option<Result<String, String>> {
-    let skill =
-        registry.find_tool_provider_for_agent_skills(tool_name, allowed_skills.unwrap_or(&[]))?;
+    if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+        registry,
+        tool_name,
+        input,
+        allowed_skills,
+        true,
+        caller_agent_id,
+    )
+    .await
+    {
+        return Some(result);
+    }
+    dispatch_skill_tool_candidates_from_runtime(
+        registry,
+        tool_name,
+        input,
+        allowed_skills,
+        false,
+        caller_agent_id,
+    )
+    .await
+}
+
+fn runtime_skill_has_tag(skill: &InstalledSkill, expected: &str) -> bool {
+    let expected = expected.trim();
+    !expected.is_empty()
+        && skill
+            .manifest
+            .skill
+            .tags
+            .iter()
+            .any(|item| item.trim().eq_ignore_ascii_case(expected))
+}
+
+fn runtime_skill_is_component(skill: &InstalledSkill) -> bool {
+    runtime_skill_has_tag(skill, "component-center")
+        || runtime_skill_has_tag(skill, "component-skill")
+}
+
+fn runtime_skill_provides_tool(skill: &InstalledSkill, tool_name: &str) -> bool {
+    skill
+        .manifest
+        .tools
+        .provided
+        .iter()
+        .any(|tool| tool.name.trim() == tool_name)
+}
+
+async fn execute_registered_skill_tool(
+    skill: &InstalledSkill,
+    tool_name: &str,
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
     debug!(
         tool = tool_name,
         skill = %skill.manifest.skill.name,
-        "Dispatching to skill"
+        "Dispatching to explicit skill"
     );
-    Some(
-        match openfang_skills::loader::execute_skill_tool(
-            &skill.manifest,
-            &skill.path,
-            tool_name,
+    match openfang_skills::loader::execute_skill_tool(
+        &skill.manifest,
+        &skill.path,
+        tool_name,
+        &enrich_skill_input(input, caller_agent_id),
+    )
+    .await
+    {
+        Ok(skill_result) => {
+            let content = serde_json::to_string(&skill_result.output)
+                .unwrap_or_else(|_| skill_result.output.to_string());
+            if skill_result.is_error {
+                Err(content)
+            } else {
+                Ok(content)
+            }
+        }
+        Err(e) => Err(format!("Skill execution failed for {tool_name}: {e}")),
+    }
+}
+
+async fn dispatch_skill_tool_by_kind(
+    registry: &SkillRegistry,
+    tool_name: &str,
+    input: &serde_json::Value,
+    allowed_skills: Option<&[String]>,
+    want_component_skill: bool,
+    caller_agent_id: Option<&str>,
+) -> Option<Result<String, String>> {
+    let registry_snapshot = fetch_registry_snapshot_for_tool(tool_name, caller_agent_id).await;
+    let skill = select_skill_provider_for_tool(
+        registry,
+        tool_name,
+        input,
+        allowed_skills,
+        want_component_skill,
+        registry_snapshot.as_ref(),
+    )?;
+    Some(execute_registered_skill_tool(skill, tool_name, input, caller_agent_id).await)
+}
+
+fn build_skill_dispatch_tool_candidates(tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+    let mut candidates = vec![tool_name.to_string()];
+    match tool_name {
+        "image_analyze" => candidates.push("media_describe".to_string()),
+        "media_describe" => {
+            if selector_input_media_kind(input) == "image" {
+                candidates.push("image_analyze".to_string());
+            }
+        }
+        "video_generate" => {
+            if has_any_non_empty_field(
+                input,
+                &[
+                    "image_path",
+                    "image_url",
+                    "image_base64",
+                    "image",
+                    "source_image",
+                    "reference_image",
+                ],
+            ) {
+                candidates = vec![
+                    "image2video".to_string(),
+                    "video_generate".to_string(),
+                    "text2video".to_string(),
+                ];
+            } else {
+                candidates = vec![
+                    "text2video".to_string(),
+                    "video_generate".to_string(),
+                    "image2video".to_string(),
+                ];
+            }
+        }
+        "video_edit" => {
+            if has_any_non_empty_field(
+                input,
+                &[
+                    "video_path",
+                    "video_url",
+                    "video_base64",
+                    "source_video",
+                    "video",
+                ],
+            ) {
+                candidates.push("video_generate".to_string());
+            } else {
+                candidates.push("image2video".to_string());
+                candidates.push("video_generate".to_string());
+            }
+        }
+        "document_parse" => candidates.push("document_extract".to_string()),
+        "document_extract" => candidates.push("document_parse".to_string()),
+        _ => {}
+    }
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|item| {
+            let key = item.trim().to_ascii_lowercase();
+            !key.is_empty() && seen.insert(key)
+        })
+        .collect()
+}
+
+async fn dispatch_skill_tool_candidates_from_runtime(
+    registry: &SkillRegistry,
+    tool_name: &str,
+    input: &serde_json::Value,
+    allowed_skills: Option<&[String]>,
+    want_component_skill: bool,
+    caller_agent_id: Option<&str>,
+) -> Option<Result<String, String>> {
+    let candidates = build_skill_dispatch_tool_candidates(tool_name, input);
+    for candidate in &candidates {
+        if let Some(result) = dispatch_skill_tool_by_kind(
+            registry,
+            candidate,
             input,
+            allowed_skills,
+            want_component_skill,
+            caller_agent_id,
         )
         .await
         {
-            Ok(skill_result) => {
-                let content = serde_json::to_string(&skill_result.output)
-                    .unwrap_or_else(|_| skill_result.output.to_string());
-                if skill_result.is_error {
-                    Err(content)
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn has_any_non_empty_field(input: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        input
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn build_video_presentable_result(
+    tool_name: &str,
+    result_payload: &serde_json::Value,
+    input: &serde_json::Value,
+) -> serde_json::Value {
+    let video_urls = result_payload["video_urls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    let saved_paths = result_payload["saved_to"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    let poster_urls = result_payload["poster_urls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    let sources = if !video_urls.is_empty() {
+        video_urls.clone()
+    } else {
+        saved_paths.clone()
+    };
+    let title = pick_string_field(input, "prompt")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(48).collect::<String>())
+        .unwrap_or_else(|| {
+            if tool_name == "video_edit" {
+                "视频编辑结果".to_string()
+            } else {
+                "视频生成结果".to_string()
+            }
+        });
+    let provider_meta = serde_json::json!({
+        "route": result_payload["route"].as_str().unwrap_or("unknown"),
+        "provider_id": result_payload["provider_id"].as_str().unwrap_or_default(),
+        "provider_type": result_payload["provider_type"].as_str().unwrap_or_default(),
+        "tool_name": result_payload["provider_tool"].as_str().unwrap_or_default(),
+    });
+    let items = sources
+        .iter()
+        .enumerate()
+        .map(|(index, src)| {
+            let poster = poster_urls
+                .get(index)
+                .cloned()
+                .or_else(|| poster_urls.first().cloned());
+            serde_json::json!({
+                "media_type": "video",
+                "asset": build_media_asset_ref(
+                    src,
+                    result_payload["mime_type"].as_str().unwrap_or("video/mp4"),
+                    tool_name,
+                    if video_urls.contains(src) { "url" } else { "saved_path" },
+                    None,
+                ),
+                "poster_asset": poster.as_ref().map(|value| build_media_asset_ref(
+                    value,
+                    "image/png",
+                    tool_name,
+                    "poster",
+                    None,
+                )),
+                "caption": if sources.len() == 1 {
+                    title.clone()
                 } else {
-                    Ok(content)
+                    format!("{title} {}", index + 1)
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "media_result",
+        "media_type": "video",
+        "title": title,
+        "summary": result_payload["summary"].as_str().or_else(|| result_payload["model"].as_str()).unwrap_or_default(),
+        "provider_meta": provider_meta,
+        "items": items,
+    })
+}
+
+fn build_media_asset_ref(
+    uri: &str,
+    mime_type: &str,
+    tool_name: &str,
+    source: &str,
+    extra: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "tool".to_string(),
+        serde_json::Value::String(tool_name.to_string()),
+    );
+    metadata.insert(
+        "source".to_string(),
+        serde_json::Value::String(source.to_string()),
+    );
+    if let Some(serde_json::Value::Object(extra_map)) = extra {
+        for (key, value) in extra_map {
+            metadata.insert(key, value);
+        }
+    }
+    let mut asset = serde_json::Map::new();
+    asset.insert(
+        "kind".to_string(),
+        serde_json::Value::String(infer_asset_kind_from_uri(uri).to_string()),
+    );
+    asset.insert(
+        "uri".to_string(),
+        serde_json::Value::String(uri.trim().to_string()),
+    );
+    asset.insert(
+        "mimeType".to_string(),
+        serde_json::Value::String(mime_type.to_string()),
+    );
+    if let Some(file_name) = infer_file_name_from_uri(uri) {
+        asset.insert("fileName".to_string(), serde_json::Value::String(file_name));
+    }
+    asset.insert("metadata".to_string(), serde_json::Value::Object(metadata));
+    serde_json::Value::Object(asset)
+}
+
+fn build_image_presentable_result(
+    tool_name: &str,
+    result_payload: &serde_json::Value,
+    input: &serde_json::Value,
+) -> serde_json::Value {
+    let image_urls = result_payload["image_urls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    let saved_paths = result_payload["saved_to"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    let sources = if !image_urls.is_empty() {
+        image_urls.clone()
+    } else {
+        saved_paths.clone()
+    };
+    let title = pick_string_field(input, "prompt")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(48).collect::<String>())
+        .unwrap_or_else(|| {
+            if tool_name == "image_edit" {
+                "图片编辑结果".to_string()
+            } else {
+                "图片生成结果".to_string()
+            }
+        });
+    let provider_meta = serde_json::json!({
+        "route": result_payload["route"].as_str().unwrap_or("unknown"),
+        "provider_id": result_payload["provider_id"].as_str().unwrap_or_default(),
+        "provider_type": result_payload["provider_type"].as_str().unwrap_or_default(),
+        "tool_name": result_payload["provider_tool"].as_str().unwrap_or_default(),
+    });
+    let items = sources
+        .iter()
+        .enumerate()
+        .map(|(index, src)| {
+            serde_json::json!({
+                "media_type": "image",
+                "asset": build_media_asset_ref(
+                    src,
+                    "image/png",
+                    tool_name,
+                    if image_urls.contains(src) { "url" } else { "saved_path" },
+                    None,
+                ),
+                "caption": if sources.len() == 1 {
+                    title.clone()
+                } else {
+                    format!("{title} {}", index + 1)
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "media_result",
+        "media_type": "image",
+        "title": title,
+        "summary": result_payload["revised_prompt"]
+            .as_str()
+            .or_else(|| result_payload["model"].as_str())
+            .unwrap_or_default(),
+        "provider_meta": provider_meta,
+        "items": items,
+    })
+}
+
+fn build_audio_presentable_result(
+    tool_name: &str,
+    result_payload: &serde_json::Value,
+    input: &serde_json::Value,
+) -> serde_json::Value {
+    let asset_url = result_payload["asset_url"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut sources = Vec::new();
+    if let Some(url) = asset_url.clone() {
+        sources.push(url);
+    }
+    if let Some(path) = result_payload["saved_to"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    {
+        sources.push(path);
+    }
+    sources.extend(
+        result_payload["saved_to"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty()),
+    );
+    sources.sort();
+    sources.dedup();
+
+    let raw_text = pick_string_field(input, "text")
+        .or_else(|| pick_string_field(result_payload, "requested_text"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let title = if raw_text.is_empty() {
+        "语音合成结果".to_string()
+    } else {
+        let preview = raw_text.chars().take(32).collect::<String>();
+        if raw_text.chars().count() > 32 {
+            format!("语音: {preview}…")
+        } else {
+            format!("语音: {preview}")
+        }
+    };
+    let duration_estimate_ms = result_payload["duration_estimate_ms"].as_u64().or_else(|| {
+        result_payload["duration_secs"]
+            .as_f64()
+            .map(|value| (value.max(0.0) * 1000.0).round() as u64)
+    });
+    let provider_meta = serde_json::json!({
+        "route": result_payload["route"].as_str().unwrap_or("unknown"),
+        "provider_id": result_payload["provider_id"].as_str().unwrap_or_default(),
+        "provider_type": result_payload["provider_type"].as_str().unwrap_or_default(),
+        "tool_name": result_payload["provider_tool"].as_str().unwrap_or_default(),
+    });
+    let summary = [
+        result_payload["engine"].as_str(),
+        result_payload["provider"].as_str(),
+        result_payload["device"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let items = sources
+        .iter()
+        .enumerate()
+        .map(|(index, src)| {
+            serde_json::json!({
+                "media_type": "audio",
+                "asset": build_media_asset_ref(
+                    src,
+                    result_payload["mime_type"].as_str().unwrap_or("audio/wav"),
+                    tool_name,
+                    if asset_url.as_deref() == Some(src.as_str()) { "url" } else { "saved_path" },
+                    duration_estimate_ms.map(|duration| serde_json::json!({ "durationMs": duration })),
+                ),
+                "caption": if sources.len() == 1 {
+                    title.clone()
+                } else {
+                    format!("{title} {}", index + 1)
+                },
+                "duration_ms": duration_estimate_ms,
+                "transcript": if raw_text.is_empty() { None } else { Some(raw_text.clone()) },
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "media_result",
+        "media_type": "audio",
+        "title": title,
+        "summary": summary,
+        "provider_meta": provider_meta,
+        "items": items,
+    })
+}
+
+fn build_speech_to_text_presentable_result(
+    result_payload: &serde_json::Value,
+) -> serde_json::Value {
+    let transcript = result_payload["transcript"]
+        .as_str()
+        .or_else(|| result_payload["text"].as_str())
+        .unwrap_or_default();
+    let summary = [
+        result_payload["provider"].as_str(),
+        result_payload["model"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "kind".to_string(),
+        serde_json::Value::String("text_result".to_string()),
+    );
+    result.insert(
+        "title".to_string(),
+        serde_json::Value::String("语音转文本结果".to_string()),
+    );
+    result.insert(
+        "text".to_string(),
+        serde_json::Value::String(transcript.to_string()),
+    );
+    if !summary.is_empty() {
+        result.insert("summary".to_string(), serde_json::Value::String(summary));
+    }
+    if let Some(source_asset) = result_payload
+        .get("source_asset")
+        .or_else(|| result_payload.get("sourceAsset"))
+        .cloned()
+        .filter(|value| value.is_object())
+    {
+        result.insert(
+            "metadata".to_string(),
+            serde_json::json!({
+                "sourceAsset": source_asset,
+            }),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn build_media_describe_presentable_result(
+    result_payload: &serde_json::Value,
+) -> serde_json::Value {
+    let text = result_payload["description"]
+        .as_str()
+        .or_else(|| result_payload["transcript"].as_str())
+        .or_else(|| result_payload["text"].as_str())
+        .or_else(|| result_payload["summary"].as_str())
+        .or_else(|| result_payload["vision_summary"].as_str())
+        .or_else(|| result_payload["ocr_summary"].as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let media_type = result_payload["media_type"]
+        .as_str()
+        .or_else(|| result_payload["mediaType"].as_str())
+        .unwrap_or("media")
+        .trim()
+        .to_ascii_lowercase();
+    let title = match media_type.as_str() {
+        "image" => "图片理解结果",
+        "audio" => "音频理解结果",
+        "video" => "视频理解结果",
+        _ => "媒体理解结果",
+    };
+    let summary = [
+        result_payload["provider"].as_str(),
+        result_payload["model"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "kind".to_string(),
+        serde_json::Value::String("text_result".to_string()),
+    );
+    result.insert(
+        "title".to_string(),
+        serde_json::Value::String(title.to_string()),
+    );
+    result.insert("text".to_string(), serde_json::Value::String(text));
+    if !summary.is_empty() {
+        result.insert("summary".to_string(), serde_json::Value::String(summary));
+    }
+    if let Some(source_asset) = result_payload
+        .get("source_asset")
+        .or_else(|| result_payload.get("sourceAsset"))
+        .cloned()
+        .filter(|value| value.is_object())
+    {
+        result.insert(
+            "metadata".to_string(),
+            serde_json::json!({
+                "sourceAsset": source_asset,
+                "mediaType": media_type,
+            }),
+        );
+    }
+    serde_json::Value::Object(result)
+}
+
+fn enrich_media_describe_payload(
+    mut payload: serde_json::Value,
+    media_type: &str,
+    source_asset: serde_json::Value,
+    prompt: &str,
+) -> serde_json::Value {
+    let presentable_result = build_media_describe_presentable_result(&payload);
+    if let Some(map) = payload.as_object_mut() {
+        map.entry("tool".to_string())
+            .or_insert_with(|| serde_json::Value::String("media_describe".to_string()));
+        map.entry("media_type".to_string())
+            .or_insert_with(|| serde_json::Value::String(media_type.to_string()));
+        map.entry("mediaType".to_string())
+            .or_insert_with(|| serde_json::Value::String(media_type.to_string()));
+        map.entry("source_asset".to_string())
+            .or_insert_with(|| source_asset.clone());
+        map.entry("sourceAsset".to_string()).or_insert(source_asset);
+        if !prompt.trim().is_empty() {
+            map.entry("prompt".to_string())
+                .or_insert_with(|| serde_json::Value::String(prompt.trim().to_string()));
+        }
+        map.entry("presentable_result".to_string())
+            .or_insert(presentable_result);
+    }
+    payload
+}
+
+fn build_media_source_asset_ref(path: &Path, mime_type: &str) -> serde_json::Value {
+    build_media_asset_ref(
+        &path.to_string_lossy(),
+        mime_type,
+        "media_describe",
+        "source_path",
+        Some(serde_json::json!({
+            "role": "source",
+        })),
+    )
+}
+
+fn enrich_presentable_payload(
+    mut payload: serde_json::Value,
+    tool_name: &str,
+    route: &str,
+    provider_id: &str,
+    provider_type: &str,
+    provider_tool: &str,
+    presentable_result: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(map) = payload.as_object_mut() {
+        map.entry("tool".to_string())
+            .or_insert_with(|| serde_json::Value::String(tool_name.to_string()));
+        map.entry("route".to_string())
+            .or_insert_with(|| serde_json::Value::String(route.to_string()));
+        map.entry("provider_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(provider_id.to_string()));
+        map.entry("provider_type".to_string())
+            .or_insert_with(|| serde_json::Value::String(provider_type.to_string()));
+        map.entry("provider_tool".to_string())
+            .or_insert_with(|| serde_json::Value::String(provider_tool.to_string()));
+        map.entry("presentable_result".to_string())
+            .or_insert(presentable_result);
+    }
+    payload
+}
+
+fn build_video_unavailable_response(
+    tool_name: &str,
+    input: &serde_json::Value,
+    attempts: &[String],
+) -> serde_json::Value {
+    let title = if tool_name == "video_edit" {
+        "视频编辑当前不可用"
+    } else {
+        "视频生成当前不可用"
+    };
+    let prompt = pick_string_field(input, "prompt")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let has_source_image = has_any_non_empty_field(
+        input,
+        &[
+            "image_path",
+            "image_url",
+            "image_base64",
+            "image",
+            "source_image",
+            "reference_image",
+        ],
+    );
+    let self_expression = !prompt.is_empty() && prompt_hits_self_expression(prompt);
+    let mut message = title.to_string();
+    if !prompt.is_empty() {
+        message.push_str("。请求：");
+        message.push_str(prompt);
+    }
+    if self_expression && has_source_image {
+        message.push_str("。已识别为“智能体用当前形象出视频”，并已按图生视频优先路线尝试。");
+    } else if self_expression {
+        message.push_str(
+            "。已识别为“智能体用当前形象出视频”，但当前没有可用视频 provider 或组件可完成该请求。",
+        );
+    } else if has_source_image {
+        message.push_str("。当前请求已带源图，但没有可用的视频 provider 或组件完成图生视频。");
+    }
+    if !attempts.is_empty() {
+        message.push_str("。已尝试路径：");
+        message.push_str(&attempts.join(" -> "));
+    }
+    let hint = if self_expression && has_source_image {
+        Some("请优先检查是否已启用“图片生成视频”组件绑定，或是否配置了可用的视频 provider。")
+    } else if self_expression {
+        Some("请先确认该智能体已有立绘或自我照片，并启用了可用的视频组件或 provider。")
+    } else if has_source_image {
+        Some("请检查“图片生成视频”组件绑定或视频 provider 是否可用。")
+    } else {
+        Some("请检查视频组件绑定、全局视频 provider，或当前模型是否具备原生视频能力。")
+    };
+    serde_json::json!({
+        "ok": false,
+        "tool": tool_name,
+        "unavailable": true,
+        "code": "video_unavailable",
+        "message": message,
+        "self_expression": self_expression,
+        "has_source_image": has_source_image,
+        "hint": hint,
+        "presentable_result": {
+            "kind": "error_result",
+            "title": title,
+            "code": "video_unavailable",
+            "message": message,
+            "summary": hint,
+        },
+    })
+}
+
+fn build_capability_unavailable_response(
+    tool_name: &str,
+    title: &str,
+    code: &str,
+    message: &str,
+    attempts: &[String],
+) -> serde_json::Value {
+    let detail = if attempts.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}。已尝试路径：{}", attempts.join(" -> "))
+    };
+    serde_json::json!({
+        "ok": false,
+        "tool": tool_name,
+        "unavailable": true,
+        "code": code,
+        "message": detail,
+        "presentable_result": {
+            "kind": "error_result",
+            "title": title,
+            "code": code,
+            "message": detail,
+        }
+    })
+}
+
+fn pick_document_source_field<'a>(input: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        input
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn infer_document_type_from_name(name: &str) -> String {
+    let normalized = name
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if normalized.ends_with(".pdf") {
+        "pdf".to_string()
+    } else if normalized.ends_with(".docx") {
+        "docx".to_string()
+    } else if normalized.ends_with(".doc") {
+        "doc".to_string()
+    } else if normalized.ends_with(".xlsx") {
+        "xlsx".to_string()
+    } else if normalized.ends_with(".xls") {
+        "xls".to_string()
+    } else if normalized.ends_with(".csv") {
+        "csv".to_string()
+    } else if normalized.ends_with(".pptx") {
+        "pptx".to_string()
+    } else if normalized.ends_with(".ppt") {
+        "ppt".to_string()
+    } else if normalized.ends_with(".md") {
+        "md".to_string()
+    } else if normalized.ends_with(".json") {
+        "json".to_string()
+    } else if normalized.ends_with(".txt") {
+        "txt".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn infer_document_mime_type(document_type: &str) -> &'static str {
+    match document_type {
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "csv" => "text/csv",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+fn document_type_is_text_like(document_type: &str) -> bool {
+    matches!(document_type, "txt" | "md" | "json" | "csv")
+}
+
+fn infer_asset_kind_from_uri(uri: &str) -> &'static str {
+    let trimmed = uri.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("data:") {
+        "data_url"
+    } else if trimmed.starts_with("/api/uploads/") {
+        "upload_url"
+    } else if trimmed.starts_with("/api/management/") {
+        "management_media_url"
+    } else if lowered.starts_with("http://") || lowered.starts_with("https://") {
+        "remote_url"
+    } else if lowered.starts_with("file://") {
+        "absolute_file"
+    } else if Path::new(trimmed).is_absolute() {
+        "absolute_file"
+    } else {
+        "workspace_file"
+    }
+}
+
+fn infer_file_name_from_uri(uri: &str) -> Option<String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed
+        .trim_start_matches("file://")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .replace('\\', "/");
+    normalized
+        .rsplit('/')
+        .find(|item| !item.trim().is_empty())
+        .map(|item| item.trim().to_string())
+}
+
+fn build_document_asset_ref(
+    uri: &str,
+    document_type: &str,
+    file_name: Option<&str>,
+    extra: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut asset = serde_json::Map::new();
+    asset.insert(
+        "kind".to_string(),
+        serde_json::Value::String(infer_asset_kind_from_uri(uri).to_string()),
+    );
+    asset.insert(
+        "uri".to_string(),
+        serde_json::Value::String(uri.trim().to_string()),
+    );
+    asset.insert(
+        "mimeType".to_string(),
+        serde_json::Value::String(infer_document_mime_type(document_type).to_string()),
+    );
+    if let Some(name) = file_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| infer_file_name_from_uri(uri))
+    {
+        asset.insert("fileName".to_string(), serde_json::Value::String(name));
+    }
+    if let Some(serde_json::Value::Object(extra_map)) = extra {
+        if !extra_map.is_empty() {
+            asset.insert("metadata".to_string(), serde_json::Value::Object(extra_map));
+        }
+    }
+    serde_json::Value::Object(asset)
+}
+
+fn summarize_document_text(text: &str, max_chars: usize) -> String {
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return String::new();
+    }
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn document_type_supports_runtime_extraction(document_type: &str) -> bool {
+    matches!(
+        document_type,
+        "pdf" | "docx" | "doc" | "xlsx" | "xls" | "xlsb" | "pptx"
+    )
+}
+
+fn decode_data_url_text(raw: &str) -> Result<String, String> {
+    let Some((meta, payload)) = raw.split_once(',') else {
+        return Err("Invalid data URL".to_string());
+    };
+    if meta.to_ascii_lowercase().contains(";base64") {
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|err| format!("Failed to decode data URL: {err}"))?;
+        String::from_utf8(decoded).map_err(|err| format!("Data URL is not valid UTF-8: {err}"))
+    } else {
+        Ok(payload.to_string())
+    }
+}
+
+fn decode_data_url_bytes(raw: &str) -> Result<Vec<u8>, String> {
+    let Some((meta, payload)) = raw.split_once(',') else {
+        return Err("Invalid data URL".to_string());
+    };
+    if meta.to_ascii_lowercase().contains(";base64") {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|err| format!("Failed to decode data URL: {err}"))
+    } else {
+        Ok(payload.as_bytes().to_vec())
+    }
+}
+
+fn decode_basic_xml_entities(raw: &str) -> String {
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn normalize_document_text(text: &str) -> Option<String> {
+    let text = text.replace('\u{0000}', "");
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let normalized = line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        if !normalized.is_empty() {
+            lines.push(normalized);
+        } else if lines.last().is_some_and(|last: &String| !last.is_empty()) {
+            lines.push(String::new());
+        }
+    }
+    while lines.last().is_some_and(|last| last.is_empty()) {
+        lines.pop();
+    }
+    let output = lines.join("\n").trim().to_string();
+    if output.is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn extract_text_from_xmlish_markup(xml: &str) -> Option<String> {
+    let replaced = xml
+        .replace("<w:tab/>", "\t")
+        .replace("<w:tab />", "\t")
+        .replace("<w:br/>", "\n")
+        .replace("<w:br />", "\n")
+        .replace("<a:br/>", "\n")
+        .replace("<a:br />", "\n")
+        .replace("</w:p>", "\n")
+        .replace("</w:tr>", "\n")
+        .replace("</w:tc>", "\t")
+        .replace("</a:p>", "\n")
+        .replace("</a:tr>", "\n")
+        .replace("</a:tc>", "\t")
+        .replace("</text:p>", "\n")
+        .replace("</text:span>", " ");
+
+    let mut plain = String::with_capacity(replaced.len());
+    let mut in_tag = false;
+    for ch in replaced.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => plain.push(ch),
+            _ => {}
+        }
+    }
+    normalize_document_text(&decode_basic_xml_entities(&plain))
+}
+
+fn extract_docx_text_from_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
+    let reader = Cursor::new(bytes.to_vec());
+    let mut archive =
+        ZipArchive::new(reader).map_err(|err| format!("打开 docx 压缩包失败: {err}"))?;
+    let mut parts = Vec::new();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|err| format!("读取 docx 条目失败: {err}"))?;
+        let name = file.name().to_string();
+        let wanted = name == "word/document.xml"
+            || (name.starts_with("word/header") && name.ends_with(".xml"))
+            || (name.starts_with("word/footer") && name.ends_with(".xml"))
+            || name == "word/footnotes.xml"
+            || name == "word/endnotes.xml";
+        if !wanted {
+            continue;
+        }
+        let mut xml = String::new();
+        file.read_to_string(&mut xml)
+            .map_err(|err| format!("读取 docx XML 失败({name}): {err}"))?;
+        if let Some(text) = extract_text_from_xmlish_markup(&xml) {
+            parts.push(text);
+        }
+    }
+    Ok(normalize_document_text(&parts.join("\n\n")))
+}
+
+fn extract_pptx_text_from_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
+    let reader = Cursor::new(bytes.to_vec());
+    let mut archive =
+        ZipArchive::new(reader).map_err(|err| format!("打开 pptx 压缩包失败: {err}"))?;
+    let mut slides = Vec::new();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|err| format!("读取 pptx 条目失败: {err}"))?;
+        let name = file.name().to_string();
+        if !(name.starts_with("ppt/slides/slide") && name.ends_with(".xml")) {
+            continue;
+        }
+        let mut xml = String::new();
+        file.read_to_string(&mut xml)
+            .map_err(|err| format!("读取 pptx XML 失败({name}): {err}"))?;
+        if let Some(text) = extract_text_from_xmlish_markup(&xml) {
+            slides.push(text);
+        }
+    }
+    Ok(normalize_document_text(&slides.join("\n\n")))
+}
+
+fn extract_spreadsheet_text_from_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
+    let cursor = Cursor::new(bytes.to_vec());
+    let mut workbook =
+        open_workbook_auto_from_rs(cursor).map_err(|err| format!("打开电子表格失败: {err}"))?;
+    let sheet_names = workbook.sheet_names().to_vec();
+    let mut sections = Vec::new();
+
+    for sheet_name in sheet_names {
+        let range = match workbook.worksheet_range(&sheet_name) {
+            Ok(range) => range,
+            Err(err) => {
+                debug!(sheet = %sheet_name, %err, "Skip unreadable worksheet");
+                continue;
+            }
+        };
+        let mut rows = Vec::new();
+        for row in range.rows() {
+            let cells = row.iter().map(|cell| cell.to_string()).collect::<Vec<_>>();
+            if cells.iter().all(|cell| cell.trim().is_empty()) {
+                continue;
+            }
+            rows.push(cells.join("\t"));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        sections.push(format!("## 工作表: {sheet_name}\n{}", rows.join("\n")));
+    }
+
+    Ok(normalize_document_text(&sections.join("\n\n")))
+}
+
+fn extract_first_spreadsheet_rows_from_bytes(
+    bytes: &[u8],
+) -> Result<Option<(String, Vec<Vec<String>>)>, String> {
+    let cursor = Cursor::new(bytes.to_vec());
+    let mut workbook =
+        open_workbook_auto_from_rs(cursor).map_err(|err| format!("打开电子表格失败: {err}"))?;
+    for sheet_name in workbook.sheet_names().to_vec() {
+        let range = match workbook.worksheet_range(&sheet_name) {
+            Ok(range) => range,
+            Err(err) => {
+                debug!(sheet = %sheet_name, %err, "Skip unreadable worksheet for csv export");
+                continue;
+            }
+        };
+        let rows = range
+            .rows()
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect::<Vec<_>>())
+            .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            return Ok(Some((sheet_name, rows)));
+        }
+    }
+    Ok(None)
+}
+
+fn document_type_is_spreadsheet(document_type: &str) -> bool {
+    matches!(document_type, "xlsx" | "xls" | "xlsb" | "csv")
+}
+
+fn escape_csv_cell(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    if escaped.contains([',', '"', '\n', '\r']) {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+
+fn render_rows_as_csv(rows: &[Vec<String>]) -> String {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| escape_csv_cell(cell.trim()))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_ascii_sequence(output: &mut Vec<String>, buffer: &mut String, min_len: usize) {
+    let candidate = buffer.trim().to_string();
+    if candidate.chars().count() >= min_len {
+        output.push(candidate);
+    }
+    buffer.clear();
+}
+
+fn extract_ascii_text_sequences(bytes: &[u8], min_len: usize) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut buffer = String::new();
+    for byte in bytes {
+        let ch = *byte as char;
+        let printable = ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                ' ' | '\n'
+                    | '\r'
+                    | '\t'
+                    | ','
+                    | '.'
+                    | ':'
+                    | ';'
+                    | '-'
+                    | '_'
+                    | '/'
+                    | '\\'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '#'
+                    | '@'
+                    | '&'
+                    | '%'
+                    | '+'
+                    | '='
+                    | '!'
+                    | '?'
+            );
+        if printable {
+            buffer.push(ch);
+        } else {
+            push_ascii_sequence(&mut output, &mut buffer, min_len);
+        }
+    }
+    push_ascii_sequence(&mut output, &mut buffer, min_len);
+    output
+}
+
+fn extract_utf16le_text_sequences(bytes: &[u8], min_len: usize) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut current = Vec::<u16>::new();
+    for chunk in bytes.chunks_exact(2) {
+        let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let printable = matches!(unit, 0x0009 | 0x000A | 0x000D | 0x0020..=0x007E)
+            || (0x4E00..=0x9FFF).contains(&unit);
+        if printable {
+            current.push(unit);
+        } else if current.len() >= min_len {
+            let text = String::from_utf16_lossy(&current);
+            output.push(text);
+            current.clear();
+        } else {
+            current.clear();
+        }
+    }
+    if current.len() >= min_len {
+        output.push(String::from_utf16_lossy(&current));
+    }
+    output
+}
+
+fn extract_legacy_word_text_from_bytes(bytes: &[u8]) -> Option<String> {
+    let mut chunks = Vec::new();
+    chunks.extend(extract_utf16le_text_sequences(bytes, 4));
+    chunks.extend(extract_ascii_text_sequences(bytes, 6));
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for chunk in chunks {
+        let normalized = chunk
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            deduped.push(normalized);
+        }
+    }
+    normalize_document_text(&deduped.join("\n"))
+}
+
+fn extract_document_text_from_bytes(
+    document_type: &str,
+    bytes: &[u8],
+) -> Result<Option<String>, String> {
+    match document_type {
+        "pdf" => pdf_extract::extract_text_from_mem(bytes)
+            .map_err(|err| format!("PDF 文本提取失败: {err}"))
+            .and_then(|text| Ok(normalize_document_text(&text))),
+        "docx" => extract_docx_text_from_bytes(bytes),
+        "doc" => Ok(extract_legacy_word_text_from_bytes(bytes)),
+        "xlsx" | "xls" | "xlsb" => extract_spreadsheet_text_from_bytes(bytes),
+        "pptx" => extract_pptx_text_from_bytes(bytes),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDocumentSource {
+    source_uri: String,
+    preview_uri: String,
+    download_uri: String,
+    file_name: String,
+    document_type: String,
+    extracted_text: Option<String>,
+}
+
+async fn resolve_document_source(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<ResolvedDocumentSource, String> {
+    let raw_source = pick_document_source_field(
+        input,
+        &[
+            "path",
+            "file",
+            "document",
+            "source_path",
+            "file_path",
+            "url",
+            "document_url",
+            "source_url",
+            "preview_url",
+        ],
+    )
+    .ok_or("Missing document source. Provide path/file/document/url.")?;
+    let explicit_type = pick_document_source_field(input, &["document_type", "file_type", "type"])
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let lowered = raw_source.to_ascii_lowercase();
+    if lowered.starts_with("data:") {
+        let file_name = pick_document_source_field(input, &["file_name", "fileName"])
+            .map(str::to_string)
+            .unwrap_or_else(|| "inline-document.txt".to_string());
+        let document_type = if explicit_type.is_empty() {
+            let inferred = infer_document_type_from_name(&file_name);
+            if inferred == "unknown" {
+                infer_document_type_from_name(raw_source)
+            } else {
+                inferred
+            }
+        } else {
+            explicit_type
+        };
+        let extracted_text = if document_type_is_text_like(&document_type) {
+            decode_data_url_text(raw_source).ok()
+        } else if document_type_supports_runtime_extraction(&document_type) {
+            decode_data_url_bytes(raw_source).ok().and_then(|bytes| {
+                extract_document_text_from_bytes(&document_type, &bytes)
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        return Ok(ResolvedDocumentSource {
+            source_uri: raw_source.to_string(),
+            preview_uri: raw_source.to_string(),
+            download_uri: raw_source.to_string(),
+            file_name,
+            document_type,
+            extracted_text,
+        });
+    }
+
+    let is_remote_like = lowered.starts_with("http://")
+        || lowered.starts_with("https://")
+        || raw_source.starts_with("/api/uploads/")
+        || raw_source.starts_with("/api/management/");
+
+    if is_remote_like {
+        let file_name = pick_document_source_field(input, &["file_name", "fileName"])
+            .map(str::to_string)
+            .or_else(|| infer_file_name_from_uri(raw_source))
+            .unwrap_or_else(|| "document".to_string());
+        let document_type = if explicit_type.is_empty() {
+            let inferred = infer_document_type_from_name(&file_name);
+            if inferred == "unknown" {
+                infer_document_type_from_name(raw_source)
+            } else {
+                inferred
+            }
+        } else {
+            explicit_type
+        };
+        let fetch_target = if raw_source.starts_with("/api/") {
+            webot_service_base_url().map(|base| format!("{base}{raw_source}"))
+        } else {
+            Some(raw_source.to_string())
+        };
+        let extracted_text = if document_type_is_text_like(&document_type)
+            || document_type_supports_runtime_extraction(&document_type)
+        {
+            if let Some(url) = fetch_target {
+                let response = reqwest::Client::new()
+                    .get(url)
+                    .timeout(std::time::Duration::from_secs(45))
+                    .send()
+                    .await
+                    .map_err(|err| format!("读取文档地址失败: {err}"))?;
+                if response.status().is_success() {
+                    let bytes = response
+                        .bytes()
+                        .await
+                        .map_err(|err| format!("读取文档字节失败: {err}"))?;
+                    if document_type_is_text_like(&document_type) {
+                        Some(String::from_utf8_lossy(&bytes).to_string())
+                    } else {
+                        extract_document_text_from_bytes(&document_type, &bytes).unwrap_or(None)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        return Ok(ResolvedDocumentSource {
+            source_uri: raw_source.to_string(),
+            preview_uri: raw_source.to_string(),
+            download_uri: raw_source.to_string(),
+            file_name,
+            document_type,
+            extracted_text,
+        });
+    }
+
+    let normalized_local = raw_source
+        .strip_prefix("file://")
+        .unwrap_or(raw_source)
+        .trim();
+    let path = resolve_file_path(normalized_local, workspace_root)?;
+    let source_uri = path.to_string_lossy().to_string();
+    let file_name = pick_document_source_field(input, &["file_name", "fileName"])
+        .map(str::to_string)
+        .or_else(|| infer_file_name_from_uri(&source_uri))
+        .unwrap_or_else(|| "document".to_string());
+    let document_type = if explicit_type.is_empty() {
+        let inferred = infer_document_type_from_name(&file_name);
+        if inferred == "unknown" {
+            infer_document_type_from_name(raw_source)
+        } else {
+            inferred
+        }
+    } else {
+        explicit_type
+    };
+    let extracted_text = if document_type_is_text_like(&document_type) {
+        Some(
+            String::from_utf8_lossy(
+                &tokio::fs::read(&path)
+                    .await
+                    .map_err(|err| format!("读取文本文档失败({source_uri}): {err}"))?,
+            )
+            .to_string(),
+        )
+    } else if document_type_supports_runtime_extraction(&document_type) {
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|err| format!("读取文档字节失败({source_uri}): {err}"))?;
+        extract_document_text_from_bytes(&document_type, &bytes)?
+    } else {
+        None
+    };
+    Ok(ResolvedDocumentSource {
+        source_uri: source_uri.clone(),
+        preview_uri: source_uri.clone(),
+        download_uri: source_uri,
+        file_name,
+        document_type,
+        extracted_text,
+    })
+}
+
+async fn read_document_source_bytes(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    let raw_source = pick_document_source_field(
+        input,
+        &[
+            "path",
+            "file",
+            "document",
+            "source_path",
+            "file_path",
+            "url",
+            "document_url",
+            "source_url",
+            "preview_url",
+        ],
+    )
+    .ok_or("Missing document source. Provide path/file/document/url.")?;
+    let lowered = raw_source.to_ascii_lowercase();
+    if lowered.starts_with("data:") {
+        return decode_data_url_bytes(raw_source);
+    }
+    if lowered.starts_with("http://")
+        || lowered.starts_with("https://")
+        || raw_source.starts_with("/api/uploads/")
+        || raw_source.starts_with("/api/management/")
+    {
+        let url = if raw_source.starts_with("/api/") {
+            webot_service_base_url()
+                .map(|base| format!("{base}{raw_source}"))
+                .ok_or_else(|| "读取 API 文档资源失败：缺少 WEBOT_SERVICE_BASE_URL".to_string())?
+        } else {
+            raw_source.to_string()
+        };
+        let response = reqwest::Client::new()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(45))
+            .send()
+            .await
+            .map_err(|err| format!("读取文档地址失败: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("读取文档地址失败: HTTP {}", response.status()));
+        }
+        return response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|err| format!("读取文档字节失败: {err}"));
+    }
+    let normalized_local = raw_source
+        .strip_prefix("file://")
+        .unwrap_or(raw_source)
+        .trim();
+    let path = resolve_file_path(normalized_local, workspace_root)?;
+    tokio::fs::read(&path)
+        .await
+        .map_err(|err| format!("读取文档字节失败({}): {err}", path.display()))
+}
+
+fn build_document_presentable_result(
+    tool_name: &str,
+    title: &str,
+    source: &ResolvedDocumentSource,
+    summary_text: Option<&str>,
+    compare_diff: Option<serde_json::Value>,
+    conversion_outputs: Vec<serde_json::Value>,
+    extra: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "kind".to_string(),
+        serde_json::Value::String("document_result".to_string()),
+    );
+    result.insert(
+        "title".to_string(),
+        serde_json::Value::String(title.to_string()),
+    );
+    result.insert(
+        "document_type".to_string(),
+        serde_json::Value::String(source.document_type.clone()),
+    );
+    result.insert(
+        "documentType".to_string(),
+        serde_json::Value::String(source.document_type.clone()),
+    );
+    let source_asset = build_document_asset_ref(
+        &source.source_uri,
+        &source.document_type,
+        Some(&source.file_name),
+        Some(serde_json::json!({
+            "tool": tool_name,
+            "role": "source",
+        })),
+    );
+    let preview_asset = build_document_asset_ref(
+        &source.preview_uri,
+        &source.document_type,
+        Some(&source.file_name),
+        Some(serde_json::json!({
+            "tool": tool_name,
+            "role": "preview",
+        })),
+    );
+    let download_asset = build_document_asset_ref(
+        &source.download_uri,
+        &source.document_type,
+        Some(&source.file_name),
+        Some(serde_json::json!({
+            "tool": tool_name,
+            "role": "download",
+        })),
+    );
+    result.insert("source_asset".to_string(), source_asset.clone());
+    result.insert("sourceAsset".to_string(), source_asset);
+    result.insert("preview_asset".to_string(), preview_asset.clone());
+    result.insert("previewAsset".to_string(), preview_asset);
+    result.insert("download_asset".to_string(), download_asset.clone());
+    result.insert("downloadAsset".to_string(), download_asset);
+    if let Some(text) = source
+        .extracted_text
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        result.insert(
+            "extracted_text".to_string(),
+            serde_json::Value::String(text.to_string()),
+        );
+        result.insert(
+            "extractedText".to_string(),
+            serde_json::Value::String(text.to_string()),
+        );
+    }
+    if let Some(summary) = summary_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        result.insert(
+            "summary".to_string(),
+            serde_json::Value::String(summary.to_string()),
+        );
+        result.insert(
+            "summaryText".to_string(),
+            serde_json::Value::String(summary.to_string()),
+        );
+    }
+    if let Some(diff) = compare_diff {
+        result.insert("compare_diff".to_string(), diff.clone());
+        result.insert("compareDiff".to_string(), diff);
+    }
+    if !conversion_outputs.is_empty() {
+        result.insert(
+            "conversion_outputs".to_string(),
+            serde_json::Value::Array(conversion_outputs.clone()),
+        );
+        result.insert(
+            "conversionOutputs".to_string(),
+            serde_json::Value::Array(conversion_outputs),
+        );
+    }
+    if let Some(extra_value) = extra {
+        result.insert("metadata".to_string(), extra_value);
+    }
+    serde_json::Value::Object(result)
+}
+
+fn build_document_unavailable_response(
+    tool_name: &str,
+    code: &str,
+    message: &str,
+    attempts: &[String],
+) -> serde_json::Value {
+    let detail = if attempts.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}。已尝试路径：{}", attempts.join(" -> "))
+    };
+    serde_json::json!({
+        "ok": false,
+        "tool": tool_name,
+        "unavailable": true,
+        "code": code,
+        "message": detail,
+        "presentable_result": {
+            "kind": "error_result",
+            "title": "文档能力暂不可用",
+            "code": code,
+            "message": detail,
+        },
+    })
+}
+
+fn build_document_compare_diff(
+    left_label: &str,
+    left_text: &str,
+    right_label: &str,
+    right_text: &str,
+) -> serde_json::Value {
+    let left_lines = left_text.lines().collect::<Vec<_>>();
+    let right_lines = right_text.lines().collect::<Vec<_>>();
+    let max_len = left_lines.len().max(right_lines.len());
+    let mut changes = Vec::new();
+    for index in 0..max_len {
+        let left = left_lines.get(index).copied().unwrap_or_default();
+        let right = right_lines.get(index).copied().unwrap_or_default();
+        if left == right {
+            continue;
+        }
+        let change = if left.is_empty() {
+            "added"
+        } else if right.is_empty() {
+            "removed"
+        } else {
+            "modified"
+        };
+        changes.push(serde_json::json!({
+            "line": index + 1,
+            "change": change,
+            "left": left,
+            "right": right,
+        }));
+        if changes.len() >= 20 {
+            break;
+        }
+    }
+    serde_json::json!({
+        "leftLabel": left_label,
+        "rightLabel": right_label,
+        "changeCount": changes.len(),
+        "changes": changes,
+    })
+}
+
+fn chunk_document_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<serde_json::Value> {
+    if text.trim().is_empty() || chunk_size == 0 {
+        return Vec::new();
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let end = (start + chunk_size).min(chars.len());
+        let content = chars[start..end].iter().collect::<String>();
+        chunks.push(serde_json::json!({
+            "index": chunks.len(),
+            "start": start,
+            "end": end,
+            "text": content,
+        }));
+        if end >= chars.len() {
+            break;
+        }
+        let next_start = end.saturating_sub(overlap.min(chunk_size.saturating_sub(1)));
+        if next_start <= start {
+            break;
+        }
+        start = next_start;
+    }
+    chunks
+}
+
+async fn ensure_document_runtime_allowed(
+    tool_name: &str,
+    capability_key: &str,
+    caller_agent_id: Option<&str>,
+) -> Result<DocumentRuntimeAllowance, String> {
+    let snapshot = fetch_capability_registry_snapshot(caller_agent_id, capability_key, "generic")
+        .await
+        .unwrap_or_default();
+    let runtime_enabled = registry_has_enabled_provider_type(
+        Some(&snapshot),
+        capability_key,
+        "generic",
+        "runtime_native",
+    );
+    let generic_enabled = registry_has_enabled_provider_type(
+        Some(&snapshot),
+        capability_key,
+        "generic",
+        "generic_provider",
+    );
+    let model_enabled = registry_has_enabled_provider_type(
+        Some(&snapshot),
+        capability_key,
+        "generic",
+        "model_fallback",
+    );
+    if runtime_enabled || generic_enabled || model_enabled || snapshot.providers.is_empty() {
+        return Ok(DocumentRuntimeAllowance::Allowed(snapshot));
+    }
+    let response = build_document_unavailable_response(
+        tool_name,
+        "document_unavailable",
+        "文档能力已被 registry 禁用，当前未找到可用的 provider。",
+        &[
+            "runtime_native(disabled_by_registry)".to_string(),
+            "generic_provider(disabled_by_registry)".to_string(),
+            "model_fallback(disabled_by_registry)".to_string(),
+        ],
+    );
+    serde_json::to_string_pretty(&response)
+        .map(DocumentRuntimeAllowance::Unavailable)
+        .map_err(|err| format!("Serialize error: {err}"))
+}
+
+enum DocumentRuntimeAllowance {
+    Allowed(RuntimeCapabilityRegistrySnapshot),
+    Unavailable(String),
+}
+
+fn document_selector_provider_candidates(
+    tool_name: &str,
+    document_type: &str,
+) -> Vec<&'static str> {
+    match tool_name {
+        "document_parse" | "document_extract" => match document_type {
+            "pdf" => vec![
+                "runtime_native:pdf_reader",
+                "runtime_native:ocr_service",
+                "runtime_native:office_preview_adapter",
+            ],
+            "doc" | "docx" => vec![
+                "component_skill:document_parser_component",
+                "runtime_native:office_preview_adapter",
+                "generic_provider:document_convert_service",
+            ],
+            "xls" | "xlsx" | "csv" => vec![
+                "component_skill:document_parser_component",
+                "runtime_native:office_preview_adapter",
+                "generic_provider:document_convert_service",
+            ],
+            "ppt" | "pptx" => vec![
+                "component_skill:document_parser_component",
+                "runtime_native:office_preview_adapter",
+                "generic_provider:document_convert_service",
+            ],
+            "txt" | "md" | "json" => vec![
+                "component_skill:document_parser_component",
+                "model_fallback:native_doc_reasoner",
+            ],
+            _ => vec![
+                "runtime_native:ocr_service",
+                "runtime_native:office_preview_adapter",
+            ],
+        },
+        "document_preview" => match document_type {
+            "pdf" => vec![
+                "runtime_native:pdf_reader",
+                "runtime_native:office_preview_adapter",
+            ],
+            "doc" | "docx" | "xls" | "xlsx" | "csv" | "ppt" | "pptx" => {
+                vec!["runtime_native:office_preview_adapter"]
+            }
+            "txt" | "md" | "json" => vec!["runtime_native:office_preview_adapter"],
+            _ => vec!["runtime_native:office_preview_adapter"],
+        },
+        "document_summarize" | "document_compare" => vec![
+            "generic_provider:document_convert_service",
+            "model_fallback:native_doc_reasoner",
+            "runtime_native:pdf_reader",
+        ],
+        "document_chunk" => vec![
+            "component_skill:document_parser_component",
+            "runtime_native:pdf_reader",
+            "generic_provider:document_convert_service",
+        ],
+        "document_convert" => vec![
+            "runtime_native:office_preview_adapter",
+            "generic_provider:document_convert_service",
+            "model_fallback:native_doc_reasoner",
+        ],
+        _ => vec![
+            "component_skill:document_parser_component",
+            "runtime_native:office_preview_adapter",
+            "generic_provider:document_convert_service",
+        ],
+    }
+}
+
+fn document_provider_type(provider_id: &str) -> &'static str {
+    match provider_id
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or_default()
+    {
+        "runtime_native" => "runtime_native",
+        "component_skill" => "component_skill",
+        "generic_provider" => "generic_provider",
+        "model_fallback" => "model_fallback",
+        _ => "unknown",
+    }
+}
+
+fn select_document_runtime_provider(
+    snapshot: &RuntimeCapabilityRegistrySnapshot,
+    tool_name: &str,
+    document_type: &str,
+) -> Option<(String, String)> {
+    let (capability_key, capability_scope) = capability_descriptor_for_tool(tool_name)?;
+    for provider_id in document_selector_provider_candidates(tool_name, document_type) {
+        if !registry_provider_is_enabled(snapshot, provider_id, capability_key, capability_scope) {
+            continue;
+        }
+        let provider_type = document_provider_type(provider_id).to_string();
+        if provider_type == "component_skill" {
+            continue;
+        }
+        return Some((provider_id.to_string(), provider_type));
+    }
+    None
+}
+
+async fn dispatch_document_skill_if_available(
+    tool_name: &str,
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+    caller_agent_id: Option<&str>,
+    attempts: &mut Vec<String>,
+) -> Option<Result<String, String>> {
+    let registry = skill_registry?;
+    let candidate_names = build_skill_dispatch_tool_candidates(tool_name, input);
+    if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+        registry,
+        tool_name,
+        input,
+        allowed_skills,
+        true,
+        caller_agent_id,
+    )
+    .await
+    {
+        return Some(result);
+    }
+    attempts.push(format!("component_skill({})", candidate_names.join("/")));
+
+    if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+        registry,
+        tool_name,
+        input,
+        allowed_skills,
+        false,
+        caller_agent_id,
+    )
+    .await
+    {
+        return Some(result);
+    }
+    attempts.push(format!("generic_provider({})", candidate_names.join("/")));
+    None
+}
+
+async fn tool_document_parse(
+    tool_name: &str,
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let mut attempts = Vec::new();
+    if let Some(result) = dispatch_document_skill_if_available(
+        tool_name,
+        input,
+        skill_registry,
+        allowed_skills,
+        caller_agent_id,
+        &mut attempts,
+    )
+    .await
+    {
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => attempts.push(format!("document_skill_error({err})")),
+        }
+    }
+    let capability_key = if tool_name == "document_extract" {
+        "extract.document"
+    } else {
+        "parse.document"
+    };
+    let registry_snapshot =
+        match ensure_document_runtime_allowed(tool_name, capability_key, caller_agent_id).await? {
+            DocumentRuntimeAllowance::Allowed(snapshot) => snapshot,
+            DocumentRuntimeAllowance::Unavailable(response) => return Ok(response),
+        };
+    let source = resolve_document_source(input, workspace_root).await?;
+    let (provider_id, provider_type) =
+        select_document_runtime_provider(&registry_snapshot, tool_name, &source.document_type)
+            .unwrap_or_else(|| {
+                (
+                    "runtime_native:document_runtime".to_string(),
+                    "runtime_native".to_string(),
+                )
+            });
+    let summary = source
+        .extracted_text
+        .as_deref()
+        .map(|text| summarize_document_text(text, 280))
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            Some(format!(
+                "{} 已接入统一文档能力链路，可预览与下载；当前运行时暂未解析正文。",
+                source.file_name
+            ))
+        });
+    let title = if tool_name == "document_extract" {
+        "文档提取结果"
+    } else {
+        "文档解析结果"
+    };
+    let presentable_result = build_document_presentable_result(
+        tool_name,
+        title,
+        &source,
+        summary.as_deref(),
+        None,
+        Vec::new(),
+        Some(serde_json::json!({
+            "operation": tool_name,
+            "supportsPreview": true,
+            "supportsExtractedText": source.extracted_text.is_some(),
+        })),
+    );
+    let response = serde_json::json!({
+        "ok": true,
+        "tool": tool_name,
+        "title": title,
+        "file_name": source.file_name,
+        "document_type": source.document_type,
+        "source_uri": source.source_uri,
+        "preview_url": source.preview_uri,
+        "download_url": source.download_uri,
+        "extracted_text": source.extracted_text,
+        "summary": summary,
+        "presentable_result": presentable_result,
+    });
+    let response = enrich_presentable_payload(
+        response,
+        tool_name,
+        &provider_type,
+        &provider_id,
+        &provider_type,
+        tool_name,
+        presentable_result,
+    );
+    serde_json::to_string_pretty(&response).map_err(|err| format!("Serialize error: {err}"))
+}
+
+async fn tool_document_preview(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let mut attempts = Vec::new();
+    if let Some(result) = dispatch_document_skill_if_available(
+        "document_preview",
+        input,
+        skill_registry,
+        allowed_skills,
+        caller_agent_id,
+        &mut attempts,
+    )
+    .await
+    {
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => attempts.push(format!("document_skill_error({err})")),
+        }
+    }
+    let registry_snapshot = match ensure_document_runtime_allowed(
+        "document_preview",
+        "preview.document",
+        caller_agent_id,
+    )
+    .await?
+    {
+        DocumentRuntimeAllowance::Allowed(snapshot) => snapshot,
+        DocumentRuntimeAllowance::Unavailable(response) => return Ok(response),
+    };
+    let source = resolve_document_source(input, workspace_root).await?;
+    let (provider_id, provider_type) = select_document_runtime_provider(
+        &registry_snapshot,
+        "document_preview",
+        &source.document_type,
+    )
+    .unwrap_or_else(|| {
+        (
+            "runtime_native:office_preview_adapter".to_string(),
+            "runtime_native".to_string(),
+        )
+    });
+    let summary = source
+        .extracted_text
+        .as_deref()
+        .map(|text| summarize_document_text(text, 200))
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some(format!("{} 可在桌面端预览。", source.file_name)));
+    let presentable_result = build_document_presentable_result(
+        "document_preview",
+        "文档预览结果",
+        &source,
+        summary.as_deref(),
+        None,
+        Vec::new(),
+        Some(serde_json::json!({
+            "operation": "document_preview",
+            "previewOnly": true,
+        })),
+    );
+    let response = serde_json::json!({
+        "ok": true,
+        "tool": "document_preview",
+        "file_name": source.file_name,
+        "document_type": source.document_type,
+        "source_uri": source.source_uri,
+        "preview_url": source.preview_uri,
+        "download_url": source.download_uri,
+        "summary": summary,
+        "presentable_result": presentable_result,
+    });
+    let response = enrich_presentable_payload(
+        response,
+        "document_preview",
+        &provider_type,
+        &provider_id,
+        &provider_type,
+        "document_preview",
+        presentable_result,
+    );
+    serde_json::to_string_pretty(&response).map_err(|err| format!("Serialize error: {err}"))
+}
+
+async fn tool_document_summarize(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let mut attempts = Vec::new();
+    if let Some(result) = dispatch_document_skill_if_available(
+        "document_summarize",
+        input,
+        skill_registry,
+        allowed_skills,
+        caller_agent_id,
+        &mut attempts,
+    )
+    .await
+    {
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => attempts.push(format!("document_skill_error({err})")),
+        }
+    }
+    let registry_snapshot = match ensure_document_runtime_allowed(
+        "document_summarize",
+        "summarize.document",
+        caller_agent_id,
+    )
+    .await?
+    {
+        DocumentRuntimeAllowance::Allowed(snapshot) => snapshot,
+        DocumentRuntimeAllowance::Unavailable(response) => return Ok(response),
+    };
+    let source = resolve_document_source(input, workspace_root).await?;
+    let (provider_id, provider_type) = select_document_runtime_provider(
+        &registry_snapshot,
+        "document_summarize",
+        &source.document_type,
+    )
+    .unwrap_or_else(|| {
+        (
+            "model_fallback:native_doc_reasoner".to_string(),
+            "model_fallback".to_string(),
+        )
+    });
+    let Some(extracted_text) = source
+        .extracted_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        let response = build_document_unavailable_response(
+            "document_summarize",
+            "document_unavailable",
+            "当前 document_summarize 仅支持 txt/md/json/csv 等可直接读取文本的文档，二进制文档请先接入组件 skill 或全局文档 provider。",
+            &[attempts, vec![provider_id.clone(), provider_type.clone()]].concat(),
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("Serialize error: {err}"));
+    };
+    let summary = summarize_document_text(extracted_text, 360);
+    let presentable_result = build_document_presentable_result(
+        "document_summarize",
+        "文档摘要结果",
+        &source,
+        Some(&summary),
+        None,
+        Vec::new(),
+        Some(serde_json::json!({
+            "operation": "document_summarize",
+        })),
+    );
+    let response = serde_json::json!({
+        "ok": true,
+        "tool": "document_summarize",
+        "file_name": source.file_name,
+        "document_type": source.document_type,
+        "summary": summary,
+        "source_uri": source.source_uri,
+        "preview_url": source.preview_uri,
+        "download_url": source.download_uri,
+        "extracted_text": extracted_text,
+        "presentable_result": presentable_result,
+    });
+    let response = enrich_presentable_payload(
+        response,
+        "document_summarize",
+        &provider_type,
+        &provider_id,
+        &provider_type,
+        "document_summarize",
+        presentable_result,
+    );
+    serde_json::to_string_pretty(&response).map_err(|err| format!("Serialize error: {err}"))
+}
+
+async fn tool_document_compare(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let mut attempts = Vec::new();
+    if let Some(result) = dispatch_document_skill_if_available(
+        "document_compare",
+        input,
+        skill_registry,
+        allowed_skills,
+        caller_agent_id,
+        &mut attempts,
+    )
+    .await
+    {
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => attempts.push(format!("document_skill_error({err})")),
+        }
+    }
+    let registry_snapshot = match ensure_document_runtime_allowed(
+        "document_compare",
+        "compare.document",
+        caller_agent_id,
+    )
+    .await?
+    {
+        DocumentRuntimeAllowance::Allowed(snapshot) => snapshot,
+        DocumentRuntimeAllowance::Unavailable(response) => return Ok(response),
+    };
+    let left_input = serde_json::json!({
+        "path": pick_document_source_field(input, &["left_path"]).unwrap_or_default(),
+        "file": pick_document_source_field(input, &["left_file"]).unwrap_or_default(),
+        "url": pick_document_source_field(input, &["left_url"]).unwrap_or_default(),
+        "document": pick_document_source_field(input, &["left_document"]).unwrap_or_default(),
+        "file_name": pick_document_source_field(input, &["left_file_name"]).unwrap_or_default(),
+        "document_type": pick_document_source_field(input, &["left_type"]).unwrap_or_default(),
+    });
+    let right_input = serde_json::json!({
+        "path": pick_document_source_field(input, &["right_path"]).unwrap_or_default(),
+        "file": pick_document_source_field(input, &["right_file"]).unwrap_or_default(),
+        "url": pick_document_source_field(input, &["right_url"]).unwrap_or_default(),
+        "document": pick_document_source_field(input, &["right_document"]).unwrap_or_default(),
+        "file_name": pick_document_source_field(input, &["right_file_name"]).unwrap_or_default(),
+        "document_type": pick_document_source_field(input, &["right_type"]).unwrap_or_default(),
+    });
+    let left = resolve_document_source(&left_input, workspace_root).await?;
+    let right = resolve_document_source(&right_input, workspace_root).await?;
+    let preferred_document_type = if left.document_type != "unknown" {
+        left.document_type.clone()
+    } else {
+        right.document_type.clone()
+    };
+    let (provider_id, provider_type) = select_document_runtime_provider(
+        &registry_snapshot,
+        "document_compare",
+        &preferred_document_type,
+    )
+    .unwrap_or_else(|| {
+        (
+            "model_fallback:native_doc_reasoner".to_string(),
+            "model_fallback".to_string(),
+        )
+    });
+    let Some(left_text) = left
+        .extracted_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        let response = build_document_unavailable_response(
+            "document_compare",
+            "document_unavailable",
+            "document_compare 当前仅支持可直接读取文本的左侧文档。",
+            &[
+                attempts.clone(),
+                vec![provider_id.clone(), provider_type.clone()],
+            ]
+            .concat(),
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("Serialize error: {err}"));
+    };
+    let Some(right_text) = right
+        .extracted_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        let response = build_document_unavailable_response(
+            "document_compare",
+            "document_unavailable",
+            "document_compare 当前仅支持可直接读取文本的右侧文档。",
+            &[attempts, vec![provider_id.clone(), provider_type.clone()]].concat(),
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("Serialize error: {err}"));
+    };
+    let diff =
+        build_document_compare_diff(&left.file_name, left_text, &right.file_name, right_text);
+    let summary = format!(
+        "{} 与 {} 的文本对比已完成，共发现 {} 处差异。",
+        left.file_name,
+        right.file_name,
+        diff["changeCount"].as_u64().unwrap_or(0)
+    );
+    let compare_source = ResolvedDocumentSource {
+        source_uri: left.source_uri.clone(),
+        preview_uri: left.preview_uri.clone(),
+        download_uri: left.download_uri.clone(),
+        file_name: format!("{} vs {}", left.file_name, right.file_name),
+        document_type: "compare".to_string(),
+        extracted_text: Some(format!(
+            "## 左侧文档\n{left_text}\n\n## 右侧文档\n{right_text}"
+        )),
+    };
+    let presentable_result = build_document_presentable_result(
+        "document_compare",
+        "文档对比结果",
+        &compare_source,
+        Some(&summary),
+        Some(diff.clone()),
+        Vec::new(),
+        Some(serde_json::json!({
+            "operation": "document_compare",
+            "leftSource": left.source_uri,
+            "rightSource": right.source_uri,
+        })),
+    );
+    let response = serde_json::json!({
+        "ok": true,
+        "tool": "document_compare",
+        "summary": summary,
+        "compare_diff": diff,
+        "presentable_result": presentable_result,
+    });
+    let response = enrich_presentable_payload(
+        response,
+        "document_compare",
+        &provider_type,
+        &provider_id,
+        &provider_type,
+        "document_compare",
+        presentable_result,
+    );
+    serde_json::to_string_pretty(&response).map_err(|err| format!("Serialize error: {err}"))
+}
+
+async fn tool_document_chunk(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let mut attempts = Vec::new();
+    if let Some(result) = dispatch_document_skill_if_available(
+        "document_chunk",
+        input,
+        skill_registry,
+        allowed_skills,
+        caller_agent_id,
+        &mut attempts,
+    )
+    .await
+    {
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => attempts.push(format!("document_skill_error({err})")),
+        }
+    }
+    let registry_snapshot =
+        match ensure_document_runtime_allowed("document_chunk", "chunk.document", caller_agent_id)
+            .await?
+        {
+            DocumentRuntimeAllowance::Allowed(snapshot) => snapshot,
+            DocumentRuntimeAllowance::Unavailable(response) => return Ok(response),
+        };
+    let source = resolve_document_source(input, workspace_root).await?;
+    let (provider_id, provider_type) = select_document_runtime_provider(
+        &registry_snapshot,
+        "document_chunk",
+        &source.document_type,
+    )
+    .unwrap_or_else(|| {
+        (
+            "component_skill:document_parser_component".to_string(),
+            "component_skill".to_string(),
+        )
+    });
+    let Some(extracted_text) = source
+        .extracted_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        let response = build_document_unavailable_response(
+            "document_chunk",
+            "document_unavailable",
+            "document_chunk 当前仅支持 txt/md/json/csv 等可直接读取文本的文档。",
+            &[attempts, vec![provider_id.clone(), provider_type.clone()]].concat(),
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("Serialize error: {err}"));
+    };
+    let chunk_size = input["chunk_size"].as_u64().unwrap_or(1200) as usize;
+    let overlap = input["overlap"].as_u64().unwrap_or(120) as usize;
+    let chunks = chunk_document_text(extracted_text, chunk_size, overlap);
+    let summary = format!(
+        "{} 已切分为 {} 个文本片段。",
+        source.file_name,
+        chunks.len()
+    );
+    let presentable_result = build_document_presentable_result(
+        "document_chunk",
+        "文档切片结果",
+        &source,
+        Some(&summary),
+        None,
+        Vec::new(),
+        Some(serde_json::json!({
+            "operation": "document_chunk",
+            "chunkCount": chunks.len(),
+            "chunkSize": chunk_size,
+            "overlap": overlap,
+        })),
+    );
+    let response = serde_json::json!({
+        "ok": true,
+        "tool": "document_chunk",
+        "summary": summary,
+        "chunks": chunks,
+        "presentable_result": presentable_result,
+    });
+    let response = enrich_presentable_payload(
+        response,
+        "document_chunk",
+        &provider_type,
+        &provider_id,
+        &provider_type,
+        "document_chunk",
+        presentable_result,
+    );
+    serde_json::to_string_pretty(&response).map_err(|err| format!("Serialize error: {err}"))
+}
+
+async fn tool_document_convert(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let mut attempts = Vec::new();
+    if let Some(result) = dispatch_document_skill_if_available(
+        "document_convert",
+        input,
+        skill_registry,
+        allowed_skills,
+        caller_agent_id,
+        &mut attempts,
+    )
+    .await
+    {
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => attempts.push(format!("document_skill_error({err})")),
+        }
+    }
+    let registry_snapshot = match ensure_document_runtime_allowed(
+        "document_convert",
+        "convert.document",
+        caller_agent_id,
+    )
+    .await?
+    {
+        DocumentRuntimeAllowance::Allowed(snapshot) => snapshot,
+        DocumentRuntimeAllowance::Unavailable(response) => return Ok(response),
+    };
+    let source = resolve_document_source(input, workspace_root).await?;
+    let (provider_id, provider_type) = select_document_runtime_provider(
+        &registry_snapshot,
+        "document_convert",
+        &source.document_type,
+    )
+    .unwrap_or_else(|| {
+        (
+            "generic_provider:document_convert_service".to_string(),
+            "generic_provider".to_string(),
+        )
+    });
+    let target_format = pick_document_source_field(input, &["target_format", "format"])
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .ok_or("document_convert requires target_format")?;
+    let Some(extracted_text) = source
+        .extracted_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        let response = build_document_unavailable_response(
+            "document_convert",
+            "document_unavailable",
+            "当前 document_convert 仅支持可直接读取文本的文档转换，请接入组件 skill 或全局转换 provider 处理二进制文档。",
+            &[attempts.clone(), vec![provider_id.clone(), provider_type.clone()]].concat(),
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("Serialize error: {err}"));
+    };
+    if !matches!(target_format.as_str(), "txt" | "md" | "json" | "csv") {
+        let response = build_document_unavailable_response(
+            "document_convert",
+            "document_convert_unsupported",
+            &format!(
+                "当前 runtime document_convert 仅支持转为 txt/md/json/csv，收到: {target_format}"
+            ),
+            &[attempts, vec![provider_id.clone(), provider_type.clone()]].concat(),
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("Serialize error: {err}"));
+    }
+    let workspace = workspace_root.ok_or("document_convert requires workspace_root")?;
+    let output_dir = workspace.join("output");
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|err| format!("创建文档转换输出目录失败: {err}"))?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let base_name = source
+        .file_name
+        .split('.')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("document");
+    let output_name = format!("{base_name}_{timestamp}.{target_format}");
+    let output_path = output_dir.join(&output_name);
+    let output_text = match target_format.as_str() {
+        "json" => serde_json::to_string_pretty(&serde_json::json!({
+            "sourceFile": source.file_name,
+            "documentType": source.document_type,
+            "text": extracted_text,
+        }))
+        .map_err(|err| format!("生成 JSON 转换结果失败: {err}"))?,
+        "md" => format!("# {}\n\n{}", source.file_name, extracted_text),
+        "csv" if source.document_type == "csv" => extracted_text.to_string(),
+        "csv" if document_type_is_spreadsheet(&source.document_type) => {
+            let bytes = read_document_source_bytes(input, workspace_root).await?;
+            let Some((_sheet_name, rows)) = extract_first_spreadsheet_rows_from_bytes(&bytes)?
+            else {
+                let response = build_document_unavailable_response(
+                    "document_convert",
+                    "document_unavailable",
+                    "当前 spreadsheet 文档未读取到可导出的工作表数据。",
+                    &[
+                        attempts.clone(),
+                        vec![provider_id.clone(), provider_type.clone()],
+                    ]
+                    .concat(),
+                );
+                return serde_json::to_string_pretty(&response)
+                    .map_err(|err| format!("Serialize error: {err}"));
+            };
+            render_rows_as_csv(&rows)
+        }
+        "csv" => {
+            let response = build_document_unavailable_response(
+                "document_convert",
+                "document_convert_unsupported",
+                "当前 runtime 仅支持将 spreadsheet/csv 文档转换为 csv。",
+                &[
+                    attempts.clone(),
+                    vec![provider_id.clone(), provider_type.clone()],
+                ]
+                .concat(),
+            );
+            return serde_json::to_string_pretty(&response)
+                .map_err(|err| format!("Serialize error: {err}"));
+        }
+        _ => extracted_text.to_string(),
+    };
+    tokio::fs::write(&output_path, output_text)
+        .await
+        .map_err(|err| format!("写入文档转换结果失败: {err}"))?;
+    let output_uri = output_path.to_string_lossy().to_string();
+    let conversion_outputs = vec![serde_json::json!({
+        "format": target_format,
+        "asset": build_document_asset_ref(
+            &output_uri,
+            &target_format,
+            Some(&output_name),
+            Some(serde_json::json!({
+                "tool": "document_convert",
+                "sourceFile": source.file_name,
+            })),
+        ),
+    })];
+    let summary = format!("{} 已转换为 {}。", source.file_name, target_format);
+    let presentable_result = build_document_presentable_result(
+        "document_convert",
+        "文档转换结果",
+        &source,
+        Some(&summary),
+        None,
+        conversion_outputs.clone(),
+        Some(serde_json::json!({
+            "operation": "document_convert",
+            "targetFormat": target_format,
+        })),
+    );
+    let response = serde_json::json!({
+        "ok": true,
+        "tool": "document_convert",
+        "summary": summary,
+        "output_file": output_uri,
+        "conversion_outputs": conversion_outputs,
+        "presentable_result": presentable_result,
+    });
+    let response = enrich_presentable_payload(
+        response,
+        "document_convert",
+        &provider_type,
+        &provider_id,
+        &provider_type,
+        "document_convert",
+        presentable_result,
+    );
+    serde_json::to_string_pretty(&response).map_err(|err| format!("Serialize error: {err}"))
+}
+
+async fn tool_video_generate(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let prompt = input["prompt"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Missing 'prompt' parameter")?;
+    let self_expression_request = prompt_hits_self_expression(prompt);
+    let has_explicit_media_source = has_any_non_empty_field(
+        input,
+        &[
+            "image_path",
+            "image_url",
+            "image_base64",
+            "source_image",
+            "reference_image",
+            "video_path",
+            "video_url",
+            "video_base64",
+            "source_video",
+        ],
+    );
+    let source_mode = resolve_video_generate_source_mode(
+        input,
+        has_explicit_media_source,
+        self_expression_request,
+    );
+    let self_default_source_request = source_mode == "self_default";
+    let mut owned_input = input.clone();
+    let mut auto_injected_video_source = false;
+    let mut auto_injected_video_source_url: Option<String> = None;
+    if let Some(object) = owned_input.as_object_mut() {
+        object.insert(
+            "source_mode".to_string(),
+            serde_json::Value::String(source_mode.to_string()),
+        );
+    }
+    if self_default_source_request {
+        let purpose = pick_string_field(input, "purpose").unwrap_or("self_video");
+        if let Some(object) = owned_input.as_object_mut() {
+            object.insert(
+                "webot_self_expression_request".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            inject_video_asset_metadata(
+                object,
+                caller_agent_id,
+                "self",
+                "video_generate",
+                Some(purpose),
+                pick_string_field(input, "save_target").or(Some("agent_profile_meta")),
+                pick_string_field(input, "meta_label").or(Some(purpose)),
+            );
+        }
+    }
+    if !has_explicit_media_source && self_default_source_request {
+        if let (Some(kh), Some(agent_id)) = (kernel, caller_agent_id) {
+            let self_ctx = kh.get_agent_self_context(agent_id)?;
+            let source_url = resolve_self_video_source_url(&self_ctx).ok_or_else(|| {
+                "当前没有可用的默认视频源图。请先为该智能体设置默认立绘、默认视频源图或自我照片。".to_string()
+            })?;
+            if let Some(object) = owned_input.as_object_mut() {
+                object.insert(
+                    "image_url".to_string(),
+                    serde_json::Value::String(source_url.clone()),
+                );
+                object.insert(
+                    "webot_self_expression_request".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                object.insert(
+                    "webot_auto_injected_video_source".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                object.insert(
+                    "webot_auto_injected_video_source_url".to_string(),
+                    serde_json::Value::String(source_url.clone()),
+                );
+            }
+            auto_injected_video_source = true;
+            auto_injected_video_source_url = Some(source_url);
+        }
+    } else if self_expression_request {
+        if let Some(object) = owned_input.as_object_mut() {
+            object.insert(
+                "webot_self_expression_request".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+    let input = &owned_input;
+    let selector_candidates = build_skill_dispatch_tool_candidates("video_generate", input);
+    let mut attempts = Vec::new();
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "generate.video", "generic").await;
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "generate.video",
+        "generic",
+        "generic_provider",
+    );
+    let model_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "generate.video",
+        "generic",
+        "model_fallback",
+    );
+
+    if let Some(registry) = skill_registry {
+        if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+            registry,
+            "video_generate",
+            input,
+            allowed_skills,
+            true,
+            caller_agent_id,
+        )
+        .await
+        {
+            match result {
+                Ok(value) => {
+                    return normalize_component_skill_media_output(&value, "video_generate")
+                }
+                Err(err) => attempts.push(format!("component_skill_error({err})")),
+            }
+        }
+        attempts.push(format!(
+            "component_skill({})",
+            selector_candidates.join("/")
+        ));
+        if generic_enabled {
+            if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+                registry,
+                "video_generate",
+                input,
+                allowed_skills,
+                false,
+                caller_agent_id,
+            )
+            .await
+            {
+                match result {
+                    Ok(value) => {
+                        return normalize_component_skill_media_output(&value, "video_generate")
+                    }
+                    Err(err) => attempts.push(format!("generic_skill_error({err})")),
                 }
             }
-            Err(e) => Err(format!("Skill execution failed for {tool_name}: {e}")),
-        },
-    )
+            attempts.push(format!(
+                "generic_provider({})",
+                selector_candidates.join("/")
+            ));
+        } else {
+            attempts.push("generic_provider(disabled_by_registry)".to_string());
+        }
+    }
+
+    if model_enabled {
+        if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+            match kernel
+                .generate_video_with_agent_model(agent_id, input)
+                .await
+            {
+                Ok(result_payload) => {
+                    let presentable_result =
+                        build_video_presentable_result("video_generate", &result_payload, input);
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "tool": "video_generate",
+                        "prompt": prompt,
+                        "route": "model_fallback",
+                        "provider_id": "native_video_model",
+                        "provider_type": "model_fallback",
+                        "provider_tool": "video_generate",
+                        "mime_type": result_payload["mime_type"].as_str().unwrap_or("video/mp4"),
+                        "model": result_payload["model"].as_str().unwrap_or_default(),
+                        "summary": result_payload["summary"].as_str().unwrap_or_default(),
+                        "source_mode": source_mode,
+                        "self_expression": self_expression_request,
+                        "auto_injected_video_source": auto_injected_video_source,
+                        "auto_injected_video_source_url": auto_injected_video_source_url,
+                        "save_target": pick_string_field(input, "save_target")
+                            .or_else(|| pick_string_field(input, "asset_save_target"))
+                            .or(if self_default_source_request {
+                                Some("agent_profile_meta")
+                            } else {
+                                None
+                            }),
+                        "meta_label": pick_string_field(input, "meta_label")
+                            .or_else(|| pick_string_field(input, "asset_meta_label"))
+                            .or(if self_default_source_request {
+                                pick_string_field(input, "purpose").or(Some("self_video"))
+                            } else {
+                                None
+                            }),
+                        "attempts": attempts.clone(),
+                        "video_urls": result_payload["video_urls"].clone(),
+                        "poster_urls": result_payload["poster_urls"].clone(),
+                        "saved_to": result_payload["saved_to"].clone(),
+                        "presentable_result": presentable_result,
+                    });
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => attempts.push(format!("model_fallback({err})")),
+            }
+        } else {
+            attempts.push("model_fallback(unavailable)".to_string());
+        }
+    } else {
+        attempts.push("model_fallback(disabled_by_registry)".to_string());
+    }
+
+    let response = build_video_unavailable_response("video_generate", input, &attempts);
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
+async fn tool_video_edit(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    input["prompt"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Missing 'prompt' parameter")?;
+    let has_video_source = has_any_non_empty_field(
+        input,
+        &[
+            "video_path",
+            "video_url",
+            "video_base64",
+            "source_video",
+            "video",
+        ],
+    );
+    let has_image_source = has_any_non_empty_field(
+        input,
+        &[
+            "image_path",
+            "image_url",
+            "image_base64",
+            "image",
+            "source_image",
+            "reference_image",
+        ],
+    );
+    if !has_video_source && !has_image_source {
+        return Err("video_edit requires a source video or source image. Provide one of video_path/video_url/video_base64/source_video or image_path/image_url/image_base64/source_image.".to_string());
+    }
+    let selector_candidates = build_skill_dispatch_tool_candidates("video_edit", input);
+    let mut attempts = Vec::new();
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "edit.video", "generic").await;
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "edit.video",
+        "generic",
+        "generic_provider",
+    );
+    let model_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "edit.video",
+        "generic",
+        "model_fallback",
+    );
+
+    if let Some(registry) = skill_registry {
+        if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+            registry,
+            "video_edit",
+            input,
+            allowed_skills,
+            true,
+            caller_agent_id,
+        )
+        .await
+        {
+            match result {
+                Ok(value) => return normalize_component_skill_media_output(&value, "video_edit"),
+                Err(err) => attempts.push(format!("component_skill_error({err})")),
+            }
+        }
+        attempts.push(format!(
+            "component_skill({})",
+            selector_candidates.join("/")
+        ));
+        if generic_enabled {
+            if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+                registry,
+                "video_edit",
+                input,
+                allowed_skills,
+                false,
+                caller_agent_id,
+            )
+            .await
+            {
+                match result {
+                    Ok(value) => {
+                        return normalize_component_skill_media_output(&value, "video_edit")
+                    }
+                    Err(err) => attempts.push(format!("generic_skill_error({err})")),
+                }
+            }
+            attempts.push(format!(
+                "generic_provider({})",
+                selector_candidates.join("/")
+            ));
+        } else {
+            attempts.push("generic_provider(disabled_by_registry)".to_string());
+        }
+    }
+
+    if model_enabled {
+        if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+            match kernel.edit_video_with_agent_model(agent_id, input).await {
+                Ok(result_payload) => {
+                    let presentable_result =
+                        build_video_presentable_result("video_edit", &result_payload, input);
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "tool": "video_edit",
+                        "route": "model_fallback",
+                        "provider_id": "native_video_model",
+                        "provider_type": "model_fallback",
+                        "provider_tool": "video_edit",
+                        "source_mode": pick_string_field(input, "source_mode")
+                            .or_else(|| pick_string_field(input, "sourceMode"))
+                            .unwrap_or(if has_video_source { "source_video" } else { "source_image" }),
+                        "mime_type": result_payload["mime_type"].as_str().unwrap_or("video/mp4"),
+                        "model": result_payload["model"].as_str().unwrap_or_default(),
+                        "summary": result_payload["summary"].as_str().unwrap_or_default(),
+                        "save_target": pick_string_field(input, "save_target")
+                            .or_else(|| pick_string_field(input, "asset_save_target")),
+                        "meta_label": pick_string_field(input, "meta_label")
+                            .or_else(|| pick_string_field(input, "asset_meta_label")),
+                        "video_urls": result_payload["video_urls"].clone(),
+                        "poster_urls": result_payload["poster_urls"].clone(),
+                        "saved_to": result_payload["saved_to"].clone(),
+                        "presentable_result": presentable_result,
+                    });
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => attempts.push(format!("model_fallback({err})")),
+            }
+        } else {
+            attempts.push("model_fallback(unavailable)".to_string());
+        }
+    } else {
+        attempts.push("model_fallback(disabled_by_registry)".to_string());
+    }
+
+    let response = build_video_unavailable_response("video_edit", input, &attempts);
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
 /// Get the current inter-agent call depth from the task-local context.
@@ -354,6 +4408,12 @@ pub async fn execute_tool(
         "my_memory_patch" => {
             tool_my_memory_patch(input, workspace_root, kernel, caller_agent_id).await
         }
+        "my_upgrade_review" => {
+            tool_my_upgrade_review(input, workspace_root, kernel, caller_agent_id).await
+        }
+        "my_upgrade_apply" => {
+            tool_my_upgrade_apply(input, workspace_root, kernel, caller_agent_id).await
+        }
         "my_photo_generate" => {
             tool_my_photo_generate(input, workspace_root, kernel, caller_agent_id).await
         }
@@ -379,48 +4439,221 @@ pub async fn execute_tool(
 
         // Image analysis tool
         "image_analyze" => {
-            tool_image_analyze(input, workspace_root, media_engine, kernel, caller_agent_id).await
+            if let Some(registry) = skill_registry {
+                if let Some(result) = dispatch_skill_tool(
+                    registry,
+                    "image_analyze",
+                    input,
+                    allowed_skills,
+                    caller_agent_id,
+                )
+                .await
+                {
+                    match result {
+                        Ok(value) => Ok(value),
+                        Err(_) => {
+                            tool_image_analyze(
+                                input,
+                                workspace_root,
+                                media_engine,
+                                kernel,
+                                caller_agent_id,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    tool_image_analyze(input, workspace_root, media_engine, kernel, caller_agent_id)
+                        .await
+                }
+            } else {
+                tool_image_analyze(input, workspace_root, media_engine, kernel, caller_agent_id)
+                    .await
+            }
         }
 
         // Media understanding tools
         "media_describe" => {
-            tool_media_describe(input, workspace_root, media_engine, kernel, caller_agent_id).await
+            if let Some(registry) = skill_registry {
+                if let Some(result) = dispatch_skill_tool(
+                    registry,
+                    "media_describe",
+                    input,
+                    allowed_skills,
+                    caller_agent_id,
+                )
+                .await
+                {
+                    match result {
+                        Ok(value) => Ok(value),
+                        Err(_) => {
+                            tool_media_describe(
+                                input,
+                                workspace_root,
+                                media_engine,
+                                kernel,
+                                caller_agent_id,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    tool_media_describe(
+                        input,
+                        workspace_root,
+                        media_engine,
+                        kernel,
+                        caller_agent_id,
+                    )
+                    .await
+                }
+            } else {
+                tool_media_describe(input, workspace_root, media_engine, kernel, caller_agent_id)
+                    .await
+            }
         }
         "media_transcribe" => tool_media_transcribe(input, media_engine).await,
 
         // Image generation tool
         "image_generate" => {
-            if let Some(registry) = skill_registry {
-                if let Some(result) =
-                    dispatch_skill_tool(registry, "image_generate", input, allowed_skills).await
-                {
-                    result
-                } else {
-                    tool_image_generate(input, workspace_root, kernel, caller_agent_id).await
-                }
-            } else {
-                tool_image_generate(input, workspace_root, kernel, caller_agent_id).await
-            }
+            tool_image_generate(
+                input,
+                workspace_root,
+                kernel,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
         }
         "image_edit" => {
-            if let Some(registry) = skill_registry {
-                if let Some(result) =
-                    dispatch_skill_tool(registry, "image_edit", input, allowed_skills).await
-                {
-                    result
-                } else {
-                    tool_image_edit(input, workspace_root, kernel, caller_agent_id).await
-                }
-            } else {
-                tool_image_edit(input, workspace_root, kernel, caller_agent_id).await
-            }
+            tool_image_edit(
+                input,
+                workspace_root,
+                kernel,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "video_generate" => {
+            tool_video_generate(
+                input,
+                kernel,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "video_edit" => {
+            tool_video_edit(
+                input,
+                kernel,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "document_parse" => {
+            tool_document_parse(
+                "document_parse",
+                input,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "document_extract" => {
+            tool_document_parse(
+                "document_extract",
+                input,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "document_preview" => {
+            tool_document_preview(
+                input,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "document_summarize" => {
+            tool_document_summarize(
+                input,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "document_compare" => {
+            tool_document_compare(
+                input,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "document_chunk" => {
+            tool_document_chunk(
+                input,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "document_convert" => {
+            tool_document_convert(
+                input,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
         }
 
         // TTS/STT tools
-            "text_to_speech" => {
-                tool_text_to_speech(input, tts_engine, workspace_root, caller_agent_id).await
-            }
-        "speech_to_text" => tool_speech_to_text(input, media_engine, workspace_root).await,
+        "text_to_speech" => {
+            tool_text_to_speech(
+                input,
+                kernel,
+                tts_engine,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
+        "speech_to_text" => {
+            tool_speech_to_text(
+                input,
+                media_engine,
+                workspace_root,
+                caller_agent_id,
+                skill_registry,
+                allowed_skills,
+            )
+            .await
+        }
 
         // Docker sandbox tool
         "docker_exec" => {
@@ -606,7 +4839,8 @@ pub async fn execute_tool(
             // Fallback 2: Skill registry tool providers
             else if let Some(registry) = skill_registry {
                 if let Some(result) =
-                    dispatch_skill_tool(registry, other, input, allowed_skills).await
+                    dispatch_skill_tool(registry, other, input, allowed_skills, caller_agent_id)
+                        .await
                 {
                     result
                 } else {
@@ -619,11 +4853,15 @@ pub async fn execute_tool(
     };
 
     match result {
-        Ok(content) => ToolResult {
-            tool_use_id: tool_use_id.to_string(),
-            content,
-            is_error: false,
-        },
+        Ok(content) => {
+            maybe_upsert_capability_job_from_tool_output(tool_name, &content, caller_agent_id)
+                .await;
+            ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content,
+                is_error: false,
+            }
+        }
         Err(err) => ToolResult {
             tool_use_id: tool_use_id.to_string(),
             content: format!("Error: {err}"),
@@ -836,12 +5074,48 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "my_photo_edit".to_string(),
-            description: "Edit an existing photo of the current agent while preserving the same identity. Use this for your own outfit change, scene change, expression change, pose tweak, or other local updates when a source self-photo already exists. Prefer this over generic image_edit when the task is about the agent itself. By default, self photos are stored under agent_profile/meta so the agent can manage its own media library later; set save_target='output' only when you explicitly want a temporary/default output copy.".to_string(),
+            name: "my_upgrade_review".to_string(),
+            description: "Create a structured self-upgrade review for the current agent only. Use this before any risky self identity/memory/system upgrade. The tool stores a review snapshot with a review_id when possible and returns review_result plus an optional confirm_result so the desktop UI can ask for explicit confirmation.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string", "description": "Describe the exact change to make to the current agent's existing self-photo while preserving the same identity." },
+                    "summary": { "type": "string", "description": "Short upgrade summary in natural language." },
+                    "reason": { "type": "string", "description": "Why this upgrade is being proposed." },
+                    "target_scope": { "type": "string", "description": "Optional scope label such as identity, memory, appearance, prompt, or mixed." },
+                    "risk_level": { "type": "string", "description": "Optional explicit risk level: low, medium, or high." },
+                    "requires_confirmation": { "type": "boolean", "description": "Override whether the upgrade must be confirmed by the user before apply." },
+                    "proposed_changes": {
+                        "type": "array",
+                        "description": "Structured proposed changes. Each item can include kind, target, summary, and payload.",
+                        "items": { "type": "object" }
+                    },
+                    "identity_patch": { "type": "object", "description": "Optional my_identity_patch-compatible payload to apply after review." },
+                    "memory_patch": { "type": "object", "description": "Optional my_memory_patch-compatible payload to apply after review." },
+                    "confirmed_by_user": { "type": "boolean", "description": "Usually false during review; only set true when creating a review after the user has already explicitly approved it." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "my_upgrade_apply".to_string(),
+            description: "Apply a previously reviewed self-upgrade for the current agent only. This tool never accepts a free-form high-risk patch by itself; it requires a review object or review_id, and confirmed_by_user=true when confirmation is required.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "review": { "type": "object", "description": "Full review payload returned by my_upgrade_review." },
+                    "review_result": { "type": "object", "description": "Alias of review." },
+                    "review_id": { "type": "string", "description": "Stored review identifier returned by my_upgrade_review." },
+                    "confirmed_by_user": { "type": "boolean", "description": "Must be true when the review requires explicit confirmation." },
+                    "reason": { "type": "string", "description": "Optional apply reason for audit logging." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "my_photo_edit".to_string(),
+            description: "Edit an existing photo of the current agent while preserving the same identity. Use this for your own outfit change, scene change, expression change, pose tweak, or other local updates when a source self-photo already exists. This tool also supports an optional second reference image for element transfer: the self photo stays as the immutable base, and the reference image only contributes the requested clothing, prop, makeup, hairstyle, or visual element. Prefer this over generic image_edit when the task is about the agent itself. By default, self photos are stored under agent_profile/meta so the agent can manage its own media library later; set save_target='output' only when you explicitly want a temporary/default output copy.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Describe the exact change to make to the current agent's existing self-photo while preserving the same identity. If you pass a second reference image, describe which elements should be transferred from that reference onto the current agent." },
                     "purpose": { "type": "string", "description": "Optional intent label such as self_photo, scene_variant, outfit_change, avatar_refine, or portrait_refine." },
                     "meta_label": { "type": "string", "description": "Optional personal media label stored under agent_profile/meta, such as 今日穿搭, 居家自拍, 最近视频, or 节日写真." },
                     "save_target": { "type": "string", "description": "Optional save target: 'agent_profile_meta' (default for self media) or 'output'." },
@@ -849,6 +5123,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "image_url": { "type": "string", "description": "Optional explicit source self-photo URL. If omitted, the tool will try the current avatar URL first, then portrait URL." },
                     "image_base64": { "type": "string", "description": "Optional explicit base64 source self-photo." },
                     "mime_type": { "type": "string", "description": "Required when image_base64 is provided." },
+                    "reference_image": { "type": "string", "description": "Optional second reference image alias. Use this when the user supplied an external clothing/object/style image that should be merged into the current agent image while keeping the current agent as the base." },
+                    "reference_image_path": { "type": "string", "description": "Optional explicit reference image path for element transfer." },
+                    "reference_image_url": { "type": "string", "description": "Optional explicit reference image URL for element transfer, such as /api/uploads/... or a remote URL." },
+                    "reference_image_base64": { "type": "string", "description": "Optional base64 reference image used only as a material/style/element source." },
+                    "reference_mime_type": { "type": "string", "description": "Required when reference_image_base64 is provided." },
                     "width": { "type": "integer", "description": "Optional output width override." },
                     "height": { "type": "integer", "description": "Optional output height override." },
                     "size": { "type": "string", "description": "Legacy size string such as '1024x1024'." },
@@ -859,14 +5138,19 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "my_photo_generate".to_string(),
-            description: "Create a new photo of the current agent, but always continue from the current avatar first, or the current portrait as fallback, so the same identity anchor stays locked automatically. The runtime injects this self identity anchor for you; the model does not need to pass any source image fields. Use this for new self-photos, same-character roleplay scenes, selfies, portraits, or appearance variants of the current agent. This tool must not create a brand-new unrelated face or replace the current self identity anchor; for unrelated characters or fully new people, use the generic image_generate tool instead. By default, self photos are stored under agent_profile/meta so the agent can manage its own personal media library later; set save_target='output' only when you explicitly want the normal workspace output instead.".to_string(),
+            description: "Create a new photo of the current agent, but always continue from the current avatar first, or the current portrait as fallback, so the same identity anchor stays locked automatically. The runtime injects this self identity anchor for you; the model does not need to pass any base source image fields. This tool also supports an optional second reference image for element fusion: the current agent remains the base identity, while the reference image only contributes the requested clothing, prop, object, makeup, or style detail. Use this for new self-photos, same-character roleplay scenes, selfies, portraits, or appearance variants of the current agent. This tool must not create a brand-new unrelated face or replace the current self identity anchor; for unrelated characters or fully new people, use the generic image_generate tool instead. By default, self photos are stored under agent_profile/meta so the agent can manage its own personal media library later; set save_target='output' only when you explicitly want the normal workspace output instead.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string", "description": "Describe the new photo you want of the current agent." },
+                    "prompt": { "type": "string", "description": "Describe the new photo you want of the current agent. If you pass a second reference image, describe which elements from that reference should appear on the current agent while keeping the same face/person." },
                     "purpose": { "type": "string", "description": "Optional intent label such as self_photo, selfie, avatar_candidate, portrait_candidate, roleplay_scene, or scene_variant." },
                     "meta_label": { "type": "string", "description": "Optional personal media label stored under agent_profile/meta, such as 今日穿搭, 自拍合集, 角色扮演, or 节日写真." },
                     "save_target": { "type": "string", "description": "Optional save target: 'agent_profile_meta' (default for self media) or 'output'." },
+                    "reference_image": { "type": "string", "description": "Optional second reference image alias. Use this when the user supplied an external clothing/object/style image that should be merged into the current agent's generated photo." },
+                    "reference_image_path": { "type": "string", "description": "Optional explicit reference image path for element transfer." },
+                    "reference_image_url": { "type": "string", "description": "Optional explicit reference image URL for element transfer, such as /api/uploads/... or a remote URL." },
+                    "reference_image_base64": { "type": "string", "description": "Optional base64 reference image used only as a material/style/element source." },
+                    "reference_mime_type": { "type": "string", "description": "Required when reference_image_base64 is provided." },
                     "width": { "type": "integer", "description": "Optional output width override." },
                     "height": { "type": "integer", "description": "Optional output height override." },
                     "size": { "type": "string", "description": "Legacy size string such as '1024x1024'." },
@@ -1020,7 +5304,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Image analysis tool ---
         ToolDefinition {
             name: "image_analyze".to_string(),
-            description: "Primary tool for understanding a local, workspace, or chat-uploaded image file. Use this first when the task is to inspect what is in an image, answer questions about an image, summarize a screenshot, or extract visible details from a local image path. When local Florence-2 vision is enabled, the runtime will prefer that local result automatically; otherwise it uses the current agent model vision path and then configured fallback vision providers. Without a prompt, returns basic file metadata and a preview for debugging.".to_string(),
+            description: "Primary tool for understanding a local, workspace, or chat-uploaded image file. Use this first when the task is to inspect what is in an image, answer questions about an image, summarize a screenshot, or extract visible details from a local image path. When local vision is enabled, the runtime will prefer the local Florence-2 + OCR stack automatically; otherwise it uses the current agent model vision path and then configured fallback vision providers. Without a prompt, returns basic file metadata and a preview for debugging.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1143,12 +5427,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Media understanding tools ---
         ToolDefinition {
             name: "media_describe".to_string(),
-            description: "Primary tool for describing a local, workspace, screenshot, or chat-uploaded image when you need a natural-language summary. Prefer this over browser_navigate for any local image path. When local Florence-2 vision is enabled, the runtime will prefer that local result automatically; otherwise it uses the current agent model vision path and then configured fallback vision providers.".to_string(),
+            description: "Primary tool for understanding local/workspace/chat-uploaded media files. For images it uses the local Florence-2 + OCR stack first, then configured vision providers, and only then current-model vision fallback. For audio it routes to speech transcription. For videos it first tries representative-frame analysis plus optional audio understanding, then configured video understanding providers. Prefer this over browser_navigate for local media files.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the image file (relative to workspace)" },
-                    "prompt": { "type": "string", "description": "Optional prompt to guide the description (e.g., 'Extract all text from this image')" }
+                    "path": { "type": "string", "description": "Path to the image/audio/video file (relative to workspace or absolute local file path)" },
+                    "prompt": { "type": "string", "description": "Optional prompt to guide understanding, such as extracting all visible text, describing the scene, or focusing on specific details." }
                 },
                 "required": ["path"]
             }),
@@ -1167,17 +5451,23 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "image_edit".to_string(),
-            description: "Edit a single existing image using a text instruction. Use this when the user wants to keep the same person/identity, the same base picture, or the same overall scene while making targeted changes such as outfit, hairstyle, makeup, pose adjustment, background adjustment, prop changes, retouching, or other fine-to-medium edits. This is the correct generic tool when consistency matters for a non-self image workflow. Default rule: only change the user-requested parts and keep everything else unchanged, including identity, style, composition, lighting, camera angle, and unmentioned details. A source image is required: pass exactly one of `image_path`, `image_url`, or `image_base64` (+ `mime_type`). Prefer passing `image_path` for a file inside the current agent workspace/workdir; the runtime will resolve and upload that local file automatically before editing. Resolution priority: component skill provider first, then configured generic image service editor (ComfyUI built-in Qwen-edit workflow when configured), then the current agent model if it supports image editing. Edited images default to the workspace output/ directory, unless save_target='agent_profile_meta' is explicitly used for self-owned personal media.".to_string(),
+            description: "Edit an existing image using a text instruction. Use this when the user wants to keep the same person/identity, the same base picture, or the same overall scene while making targeted changes such as outfit, hairstyle, makeup, pose adjustment, background adjustment, prop changes, retouching, or other fine-to-medium edits. This tool also supports an optional second reference image: the first image is always the base image to preserve and modify, while the reference image only contributes the requested elements that should be merged into the base. This is the correct generic tool when consistency matters for a non-self image workflow. Default rule: only change the user-requested parts and keep everything else unchanged, including identity, style, composition, lighting, camera angle, and unmentioned details. The base source image is required: pass exactly one of `image_path`, `image_url`, `image_base64`, or `source_image` (+ `mime_type` for base64). Prefer passing `image_path` for a file inside the current agent workspace/workdir; the runtime will resolve and upload that local file automatically before editing. Resolution priority: component skill provider first, then configured generic image service editor (ComfyUI built-in Qwen-edit workflow when configured), then the current agent model if it supports image editing. Edited images default to the workspace output/ directory, unless save_target='agent_profile_meta' is explicitly used for self-owned personal media.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "description": "Modify an existing image while keeping the original as the base. Requires exactly one source image via image_path, image_url, or image_base64 with mime_type.",
+                "description": "Modify an existing image while keeping the first image as the base. You may optionally provide a second reference image whose elements should be transferred into the base image.",
                 "properties": {
-                    "prompt": { "type": "string", "description": "Text instruction describing how to modify the existing input image while preserving the original image as the base. Prefer image_edit when the same person/identity or same base scene should stay recognizable. Only describe the exact requested change, and explicitly keep all other unmentioned elements unchanged. Typical use cases: outfit change, background refinement, prop change, pose tweak, face cleanup, detail retouching, or other fine-to-medium edits." },
+                    "prompt": { "type": "string", "description": "Text instruction describing how to modify the existing base image while preserving it as the main image. If a second reference image is provided, explicitly describe which elements should be transferred from the reference image into the base image. Typical use cases: outfit change, clothing transfer, prop merge, background refinement, pose tweak, face cleanup, detail retouching, or other fine-to-medium edits." },
                     "negative_prompt": { "type": "string", "description": "Optional negative prompt for providers that support it" },
-                    "image_path": { "type": "string", "description": "Preferred only for a real relative or absolute file path inside the agent workspace/local filesystem. Do not use /api/uploads/... here unless you truly mean the chat-upload URL; the runtime will normalize that case automatically." },
-                    "image_url": { "type": "string", "description": "Single source image URL such as /api/uploads/... or an http/https image URL. Prefer this for chat-history images and uploaded images shown in the UI." },
-                    "image_base64": { "type": "string", "description": "Optional base64-encoded source image data" },
+                    "image_path": { "type": "string", "description": "Preferred base image path for a real relative or absolute file path inside the agent workspace/local filesystem. This first image is always the one to preserve and modify." },
+                    "image_url": { "type": "string", "description": "Base image URL such as /api/uploads/... or an http/https image URL. Prefer this for chat-history images and uploaded images shown in the UI. This first image is always the one to preserve and modify." },
+                    "source_image": { "type": "string", "description": "Alias of the base image path or URL. Use this if the calling style already names the main image as source_image." },
+                    "image_base64": { "type": "string", "description": "Optional base64-encoded base image data." },
                     "mime_type": { "type": "string", "description": "Required when image_base64 is provided, e.g. image/png" },
+                    "reference_image": { "type": "string", "description": "Optional second reference image alias. Use this when the user supplied another image whose clothing/object/style elements should be merged into the base image while keeping the first image as the main subject." },
+                    "reference_image_path": { "type": "string", "description": "Optional explicit second reference image path. Only the requested elements from this image should transfer into the base image." },
+                    "reference_image_url": { "type": "string", "description": "Optional explicit second reference image URL, such as /api/uploads/... or an http/https image URL." },
+                    "reference_image_base64": { "type": "string", "description": "Optional base64-encoded second reference image data." },
+                    "reference_mime_type": { "type": "string", "description": "Required when reference_image_base64 is provided, e.g. image/png." },
                     "model": { "type": "string", "description": "Optional legacy model hint for direct OpenAI-compatible fallback. Recommended default: 'gpt-image-1'." },
                     "size": { "type": "string", "description": "Legacy output size string such as '1024x1024'. Ignored when width and height are provided." },
                     "width": { "type": "integer", "description": "Output image width override" },
@@ -1209,6 +5499,174 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "meta_label": { "type": "string", "description": "Optional personal media label used only when save_target='agent_profile_meta', such as 今日穿搭 or 最近视频." }
                 },
                 "required": ["prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "video_generate".to_string(),
+            description: "Generate a video through the unified runtime video pipeline. Resolution order is fixed: first try injected component skills that expose video abilities (for example image2video/text2video), then try globally configured generic video providers, and finally fall back to the current agent model if it supports native video generation. Use one of three stable modes: `source_mode='self_default'` for a video of the current agent itself, `source_mode='image_to_video'` when you already have a source image, or `source_mode='text_to_video'` for prompt-only generation. For the current agent's own self video, prefer `source_mode='self_default'` and pass only the prompt; do not pass image/video source fields, because the runtime can automatically inject the current default video source, portrait, or self photo. Generated videos default to the workspace output/ directory, unless save_target='agent_profile_meta' is explicitly or implicitly used for the current agent's own personal media. Successful results must flow into standardized job_result -> media_result(video) rendering instead of ad-hoc UI prompt rules.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Text instruction for the desired video. Required." },
+                    "source_mode": { "type": "string", "description": "Optional routing hint: 'self_default', 'image_to_video', or 'text_to_video'. Use 'self_default' for a video of the current agent itself without manually passing source media." },
+                    "negative_prompt": { "type": "string", "description": "Optional negative prompt when the provider supports it." },
+                    "image_path": { "type": "string", "description": "Optional local image path when the task is image-to-video. Prefer this for workspace files." },
+                    "image_url": { "type": "string", "description": "Optional image URL or /api/uploads/... URL when the task is image-to-video." },
+                    "image_base64": { "type": "string", "description": "Optional base64 image content when the task is image-to-video." },
+                    "source_image": { "type": "string", "description": "Alias of image_url/image_path for image-to-video providers that conceptually name the field as source_image." },
+                    "reference_image": { "type": "string", "description": "Alias of image_url/image_path when the provider expects a reference image field." },
+                    "mime_type": { "type": "string", "description": "Required when image_base64 is provided, e.g. image/png." },
+                    "duration_seconds": { "type": "integer", "description": "Optional target video duration in seconds." },
+                    "width": { "type": "integer", "description": "Optional target width." },
+                    "height": { "type": "integer", "description": "Optional target height." },
+                    "fps": { "type": "integer", "description": "Optional target frames per second." },
+                    "count": { "type": "integer", "description": "Optional number of videos to generate. Default 1." },
+                    "save_target": { "type": "string", "description": "Optional save target: 'output' (default for normal videos) or 'agent_profile_meta' (default for current-agent self video). Only use agent_profile_meta when the video is explicitly the current agent's own personal media." },
+                    "meta_label": { "type": "string", "description": "Optional personal media label used when save_target='agent_profile_meta', such as 今日自拍视频, 打招呼视频, 最近视频, or 舞蹈片段." }
+                },
+                "required": ["prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "video_edit".to_string(),
+            description: "Edit or transform an existing video result while keeping a source asset as the base. Resolution order is fixed: component skills first, then generic configured video providers, then current-model native capability as the last fallback. Provide a source video or a source image when the edit path is source-conditioned. Use `source_mode='source_video'` when modifying an existing video, or `source_mode='source_image'` when generating a new video from a source image plus edit instructions. Edited videos default to the workspace output/ directory, unless save_target='agent_profile_meta' is explicitly used for the current agent's own personal media.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Text instruction describing how to modify the existing source video or source image into a target video." },
+                    "source_mode": { "type": "string", "description": "Optional routing hint: 'source_video' or 'source_image'. Use 'source_video' when editing an existing video, and 'source_image' when turning a source image into a video with edit-style instructions." },
+                    "video_path": { "type": "string", "description": "Optional local source video path." },
+                    "video_url": { "type": "string", "description": "Optional source video URL or /api/uploads/... URL." },
+                    "video_base64": { "type": "string", "description": "Optional base64 source video content." },
+                    "source_video": { "type": "string", "description": "Alias of video_url/video_path for providers that conceptually name the field as source_video." },
+                    "image_path": { "type": "string", "description": "Optional local source image path for image-conditioned video edit/generation." },
+                    "image_url": { "type": "string", "description": "Optional source image URL when the edit is image-conditioned." },
+                    "image_base64": { "type": "string", "description": "Optional base64 source image content." },
+                    "source_image": { "type": "string", "description": "Alias of image_url/image_path for providers that conceptually name the field as source_image." },
+                    "mime_type": { "type": "string", "description": "Required when video_base64 or image_base64 is provided." },
+                    "duration_seconds": { "type": "integer", "description": "Optional target duration in seconds." },
+                    "width": { "type": "integer", "description": "Optional target width." },
+                    "height": { "type": "integer", "description": "Optional target height." },
+                    "fps": { "type": "integer", "description": "Optional target frames per second." },
+                    "save_target": { "type": "string", "description": "Optional save target: 'output' (default) or 'agent_profile_meta'. Only use agent_profile_meta when the edited video is explicitly the current agent's own personal media." },
+                    "meta_label": { "type": "string", "description": "Optional personal media label used only when save_target='agent_profile_meta', such as 最近视频 or 角色短片." }
+                },
+                "required": ["prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "document_parse".to_string(),
+            description: "Parse a document into the unified document_result pipeline. Resolution order is component skills first, then runtime/native/global providers, then structured unavailable fallback. Supports local files, /api/uploads URLs, /api/management URLs, and remote URLs.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace or absolute file path." },
+                    "file": { "type": "string", "description": "Alias of path." },
+                    "document": { "type": "string", "description": "Alias of path/url." },
+                    "url": { "type": "string", "description": "Remote URL or /api/uploads/... URL." },
+                    "file_name": { "type": "string", "description": "Optional file name override." },
+                    "document_type": { "type": "string", "description": "Optional explicit document type such as pdf/docx/xlsx/pptx/txt/md/json/csv." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "document_extract".to_string(),
+            description: "Extract text and structural metadata from a document. Uses the same routing order as document_parse and returns standardized document_result output.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "file": { "type": "string" },
+                    "document": { "type": "string" },
+                    "url": { "type": "string" },
+                    "file_name": { "type": "string" },
+                    "document_type": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "document_summarize".to_string(),
+            description: "Summarize a document through the unified document routing layer. Component skills can override it; runtime provides a lightweight text-document fallback.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "file": { "type": "string" },
+                    "document": { "type": "string" },
+                    "url": { "type": "string" },
+                    "file_name": { "type": "string" },
+                    "document_type": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "document_convert".to_string(),
+            description: "Convert a document to another format. Component skills/global providers are preferred; runtime provides a lightweight text-document conversion fallback for txt/md/json.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "file": { "type": "string" },
+                    "document": { "type": "string" },
+                    "url": { "type": "string" },
+                    "file_name": { "type": "string" },
+                    "document_type": { "type": "string" },
+                    "target_format": { "type": "string", "description": "Target format, currently txt/md/json in runtime fallback." }
+                },
+                "required": ["target_format"]
+            }),
+        },
+        ToolDefinition {
+            name: "document_compare".to_string(),
+            description: "Compare two documents and return a standardized compare diff inside document_result. Component skills/global providers are preferred; runtime fallback currently supports directly readable text documents.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "left_path": { "type": "string" },
+                    "left_file": { "type": "string" },
+                    "left_document": { "type": "string" },
+                    "left_url": { "type": "string" },
+                    "left_file_name": { "type": "string" },
+                    "left_type": { "type": "string" },
+                    "right_path": { "type": "string" },
+                    "right_file": { "type": "string" },
+                    "right_document": { "type": "string" },
+                    "right_url": { "type": "string" },
+                    "right_file_name": { "type": "string" },
+                    "right_type": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "document_preview".to_string(),
+            description: "Prepare a document preview through the unified document_result pipeline. Desktop renderers can map the result to OfficePreviewCard or MarkdownPreviewCard, while other channels can degrade to links and summary text.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "file": { "type": "string" },
+                    "document": { "type": "string" },
+                    "url": { "type": "string" },
+                    "file_name": { "type": "string" },
+                    "document_type": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "document_chunk".to_string(),
+            description: "Chunk a text-like document into segments through the unified document capability layer. Component skills/global providers are preferred; runtime fallback supports txt/md/json/csv.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "file": { "type": "string" },
+                    "document": { "type": "string" },
+                    "url": { "type": "string" },
+                    "file_name": { "type": "string" },
+                    "document_type": { "type": "string" },
+                    "chunk_size": { "type": "integer", "description": "Chunk size in characters. Default 1200." },
+                    "overlap": { "type": "integer", "description": "Chunk overlap in characters. Default 120." }
+                }
             }),
         },
         // --- Cron scheduling tools ---
@@ -1530,6 +5988,172 @@ fn should_treat_image_ref_as_url(image_ref: &str) -> bool {
         || trimmed.starts_with("api/uploads/")
         || trimmed.starts_with("http://")
         || trimmed.starts_with("https://")
+}
+
+#[derive(Debug, Default, Clone)]
+struct ResolvedToolImageSource {
+    image_path: String,
+    image_url: String,
+    image_base64: String,
+    mime_type: String,
+}
+
+impl ResolvedToolImageSource {
+    fn is_empty(&self) -> bool {
+        self.image_path.trim().is_empty()
+            && self.image_url.trim().is_empty()
+            && self.image_base64.trim().is_empty()
+    }
+
+    fn insert_into(
+        &self,
+        target: &mut serde_json::Map<String, serde_json::Value>,
+        prefix: Option<&str>,
+    ) {
+        let key = |name: &str| match prefix {
+            Some(prefix) => format!("{prefix}_{name}"),
+            None => name.to_string(),
+        };
+        if !self.image_path.trim().is_empty() {
+            target.insert(
+                key("image_path"),
+                serde_json::Value::String(self.image_path.clone()),
+            );
+        }
+        if !self.image_url.trim().is_empty() {
+            target.insert(
+                key("image_url"),
+                serde_json::Value::String(self.image_url.clone()),
+            );
+        }
+        if !self.image_base64.trim().is_empty() {
+            target.insert(
+                key("image_base64"),
+                serde_json::Value::String(self.image_base64.clone()),
+            );
+        }
+        if !self.mime_type.trim().is_empty() {
+            let mime_key = if prefix == Some("reference") {
+                "reference_mime_type".to_string()
+            } else {
+                key("mime_type")
+            };
+            target.insert(mime_key, serde_json::Value::String(self.mime_type.clone()));
+        }
+    }
+}
+
+fn pick_first_string_field<'a>(input: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| pick_string_field(input, key))
+}
+
+fn resolve_tool_image_source(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    path_keys: &[&str],
+    url_keys: &[&str],
+    base64_keys: &[&str],
+    mime_keys: &[&str],
+    alias_keys: &[&str],
+    slot_label: &str,
+    required: bool,
+) -> Result<ResolvedToolImageSource, String> {
+    let mut raw_path = pick_first_string_field(input, path_keys)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut image_url = pick_first_string_field(input, url_keys)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let image_base64 = pick_first_string_field(input, base64_keys)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mime_type = pick_first_string_field(input, mime_keys)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if raw_path.is_empty() && image_url.is_empty() {
+        if let Some(alias) = pick_first_string_field(input, alias_keys) {
+            if should_treat_image_ref_as_url(alias) {
+                image_url = alias.trim().to_string();
+            } else {
+                raw_path = alias.trim().to_string();
+            }
+        }
+    }
+
+    let mut resolved_image_path = None;
+    if !raw_path.trim().is_empty() {
+        if should_treat_image_ref_as_url(&raw_path) {
+            if image_url.trim().is_empty() {
+                image_url = raw_path.trim().to_string();
+            }
+            if let Some(file_id) = extract_local_upload_id(&raw_path) {
+                resolved_image_path =
+                    recover_saved_upload_path_from_workspace(file_id, workspace_root)
+                        .map(|path| path.to_string_lossy().to_string());
+            }
+        } else {
+            resolved_image_path = Some(
+                resolve_media_path(&raw_path, workspace_root)?
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+
+    if resolved_image_path.is_none() && !image_url.trim().is_empty() {
+        if let Some(file_id) = extract_local_upload_id(&image_url) {
+            resolved_image_path = recover_saved_upload_path_from_workspace(file_id, workspace_root)
+                .map(|path| path.to_string_lossy().to_string());
+        }
+    }
+
+    let has_path = resolved_image_path
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_url = !image_url.trim().is_empty();
+    let has_base64 = !image_base64.trim().is_empty();
+    let source_count = [has_path, has_url, has_base64]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+
+    if source_count == 0 {
+        if required {
+            return Err(format!(
+                "{slot_label} requires exactly one source image. Provide one of image_path/image_url/image_base64{}.",
+                if alias_keys.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" or {}", alias_keys.join("/"))
+                }
+            ));
+        }
+        return Ok(ResolvedToolImageSource::default());
+    }
+
+    if source_count > 1 {
+        return Err(format!(
+            "{slot_label} only accepts one source image. Do not mix path/url/base64 inputs in the same slot."
+        ));
+    }
+
+    if has_base64 && mime_type.trim().is_empty() {
+        return Err(format!(
+            "{slot_label} requires a MIME type when using base64 input."
+        ));
+    }
+
+    Ok(ResolvedToolImageSource {
+        image_path: resolved_image_path.unwrap_or_default(),
+        image_url,
+        image_base64,
+        mime_type,
+    })
 }
 
 fn extract_saved_image_path_from_tool_result_content(
@@ -2123,6 +6747,184 @@ fn build_memory_audit_block(memory_type: &str, content: &str, reason: Option<&st
     lines.join("\n")
 }
 
+fn self_upgrade_review_storage_key(agent_id: &str, review_id: &str) -> String {
+    format!("self_upgrade_review:{agent_id}:{review_id}")
+}
+
+fn normalize_upgrade_risk_level(value: Option<&str>) -> String {
+    match value
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or("medium")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "low" => "low".to_string(),
+        "high" | "critical" => "high".to_string(),
+        _ => "medium".to_string(),
+    }
+}
+
+fn extract_upgrade_review_record(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let object = value.as_object()?;
+    if let Some(review) = object.get("review") {
+        return extract_upgrade_review_record(review).or_else(|| Some(review.clone()));
+    }
+    if object.contains_key("review_id") || object.contains_key("reviewId") {
+        return Some(value.clone());
+    }
+    None
+}
+
+fn infer_upgrade_target_scope(
+    explicit_scope: Option<&str>,
+    identity_patch: Option<&serde_json::Value>,
+    memory_patch: Option<&serde_json::Value>,
+) -> String {
+    if let Some(value) = explicit_scope
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        return value.to_string();
+    }
+    match (identity_patch.is_some(), memory_patch.is_some()) {
+        (true, true) => "mixed".to_string(),
+        (true, false) => "identity".to_string(),
+        (false, true) => "memory".to_string(),
+        (false, false) => "self".to_string(),
+    }
+}
+
+fn infer_upgrade_risk_level(
+    explicit_level: Option<&str>,
+    identity_patch: Option<&serde_json::Value>,
+    memory_patch: Option<&serde_json::Value>,
+    target_scope: &str,
+) -> String {
+    if explicit_level.is_some() {
+        return normalize_upgrade_risk_level(explicit_level);
+    }
+    if let Some(identity_patch) = identity_patch.and_then(serde_json::Value::as_object) {
+        if identity_patch.get("system_prompt").is_some()
+            || identity_patch.get("avatar_url").is_some()
+            || identity_patch
+                .get("files")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|files| {
+                    files.keys().any(|name| {
+                        matches!(
+                            name.as_str(),
+                            "IDENTITY.md" | "SOUL.md" | "AGENTS.md" | "BOOTSTRAP.md"
+                        )
+                    })
+                })
+        {
+            return "high".to_string();
+        }
+    }
+    if memory_patch.is_some() || matches!(target_scope, "mixed" | "identity") {
+        return "medium".to_string();
+    }
+    "low".to_string()
+}
+
+fn build_upgrade_proposed_changes(
+    explicit_changes: Option<&serde_json::Value>,
+    identity_patch: Option<&serde_json::Value>,
+    memory_patch: Option<&serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut changes = explicit_changes
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(identity_patch) = identity_patch {
+        let summary = if let Some(files) = identity_patch
+            .get("files")
+            .and_then(serde_json::Value::as_object)
+        {
+            if files.is_empty() {
+                "更新自我身份字段".to_string()
+            } else {
+                format!(
+                    "更新身份文件：{}",
+                    files.keys().cloned().collect::<Vec<_>>().join("、")
+                )
+            }
+        } else if identity_patch.get("system_prompt").is_some() {
+            "更新系统提示词".to_string()
+        } else if identity_patch.get("avatar_url").is_some() {
+            "更新头像或外观锚点".to_string()
+        } else {
+            "更新自我身份配置".to_string()
+        };
+        changes.push(serde_json::json!({
+            "kind": "identity_patch",
+            "target": "self_identity",
+            "summary": summary,
+            "payload": identity_patch,
+        }));
+    }
+    if let Some(memory_patch) = memory_patch {
+        let memory_type = memory_patch
+            .get("memory_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .unwrap_or("self_upgrade_note");
+        changes.push(serde_json::json!({
+            "kind": "memory_patch",
+            "target": "self_memory",
+            "summary": format!("写入自我记忆（{memory_type}）"),
+            "payload": memory_patch,
+        }));
+    }
+    changes
+}
+
+async fn append_capability_audit_log_to_webot(
+    action: &str,
+    provider_id: Option<&str>,
+    agent_id: Option<&str>,
+    capability_key: Option<&str>,
+    capability_scope: Option<&str>,
+    payload: &serde_json::Value,
+) {
+    let Some(service_base) = webot_service_base_url() else {
+        return;
+    };
+    let body = serde_json::json!({
+        "action": action,
+        "provider_id": provider_id,
+        "agent_id": agent_id,
+        "capability_key": capability_key,
+        "capability_scope": capability_scope,
+        "payload": payload,
+    });
+    match reqwest::Client::new()
+        .post(format!("{service_base}/api/management/audit/capabilities"))
+        .timeout(std::time::Duration::from_secs(8))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            warn!(
+                action = action,
+                status = %response.status(),
+                "Failed to append capability audit log to Webot service"
+            );
+        }
+        Err(error) => {
+            warn!(
+                action = action,
+                error = %error,
+                "Failed to post capability audit log to Webot service"
+            );
+        }
+    }
+}
+
 async fn append_to_memory_md(
     workspace_root: Option<&Path>,
     content: &str,
@@ -2149,6 +6951,32 @@ fn pick_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a 
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|item| !item.is_empty())
+}
+
+fn resolve_video_generate_source_mode(
+    input: &serde_json::Value,
+    has_explicit_media_source: bool,
+    self_expression_request: bool,
+) -> &'static str {
+    let explicit = pick_string_field(input, "source_mode")
+        .or_else(|| pick_string_field(input, "sourceMode"))
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match explicit.as_str() {
+        "self_default" | "self" | "agent_self" | "self_video" => "self_default",
+        "image_to_video" | "image2video" | "image" => "image_to_video",
+        "text_to_video" | "text2video" | "text" => "text_to_video",
+        _ => {
+            if self_expression_request {
+                "self_default"
+            } else if has_explicit_media_source {
+                "image_to_video"
+            } else {
+                "text_to_video"
+            }
+        }
+    }
 }
 
 fn build_image_asset_metadata(
@@ -2244,6 +7072,52 @@ fn inject_image_asset_metadata(
     save_target: Option<&str>,
     meta_label: Option<&str>,
 ) {
+    inject_media_asset_metadata(
+        map,
+        caller_agent_id,
+        owner_scope,
+        source_tool,
+        "photo",
+        "image",
+        purpose,
+        save_target,
+        meta_label,
+    );
+}
+
+fn inject_video_asset_metadata(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    caller_agent_id: Option<&str>,
+    owner_scope: &str,
+    source_tool: &str,
+    purpose: Option<&str>,
+    save_target: Option<&str>,
+    meta_label: Option<&str>,
+) {
+    inject_media_asset_metadata(
+        map,
+        caller_agent_id,
+        owner_scope,
+        source_tool,
+        "video",
+        "video",
+        purpose,
+        save_target,
+        meta_label,
+    );
+}
+
+fn inject_media_asset_metadata(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    caller_agent_id: Option<&str>,
+    owner_scope: &str,
+    source_tool: &str,
+    asset_family: &str,
+    media_kind: &str,
+    purpose: Option<&str>,
+    save_target: Option<&str>,
+    meta_label: Option<&str>,
+) {
     if let Some(agent_id) = caller_agent_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -2263,11 +7137,11 @@ fn inject_image_asset_metadata(
     );
     map.insert(
         "asset_family".to_string(),
-        serde_json::Value::String("photo".to_string()),
+        serde_json::Value::String(asset_family.to_string()),
     );
     map.insert(
         "media_kind".to_string(),
-        serde_json::Value::String("image".to_string()),
+        serde_json::Value::String(media_kind.to_string()),
     );
     if let Some(purpose) = purpose.filter(|value| !value.trim().is_empty()) {
         map.insert(
@@ -2289,79 +7163,212 @@ fn inject_image_asset_metadata(
     }
 }
 
+fn embodiment_asset_url(self_ctx: &serde_json::Value, field: &str) -> Option<String> {
+    self_ctx
+        .get("embodiment")
+        .and_then(|value| value.get("assets"))
+        .and_then(|value| value.get(field))
+        .and_then(|value| value.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn embodiment_first_self_photo_url(self_ctx: &serde_json::Value) -> Option<String> {
+    self_ctx
+        .get("embodiment")
+        .and_then(|value| value.get("assets"))
+        .and_then(|value| value.get("selfPhotos"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item.get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            })
+        })
+}
+
+fn resolve_default_self_image_url(self_ctx: &serde_json::Value) -> Option<String> {
+    embodiment_asset_url(self_ctx, "defaultPortrait")
+        .or_else(|| embodiment_asset_url(self_ctx, "defaultAvatar"))
+        .or_else(|| embodiment_first_self_photo_url(self_ctx))
+        .or_else(|| {
+            self_ctx
+                .get("portrait_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            self_ctx
+                .get("avatar_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn resolve_self_video_source_url(self_ctx: &serde_json::Value) -> Option<String> {
+    embodiment_asset_url(self_ctx, "defaultVideoSource")
+        .or_else(|| embodiment_asset_url(self_ctx, "defaultPortrait"))
+        .or_else(|| embodiment_first_self_photo_url(self_ctx))
+        .or_else(|| {
+            self_ctx
+                .get("portrait_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            self_ctx
+                .get("avatar_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn prompt_hits_self_expression(prompt: &str) -> bool {
+    let compact = prompt.trim();
+    if compact.is_empty() {
+        return false;
+    }
+    if [
+        "用你自己",
+        "按你当前形象",
+        "按你现在的样子",
+        "用你现在的样子",
+        "用你当前照片",
+        "按你当前照片",
+        "沿用你当前照片里的形象",
+        "沿用你当前形象",
+        "用你的照片",
+        "用你的立绘",
+        "用你的自拍",
+        "用你的形象",
+        "用你的声音",
+        "你自己说",
+        "以你自己的身份来表达",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle))
+    {
+        return true;
+    }
+
+    (compact.contains("你的视频")
+        || compact.contains("一段你的视频")
+        || compact.contains("你来出镜")
+        || compact.contains("让你出镜"))
+        && (compact.contains("生成")
+            || compact.contains("做")
+            || compact.contains("来一段")
+            || compact.contains("拍")
+            || compact.contains("跳舞")
+            || compact.contains("出镜")
+            || compact.contains("动起来"))
+}
+
+fn resolve_self_default_voice_binding(
+    self_ctx: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let voice_object = self_ctx
+        .get("embodiment")
+        .and_then(|value| value.get("voice"))
+        .and_then(|value| value.get("defaultVoice"));
+    let speaker_profile_id = voice_object
+        .and_then(|value| value.get("speakerProfileId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            self_ctx
+                .get("tts_config")
+                .and_then(|value| value.get("speakerProfileId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        });
+    let voice = voice_object
+        .and_then(|value| value.get("voice"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    (speaker_profile_id, voice)
+}
+
 fn resolve_self_identity_anchor_source(
     self_ctx: &serde_json::Value,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let mut source = serde_json::Map::new();
-    if let Some(url) = self_ctx
-        .get("avatar_url")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(url) = resolve_default_self_image_url(self_ctx) {
         source.insert(
             "image_url".to_string(),
             serde_json::Value::String(url.to_string()),
         );
-    } else if let Some(url) = self_ctx
-        .get("portrait_url")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        source.insert(
-            "image_url".to_string(),
-            serde_json::Value::String(url.to_string()),
-        );
-    } else if let Some(url) = self_ctx
-        .get("portrait_url")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        source.insert(
-            "image_url".to_string(),
-            serde_json::Value::String(url.to_string()),
-        );
-    } else {
-        return Err(
-            "No self-photo identity anchor is available. my_photo_generate can only continue from your current avatar or portrait. Set the current avatar/portrait first. If you want a brand-new unrelated person or roleplay character, use image_generate instead.".to_string(),
-        );
+        return Ok(source);
     }
-    Ok(source)
+    Err(
+        "No self-photo identity anchor is available. my_photo_generate can only continue from your current default portrait, avatar, or self photo. Set the current avatar/portrait first. If you want a brand-new unrelated person or roleplay character, use image_generate instead.".to_string(),
+    )
 }
 
 fn resolve_self_photo_source(
     input: &serde_json::Value,
     self_ctx: &serde_json::Value,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let mut source = serde_json::Map::new();
-    if let Some(path) = pick_string_field(input, "image_path") {
-        source.insert(
-            "image_path".to_string(),
-            serde_json::Value::String(path.to_string()),
-        );
-    } else if let Some(url) = pick_string_field(input, "image_url") {
-        source.insert(
-            "image_url".to_string(),
-            serde_json::Value::String(url.to_string()),
-        );
-    } else if let Some(base64) = pick_string_field(input, "image_base64") {
-        let mime_type = pick_string_field(input, "mime_type")
-            .ok_or_else(|| "mime_type is required when image_base64 is provided".to_string())?;
-        source.insert(
-            "image_base64".to_string(),
-            serde_json::Value::String(base64.to_string()),
-        );
-        source.insert(
-            "mime_type".to_string(),
-            serde_json::Value::String(mime_type.to_string()),
-        );
-        return Ok(source);
-    } else {
+    let resolved = resolve_tool_image_source(
+        input,
+        None,
+        &["image_path"],
+        &["image_url"],
+        &["image_base64"],
+        &["mime_type"],
+        &["source_image"],
+        "my_photo_edit source",
+        false,
+    )?;
+    if resolved.is_empty() {
         return resolve_self_identity_anchor_source(self_ctx);
     }
+    let mut source = serde_json::Map::new();
+    resolved.insert_into(&mut source, None);
     Ok(source)
+}
+
+fn extend_reference_image_source(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    slot_label: &str,
+) -> Result<(), String> {
+    let resolved = resolve_tool_image_source(
+        input,
+        workspace_root,
+        &["reference_image_path"],
+        &["reference_image_url"],
+        &["reference_image_base64"],
+        &["reference_mime_type"],
+        &["reference_image"],
+        slot_label,
+        false,
+    )?;
+    if resolved.is_empty() {
+        return Ok(());
+    }
+    resolved.insert_into(target, Some("reference"));
+    Ok(())
 }
 
 async fn tool_my_identity_patch(
@@ -2540,6 +7547,283 @@ async fn tool_my_memory_patch(
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
+async fn tool_my_upgrade_review(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let (kh, agent_id) = require_self_tool_context(kernel, caller_agent_id)?;
+    let _ = workspace_root;
+    let self_ctx = kh.get_agent_self_context(agent_id)?;
+    let identity_patch = input.get("identity_patch").cloned();
+    let memory_patch = input.get("memory_patch").cloned();
+    let proposed_changes = build_upgrade_proposed_changes(
+        input.get("proposed_changes"),
+        identity_patch.as_ref(),
+        memory_patch.as_ref(),
+    );
+    let summary = pick_string_field(input, "summary")
+        .or_else(|| pick_string_field(input, "reason"))
+        .or_else(|| {
+            if proposed_changes.is_empty() {
+                None
+            } else {
+                Some("当前智能体需要执行一轮自我升级")
+            }
+        })
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            "my_upgrade_review requires summary/reason or at least one proposed identity/memory change."
+                .to_string()
+        })?;
+    let target_scope = infer_upgrade_target_scope(
+        pick_string_field(input, "target_scope"),
+        identity_patch.as_ref(),
+        memory_patch.as_ref(),
+    );
+    let risk_level = infer_upgrade_risk_level(
+        pick_string_field(input, "risk_level"),
+        identity_patch.as_ref(),
+        memory_patch.as_ref(),
+        &target_scope,
+    );
+    let requires_confirmation = input
+        .get("requires_confirmation")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| risk_level != "low");
+    let review_id = pick_string_field(input, "review_id")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("upgrade-review-{}", uuid::Uuid::new_v4()));
+    let review_key = self_upgrade_review_storage_key(agent_id, &review_id);
+    let review_record = serde_json::json!({
+        "review_id": review_id,
+        "agent_id": agent_id,
+        "target_scope": target_scope,
+        "risk_level": risk_level,
+        "summary": summary,
+        "reason": pick_string_field(input, "reason"),
+        "requires_confirmation": requires_confirmation,
+        "proposed_changes": proposed_changes,
+        "identity_patch": identity_patch,
+        "memory_patch": memory_patch,
+        "self_context_snapshot": self_ctx,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let stored = kh.memory_store(&review_key, review_record.clone()).is_ok();
+    append_capability_audit_log_to_webot(
+        "self_upgrade_review",
+        None,
+        Some(agent_id),
+        Some("review.upgrade"),
+        Some("self"),
+        &serde_json::json!({
+            "review_id": review_id,
+            "review_key": review_key,
+            "stored": stored,
+            "risk_level": review_record.get("risk_level").cloned().unwrap_or(serde_json::Value::Null),
+            "target_scope": review_record.get("target_scope").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    )
+    .await;
+    let response = serde_json::json!({
+        "ok": true,
+        "review_id": review_id,
+        "review_key": review_key,
+        "stored": stored,
+        "review": review_record,
+        "presentable_result": {
+            "kind": "review_result",
+            "title": "自我升级审查",
+            "summary": summary,
+            "reviewId": review_id,
+            "targetScope": review_record.get("target_scope").cloned().unwrap_or(serde_json::Value::Null),
+            "riskLevel": review_record.get("risk_level").cloned().unwrap_or(serde_json::Value::Null),
+            "reason": pick_string_field(input, "reason"),
+            "requiresConfirmation": requires_confirmation,
+            "proposedChanges": review_record.get("proposed_changes").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+            "confirmAction": "confirm_self_upgrade",
+            "cancelAction": "cancel_self_upgrade",
+            "confirmLabel": "确认升级",
+            "cancelLabel": "暂不升级",
+            "payload": {
+                "reviewId": review_id,
+                "review": review_record,
+            }
+        }
+    });
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
+async fn tool_my_upgrade_apply(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let (kh, agent_id) = require_self_tool_context(kernel, caller_agent_id)?;
+    let review = input
+        .get("review")
+        .and_then(extract_upgrade_review_record)
+        .or_else(|| input.get("review_result").and_then(extract_upgrade_review_record))
+        .or_else(|| {
+            let review_id = pick_string_field(input, "review_id")?;
+            let review_key = self_upgrade_review_storage_key(agent_id, &review_id);
+            kh.memory_recall(&review_key)
+                .ok()
+                .flatten()
+                .and_then(|value| extract_upgrade_review_record(&value).or(Some(value)))
+        })
+        .ok_or_else(|| {
+            "my_upgrade_apply requires a review object or a resolvable review_id from my_upgrade_review."
+                .to_string()
+        })?;
+    let review_object = review
+        .as_object()
+        .ok_or_else(|| "upgrade review payload must be a JSON object".to_string())?;
+    let review_id = review_object
+        .get("review_id")
+        .or_else(|| review_object.get("reviewId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .ok_or_else(|| "upgrade review payload is missing review_id".to_string())?;
+    let requires_confirmation = review_object
+        .get("requires_confirmation")
+        .or_else(|| review_object.get("requiresConfirmation"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let confirmed_by_user = bool_flag(input, "confirmed_by_user");
+    if requires_confirmation && !confirmed_by_user {
+        let confirm_response = serde_json::json!({
+            "ok": false,
+            "review_id": review_id,
+            "requires_confirmation": true,
+            "presentable_result": {
+                "kind": "confirm_result",
+                "title": "确认自我升级",
+                "summary": review_object.get("summary").cloned().unwrap_or(serde_json::Value::String("该升级需要显式确认".to_string())),
+                "description": "当前升级审查被标记为需要用户确认；确认后才允许执行 my_upgrade_apply。",
+                "riskLevel": review_object.get("risk_level").or_else(|| review_object.get("riskLevel")).cloned().unwrap_or(serde_json::Value::String("medium".to_string())),
+                "confirmAction": "confirm_self_upgrade",
+                "cancelAction": "cancel_self_upgrade",
+                "confirmLabel": "确认并应用",
+                "cancelLabel": "取消升级",
+                "payload": {
+                    "reviewId": review_id,
+                    "review": review,
+                }
+            }
+        });
+        return serde_json::to_string_pretty(&confirm_response)
+            .map_err(|e| format!("Serialize error: {e}"));
+    }
+
+    let mut applied_changes = Vec::new();
+    let mut identity_result = None;
+    if let Some(identity_patch) = review_object
+        .get("identity_patch")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    {
+        let mut delegated = identity_patch;
+        delegated.insert(
+            "confirmed_by_user".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        if !delegated.contains_key("reason") {
+            delegated.insert(
+                "reason".to_string(),
+                serde_json::Value::String(
+                    pick_string_field(input, "reason")
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("apply review {}", review_id)),
+                ),
+            );
+        }
+        let result = tool_my_identity_patch(
+            &serde_json::Value::Object(delegated),
+            workspace_root,
+            kernel,
+            caller_agent_id,
+        )
+        .await?;
+        identity_result = Some(
+            serde_json::from_str::<serde_json::Value>(&result)
+                .unwrap_or_else(|_| serde_json::Value::String(result.clone())),
+        );
+        applied_changes.push("已应用身份与文件更新".to_string());
+    }
+
+    let mut memory_result = None;
+    if let Some(memory_patch) = review_object
+        .get("memory_patch")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    {
+        let mut delegated = memory_patch;
+        if !delegated.contains_key("reason") {
+            delegated.insert(
+                "reason".to_string(),
+                serde_json::Value::String(
+                    pick_string_field(input, "reason")
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("apply review {}", review_id)),
+                ),
+            );
+        }
+        let result = tool_my_memory_patch(
+            &serde_json::Value::Object(delegated),
+            workspace_root,
+            kernel,
+            caller_agent_id,
+        )
+        .await?;
+        memory_result = Some(
+            serde_json::from_str::<serde_json::Value>(&result)
+                .unwrap_or_else(|_| serde_json::Value::String(result.clone())),
+        );
+        applied_changes.push("已写入自我记忆补丁".to_string());
+    }
+
+    if applied_changes.is_empty() {
+        return Err(
+            "The reviewed upgrade does not contain identity_patch or memory_patch payloads to apply."
+                .to_string(),
+        );
+    }
+
+    append_capability_audit_log_to_webot(
+        "self_upgrade_apply",
+        None,
+        Some(agent_id),
+        Some("apply.upgrade"),
+        Some("self"),
+        &serde_json::json!({
+            "review_id": review_id,
+            "applied_changes": applied_changes,
+        }),
+    )
+    .await;
+
+    let response = serde_json::json!({
+        "ok": true,
+        "review_id": review_id,
+        "identity_result": identity_result,
+        "memory_result": memory_result,
+        "presentable_result": {
+            "kind": "patch_result",
+            "title": "自我升级已应用",
+            "summary": review_object.get("summary").cloned().unwrap_or(serde_json::Value::String("已根据审查结果完成自我升级".to_string())),
+            "reviewId": review_id,
+            "targetScope": review_object.get("target_scope").or_else(|| review_object.get("targetScope")).cloned().unwrap_or(serde_json::Value::String("self".to_string())),
+            "riskLevel": review_object.get("risk_level").or_else(|| review_object.get("riskLevel")).cloned().unwrap_or(serde_json::Value::String("medium".to_string())),
+            "appliedChanges": applied_changes,
+        }
+    });
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
 async fn tool_my_photo_generate(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
@@ -2566,6 +7850,12 @@ async fn tool_my_photo_generate(
         )),
     );
     delegated.extend(resolve_self_identity_anchor_source(&self_ctx)?);
+    extend_reference_image_source(
+        &mut delegated,
+        input,
+        workspace_root,
+        "my_photo_generate reference",
+    )?;
     for key in [
         "negative_prompt",
         "model",
@@ -2593,6 +7883,8 @@ async fn tool_my_photo_generate(
         workspace_root,
         kernel,
         caller_agent_id,
+        None,
+        None,
     )
     .await
 }
@@ -2617,6 +7909,12 @@ async fn tool_my_photo_edit(
         )),
     );
     delegated.extend(resolve_self_photo_source(input, &self_ctx)?);
+    extend_reference_image_source(
+        &mut delegated,
+        input,
+        workspace_root,
+        "my_photo_edit reference",
+    )?;
     for key in [
         "negative_prompt",
         "model",
@@ -2644,6 +7942,8 @@ async fn tool_my_photo_edit(
         workspace_root,
         kernel,
         caller_agent_id,
+        None,
+        None,
     )
     .await
 }
@@ -3456,6 +8756,36 @@ async fn tool_image_analyze(
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let prompt = input["prompt"].as_str().map(str::trim).unwrap_or("");
     let path = resolve_media_path(raw_path, workspace_root)?;
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "analyze.media", "generic").await;
+    let local_enabled = registry_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            registry_provider_is_enabled(
+                snapshot,
+                "runtime_native:local_vision_service",
+                "analyze.media",
+                "generic",
+            ) || registry_provider_is_enabled(
+                snapshot,
+                "runtime_native:ocr_service",
+                "analyze.media",
+                "generic",
+            )
+        })
+        .unwrap_or(true);
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "analyze.media",
+        "generic",
+        "generic_provider",
+    );
+    let model_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "analyze.media",
+        "generic",
+        "model_fallback",
+    );
 
     let data = tokio::fs::read(&path)
         .await
@@ -3510,16 +8840,31 @@ async fn tool_image_analyze(
         };
         let vision_result = match mime {
             Some(mime_type) => {
-                let local_vision_error =
-                    match crate::local_vision::analyze_image_path_with_local_service(
+                if !local_enabled && !generic_enabled && !model_enabled {
+                    let response = build_capability_unavailable_response(
+                        "image_analyze",
+                        "视觉分析当前不可用",
+                        "vision_unavailable",
+                        "视觉分析能力已被 registry 禁用，未找到可用的本地视觉、全局视觉 provider 或模型兜底。",
+                        &[
+                            "runtime_native(disabled_by_registry)".to_string(),
+                            "generic_provider(disabled_by_registry)".to_string(),
+                            "model_fallback(disabled_by_registry)".to_string(),
+                        ],
+                    );
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                let local_vision_error = if local_enabled {
+                    match crate::local_vision::analyze_image_path_with_local_service_detail(
                         &path,
                         mime_type,
                         Some(prompt),
                     )
                     .await
                     {
-                        Ok(Some(understanding)) => {
-                            let local_json = serde_json::to_value(&understanding)
+                        Ok(Some(detail)) => {
+                            let local_json = serde_json::to_value(&detail)
                                 .map_err(|e| format!("Serialize error: {e}"))?;
                             result["vision_analysis"] = local_json;
                             return serde_json::to_string_pretty(&result)
@@ -3527,7 +8872,10 @@ async fn tool_image_analyze(
                         }
                         Ok(None) => None,
                         Err(err) => Some(err),
-                    };
+                    }
+                } else {
+                    Some("Local vision stack disabled by registry.".to_string())
+                };
                 describe_image_bytes_with_timeouts(
                     prompt,
                     mime_type,
@@ -3535,13 +8883,15 @@ async fn tool_image_analyze(
                     media_engine,
                     kernel,
                     caller_agent_id,
+                    generic_enabled,
+                    model_enabled,
                     std::time::Duration::from_secs(CURRENT_MODEL_VISION_TIMEOUT_SECS),
                     std::time::Duration::from_secs(FALLBACK_VISION_TIMEOUT_SECS),
                 )
                 .await
                 .map_err(|err| match local_vision_error {
                     Some(local_err) => {
-                        format!("Local Florence-2 path failed: {local_err} | {err}")
+                        format!("Local vision stack failed: {local_err} | {err}")
                     }
                     None => err,
                 })
@@ -3746,56 +9096,235 @@ async fn tool_media_describe_with_timeouts(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(
-            "Describe this image in detail. Extract visible text, numbers, tables, charts, UI elements, and any other relevant information.",
+            "Describe this media in detail. For images, extract visible text, numbers, tables, charts, UI elements, and any other relevant information. For videos, summarize the visible scene and any spoken or embedded text. For audio, transcribe the content accurately.",
         );
     let path = resolve_media_path(raw_path, workspace_root)?;
-
-    // Read image file
-    let data = tokio::fs::read(&path)
-        .await
-        .map_err(|e| format!("Failed to read image file: {e}"))?;
-
-    // Detect MIME type from extension
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "analyze.media", "generic").await;
+    let local_enabled = registry_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            registry_provider_is_enabled(
+                snapshot,
+                "runtime_native:local_vision_service",
+                "analyze.media",
+                "generic",
+            ) || registry_provider_is_enabled(
+                snapshot,
+                "runtime_native:ocr_service",
+                "analyze.media",
+                "generic",
+            )
+        })
+        .unwrap_or(true);
+    let runtime_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "analyze.media",
+        "generic",
+        "runtime_native",
+    );
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "analyze.media",
+        "generic",
+        "generic_provider",
+    );
+    let model_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "analyze.media",
+        "generic",
+        "model_fallback",
+    );
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
-        _ => return Err(format!("Unsupported image format: .{ext}")),
-    };
-    let local_vision_error =
-        match crate::local_vision::analyze_image_path_with_local_service(&path, mime, Some(prompt))
-            .await
-        {
-            Ok(Some(understanding)) => {
-                return serde_json::to_string_pretty(&understanding)
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => {
+            let data = tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("Failed to read image file: {e}"))?;
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                "bmp" => "image/bmp",
+                "svg" => "image/svg+xml",
+                _ => unreachable!(),
+            };
+            if !local_enabled && !generic_enabled && !model_enabled {
+                let response = build_capability_unavailable_response(
+                    "media_describe",
+                    "媒体理解当前不可用",
+                    "vision_unavailable",
+                    "图片视觉理解能力已被 registry 禁用，未找到可用的 provider。",
+                    &[
+                        "runtime_native(disabled_by_registry)".to_string(),
+                        "generic_provider(disabled_by_registry)".to_string(),
+                        "model_fallback(disabled_by_registry)".to_string(),
+                    ],
+                );
+                return serde_json::to_string_pretty(&response)
                     .map_err(|e| format!("Serialize error: {e}"));
             }
-            Ok(None) => None,
-            Err(err) => Some(err),
-        };
-    describe_image_bytes_with_timeouts(
-        prompt,
-        mime,
-        &data,
-        media_engine,
-        kernel,
-        caller_agent_id,
-        current_model_timeout,
-        fallback_timeout,
-    )
-    .await
-    .map_err(|err| match local_vision_error {
-        Some(local_err) => format!("Local Florence-2 path failed: {local_err} | {err}"),
-        None => err,
-    })
+            let local_vision_error = if local_enabled {
+                match crate::local_vision::analyze_image_path_with_local_service_detail(
+                    &path,
+                    mime,
+                    Some(prompt),
+                )
+                .await
+                {
+                    Ok(Some(detail)) => {
+                        let payload = enrich_media_describe_payload(
+                            serde_json::to_value(&detail)
+                                .map_err(|e| format!("Serialize error: {e}"))?,
+                            "image",
+                            build_media_source_asset_ref(&path, mime),
+                            prompt,
+                        );
+                        return serde_json::to_string_pretty(&payload)
+                            .map_err(|e| format!("Serialize error: {e}"));
+                    }
+                    Ok(None) => None,
+                    Err(err) => Some(err),
+                }
+            } else {
+                Some("Local vision stack disabled by registry.".to_string())
+            };
+            describe_image_bytes_with_timeouts(
+                prompt,
+                mime,
+                &data,
+                media_engine,
+                kernel,
+                caller_agent_id,
+                generic_enabled,
+                model_enabled,
+                current_model_timeout,
+                fallback_timeout,
+            )
+            .await
+            .and_then(|raw| {
+                let payload = serde_json::from_str::<serde_json::Value>(&raw)
+                    .map_err(|e| format!("Serialize error: {e}"))?;
+                let payload = enrich_media_describe_payload(
+                    payload,
+                    "image",
+                    build_media_source_asset_ref(&path, mime),
+                    prompt,
+                );
+                serde_json::to_string_pretty(&payload).map_err(|e| format!("Serialize error: {e}"))
+            })
+            .map_err(|err| match local_vision_error {
+                Some(local_err) => format!("Local vision stack failed: {local_err} | {err}"),
+                None => err,
+            })
+        }
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" | "webm" => {
+            let mime = match ext.as_str() {
+                "mp3" => "audio/mpeg",
+                "wav" => "audio/wav",
+                "ogg" => "audio/ogg",
+                "flac" => "audio/flac",
+                "m4a" => "audio/mp4",
+                "webm" => "audio/webm",
+                _ => unreachable!(),
+            };
+            if !runtime_enabled && !generic_enabled {
+                let response = build_capability_unavailable_response(
+                    "media_describe",
+                    "媒体理解当前不可用",
+                    "audio_unavailable",
+                    "音频理解能力已被 registry 禁用，未找到可用的分析 provider。",
+                    &[
+                        "runtime_native(disabled_by_registry)".to_string(),
+                        "generic_provider(disabled_by_registry)".to_string(),
+                    ],
+                );
+                return serde_json::to_string_pretty(&response)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            let size_bytes = tokio::fs::metadata(&path)
+                .await
+                .map_err(|e| format!("Failed to inspect media file: {e}"))?
+                .len();
+            let attachment = openfang_types::media::MediaAttachment {
+                media_type: openfang_types::media::MediaType::Audio,
+                mime_type: mime.to_string(),
+                source: openfang_types::media::MediaSource::FilePath {
+                    path: path.to_string_lossy().to_string(),
+                },
+                size_bytes,
+            };
+            let engine =
+                media_engine.ok_or("Media engine not available. Check media configuration.")?;
+            let understanding = engine.transcribe_audio(&attachment).await?;
+            let payload = enrich_media_describe_payload(
+                serde_json::json!({
+                    "description": understanding.description,
+                    "provider": understanding.provider,
+                    "model": understanding.model,
+                    "media_type": "audio",
+                }),
+                "audio",
+                build_media_source_asset_ref(&path, mime),
+                prompt,
+            );
+            serde_json::to_string_pretty(&payload).map_err(|e| format!("Serialize error: {e}"))
+        }
+        "mp4" | "mov" => {
+            let mime = match ext.as_str() {
+                "mp4" => "video/mp4",
+                "mov" => "video/quicktime",
+                _ => unreachable!(),
+            };
+            if !runtime_enabled && !generic_enabled {
+                let response = build_capability_unavailable_response(
+                    "media_describe",
+                    "媒体理解当前不可用",
+                    "video_unavailable",
+                    "视频理解能力已被 registry 禁用，未找到可用的分析 provider。",
+                    &[
+                        "runtime_native(disabled_by_registry)".to_string(),
+                        "generic_provider(disabled_by_registry)".to_string(),
+                    ],
+                );
+                return serde_json::to_string_pretty(&response)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            let size_bytes = tokio::fs::metadata(&path)
+                .await
+                .map_err(|e| format!("Failed to inspect media file: {e}"))?
+                .len();
+            let attachment = openfang_types::media::MediaAttachment {
+                media_type: openfang_types::media::MediaType::Video,
+                mime_type: mime.to_string(),
+                source: openfang_types::media::MediaSource::FilePath {
+                    path: path.to_string_lossy().to_string(),
+                },
+                size_bytes,
+            };
+            let engine =
+                media_engine.ok_or("Media engine not available. Check media configuration.")?;
+            let understanding = engine.describe_video(&attachment).await?;
+            let payload = enrich_media_describe_payload(
+                serde_json::json!({
+                    "description": understanding.description,
+                    "provider": understanding.provider,
+                    "model": understanding.model,
+                    "media_type": "video",
+                }),
+                "video",
+                build_media_source_asset_ref(&path, mime),
+                prompt,
+            );
+            serde_json::to_string_pretty(&payload).map_err(|e| format!("Serialize error: {e}"))
+        }
+        _ => Err(format!("Unsupported media format: .{ext}")),
+    }
 }
 
 async fn describe_image_bytes_with_timeouts(
@@ -3805,6 +9334,8 @@ async fn describe_image_bytes_with_timeouts(
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
+    allow_generic_provider: bool,
+    allow_model_fallback: bool,
     current_model_timeout: std::time::Duration,
     fallback_timeout: std::time::Duration,
 ) -> Result<String, String> {
@@ -3818,58 +9349,66 @@ async fn describe_image_bytes_with_timeouts(
     }
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(data);
-
-    let mut current_model_error = None;
-    if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
-        match run_with_timeout(
-            "Current agent model vision request",
-            current_model_timeout,
-            kernel.describe_image_with_agent_model(agent_id, prompt, mime, &base64_data),
-        )
-        .await
-        {
-            Ok(understanding) => {
-                return serde_json::to_string_pretty(&understanding)
-                    .map_err(|e| format!("Serialize error: {e}"));
-            }
-            Err(err) => current_model_error = Some(err),
-        }
-    }
-
     let attachment = openfang_types::media::MediaAttachment {
         media_type: openfang_types::media::MediaType::Image,
         mime_type: mime.to_string(),
         source: openfang_types::media::MediaSource::Base64 {
-            data: base64_data,
+            data: base64_data.clone(),
             mime_type: mime.to_string(),
         },
         size_bytes: data.len() as u64,
     };
 
-    let fallback_error = match media_engine {
-        Some(engine) => match run_with_timeout(
-            "Fallback vision provider request",
-            fallback_timeout,
-            engine.describe_image(&attachment),
-        )
-        .await
-        {
-            Ok(understanding) => {
-                return serde_json::to_string_pretty(&understanding)
-                    .map_err(|e| format!("Serialize error: {e}"));
-            }
-            Err(err) => err,
-        },
-        None => "Media engine not available. Check media configuration.".to_string(),
+    let fallback_error = if allow_generic_provider {
+        match media_engine {
+            Some(engine) => match run_with_timeout(
+                "Fallback vision provider request",
+                fallback_timeout,
+                engine.describe_image(&attachment),
+            )
+            .await
+            {
+                Ok(understanding) => {
+                    return serde_json::to_string_pretty(&understanding)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => Some(err),
+            },
+            None => Some("Media engine not available. Check media configuration.".to_string()),
+        }
+    } else {
+        Some("Configured vision provider path disabled by registry.".to_string())
     };
 
-    let mut parts = Vec::new();
-    if let Some(err) = current_model_error {
-        parts.push(format!("Current agent model path failed: {err}"));
+    let mut current_model_error = None;
+    if allow_model_fallback {
+        if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+            match run_with_timeout(
+                "Current agent model vision request",
+                current_model_timeout,
+                kernel.describe_image_with_agent_model(agent_id, prompt, mime, &base64_data),
+            )
+            .await
+            {
+                Ok(understanding) => {
+                    return serde_json::to_string_pretty(&understanding)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => current_model_error = Some(err),
+            }
+        }
+    } else {
+        current_model_error =
+            Some("Current agent model fallback disabled by registry.".to_string());
     }
-    parts.push(format!(
-        "Fallback vision provider path failed: {fallback_error}"
-    ));
+
+    let mut parts = Vec::new();
+    if let Some(err) = fallback_error {
+        parts.push(format!("Configured vision provider path failed: {err}"));
+    }
+    if let Some(err) = current_model_error {
+        parts.push(format!("Current agent model fallback path failed: {err}"));
+    }
     parts.push(
         "Do not retry local image analysis with browser_navigate or shell_exec. Use image_analyze/media_describe for chat-uploaded images, and if the screenshot is blurry ask for a clearer image instead."
             .to_string(),
@@ -4116,6 +9655,8 @@ async fn tool_image_generate(
     workspace_root: Option<&Path>,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
 ) -> Result<String, String> {
     let prompt = input["prompt"]
         .as_str()
@@ -4160,26 +9701,160 @@ async fn tool_image_generate(
         "image_generate",
         "generated_image",
     );
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "generate.image", "generic").await;
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "generate.image",
+        "generic",
+        "generic_provider",
+    );
+    let model_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "generate.image",
+        "generic",
+        "model_fallback",
+    );
+    let mut attempts = Vec::new();
 
-    if let Some(response_json) = crate::image_gen::execute_configured_image_generate_tool(
-        &request,
-        workspace_root,
-        Some(&asset_metadata),
-    )
-    .await?
-    {
-        return Ok(response_json);
+    if let Some(registry) = skill_registry {
+        let selector_candidates = build_skill_dispatch_tool_candidates("image_generate", input);
+        if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+            registry,
+            "image_generate",
+            input,
+            allowed_skills,
+            true,
+            caller_agent_id,
+        )
+        .await
+        {
+            match result {
+                Ok(value) => return Ok(value),
+                Err(err) => attempts.push(format!("component_skill_error({err})")),
+            }
+        }
+        attempts.push(format!(
+            "component_skill({})",
+            selector_candidates.join("/")
+        ));
+
+        if generic_enabled {
+            if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+                registry,
+                "image_generate",
+                input,
+                allowed_skills,
+                false,
+                caller_agent_id,
+            )
+            .await
+            {
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(err) => attempts.push(format!("generic_skill_error({err})")),
+                }
+            }
+            attempts.push(format!(
+                "generic_provider({})",
+                selector_candidates.join("/")
+            ));
+        } else {
+            attempts.push("generic_provider(disabled_by_registry)".to_string());
+        }
     }
 
-    let result = if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
-        kernel
-            .generate_image_with_agent_model(agent_id, &request)
-            .await?
+    if generic_enabled {
+        match crate::image_gen::execute_configured_image_generate_tool(
+            &request,
+            workspace_root,
+            Some(&asset_metadata),
+        )
+        .await
+        {
+            Ok(Some(response_json)) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&response_json)
+                    .map_err(|e| format!("Parse error: {e}"))?;
+                let payload = enrich_presentable_payload(
+                    parsed.clone(),
+                    "image_generate",
+                    "generic_provider",
+                    "generic_provider:configured_image_service",
+                    "generic_provider",
+                    "image_generate",
+                    build_image_presentable_result("image_generate", &parsed, input),
+                );
+                return serde_json::to_string_pretty(&payload)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            Ok(None) => attempts.push("generic_provider(configured_image_service)".to_string()),
+            Err(err) => attempts.push(format!("generic_provider_error({err})")),
+        }
     } else {
-        crate::image_gen::generate_image(&request).await?
-    };
-    let response = build_image_result_response(&result, workspace_root, input, caller_agent_id);
+        attempts.push("generic_provider(disabled_by_registry)".to_string());
+    }
 
+    if model_enabled {
+        if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+            match kernel
+                .generate_image_with_agent_model(agent_id, &request)
+                .await
+            {
+                Ok(result) => {
+                    let response_payload = build_image_result_response(
+                        &result,
+                        workspace_root,
+                        input,
+                        caller_agent_id,
+                    );
+                    let response = enrich_presentable_payload(
+                        response_payload.clone(),
+                        "image_generate",
+                        "model_fallback",
+                        "model_fallback:native_image_model",
+                        "model_fallback",
+                        "image_generate",
+                        build_image_presentable_result("image_generate", &response_payload, input),
+                    );
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => attempts.push(format!("model_fallback({err})")),
+            }
+        } else {
+            match crate::image_gen::generate_image(&request).await {
+                Ok(result) => {
+                    let response_payload = build_image_result_response(
+                        &result,
+                        workspace_root,
+                        input,
+                        caller_agent_id,
+                    );
+                    let response = enrich_presentable_payload(
+                        response_payload.clone(),
+                        "image_generate",
+                        "model_fallback",
+                        "model_fallback:native_image_model",
+                        "model_fallback",
+                        "image_generate",
+                        build_image_presentable_result("image_generate", &response_payload, input),
+                    );
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => attempts.push(format!("model_fallback({err})")),
+            }
+        }
+    } else {
+        attempts.push("model_fallback(disabled_by_registry)".to_string());
+    }
+    let response = build_capability_unavailable_response(
+        "image_generate",
+        "图片生成当前不可用",
+        "image_unavailable",
+        "图片生成已被 registry 禁用，未找到可用的组件技能、全局 provider 或模型兜底。",
+        &attempts,
+    );
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
@@ -4189,6 +9864,8 @@ async fn tool_image_edit(
     workspace_root: Option<&Path>,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
 ) -> Result<String, String> {
     let prompt = input["prompt"]
         .as_str()
@@ -4201,61 +9878,28 @@ async fn tool_image_edit(
         _ => openfang_types::media::ImageGenModel::GptImage1,
     };
 
-    let raw_image_path = input["image_path"].as_str().unwrap_or_default().trim();
-    let mut image_url = input["image_url"]
-        .as_str()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let mut resolved_image_path = None;
-
-    if !raw_image_path.is_empty() {
-        if should_treat_image_ref_as_url(raw_image_path) {
-            if image_url.is_empty() {
-                image_url = raw_image_path.to_string();
-            }
-            if let Some(file_id) = extract_local_upload_id(raw_image_path) {
-                resolved_image_path =
-                    recover_saved_upload_path_from_workspace(file_id, workspace_root)
-                        .map(|path| path.to_string_lossy().to_string());
-            }
-        } else {
-            resolved_image_path = Some(
-                resolve_media_path(raw_image_path, workspace_root)?
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        }
-    }
-
-    if resolved_image_path.is_none() && !image_url.is_empty() {
-        if let Some(file_id) = extract_local_upload_id(&image_url) {
-            resolved_image_path = recover_saved_upload_path_from_workspace(file_id, workspace_root)
-                .map(|path| path.to_string_lossy().to_string());
-        }
-    }
-
-    let image_base64 = input["image_base64"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let mime_type = input["mime_type"].as_str().unwrap_or_default().to_string();
-
-    let has_image_path = resolved_image_path
-        .as_deref()
-        .is_some_and(|path| !path.trim().is_empty());
-    let has_image_url = !image_url.trim().is_empty();
-    let has_image_base64 = !image_base64.trim().is_empty();
-
-    if !has_image_path && !has_image_url && !has_image_base64 {
-        return Err(
-            "image_edit requires a source image. Provide exactly one of 'image_path', 'image_url', or 'image_base64' (with 'mime_type'). Use image_edit only when modifying an existing image.".to_string(),
-        );
-    }
-
-    if has_image_base64 && mime_type.trim().is_empty() {
-        return Err("image_edit requires 'mime_type' when 'image_base64' is provided.".to_string());
-    }
+    let primary_source = resolve_tool_image_source(
+        input,
+        workspace_root,
+        &["image_path"],
+        &["image_url"],
+        &["image_base64"],
+        &["mime_type"],
+        &["source_image"],
+        "image_edit primary source",
+        true,
+    )?;
+    let reference_source = resolve_tool_image_source(
+        input,
+        workspace_root,
+        &["reference_image_path"],
+        &["reference_image_url"],
+        &["reference_image_base64"],
+        &["reference_mime_type"],
+        &["reference_image"],
+        "image_edit reference source",
+        false,
+    )?;
 
     let request = openfang_types::media::ImageEditRequest {
         prompt: prompt.to_string(),
@@ -4264,10 +9908,14 @@ async fn tool_image_edit(
             .unwrap_or_default()
             .to_string(),
         model,
-        image_path: resolved_image_path.unwrap_or_default(),
-        image_url,
-        image_base64,
-        mime_type,
+        image_path: primary_source.image_path,
+        image_url: primary_source.image_url,
+        image_base64: primary_source.image_base64,
+        mime_type: primary_source.mime_type,
+        reference_image_path: reference_source.image_path,
+        reference_image_url: reference_source.image_url,
+        reference_image_base64: reference_source.image_base64,
+        reference_mime_type: reference_source.mime_type,
         size: input["size"].as_str().unwrap_or("1024x1024").to_string(),
         width: input["width"]
             .as_u64()
@@ -4285,33 +9933,167 @@ async fn tool_image_edit(
         "image_edit",
         "edited_image",
     );
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "edit.image", "generic").await;
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "edit.image",
+        "generic",
+        "generic_provider",
+    );
+    let model_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "edit.image",
+        "generic",
+        "model_fallback",
+    );
+    let mut attempts = Vec::new();
 
-    if let Some(response_json) = crate::image_gen::execute_configured_image_edit_tool(
-        &request,
-        workspace_root,
-        Some(&asset_metadata),
-    )
-    .await?
-    {
-        return Ok(response_json);
+    if let Some(registry) = skill_registry {
+        let selector_candidates = build_skill_dispatch_tool_candidates("image_edit", input);
+        if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+            registry,
+            "image_edit",
+            input,
+            allowed_skills,
+            true,
+            caller_agent_id,
+        )
+        .await
+        {
+            match result {
+                Ok(value) => return Ok(value),
+                Err(err) => attempts.push(format!("component_skill_error({err})")),
+            }
+        }
+        attempts.push(format!(
+            "component_skill({})",
+            selector_candidates.join("/")
+        ));
+
+        if generic_enabled {
+            if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+                registry,
+                "image_edit",
+                input,
+                allowed_skills,
+                false,
+                caller_agent_id,
+            )
+            .await
+            {
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(err) => attempts.push(format!("generic_skill_error({err})")),
+                }
+            }
+            attempts.push(format!(
+                "generic_provider({})",
+                selector_candidates.join("/")
+            ));
+        } else {
+            attempts.push("generic_provider(disabled_by_registry)".to_string());
+        }
     }
 
-    let result = if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
-        kernel
-            .edit_image_with_agent_model(agent_id, &request)
-            .await?
-    } else {
-        crate::image_gen::generate_openai_compatible_image_edit(
+    if generic_enabled {
+        match crate::image_gen::execute_configured_image_edit_tool(
             &request,
-            &request.model.to_string(),
-            "https://api.openai.com/v1",
-            &std::env::var("OPENAI_API_KEY")
-                .map_err(|_| "OPENAI_API_KEY not set. Image editing requires an OpenAI API key.")?,
+            workspace_root,
+            Some(&asset_metadata),
         )
-        .await?
-    };
+        .await
+        {
+            Ok(Some(response_json)) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&response_json)
+                    .map_err(|e| format!("Parse error: {e}"))?;
+                let payload = enrich_presentable_payload(
+                    parsed.clone(),
+                    "image_edit",
+                    "generic_provider",
+                    "generic_provider:configured_image_service",
+                    "generic_provider",
+                    "image_edit",
+                    build_image_presentable_result("image_edit", &parsed, input),
+                );
+                return serde_json::to_string_pretty(&payload)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            Ok(None) => attempts.push("generic_provider(configured_image_service)".to_string()),
+            Err(err) => attempts.push(format!("generic_provider_error({err})")),
+        }
+    } else {
+        attempts.push("generic_provider(disabled_by_registry)".to_string());
+    }
 
-    let response = build_image_result_response(&result, workspace_root, input, caller_agent_id);
+    if model_enabled {
+        if let (Some(kernel), Some(agent_id)) = (kernel, caller_agent_id) {
+            match kernel.edit_image_with_agent_model(agent_id, &request).await {
+                Ok(result) => {
+                    let response_payload = build_image_result_response(
+                        &result,
+                        workspace_root,
+                        input,
+                        caller_agent_id,
+                    );
+                    let response = enrich_presentable_payload(
+                        response_payload.clone(),
+                        "image_edit",
+                        "model_fallback",
+                        "model_fallback:native_image_model",
+                        "model_fallback",
+                        "image_edit",
+                        build_image_presentable_result("image_edit", &response_payload, input),
+                    );
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => attempts.push(format!("model_fallback({err})")),
+            }
+        } else {
+            match crate::image_gen::generate_openai_compatible_image_edit(
+                &request,
+                &request.model.to_string(),
+                "https://api.openai.com/v1",
+                &std::env::var("OPENAI_API_KEY").map_err(|_| {
+                    "OPENAI_API_KEY not set. Image editing requires an OpenAI API key."
+                })?,
+            )
+            .await
+            {
+                Ok(result) => {
+                    let response_payload = build_image_result_response(
+                        &result,
+                        workspace_root,
+                        input,
+                        caller_agent_id,
+                    );
+                    let response = enrich_presentable_payload(
+                        response_payload.clone(),
+                        "image_edit",
+                        "model_fallback",
+                        "model_fallback:native_image_model",
+                        "model_fallback",
+                        "image_edit",
+                        build_image_presentable_result("image_edit", &response_payload, input),
+                    );
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+                Err(err) => attempts.push(format!("model_fallback({err})")),
+            }
+        }
+    } else {
+        attempts.push("model_fallback(disabled_by_registry)".to_string());
+    }
+
+    let response = build_capability_unavailable_response(
+        "image_edit",
+        "图片编辑当前不可用",
+        "image_unavailable",
+        "图片编辑已被 registry 禁用，未找到可用的组件技能、全局 provider 或模型兜底。",
+        &attempts,
+    );
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
@@ -4321,19 +10103,140 @@ async fn tool_image_edit(
 
 async fn tool_text_to_speech(
     input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
     tts_engine: Option<&crate::tts::TtsEngine>,
     workspace_root: Option<&Path>,
     caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
 ) -> Result<String, String> {
+    let mut effective_input = input.clone();
+    if input.get("voice").is_none() && input.get("speaker_profile_id").is_none() {
+        if let (Some(kh), Some(agent_id)) = (kernel, caller_agent_id) {
+            let self_ctx = kh.get_agent_self_context(agent_id)?;
+            let (speaker_profile_id, voice) = resolve_self_default_voice_binding(&self_ctx);
+            if let Some(object) = effective_input.as_object_mut() {
+                if let Some(value) = speaker_profile_id {
+                    object.insert(
+                        "speaker_profile_id".to_string(),
+                        serde_json::Value::String(value),
+                    );
+                }
+                if let Some(value) = voice {
+                    object.insert("voice".to_string(), serde_json::Value::String(value));
+                }
+            }
+        }
+    }
+    let input = &effective_input;
     let text = input["text"].as_str().ok_or("Missing 'text' parameter")?;
     let voice = input["voice"].as_str();
     let format = input["format"].as_str();
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "generate.audio", "generic").await;
+    let local_enabled = registry_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            registry_provider_is_enabled(
+                snapshot,
+                "runtime_native:f5_tts_onnx",
+                "generate.audio",
+                "generic",
+            )
+        })
+        .unwrap_or(true);
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "generate.audio",
+        "generic",
+        "generic_provider",
+    );
+    let mut attempts = Vec::new();
+    if let Some(registry) = skill_registry {
+        let selector_candidates = build_skill_dispatch_tool_candidates("text_to_speech", input);
+        if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+            registry,
+            "text_to_speech",
+            input,
+            allowed_skills,
+            true,
+            caller_agent_id,
+        )
+        .await
+        {
+            match result {
+                Ok(value) => return Ok(value),
+                Err(err) => attempts.push(format!("component_skill_error({err})")),
+            }
+        }
+        attempts.push(format!(
+            "component_skill({})",
+            selector_candidates.join("/")
+        ));
 
-    let local_tts_error = match synthesize_via_webot_local_tts(input, caller_agent_id).await {
-        Ok(Some(result)) => return Ok(result),
-        Ok(None) => None,
-        Err(error) => Some(error),
+        if generic_enabled {
+            if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+                registry,
+                "text_to_speech",
+                input,
+                allowed_skills,
+                false,
+                caller_agent_id,
+            )
+            .await
+            {
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(err) => attempts.push(format!("generic_skill_error({err})")),
+                }
+            }
+            attempts.push(format!(
+                "generic_provider({})",
+                selector_candidates.join("/")
+            ));
+        } else {
+            attempts.push("generic_provider(disabled_by_registry)".to_string());
+        }
+    }
+    let local_tts_error = if local_enabled {
+        match synthesize_via_webot_local_tts(input, caller_agent_id).await {
+            Ok(Some(result)) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&result)
+                    .map_err(|e| format!("Parse error: {e}"))?;
+                let payload = enrich_presentable_payload(
+                    parsed.clone(),
+                    "text_to_speech",
+                    "runtime_native",
+                    "runtime_native:f5_tts_onnx",
+                    "runtime_native",
+                    "text_to_speech",
+                    build_audio_presentable_result("text_to_speech", &parsed, input),
+                );
+                return serde_json::to_string_pretty(&payload)
+                    .map_err(|e| format!("Serialize error: {e}"));
+            }
+            Ok(None) => None,
+            Err(error) => Some(error),
+        }
+    } else {
+        attempts.push("runtime_native(f5_tts_onnx:disabled_by_registry)".to_string());
+        None
     };
+
+    if !local_enabled && !generic_enabled {
+        let response = build_capability_unavailable_response(
+            "text_to_speech",
+            "语音生成当前不可用",
+            "audio_unavailable",
+            "语音生成能力已被 registry 禁用，未找到可用的本地或全局 TTS provider。",
+            &attempts,
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialize error: {e}"));
+    }
+    if !generic_enabled {
+        attempts.push("generic_provider(disabled_by_registry)".to_string());
+    }
 
     let engine = tts_engine.ok_or_else(|| {
         if let Some(local_error) = local_tts_error.as_ref() {
@@ -4344,15 +10247,33 @@ async fn tool_text_to_speech(
             "TTS engine not available. Configure Webot local TTS or enable runtime tts.enabled/provider.".to_string()
         }
     })?;
+    if !generic_enabled {
+        let response = build_capability_unavailable_response(
+            "text_to_speech",
+            "语音生成当前不可用",
+            "audio_unavailable",
+            "语音生成的全局 provider 已被 registry 禁用。",
+            &attempts,
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialize error: {e}"));
+    }
     let result = match engine.synthesize(text, voice, format).await {
         Ok(result) => result,
         Err(error) => {
             if let Some(local_error) = local_tts_error {
-                return Err(format!(
-                    "Webot local TTS failed: {local_error}; runtime TTS fallback failed: {error}"
-                ));
+                attempts.push(format!("runtime_native({local_error})"));
             }
-            return Err(error);
+            attempts.push(format!("generic_provider({error})"));
+            let response = build_capability_unavailable_response(
+                "text_to_speech",
+                "语音生成当前不可用",
+                "audio_unavailable",
+                "语音生成未找到可用结果。",
+                &attempts,
+            );
+            return serde_json::to_string_pretty(&response)
+                .map_err(|e| format!("Serialize error: {e}"));
         }
     };
 
@@ -4376,14 +10297,31 @@ async fn tool_text_to_speech(
         None
     };
 
+    let provider_id = format!("generic_provider:{}", result.provider.trim());
     let response = serde_json::json!({
+        "tool": "text_to_speech",
+        "route": "generic_provider",
+        "provider_id": provider_id.clone(),
+        "provider_type": "generic_provider",
+        "provider_tool": "text_to_speech",
         "saved_to": saved_path,
         "format": result.format,
+        "mime_type": format!("audio/{}", result.format),
         "provider": result.provider,
         "duration_estimate_ms": result.duration_estimate_ms,
         "size_bytes": result.audio_data.len(),
     });
+    let presentable_result = build_audio_presentable_result("text_to_speech", &response, input);
 
+    let response = enrich_presentable_payload(
+        response,
+        "text_to_speech",
+        "generic_provider",
+        &provider_id,
+        "generic_provider",
+        "text_to_speech",
+        presentable_result,
+    );
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
@@ -4531,7 +10469,84 @@ async fn tool_speech_to_text(
     input: &serde_json::Value,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
 ) -> Result<String, String> {
+    let registry_snapshot =
+        fetch_capability_registry_snapshot(caller_agent_id, "transcribe.audio", "generic").await;
+    let runtime_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "transcribe.audio",
+        "generic",
+        "runtime_native",
+    );
+    let generic_enabled = registry_has_enabled_provider_type(
+        registry_snapshot.as_ref(),
+        "transcribe.audio",
+        "generic",
+        "generic_provider",
+    );
+    let mut attempts = Vec::new();
+    if let Some(registry) = skill_registry {
+        let selector_candidates = build_skill_dispatch_tool_candidates("speech_to_text", input);
+        if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+            registry,
+            "speech_to_text",
+            input,
+            allowed_skills,
+            true,
+            caller_agent_id,
+        )
+        .await
+        {
+            match result {
+                Ok(value) => return Ok(value),
+                Err(err) => attempts.push(format!("component_skill_error({err})")),
+            }
+        }
+        attempts.push(format!(
+            "component_skill({})",
+            selector_candidates.join("/")
+        ));
+
+        if generic_enabled {
+            if let Some(result) = dispatch_skill_tool_candidates_from_runtime(
+                registry,
+                "speech_to_text",
+                input,
+                allowed_skills,
+                false,
+                caller_agent_id,
+            )
+            .await
+            {
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(err) => attempts.push(format!("generic_skill_error({err})")),
+                }
+            }
+            attempts.push(format!(
+                "generic_provider({})",
+                selector_candidates.join("/")
+            ));
+        } else {
+            attempts.push("generic_provider(disabled_by_registry)".to_string());
+        }
+    }
+    if !runtime_enabled && !generic_enabled {
+        attempts.push("runtime_native(disabled_by_registry)".to_string());
+        attempts.push("generic_provider(disabled_by_registry)".to_string());
+        let response = build_capability_unavailable_response(
+            "speech_to_text",
+            "语音转文本当前不可用",
+            "audio_unavailable",
+            "语音转文本能力已被 registry 禁用，未找到可用的 STT provider。",
+            &attempts,
+        );
+        return serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialize error: {e}"));
+    }
     let engine = media_engine.ok_or("Media engine not available for speech-to-text")?;
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let _language = input["language"].as_str();
@@ -4572,14 +10587,63 @@ async fn tool_speech_to_text(
         size_bytes: data.len() as u64,
     };
 
-    let understanding = engine.transcribe_audio(&attachment).await?;
+    let understanding = match engine.transcribe_audio(&attachment).await {
+        Ok(value) => value,
+        Err(err) => {
+            if !runtime_enabled {
+                attempts.push("runtime_native(disabled_by_registry)".to_string());
+            }
+            if !generic_enabled {
+                attempts.push("generic_provider(disabled_by_registry)".to_string());
+            }
+            attempts.push(format!("transcribe_audio({err})"));
+            let response = build_capability_unavailable_response(
+                "speech_to_text",
+                "语音转文本当前不可用",
+                "audio_unavailable",
+                "语音转文本未找到可用结果。",
+                &attempts,
+            );
+            return serde_json::to_string_pretty(&response)
+                .map_err(|e| format!("Serialize error: {e}"));
+        }
+    };
 
+    let provider_id = format!("generic_provider:{}", understanding.provider.trim());
+    let source_asset = build_media_asset_ref(
+        &resolved.to_string_lossy(),
+        mime_type,
+        "speech_to_text",
+        "source_path",
+        Some(serde_json::json!({
+            "role": "source",
+        })),
+    );
     let response = serde_json::json!({
+        "tool": "speech_to_text",
+        "route": "generic_provider",
+        "provider_id": provider_id.clone(),
+        "provider_type": "generic_provider",
+        "provider_tool": "speech_to_text",
         "transcript": understanding.description,
         "provider": understanding.provider,
         "model": understanding.model,
+        "mime_type": mime_type,
+        "source_path": resolved.to_string_lossy().to_string(),
+        "source_asset": source_asset.clone(),
+        "sourceAsset": source_asset,
     });
+    let presentable_result = build_speech_to_text_presentable_result(&response);
 
+    let response = enrich_presentable_payload(
+        response,
+        "speech_to_text",
+        "generic_provider",
+        &provider_id,
+        "generic_provider",
+        "speech_to_text",
+        presentable_result,
+    );
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
@@ -4849,7 +10913,389 @@ mod tests {
     use super::*;
     use crate::kernel_handle::{AgentInfo, KernelHandle};
     use async_trait::async_trait;
+    use openfang_skills::{
+        InstalledSkill, SkillManifest, SkillMeta, SkillRequirements, SkillRuntimeConfig,
+        SkillToolDef, SkillTools,
+    };
     use std::sync::Arc;
+
+    fn build_minimal_pdf_bytes(text: &str) -> Vec<u8> {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        let objects = vec![
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n".to_string(),
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\nBT\n/F1 18 Tf\n40 100 Td\n({escaped}) Tj\nET\nendstream\nendobj\n",
+                31 + escaped.len()
+            ),
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+        ];
+
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = vec![0usize];
+        for object in &objects {
+            offsets.push(pdf.len());
+            pdf.push_str(object);
+        }
+        let startxref = pdf.len();
+        pdf.push_str("xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str("trailer\n<< /Root 1 0 R /Size 6 >>\n");
+        pdf.push_str(&format!("startxref\n{startxref}\n%%EOF\n"));
+        pdf.into_bytes()
+    }
+
+    fn write_zip_entries(path: &Path, entries: &[(&str, &str)]) {
+        let file = std::fs::File::create(path).expect("create zip file");
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
+        for (name, content) in entries {
+            writer.start_file(*name, options).expect("start zip entry");
+            std::io::Write::write_all(&mut writer, content.as_bytes()).expect("write zip entry");
+        }
+        writer.finish().expect("finish zip");
+    }
+
+    fn build_test_skill(tool_name: &str, skill_name: &str, tags: &[&str]) -> InstalledSkill {
+        InstalledSkill {
+            manifest: SkillManifest {
+                skill: SkillMeta {
+                    name: skill_name.to_string(),
+                    version: "0.1.0".to_string(),
+                    description: "test skill".to_string(),
+                    author: String::new(),
+                    license: String::new(),
+                    tags: tags.iter().map(|item| item.to_string()).collect(),
+                },
+                runtime: SkillRuntimeConfig::default(),
+                tools: SkillTools {
+                    provided: vec![SkillToolDef {
+                        name: tool_name.to_string(),
+                        description: "test tool".to_string(),
+                        input_schema: serde_json::json!({"type":"object"}),
+                    }],
+                },
+                requirements: SkillRequirements::default(),
+                prompt_context: None,
+                source: None,
+            },
+            path: PathBuf::from("."),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn test_selector_score_skill_prefers_pdf_specialization_for_document_parse() {
+        let pdf_skill = build_test_skill(
+            "document_parse",
+            "document_pdf_parser",
+            &[
+                "component-center",
+                "component-skill",
+                "base-tool:document_parse",
+                "capability-key:parse.document",
+                "capability-scope:generic",
+                "specialization:pdf",
+                "subject-policy:document_first",
+                "preferred-mime:application/pdf",
+            ],
+        );
+        let general_skill = build_test_skill(
+            "document_parse",
+            "document_general_parser",
+            &[
+                "component-center",
+                "component-skill",
+                "base-tool:document_parse",
+                "capability-key:parse.document",
+                "capability-scope:generic",
+                "specialization:general",
+            ],
+        );
+        let input = serde_json::json!({
+            "path": "sample.pdf",
+            "document_type": "pdf",
+            "mime_type": "application/pdf",
+            "prompt": "请解析这个 PDF 文档"
+        });
+
+        let pdf_score = selector_score_skill(&pdf_skill, "document_parse", &input, true);
+        let general_score = selector_score_skill(&general_skill, "document_parse", &input, true);
+
+        assert!(
+            pdf_score > general_score,
+            "pdf specialized skill should score higher"
+        );
+    }
+
+    #[test]
+    fn test_runtime_skill_allowed_by_registry_blocks_disabled_generic_skill() {
+        let skill = build_test_skill(
+            "text_to_speech",
+            "openai_tts",
+            &[
+                "base-tool:text_to_speech",
+                "capability-key:generate.audio",
+                "capability-scope:generic",
+            ],
+        );
+        let snapshot = RuntimeCapabilityRegistrySnapshot {
+            providers: vec![RuntimeRegistryProviderRecord {
+                provider_id: "generic_provider:openai_tts".to_string(),
+                provider_type: "generic_provider".to_string(),
+                capabilities: vec![RuntimeRegistryCapabilityDescriptor {
+                    key: "generate.audio".to_string(),
+                    scope: "generic".to_string(),
+                }],
+                enabled: false,
+                health_state: "disabled".to_string(),
+            }],
+            bindings: Vec::new(),
+            health_states: Vec::new(),
+            agent_bindings: Vec::new(),
+        };
+
+        assert!(!runtime_skill_allowed_by_registry(
+            &skill,
+            "text_to_speech",
+            false,
+            Some(&snapshot),
+        ));
+    }
+
+    #[test]
+    fn test_build_skill_dispatch_tool_candidates_prefers_text2video_without_image() {
+        let candidates = build_skill_dispatch_tool_candidates(
+            "video_generate",
+            &serde_json::json!({
+                "prompt": "生成一个跳舞视频"
+            }),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "text2video".to_string(),
+                "video_generate".to_string(),
+                "image2video".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_skill_dispatch_tool_candidates_prefers_image2video_with_source_image() {
+        let candidates = build_skill_dispatch_tool_candidates(
+            "video_generate",
+            &serde_json::json!({
+                "prompt": "用你当前形象生成一段视频",
+                "image_url": "https://example.com/portrait.png"
+            }),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "image2video".to_string(),
+                "video_generate".to_string(),
+                "text2video".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_prompt_hits_self_expression_supports_current_portrait_phrases() {
+        assert!(prompt_hits_self_expression(
+            "沿用你当前照片里的形象生成请安视频"
+        ));
+        assert!(prompt_hits_self_expression(
+            "按你现在的样子向我走来并说早安"
+        ));
+        assert!(prompt_hits_self_expression("用你的立绘生成一段视频"));
+    }
+
+    #[test]
+    fn test_selector_score_skill_rejects_media_dependent_video_skill_without_source() {
+        let media_dependent_skill = build_test_skill(
+            "video_generate",
+            "image2video",
+            &[
+                "base-tool:video_generate",
+                "capability-key:generate.video",
+                "capability-scope:generic",
+                "source-policy:requires_image",
+                "requires-slot:image",
+                "requires-slot:prompt",
+            ],
+        );
+        let text_only_video_skill = build_test_skill(
+            "video_generate",
+            "text2video",
+            &[
+                "base-tool:video_generate",
+                "capability-key:generate.video",
+                "capability-scope:generic",
+                "source-policy:text_only",
+                "supports-text-only",
+                "requires-slot:prompt",
+            ],
+        );
+        let input = serde_json::json!({
+            "prompt": "让角色跳舞"
+        });
+
+        assert!(
+            selector_score_skill(&media_dependent_skill, "video_generate", &input, true)
+                <= i64::MIN / 4
+        );
+        assert!(selector_score_skill(&text_only_video_skill, "video_generate", &input, true) > 0);
+    }
+
+    #[test]
+    fn test_build_skill_dispatch_tool_candidates_links_image_analyze_and_media_describe() {
+        let image_candidates = build_skill_dispatch_tool_candidates(
+            "image_analyze",
+            &serde_json::json!({
+                "path": "sample.png"
+            }),
+        );
+        let media_image_candidates = build_skill_dispatch_tool_candidates(
+            "media_describe",
+            &serde_json::json!({
+                "path": "sample.png"
+            }),
+        );
+        let media_audio_candidates = build_skill_dispatch_tool_candidates(
+            "media_describe",
+            &serde_json::json!({
+                "path": "sample.mp3"
+            }),
+        );
+        assert_eq!(
+            image_candidates,
+            vec!["image_analyze".to_string(), "media_describe".to_string()]
+        );
+        assert_eq!(
+            media_image_candidates,
+            vec!["media_describe".to_string(), "image_analyze".to_string()]
+        );
+        assert_eq!(media_audio_candidates, vec!["media_describe".to_string()]);
+    }
+
+    #[test]
+    fn test_build_skill_dispatch_tool_candidates_links_document_parse_and_extract() {
+        let parse_candidates = build_skill_dispatch_tool_candidates(
+            "document_parse",
+            &serde_json::json!({"path": "sample.pdf"}),
+        );
+        let extract_candidates = build_skill_dispatch_tool_candidates(
+            "document_extract",
+            &serde_json::json!({"path": "sample.pdf"}),
+        );
+        assert_eq!(
+            parse_candidates,
+            vec!["document_parse".to_string(), "document_extract".to_string()]
+        );
+        assert_eq!(
+            extract_candidates,
+            vec!["document_extract".to_string(), "document_parse".to_string()]
+        );
+    }
+
+    fn build_minimal_docx(path: &Path, text: &str) {
+        write_zip_entries(
+            path,
+            &[
+                (
+                    "[Content_Types].xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#,
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+                ),
+                (
+                    "word/document.xml",
+                    &format!(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>{text}</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#
+                    ),
+                ),
+            ],
+        );
+    }
+
+    fn build_minimal_xlsx(path: &Path) {
+        write_zip_entries(
+            path,
+            &[
+                (
+                    "[Content_Types].xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#,
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+                ),
+                (
+                    "xl/workbook.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>名称</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>值</t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" t="inlineStr"><is><t>测试项</t></is></c>
+      <c r="B2"><v>42</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#,
+                ),
+            ],
+        );
+    }
 
     #[test]
     fn test_builtin_tool_definitions() {
@@ -4893,16 +11339,27 @@ mod tests {
         assert!(names.contains(&"browser_wait"));
         assert!(names.contains(&"browser_run_js"));
         assert!(names.contains(&"browser_back"));
-        // 4 self-management tools
+        // 6 self-management tools
         assert!(names.contains(&"my_identity_patch"));
         assert!(names.contains(&"my_memory_patch"));
+        assert!(names.contains(&"my_upgrade_review"));
+        assert!(names.contains(&"my_upgrade_apply"));
         assert!(names.contains(&"my_photo_generate"));
         assert!(names.contains(&"my_photo_edit"));
-        // 4 media/image tools
+        // 6 media/image/video tools
         assert!(names.contains(&"media_describe"));
         assert!(names.contains(&"media_transcribe"));
         assert!(names.contains(&"image_generate"));
         assert!(names.contains(&"image_edit"));
+        assert!(names.contains(&"video_generate"));
+        assert!(names.contains(&"video_edit"));
+        assert!(names.contains(&"document_parse"));
+        assert!(names.contains(&"document_extract"));
+        assert!(names.contains(&"document_summarize"));
+        assert!(names.contains(&"document_convert"));
+        assert!(names.contains(&"document_compare"));
+        assert!(names.contains(&"document_preview"));
+        assert!(names.contains(&"document_chunk"));
         // 3 cron tools
         assert!(names.contains(&"cron_create"));
         assert!(names.contains(&"cron_list"));
@@ -4973,6 +11430,55 @@ mod tests {
             .and_then(|properties| properties.get("image_url"))
             .is_none());
 
+        let video_generate = tools
+            .iter()
+            .find(|tool| tool.name == "video_generate")
+            .expect("video_generate tool missing");
+        assert!(video_generate
+            .description
+            .contains("source_mode='self_default'"));
+        assert!(video_generate
+            .description
+            .contains("job_result -> media_result(video)"));
+        assert!(video_generate
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("source_mode"))
+            .is_some());
+        assert!(video_generate
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("save_target"))
+            .is_some());
+        assert!(video_generate
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("meta_label"))
+            .is_some());
+
+        let video_edit = tools
+            .iter()
+            .find(|tool| tool.name == "video_edit")
+            .expect("video_edit tool missing");
+        assert!(video_edit
+            .description
+            .contains("source_mode='source_video'"));
+        assert!(video_edit
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("source_mode"))
+            .is_some());
+        assert!(video_edit
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("source_video"))
+            .is_some());
+        assert!(video_edit
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("save_target"))
+            .is_some());
+
         let my_identity_patch = tools
             .iter()
             .find(|tool| tool.name == "my_identity_patch")
@@ -4994,6 +11500,43 @@ mod tests {
         assert!(browser_navigate_local_source_error("\\\\server\\share\\example.png").is_some());
         assert!(browser_navigate_local_source_error("data:image/png;base64,abc").is_some());
         assert!(browser_navigate_local_source_error("https://example.com").is_none());
+    }
+
+    #[test]
+    fn test_resolve_video_generate_source_mode_prefers_explicit_and_self_defaults() {
+        let explicit_self = serde_json::json!({
+            "source_mode": "self_default",
+            "prompt": "生成一段你的视频"
+        });
+        assert_eq!(
+            resolve_video_generate_source_mode(&explicit_self, false, false),
+            "self_default"
+        );
+
+        let inferred_self = serde_json::json!({
+            "prompt": "生成一段你的视频"
+        });
+        assert_eq!(
+            resolve_video_generate_source_mode(&inferred_self, false, true),
+            "self_default"
+        );
+
+        let inferred_image = serde_json::json!({
+            "prompt": "让她走过来",
+            "image_url": "https://example.com/portrait.png"
+        });
+        assert_eq!(
+            resolve_video_generate_source_mode(&inferred_image, true, false),
+            "image_to_video"
+        );
+
+        let inferred_text = serde_json::json!({
+            "prompt": "雪夜城市延时摄影"
+        });
+        assert_eq!(
+            resolve_video_generate_source_mode(&inferred_text, false, false),
+            "text_to_video"
+        );
     }
 
     #[test]
@@ -5024,6 +11567,188 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_document_parse_text_file_returns_document_result() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("doc.md");
+        tokio::fs::write(&file_path, "# 标题\n\n这是一个文档能力测试。")
+            .await
+            .expect("write file");
+
+        let result = tool_document_parse(
+            "document_parse",
+            &serde_json::json!({
+                "path": "doc.md",
+            }),
+            Some(temp_dir.path()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("document_parse");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse document result");
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["document_type"], "md");
+        assert_eq!(payload["presentable_result"]["kind"], "document_result");
+        assert!(payload["presentable_result"]["extracted_text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("文档能力测试"));
+    }
+
+    #[tokio::test]
+    async fn test_document_convert_text_file_creates_output_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("source.txt");
+        tokio::fs::write(&file_path, "转换测试文本")
+            .await
+            .expect("write file");
+
+        let result = tool_document_convert(
+            &serde_json::json!({
+                "path": "source.txt",
+                "target_format": "json",
+            }),
+            Some(temp_dir.path()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("document_convert");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse convert result");
+        let output_file = payload["output_file"]
+            .as_str()
+            .expect("output_file should exist");
+        assert!(Path::new(output_file).exists());
+        assert_eq!(payload["presentable_result"]["kind"], "document_result");
+        assert_eq!(
+            payload["presentable_result"]["conversion_outputs"][0]["format"],
+            "json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_document_convert_xlsx_file_to_csv() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("sheet.xlsx");
+        build_minimal_xlsx(&file_path);
+
+        let result = tool_document_convert(
+            &serde_json::json!({
+                "path": "sheet.xlsx",
+                "target_format": "csv",
+            }),
+            Some(temp_dir.path()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("document_convert csv");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse convert csv result");
+        let output_file = payload["output_file"]
+            .as_str()
+            .expect("output_file should exist");
+        assert!(Path::new(output_file).exists());
+        let content = std::fs::read_to_string(output_file).expect("read csv output");
+        assert!(content.contains("名称,值"));
+        assert!(content.contains("测试项,42"));
+        assert_eq!(
+            payload["presentable_result"]["conversion_outputs"][0]["format"],
+            "csv"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_document_parse_pdf_file_extracts_text() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("sample.pdf");
+        tokio::fs::write(&file_path, build_minimal_pdf_bytes("PDF SAMPLE TEXT"))
+            .await
+            .expect("write pdf");
+
+        let result = tool_document_parse(
+            "document_parse",
+            &serde_json::json!({
+                "path": "sample.pdf",
+            }),
+            Some(temp_dir.path()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("document_parse pdf");
+        let payload = serde_json::from_str::<serde_json::Value>(&result).expect("parse pdf result");
+        assert_eq!(payload["document_type"], "pdf");
+        assert!(payload["presentable_result"]["extracted_text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("PDF SAMPLE TEXT"));
+    }
+
+    #[tokio::test]
+    async fn test_document_parse_docx_file_extracts_text() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("sample.docx");
+        build_minimal_docx(&file_path, "Word 文档测试");
+
+        let result = tool_document_parse(
+            "document_parse",
+            &serde_json::json!({
+                "path": "sample.docx",
+            }),
+            Some(temp_dir.path()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("document_parse docx");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse docx result");
+        assert_eq!(payload["document_type"], "docx");
+        assert!(payload["presentable_result"]["extracted_text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Word 文档测试"));
+    }
+
+    #[tokio::test]
+    async fn test_document_parse_xlsx_file_extracts_text() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("sample.xlsx");
+        build_minimal_xlsx(&file_path);
+
+        let result = tool_document_parse(
+            "document_parse",
+            &serde_json::json!({
+                "path": "sample.xlsx",
+            }),
+            Some(temp_dir.path()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("document_parse xlsx");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse xlsx result");
+        assert_eq!(payload["document_type"], "xlsx");
+        let extracted = payload["presentable_result"]["extracted_text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(extracted.contains("工作表: Sheet1"));
+        assert!(extracted.contains("测试项"));
+        assert!(extracted.contains("42"));
     }
 
     #[tokio::test]
@@ -5058,6 +11783,8 @@ mod tests {
             &serde_json::json!({
                 "prompt": "把耳环换成红宝石款式"
             }),
+            None,
+            None,
             None,
             None,
             None,
@@ -5117,6 +11844,94 @@ mod tests {
         assert!(result.contains("MEMORY.md"));
     }
 
+    #[tokio::test]
+    async fn test_my_upgrade_review_returns_review_result() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = tool_my_upgrade_review(
+            &serde_json::json!({
+                "summary": "准备修正自我记忆表达风格",
+                "memory_patch": {
+                    "content": "回答时先给结论再解释",
+                    "memory_type": "self_upgrade_note"
+                }
+            }),
+            None,
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect("my_upgrade_review should succeed");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse review payload");
+        assert_eq!(payload["presentable_result"]["kind"], "review_result");
+        assert_eq!(payload["review"]["agent_id"], "agent-1");
+    }
+
+    #[tokio::test]
+    async fn test_my_upgrade_apply_requires_confirmation_when_review_demands_it() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = tool_my_upgrade_apply(
+            &serde_json::json!({
+                "review": {
+                    "review_id": "review-1",
+                    "summary": "需要确认后写入记忆",
+                    "requires_confirmation": true,
+                    "memory_patch": {
+                        "content": "确认后再写入",
+                        "memory_type": "self_upgrade_note"
+                    }
+                }
+            }),
+            None,
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect("my_upgrade_apply should return confirm_result");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse apply payload");
+        assert_eq!(payload["presentable_result"]["kind"], "confirm_result");
+    }
+
+    #[tokio::test]
+    async fn test_my_upgrade_apply_uses_review_payload_when_confirmed() {
+        let workspace = std::env::temp_dir().join(format!(
+            "openfang_my_upgrade_workspace_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = tool_my_upgrade_apply(
+            &serde_json::json!({
+                "confirmed_by_user": true,
+                "review": {
+                    "review_id": "review-2",
+                    "summary": "写入新的升级记忆",
+                    "requires_confirmation": true,
+                    "memory_patch": {
+                        "content": "升级完成后记住新的表达要求",
+                        "memory_type": "self_upgrade_note"
+                    }
+                }
+            }),
+            Some(workspace.as_path()),
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect("my_upgrade_apply should succeed");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let payload = serde_json::from_str::<serde_json::Value>(&result)
+            .expect("parse apply success payload");
+        assert_eq!(payload["presentable_result"]["kind"], "patch_result");
+    }
+
     #[test]
     fn test_resolve_self_photo_source_falls_back_to_avatar_url() {
         let self_ctx = serde_json::json!({
@@ -5140,6 +11955,97 @@ mod tests {
         assert_eq!(
             source.get("image_url").and_then(serde_json::Value::as_str),
             Some("https://example.com/portrait.png")
+        );
+    }
+
+    #[test]
+    fn test_resolve_self_photo_source_prefers_embodiment_default_portrait() {
+        let self_ctx = serde_json::json!({
+            "avatar_url": "https://example.com/avatar.png",
+            "embodiment": {
+                "assets": {
+                    "defaultPortrait": {
+                        "url": "https://example.com/embodiment-portrait.png"
+                    }
+                }
+            }
+        });
+        let source = resolve_self_photo_source(&serde_json::json!({}), &self_ctx)
+            .expect("embodiment portrait fallback should resolve");
+        assert_eq!(
+            source.get("image_url").and_then(serde_json::Value::as_str),
+            Some("https://example.com/embodiment-portrait.png")
+        );
+    }
+
+    #[test]
+    fn test_resolve_self_default_voice_binding_prefers_embodiment() {
+        let self_ctx = serde_json::json!({
+            "tts_config": {
+                "speakerProfileId": "legacy-speaker"
+            },
+            "embodiment": {
+                "voice": {
+                    "defaultVoice": {
+                        "mode": "speaker_profile",
+                        "speakerProfileId": "embodiment-speaker",
+                        "voice": "soft"
+                    }
+                }
+            }
+        });
+        let (speaker_profile_id, voice) = resolve_self_default_voice_binding(&self_ctx);
+        assert_eq!(speaker_profile_id.as_deref(), Some("embodiment-speaker"));
+        assert_eq!(voice.as_deref(), Some("soft"));
+    }
+
+    #[test]
+    fn test_extract_job_result_payload_supports_camel_case_component_output() {
+        let payload = serde_json::json!({
+            "presentableResult": {
+                "kind": "job_result",
+                "job_id": "component-job-1",
+                "status": "queued"
+            }
+        });
+
+        let extracted = extract_job_result_payload(&payload).expect("job_result payload");
+        assert_eq!(
+            extracted.get("job_id").and_then(serde_json::Value::as_str),
+            Some("component-job-1")
+        );
+        assert_eq!(
+            extracted.get("status").and_then(serde_json::Value::as_str),
+            Some("queued")
+        );
+    }
+
+    #[test]
+    fn test_normalize_component_skill_media_output_promotes_job_result() {
+        let content = serde_json::json!({
+            "outputType": "video",
+            "presentableResult": {
+                "kind": "job_result",
+                "job_id": "component-job-2",
+                "status": "queued"
+            },
+            "providerMeta": {
+                "providerId": "component_skill:image2video"
+            },
+            "text": "LTX2.3图片生成视频 已提交，正在生成视频"
+        })
+        .to_string();
+
+        let normalized = normalize_component_skill_media_output(&content, "video_generate")
+            .expect("normalized content");
+        let parsed: serde_json::Value = serde_json::from_str(&normalized).expect("normalized json");
+        assert_eq!(parsed["tool"], "video_generate");
+        assert_eq!(parsed["output_type"], "video");
+        assert_eq!(parsed["presentable_result"]["kind"], "job_result");
+        assert_eq!(parsed["job_result"]["job_id"], "component-job-2");
+        assert_eq!(
+            parsed["provider_meta"]["providerId"],
+            "component_skill:image2video"
         );
     }
 
@@ -6015,10 +12921,10 @@ mod tests {
 
         let err = result.expect_err("expected timeout");
         assert!(err.contains(
-            "Current agent model path failed: Current agent model vision request timed out after 10ms"
+            "Configured vision provider path failed: Media engine not available. Check media configuration."
         ));
         assert!(err.contains(
-            "Fallback vision provider path failed: Media engine not available. Check media configuration."
+            "Current agent model fallback path failed: Current agent model vision request timed out after 10ms"
         ));
     }
 

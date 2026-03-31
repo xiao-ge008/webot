@@ -598,6 +598,8 @@ pub struct AgentIdentity {
     pub emoji: Option<String>,
     /// Avatar URL (http/https) or data URI.
     pub avatar_url: Option<String>,
+    /// Portrait URL used for richer self-image and video-source binding.
+    pub portrait_url: Option<String>,
     /// Hex color code (e.g., "#FF5C00") for UI accent.
     pub color: Option<String>,
     /// Archetype: "researcher", "coder", "assistant", "writer", "devops", "support", "analyst".
@@ -1018,6 +1020,7 @@ mod tests {
         let id = AgentIdentity::default();
         assert!(id.emoji.is_none());
         assert!(id.avatar_url.is_none());
+        assert!(id.portrait_url.is_none());
         assert!(id.color.is_none());
         assert!(id.archetype.is_none());
         assert!(id.vibe.is_none());
@@ -1029,6 +1032,7 @@ mod tests {
         let id = AgentIdentity {
             emoji: Some("\u{1F916}".to_string()),
             avatar_url: Some("https://example.com/avatar.png".to_string()),
+            portrait_url: Some("https://example.com/portrait.png".to_string()),
             color: Some("#FF5C00".to_string()),
             archetype: Some("assistant".to_string()),
             vibe: Some("friendly".to_string()),
@@ -1037,6 +1041,10 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let back: AgentIdentity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.emoji, Some("\u{1F916}".to_string()));
+        assert_eq!(
+            back.portrait_url,
+            Some("https://example.com/portrait.png".to_string())
+        );
         assert_eq!(back.color, Some("#FF5C00".to_string()));
     }
 

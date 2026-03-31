@@ -1,5 +1,6 @@
-import { requestJson } from '@/services/transport';
+import { getApiBaseUrl, requestJson } from '@/services/transport';
 import {
+  type AgentSpeakerProfile,
   type AgentTtsSynthesisResult,
   DEFAULT_APP_TTS_SETTINGS,
   type AppTtsSettings,
@@ -40,6 +41,29 @@ function asOptionalString(value: unknown): string | undefined {
   return text || undefined;
 }
 
+function normalizeSpeakerProfile(value: unknown): AgentSpeakerProfile | null {
+  const record = isRecord(value) ? value : null;
+  if (!record) {
+    return null;
+  }
+  const id = asString(record.id).trim();
+  const name = asString(record.name).trim();
+  if (!id || !name) {
+    return null;
+  }
+  return {
+    id,
+    name,
+    engine: 'f5-tts-onnx',
+    refAudioPath: asString(record.refAudioPath) || undefined,
+    refText: asString(record.refText) || undefined,
+    language: asString(record.language) || undefined,
+    notes: asString(record.notes) || undefined,
+    createdAt: asString(record.createdAt),
+    updatedAt: asString(record.updatedAt),
+  };
+}
+
 function normalizeProviderConfig(value: unknown, fallback: RemoteTtsProviderConfig): RemoteTtsProviderConfig {
   const record = isRecord(value) ? value : {};
   return {
@@ -72,6 +96,11 @@ export function normalizeAppTtsSettings(value: unknown): AppTtsSettings {
   ).includes(activeProviderValue as RemoteTtsProviderId)
     ? (activeProviderValue as RemoteTtsProviderId)
     : DEFAULT_APP_TTS_SETTINGS.remote.activeProvider;
+  const speakerProfiles = Array.isArray(record.speakerProfiles)
+    ? record.speakerProfiles
+        .map(normalizeSpeakerProfile)
+        .filter((item): item is AgentSpeakerProfile => Boolean(item))
+    : [];
 
   return {
     enabled: asBool(record.enabled, DEFAULT_APP_TTS_SETTINGS.enabled),
@@ -102,6 +131,7 @@ export function normalizeAppTtsSettings(value: unknown): AppTtsSettings {
       indextts: normalizeProviderConfig(remote.indextts, DEFAULT_APP_TTS_SETTINGS.remote.indextts),
       qwenTts: normalizeProviderConfig(remote.qwenTts, DEFAULT_APP_TTS_SETTINGS.remote.qwenTts),
     },
+    speakerProfiles,
   };
 }
 
@@ -196,6 +226,70 @@ export async function unloadTtsEngine(): Promise<TtsManagementStatus> {
   const payload = await requestJson<unknown>('/api/management/tts/unload', {
     method: 'POST',
   });
+  if (!isRecord(payload)) {
+    return normalizeTtsManagementStatus({});
+  }
+  return normalizeTtsManagementStatus(payload.status);
+}
+
+async function postMultipartJson(path: string, formData: FormData): Promise<unknown> {
+  const requestWithBase = async (baseUrl: string): Promise<unknown> => {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+      },
+      body: formData,
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    return text.trim() ? (JSON.parse(text) as unknown) : {};
+  };
+
+  const firstBaseUrl = await getApiBaseUrl();
+  try {
+    return await requestWithBase(firstBaseUrl);
+  } catch {
+    const secondBaseUrl = await getApiBaseUrl({ forceRefresh: true });
+    return requestWithBase(secondBaseUrl);
+  }
+}
+
+export interface UploadGlobalSpeakerProfileInput {
+  file: File;
+  name: string;
+  refText: string;
+  language?: string;
+  notes?: string;
+}
+
+export async function uploadGlobalSpeakerProfile(
+  input: UploadGlobalSpeakerProfileInput,
+): Promise<TtsManagementStatus> {
+  const formData = new FormData();
+  formData.append('file', input.file, input.file.name || 'speaker.wav');
+  formData.append('name', input.name);
+  formData.append('refText', input.refText);
+  if (input.language?.trim()) {
+    formData.append('language', input.language.trim());
+  }
+  if (input.notes?.trim()) {
+    formData.append('notes', input.notes.trim());
+  }
+  const payload = await postMultipartJson('/api/management/tts/speaker-profiles/upload', formData);
+  const record = isRecord(payload) ? payload : {};
+  return normalizeTtsManagementStatus(record.status);
+}
+
+export async function deleteGlobalSpeakerProfile(profileId: string): Promise<TtsManagementStatus> {
+  const payload = await requestJson<unknown>(
+    `/api/management/tts/speaker-profiles/${encodeURIComponent(profileId)}`,
+    {
+      method: 'DELETE',
+    },
+  );
   if (!isRecord(payload)) {
     return normalizeTtsManagementStatus({});
   }

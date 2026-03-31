@@ -75,18 +75,23 @@ function handleStreamChunk(chunk: AgentChatStreamChunk): void {
     patchMessage((current) => {
       const startedAt = current.generationStartedAt ?? Date.now();
       const uiRawText = extractUiRawText(buffer.rawText);
+      const resolvedSpec = current.spec ?? tryParseInlineSpecFromText(buffer.rawText);
+      const resolvedText = resolvedSpec
+        ? cleanupAssistantText(buffer.rawText, resolvedSpec)
+        : sanitizeAssistantText(stripThinkingBlocks(buffer.rawText));
       return {
         ...current,
         generationStartedAt: startedAt,
         generationElapsedMs: Math.max(0, Date.now() - startedAt),
         streaming: true,
         thinking: false,
-        text: sanitizeAssistantText(stripThinkingBlocks(buffer.rawText)),
+        text: resolvedText,
+        spec: resolvedSpec,
         debugRawStream: buffer.rawText,
         uiRawText,
-        uiStreamState: uiRawText ? 'streaming' : (current.uiStreamState ?? 'idle'),
+        uiStreamState: resolvedSpec != null || uiRawText ? 'streaming' : (current.uiStreamState ?? 'idle'),
         debugHasUiJson: Boolean(uiRawText),
-        cardPending: uiRawText ? true : current.cardPending,
+        cardPending: resolvedSpec == null && Boolean(uiRawText) ? true : current.cardPending,
       };
     });
     return;
@@ -116,7 +121,7 @@ function handleStreamChunk(chunk: AgentChatStreamChunk): void {
         uiRawText: buffer.patchBuffer,
         uiStreamState: 'streaming',
         debugHasUiJson: true,
-        cardPending: true,
+        cardPending: nextSpec == null,
         spec: nextSpec,
       };
     });

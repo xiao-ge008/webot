@@ -3,7 +3,7 @@ import { Header, HomeTabProvider } from './Header';
 import { Footer } from './Footer';
 import { InAppNotificationCenter } from '@/components/ui/in-app-notification-center';
 import { ChatKeepAliveLayer } from './ChatKeepAliveLayer';
-import { TaskDeliveryWatcher } from '@/components/tasks/TaskDeliveryWatcher';
+import { TaskNoticeBridge } from '@/components/tasks/TaskNoticeBridge';
 
 /** 全局布局：顶部导航栏 + 内容区 */
 export function AppLayout() {
@@ -18,7 +18,7 @@ export function AppLayout() {
         {/* 顶部导航栏 */}
         <Header />
         <InAppNotificationCenter />
-        <TaskDeliveryWatcher />
+        <TaskNoticeBridge />
 
       {/* 主内容区 */}
       <main className="flex-1 min-h-0 pt-14 flex flex-col items-stretch">

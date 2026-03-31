@@ -19,12 +19,11 @@ export interface ChatRendererProps {
   inputToolbar?: ReactNode;
   contextUsage?: ChatContextUsageMeter;
   onUserActivity?: (source: 'input' | 'send' | 'focus' | 'keydown' | 'ui_action') => void;
-  onSendMessage: (payload: ChatSendPayload) => void;
+  onSendMessage: (payload: ChatSendPayload) => boolean | void | Promise<boolean | void>;
   onSendSilentMessage: (text: string) => void;
   onRegenerateMessage: (messageId: string) => void;
   onStopStreaming: () => void;
   onCreateTaskCard: (messageId: string) => void;
-  onConfirmCreateTaskCard?: (messageId: string) => void;
   onCancelTaskCard: (messageId: string) => void;
   onDeleteTaskCard: (messageId: string) => void;
   onToggleAutoConversation?: () => void;
@@ -34,6 +33,8 @@ export interface ChatRendererProps {
   onCancelGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
   onConfirmAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
   onCancelAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
+  onConfirmSelfUpgrade?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
+  onCancelSelfUpgrade?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (v: boolean) => void;
   infoSidebarCollapsed: boolean;
@@ -59,7 +60,6 @@ export const ChatRenderer = memo(function ChatRenderer({
   onRegenerateMessage,
   onStopStreaming,
   onCreateTaskCard,
-  onConfirmCreateTaskCard,
   onCancelTaskCard,
   onDeleteTaskCard,
   onToggleAutoConversation,
@@ -69,6 +69,8 @@ export const ChatRenderer = memo(function ChatRenderer({
   onCancelGroupUpgrade,
   onConfirmAgentManagement,
   onCancelAgentManagement,
+  onConfirmSelfUpgrade,
+  onCancelSelfUpgrade,
   sidebarCollapsed,
   setSidebarCollapsed,
   infoSidebarCollapsed,
@@ -94,7 +96,6 @@ export const ChatRenderer = memo(function ChatRenderer({
       onRegenerateMessage={onRegenerateMessage}
       onStopStreaming={onStopStreaming}
       onCreateTaskCard={onCreateTaskCard}
-      onConfirmCreateTaskCard={onConfirmCreateTaskCard}
       onCancelTaskCard={onCancelTaskCard}
       onDeleteTaskCard={onDeleteTaskCard}
       onToggleAutoConversation={onToggleAutoConversation}
@@ -104,6 +105,8 @@ export const ChatRenderer = memo(function ChatRenderer({
       onCancelGroupUpgrade={onCancelGroupUpgrade}
       onConfirmAgentManagement={onConfirmAgentManagement}
       onCancelAgentManagement={onCancelAgentManagement}
+      onConfirmSelfUpgrade={onConfirmSelfUpgrade}
+      onCancelSelfUpgrade={onCancelSelfUpgrade}
       sidebarCollapsed={sidebarCollapsed}
       onToggleSidebar={() => setSidebarCollapsed(!sidebarCollapsed)}
       infoSidebarCollapsed={infoSidebarCollapsed}

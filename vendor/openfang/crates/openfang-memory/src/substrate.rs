@@ -9,6 +9,7 @@ use crate::migration::run_migrations;
 use crate::semantic::SemanticStore;
 use crate::session::{Session, SessionStore};
 use crate::structured::StructuredStore;
+use crate::task_center::TaskCenterStore;
 use crate::usage::UsageStore;
 
 use async_trait::async_trait;
@@ -33,6 +34,7 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
+    task_center: TaskCenterStore,
 }
 
 impl MemorySubstrate {
@@ -51,7 +53,8 @@ impl MemorySubstrate {
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
-            consolidation: ConsolidationEngine::new(shared, decay_rate),
+            consolidation: ConsolidationEngine::new(Arc::clone(&shared), decay_rate),
+            task_center: TaskCenterStore::new(Arc::clone(&shared)),
         })
     }
 
@@ -69,7 +72,8 @@ impl MemorySubstrate {
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
-            consolidation: ConsolidationEngine::new(shared, decay_rate),
+            consolidation: ConsolidationEngine::new(Arc::clone(&shared), decay_rate),
+            task_center: TaskCenterStore::new(Arc::clone(&shared)),
         })
     }
 
@@ -81,6 +85,120 @@ impl MemorySubstrate {
     /// Get the shared database connection (for constructing stores from outside).
     pub fn usage_conn(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.conn)
+    }
+
+    pub fn task_create(
+        &self,
+        spec: &openfang_types::tasks::ManagedTaskSpec,
+        runtime: &openfang_types::tasks::ManagedTaskRuntime,
+    ) -> OpenFangResult<()> {
+        self.task_center.create_task(spec, runtime)
+    }
+
+    pub fn task_update(
+        &self,
+        spec: &openfang_types::tasks::ManagedTaskSpec,
+        runtime: &openfang_types::tasks::ManagedTaskRuntime,
+    ) -> OpenFangResult<()> {
+        self.task_center.update_task(spec, runtime)
+    }
+
+    pub fn task_get(
+        &self,
+        task_id: &str,
+    ) -> OpenFangResult<Option<openfang_types::tasks::ManagedTaskDetail>> {
+        self.task_center.get_task(task_id)
+    }
+
+    pub fn task_list_managed(
+        &self,
+        agent_id: Option<&str>,
+    ) -> OpenFangResult<Vec<openfang_types::tasks::ManagedTaskDetail>> {
+        self.task_center.list_tasks(agent_id)
+    }
+
+    pub fn task_find_by_cron_job_id(
+        &self,
+        cron_job_id: &str,
+    ) -> OpenFangResult<Option<openfang_types::tasks::ManagedTaskDetail>> {
+        self.task_center.find_task_by_cron_job_id(cron_job_id)
+    }
+
+    pub fn task_delete_managed(&self, task_id: &str) -> OpenFangResult<()> {
+        self.task_center.delete_task(task_id)
+    }
+
+    pub fn task_append_run(
+        &self,
+        run: &openfang_types::tasks::ManagedTaskRun,
+    ) -> OpenFangResult<()> {
+        self.task_center.append_run(run)
+    }
+
+    pub fn task_list_runs_managed(
+        &self,
+        task_id: &str,
+    ) -> OpenFangResult<Vec<openfang_types::tasks::ManagedTaskRun>> {
+        self.task_center.list_runs(task_id)
+    }
+
+    pub fn task_append_event(
+        &self,
+        event: &openfang_types::tasks::ManagedTaskEvent,
+    ) -> OpenFangResult<()> {
+        self.task_center.append_event(event)
+    }
+
+    pub fn task_list_events_managed(
+        &self,
+        task_id: &str,
+    ) -> OpenFangResult<Vec<openfang_types::tasks::ManagedTaskEvent>> {
+        self.task_center.list_events(task_id)
+    }
+
+    pub fn task_append_delivery(
+        &self,
+        delivery: &openfang_types::tasks::ManagedTaskDelivery,
+    ) -> OpenFangResult<()> {
+        self.task_center.append_delivery(delivery)
+    }
+
+    pub fn task_append_delivery_attempt(
+        &self,
+        attempt: &openfang_types::tasks::ManagedTaskDeliveryAttempt,
+    ) -> OpenFangResult<()> {
+        self.task_center.append_delivery_attempt(attempt)
+    }
+
+    pub fn task_list_deliveries_managed(
+        &self,
+        task_id: &str,
+    ) -> OpenFangResult<Vec<openfang_types::tasks::ManagedTaskDelivery>> {
+        self.task_center.list_deliveries(task_id)
+    }
+
+    pub fn task_list_delivery_attempts_managed(
+        &self,
+        task_id: &str,
+    ) -> OpenFangResult<Vec<openfang_types::tasks::ManagedTaskDeliveryAttempt>> {
+        self.task_center.list_delivery_attempts(task_id)
+    }
+
+    pub fn task_list_pending_deliveries_managed(
+        &self,
+        target_kind: Option<&str>,
+        origin_chat_session_id: Option<&str>,
+    ) -> OpenFangResult<Vec<openfang_types::tasks::ManagedTaskDelivery>> {
+        self.task_center
+            .list_pending_deliveries(target_kind, origin_chat_session_id)
+    }
+
+    pub fn task_mark_delivery_status(
+        &self,
+        delivery_id: &str,
+        status: openfang_types::tasks::ManagedTaskDeliveryStatus,
+    ) -> OpenFangResult<Option<openfang_types::tasks::ManagedTaskDelivery>> {
+        self.task_center.mark_delivery_status(delivery_id, status)
     }
 
     /// Save an agent entry to persistent storage.

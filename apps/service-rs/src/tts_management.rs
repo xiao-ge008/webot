@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::extract::{Multipart, Path as AxumPath};
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -43,6 +45,8 @@ pub struct AppTtsSettings {
     pub local: LocalTtsSettings,
     #[serde(default)]
     pub remote: RemoteTtsSettings,
+    #[serde(default)]
+    pub speaker_profiles: Vec<SpeakerProfileRecord>,
 }
 
 impl Default for AppTtsSettings {
@@ -53,6 +57,7 @@ impl Default for AppTtsSettings {
             active_local_engine: default_local_engine(),
             local: LocalTtsSettings::default(),
             remote: RemoteTtsSettings::default(),
+            speaker_profiles: Vec::new(),
         }
     }
 }
@@ -268,6 +273,17 @@ fn default_model_dir() -> PathBuf {
         .join(F5_ENGINE_ID)
 }
 
+fn tts_shared_data_root() -> Result<PathBuf, String> {
+    Ok(path_resolver::webot_home_dir()?
+        .join("shared")
+        .join("data")
+        .join("tts"))
+}
+
+fn tts_global_speaker_profiles_root() -> Result<PathBuf, String> {
+    Ok(tts_shared_data_root()?.join("speaker-profiles"))
+}
+
 fn default_model_dir_string() -> String {
     default_model_dir().to_string_lossy().to_string()
 }
@@ -297,6 +313,11 @@ fn normalize_config(mut config: AppTtsSettings) -> AppTtsSettings {
     if config.remote.active_provider.trim().is_empty() {
         config.remote.active_provider = default_remote_provider();
     }
+    config.speaker_profiles = config
+        .speaker_profiles
+        .into_iter()
+        .filter_map(normalize_speaker_profile)
+        .collect();
     config
 }
 
@@ -353,7 +374,9 @@ fn compute_model_status(config: AppTtsSettings, state: &TtsDownloadState) -> Tts
         total_present_bytes
     };
     let downloaded_bytes = if state.active {
-        state.downloaded_bytes.min(total_bytes.max(state.downloaded_bytes))
+        state
+            .downloaded_bytes
+            .min(total_bytes.max(state.downloaded_bytes))
     } else {
         total_present_bytes
     };
@@ -426,8 +449,12 @@ async fn estimate_total_bytes() -> u64 {
         Ok(value) => value,
         Err(_) => return 0,
     };
-    let archive_len = head_content_length(&client, F5_ARCHIVE_URLS).await.unwrap_or(0);
-    let vocab_len = head_content_length(&client, F5_VOCAB_URLS).await.unwrap_or(0);
+    let archive_len = head_content_length(&client, F5_ARCHIVE_URLS)
+        .await
+        .unwrap_or(0);
+    let vocab_len = head_content_length(&client, F5_VOCAB_URLS)
+        .await
+        .unwrap_or(0);
     archive_len.saturating_add(vocab_len)
 }
 
@@ -480,16 +507,22 @@ fn has_required_archive_files(model_dir: &Path) -> bool {
         .all(|item| model_dir.join(item.relative_path).is_file())
 }
 
-fn extract_required_files_from_archive(archive_path: &Path, model_dir: &Path) -> Result<(), String> {
+fn extract_required_files_from_archive(
+    archive_path: &Path,
+    model_dir: &Path,
+) -> Result<(), String> {
     let file = fs::File::open(archive_path)
         .map_err(|error| format!("打开模型压缩包失败({}): {error}", archive_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| format!("解析模型压缩包失败({}): {error}", archive_path.display()))?;
 
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| format!("读取模型压缩包条目失败({}): {error}", archive_path.display()))?;
+        let mut entry = archive.by_index(index).map_err(|error| {
+            format!(
+                "读取模型压缩包条目失败({}): {error}",
+                archive_path.display()
+            )
+        })?;
         if entry.is_dir() {
             continue;
         }
@@ -506,9 +539,8 @@ fn extract_required_files_from_archive(archive_path: &Path, model_dir: &Path) ->
         }
         let target_path = model_dir.join(file_name);
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!("创建模型解压目录失败({}): {error}", parent.display())
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("创建模型解压目录失败({}): {error}", parent.display()))?;
         }
         let mut output = fs::File::create(&target_path)
             .map_err(|error| format!("创建解压文件失败({}): {error}", target_path.display()))?;
@@ -526,10 +558,7 @@ fn extract_required_files_from_archive(archive_path: &Path, model_dir: &Path) ->
         .filter(|relative_path| !model_dir.join(relative_path).is_file())
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        return Err(format!(
-            "模型压缩包缺少关键文件: {}",
-            missing.join(", ")
-        ));
+        return Err(format!("模型压缩包缺少关键文件: {}", missing.join(", ")));
     }
     Ok(())
 }
@@ -565,12 +594,14 @@ async fn download_model_files(config: &AppTtsSettings) -> Result<(), String> {
         let expected_len = response.content_length().unwrap_or(0);
         total_bytes = total_bytes.max(expected_len);
         let mut stream = response.bytes_stream();
-        let mut output = tokio::fs::File::create(&temp_archive_path).await.map_err(|error| {
-            format!(
-                "创建模型压缩包临时文件失败({}): {error}",
-                temp_archive_path.display()
-            )
-        })?;
+        let mut output = tokio::fs::File::create(&temp_archive_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "创建模型压缩包临时文件失败({}): {error}",
+                    temp_archive_path.display()
+                )
+            })?;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| format!("读取下载流失败: {error}"))?;
             tokio::io::AsyncWriteExt::write_all(&mut output, &chunk)
@@ -592,12 +623,14 @@ async fn download_model_files(config: &AppTtsSettings) -> Result<(), String> {
             )
             .await;
         }
-        tokio::io::AsyncWriteExt::flush(&mut output).await.map_err(|error| {
-            format!(
-                "刷新模型压缩包失败({}): {error}",
-                temp_archive_path.display()
-            )
-        })?;
+        tokio::io::AsyncWriteExt::flush(&mut output)
+            .await
+            .map_err(|error| {
+                format!(
+                    "刷新模型压缩包失败({}): {error}",
+                    temp_archive_path.display()
+                )
+            })?;
         drop(output);
 
         extract_required_files_from_archive(&temp_archive_path, &model_dir)?;
@@ -619,9 +652,14 @@ async fn download_model_files(config: &AppTtsSettings) -> Result<(), String> {
         let expected_len = response.content_length().unwrap_or(0);
         total_bytes = total_bytes.max(completed_bytes.saturating_add(expected_len));
         let mut stream = response.bytes_stream();
-        let mut output = tokio::fs::File::create(&temp_vocab_path).await.map_err(|error| {
-            format!("创建词表临时文件失败({}): {error}", temp_vocab_path.display())
-        })?;
+        let mut output = tokio::fs::File::create(&temp_vocab_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "创建词表临时文件失败({}): {error}",
+                    temp_vocab_path.display()
+                )
+            })?;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| format!("读取下载流失败: {error}"))?;
             tokio::io::AsyncWriteExt::write_all(&mut output, &chunk)
@@ -695,9 +733,9 @@ struct AgentTtsConfigRecord {
     max_chunk_chars: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct AgentSpeakerProfileRecord {
+pub struct SpeakerProfileRecord {
     #[serde(default)]
     id: String,
     #[serde(default)]
@@ -712,6 +750,10 @@ struct AgentSpeakerProfileRecord {
     language: Option<String>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -796,7 +838,7 @@ fn normalize_agent_tts_config(mut config: AgentTtsConfigRecord) -> AgentTtsConfi
     config
 }
 
-fn normalize_speaker_profile(mut profile: AgentSpeakerProfileRecord) -> Option<AgentSpeakerProfileRecord> {
+fn normalize_speaker_profile(mut profile: SpeakerProfileRecord) -> Option<SpeakerProfileRecord> {
     profile.id = profile.id.trim().to_string();
     profile.name = profile.name.trim().to_string();
     profile.engine = if profile.engine.trim().is_empty() {
@@ -820,6 +862,8 @@ fn normalize_speaker_profile(mut profile: AgentSpeakerProfileRecord) -> Option<A
         .notes
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    profile.created_at = profile.created_at.trim().to_string();
+    profile.updated_at = profile.updated_at.trim().to_string();
     if profile.id.is_empty() || profile.name.is_empty() {
         return None;
     }
@@ -828,18 +872,39 @@ fn normalize_speaker_profile(mut profile: AgentSpeakerProfileRecord) -> Option<A
 
 fn parse_agent_tts_config(raw: Option<&Value>) -> Result<AgentTtsConfigRecord, String> {
     match raw {
-        Some(value) if !value.is_null() => serde_json::from_value::<AgentTtsConfigRecord>(value.clone())
-            .map(normalize_agent_tts_config)
-            .map_err(|error| format!("解析智能体 TTS 配置失败: {error}")),
+        Some(value) if !value.is_null() => {
+            let mut parsed = serde_json::from_value::<AgentTtsConfigRecord>(value.clone())
+                .map_err(|error| format!("解析智能体 TTS 配置失败: {error}"))?;
+            let enabled_missing = value.get("enabled").is_none() && value.get("Enabled").is_none();
+            if enabled_missing
+                && !parsed.enabled
+                && parsed
+                    .speaker_profile_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .is_some()
+            {
+                parsed.enabled = true;
+            }
+            Ok(normalize_agent_tts_config(parsed))
+        }
         _ => Ok(AgentTtsConfigRecord::default()),
     }
 }
 
-fn parse_speaker_profiles(raw: Option<&Value>) -> Result<Vec<AgentSpeakerProfileRecord>, String> {
+fn parse_speaker_profiles(raw: Option<&Value>) -> Result<Vec<SpeakerProfileRecord>, String> {
     match raw {
-        Some(value) if !value.is_null() => serde_json::from_value::<Vec<AgentSpeakerProfileRecord>>(value.clone())
-            .map_err(|error| format!("解析音色样本配置失败: {error}"))
-            .map(|items| items.into_iter().filter_map(normalize_speaker_profile).collect()),
+        Some(value) if !value.is_null() => {
+            serde_json::from_value::<Vec<SpeakerProfileRecord>>(value.clone())
+                .map_err(|error| format!("解析音色样本配置失败: {error}"))
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .filter_map(normalize_speaker_profile)
+                        .collect()
+                })
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -898,15 +963,18 @@ fn resolve_effective_service_mode(global: &AppTtsSettings, agent: &AgentTtsConfi
 }
 
 fn pick_speaker_profile<'a>(
-    profiles: &'a [AgentSpeakerProfileRecord],
+    profiles: &'a [SpeakerProfileRecord],
     requested_id: Option<&str>,
     config_default_id: Option<&str>,
-) -> Option<&'a AgentSpeakerProfileRecord> {
+) -> Option<&'a SpeakerProfileRecord> {
     let requested = requested_id
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if let Some(target) = requested {
-        if let Some(hit) = profiles.iter().find(|item| item.id.eq_ignore_ascii_case(target)) {
+        if let Some(hit) = profiles
+            .iter()
+            .find(|item| item.id.eq_ignore_ascii_case(target))
+        {
             return Some(hit);
         }
     }
@@ -914,7 +982,10 @@ fn pick_speaker_profile<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if let Some(target) = config_default {
-        if let Some(hit) = profiles.iter().find(|item| item.id.eq_ignore_ascii_case(target)) {
+        if let Some(hit) = profiles
+            .iter()
+            .find(|item| item.id.eq_ignore_ascii_case(target))
+        {
             return Some(hit);
         }
     }
@@ -1033,7 +1104,10 @@ fn split_text_chunks(text: &str, strategy: &str, max_chars: usize) -> Vec<String
     }
 
     let mut merged = chunk_segments_with_limit(base_segments, max_chars);
-    if merged.iter().any(|item| item.chars().count() > max_chars.max(1)) {
+    if merged
+        .iter()
+        .any(|item| item.chars().count() > max_chars.max(1))
+    {
         merged = merged
             .into_iter()
             .flat_map(|item| {
@@ -1146,8 +1220,12 @@ async fn install_tts_runtime_dependencies(model_dir: &Path) -> Result<PathBuf, S
             .parent()
             .and_then(Path::parent)
             .ok_or_else(|| "无法确定 TTS 虚拟环境目录".to_string())?;
-        fs::create_dir_all(venv_root)
-            .map_err(|error| format!("创建 TTS 虚拟环境目录失败({}): {error}", venv_root.display()))?;
+        fs::create_dir_all(venv_root).map_err(|error| {
+            format!(
+                "创建 TTS 虚拟环境目录失败({}): {error}",
+                venv_root.display()
+            )
+        })?;
         let bootstrap_candidates = python_command_candidates(&[]);
         let mut last_error = String::new();
         let mut created = false;
@@ -1224,7 +1302,8 @@ pub async fn build_local_f5_synthesis_plan(
     }
 
     let profile = assignment_store::get_agent_profile_override(agent_id)?;
-    let agent_config = parse_agent_tts_config(profile.as_ref().and_then(|item| item.tts_config.as_ref()))?;
+    let agent_config =
+        parse_agent_tts_config(profile.as_ref().and_then(|item| item.tts_config.as_ref()))?;
     if !agent_config.enabled {
         return Err("当前智能体未开启 TTS，请先在智能体编辑页启用 TTS 服务".to_string());
     }
@@ -1236,13 +1315,32 @@ pub async fn build_local_f5_synthesis_plan(
         ));
     }
 
-    let speaker_profiles = parse_speaker_profiles(profile.as_ref().and_then(|item| item.speaker_profiles.as_ref()))?;
-    let speaker = pick_speaker_profile(
-        &speaker_profiles,
+    let agent_speaker_profiles = parse_speaker_profiles(
+        profile
+            .as_ref()
+            .and_then(|item| item.speaker_profiles.as_ref()),
+    )?;
+    let agent_speaker = pick_speaker_profile(
+        &agent_speaker_profiles,
         speaker_profile_id_override,
         agent_config.speaker_profile_id.as_deref(),
-    )
-    .ok_or_else(|| "当前智能体尚未配置可用音色样本，请先上传参考音频并填写参考文本".to_string())?;
+    );
+    let global_speaker = if agent_speaker.is_none() {
+        pick_speaker_profile(
+            &global_config.speaker_profiles,
+            speaker_profile_id_override,
+            agent_config.speaker_profile_id.as_deref(),
+        )
+    } else {
+        None
+    };
+    let (speaker, speaker_data_root) = if let Some(speaker) = agent_speaker {
+        (speaker, data_root.to_path_buf())
+    } else if let Some(speaker) = global_speaker {
+        (speaker, tts_shared_data_root()?)
+    } else {
+        return Err("当前既没有可用的智能体私有音色，也没有可用的全局音色。请先在全局 TTS 设置中上传参考音频并填写参考文本。".to_string());
+    };
 
     if !speaker.engine.eq_ignore_ascii_case(F5_ENGINE_ID) {
         return Err(format!(
@@ -1255,7 +1353,7 @@ pub async fn build_local_f5_synthesis_plan(
         .ref_audio_path
         .as_deref()
         .ok_or_else(|| format!("音色 `{}` 缺少参考音频路径", speaker.name))?;
-    let reference_audio_path = resolve_reference_audio_path(data_root, raw_ref_path)?;
+    let reference_audio_path = resolve_reference_audio_path(&speaker_data_root, raw_ref_path)?;
     let reference_text = speaker
         .ref_text
         .as_ref()
@@ -1296,7 +1394,9 @@ fn script_path() -> PathBuf {
         .join("f5_tts_infer.py")
 }
 
-pub async fn synthesize_local_f5(plan: &LocalF5SynthesisPlan) -> Result<LocalF5SynthesisResult, String> {
+pub async fn synthesize_local_f5(
+    plan: &LocalF5SynthesisPlan,
+) -> Result<LocalF5SynthesisResult, String> {
     let script = script_path();
     if !script.is_file() {
         return Err(format!("本地 F5 推理脚本不存在: {}", script.display()));
@@ -1319,7 +1419,8 @@ pub async fn synthesize_local_f5(plan: &LocalF5SynthesisPlan) -> Result<LocalF5S
     });
     fs::write(
         &request_path,
-        serde_json::to_vec_pretty(&payload).map_err(|error| format!("序列化 TTS 请求失败: {error}"))?,
+        serde_json::to_vec_pretty(&payload)
+            .map_err(|error| format!("序列化 TTS 请求失败: {error}"))?,
     )
     .map_err(|error| format!("写入 TTS 请求文件失败({}): {error}", request_path.display()))?;
 
@@ -1402,7 +1503,8 @@ pub async fn synthesize_local_f5(plan: &LocalF5SynthesisPlan) -> Result<LocalF5S
     let _ = fs::remove_file(&request_path);
     let _ = fs::remove_file(&output_path);
     if last_error.is_empty() {
-        last_error = "未找到可用的 Python 解释器，请安装 Python 3 或设置 WEBOT_TTS_PYTHON".to_string();
+        last_error =
+            "未找到可用的 Python 解释器，请安装 Python 3 或设置 WEBOT_TTS_PYTHON".to_string();
     }
     Err(last_error)
 }
@@ -1430,6 +1532,217 @@ pub async fn get_tts_status() -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({ "status": status })))
 }
 
+#[derive(Debug, Clone)]
+struct UploadedSpeakerProfileInput {
+    file_bytes: Vec<u8>,
+    name: String,
+    ref_text: String,
+    language: Option<String>,
+    notes: Option<String>,
+}
+
+fn sanitize_speaker_profile_id(raw: &str) -> String {
+    let compact = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let collapsed = compact
+        .split('-')
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        format!("voice-{}", Uuid::new_v4().simple())
+    } else {
+        collapsed
+    }
+}
+
+fn ensure_wav_upload(file_name: &str) -> Result<(), ApiError> {
+    let is_wav = PathBuf::from(file_name)
+        .extension()
+        .and_then(|item| item.to_str())
+        .map(|item| item.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
+    if !is_wav {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "当前仅支持上传 WAV 参考音频",
+        ));
+    }
+    Ok(())
+}
+
+async fn parse_uploaded_speaker_profile(
+    mut multipart: Multipart,
+) -> Result<UploadedSpeakerProfileInput, ApiError> {
+    let mut file_name: Option<String> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut name: Option<String> = None;
+    let mut ref_text: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut notes: Option<String> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("读取上传内容失败: {error}"),
+        )
+    })? {
+        let field_name = field.name().unwrap_or_default().trim().to_string();
+        match field_name.as_str() {
+            "file" => {
+                file_name = field.file_name().map(ToString::to_string);
+                let bytes = field.bytes().await.map_err(|error| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("读取上传文件失败: {error}"),
+                    )
+                })?;
+                file_bytes = Some(bytes.to_vec());
+            }
+            "name" => {
+                name = field
+                    .text()
+                    .await
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+            }
+            "refText" => {
+                ref_text = field
+                    .text()
+                    .await
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+            }
+            "language" => {
+                language = field
+                    .text()
+                    .await
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+            }
+            "notes" => {
+                notes = field
+                    .text()
+                    .await
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+            }
+            _ => {}
+        }
+    }
+
+    let file_name = file_name.unwrap_or_else(|| "speaker.wav".to_string());
+    ensure_wav_upload(&file_name)?;
+    let file_bytes = file_bytes.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "未检测到 file 字段，请上传 WAV 音频",
+        )
+    })?;
+    let name = name.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "请填写音色名称"))?;
+    let ref_text =
+        ref_text.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "请填写参考文本"))?;
+
+    Ok(UploadedSpeakerProfileInput {
+        file_bytes,
+        name,
+        ref_text,
+        language,
+        notes,
+    })
+}
+
+fn build_uploaded_speaker_profile(
+    id: &str,
+    relative_path: &str,
+    input: &UploadedSpeakerProfileInput,
+    now: &str,
+) -> SpeakerProfileRecord {
+    SpeakerProfileRecord {
+        id: id.to_string(),
+        name: input.name.trim().to_string(),
+        engine: default_local_engine(),
+        ref_audio_path: Some(relative_path.to_string()),
+        ref_text: Some(input.ref_text.trim().to_string()),
+        language: input.language.clone(),
+        notes: input.notes.clone(),
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+    }
+}
+
+pub async fn upload_speaker_profile(multipart: Multipart) -> Result<Json<Value>, ApiError> {
+    let input = parse_uploaded_speaker_profile(multipart).await?;
+    let mut config = load_config().await.map_err(internal_error)?;
+    let root = tts_global_speaker_profiles_root().map_err(internal_error)?;
+    fs::create_dir_all(&root)
+        .map_err(|error| internal_error(format!("创建全局音色目录失败: {error}")))?;
+
+    let profile_id = sanitize_speaker_profile_id(&input.name);
+    let unique_file_name = format!("{}-{}.wav", profile_id, Uuid::new_v4().simple());
+    let relative_path = format!("speaker-profiles/{unique_file_name}");
+    let target_path = root.join(&unique_file_name);
+    fs::write(&target_path, &input.file_bytes)
+        .map_err(|error| internal_error(format!("保存参考音频失败: {error}")))?;
+
+    let now = Utc::now().to_rfc3339();
+    let profile = build_uploaded_speaker_profile(&profile_id, &relative_path, &input, &now);
+    config
+        .speaker_profiles
+        .retain(|item| !item.id.eq_ignore_ascii_case(&profile_id));
+    config.speaker_profiles.push(profile.clone());
+    config = normalize_config(config);
+    persist_config(&config).await.map_err(internal_error)?;
+    let status = refresh_status().await.map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "profile": profile,
+        "config": config,
+        "status": status,
+    })))
+}
+
+pub async fn delete_speaker_profile(
+    AxumPath(profile_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut config = load_config().await.map_err(internal_error)?;
+    let target_index = config
+        .speaker_profiles
+        .iter()
+        .position(|item| item.id.eq_ignore_ascii_case(profile_id.trim()))
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "未找到指定音色"))?;
+    let removed = config.speaker_profiles.remove(target_index);
+    if let Some(relative_path) = removed.ref_audio_path.as_deref() {
+        if let Ok(base_root) = tts_shared_data_root() {
+            let target_path = base_root.join(relative_path);
+            if target_path.is_file() {
+                let _ = fs::remove_file(target_path);
+            }
+        }
+    }
+    config = normalize_config(config);
+    persist_config(&config).await.map_err(internal_error)?;
+    let status = refresh_status().await.map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "deletedProfileId": removed.id,
+        "config": config,
+        "status": status,
+    })))
+}
+
 pub async fn start_tts_download() -> Result<Json<Value>, ApiError> {
     let status = refresh_status().await.map_err(internal_error)?;
     if status.model_ready {
@@ -1439,7 +1752,9 @@ pub async fn start_tts_download() -> Result<Json<Value>, ApiError> {
     {
         let guard = download_state().lock().await;
         if guard.active {
-            return Ok(Json(json!({ "status": compute_model_status(status.config, &guard) })));
+            return Ok(Json(
+                json!({ "status": compute_model_status(status.config, &guard) }),
+            ));
         }
     }
 
@@ -1456,7 +1771,9 @@ pub async fn start_tts_download() -> Result<Json<Value>, ApiError> {
             }
             Err(error) => {
                 set_download_state(false, 0, 0, None, Some(error.clone())).await;
-                if let Err(persist_error) = save_status_override("failed", Some(error.clone())).await {
+                if let Err(persist_error) =
+                    save_status_override("failed", Some(error.clone())).await
+                {
                     tracing::warn!(
                         error = %persist_error,
                         cause = %error,

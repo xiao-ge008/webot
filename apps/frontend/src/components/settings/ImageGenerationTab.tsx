@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -12,9 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Badge } from "@/components/ui/badge";
-import { CloudCog, Link2, RefreshCw, Save, Sparkles } from "lucide-react";
+import { Link2, RefreshCw, Save } from "lucide-react";
 import {
   getImageGenerationConfig,
   probeComfyuiResources,
@@ -146,6 +145,36 @@ export function ImageGenerationTab() {
       comfyui: {
         ...prev.comfyui,
         edit: { ...prev.comfyui.edit, ...patch },
+      },
+    }));
+
+  const updateModelscopeBase = (
+    patch: Partial<ImageGenerationConfig["modelscope"]>,
+  ) =>
+    setConfig((prev) => ({
+      ...prev,
+      modelscope: { ...prev.modelscope, ...patch },
+    }));
+
+  const updateModelscopeGenerate = (
+    patch: Partial<ImageGenerationConfig["modelscope"]["generate"]>,
+  ) =>
+    setConfig((prev) => ({
+      ...prev,
+      modelscope: {
+        ...prev.modelscope,
+        generate: { ...prev.modelscope.generate, ...patch },
+      },
+    }));
+
+  const updateModelscopeEdit = (
+    patch: Partial<ImageGenerationConfig["modelscope"]["edit"]>,
+  ) =>
+    setConfig((prev) => ({
+      ...prev,
+      modelscope: {
+        ...prev.modelscope,
+        edit: { ...prev.modelscope.edit, ...patch },
       },
     }));
 
@@ -307,18 +336,99 @@ export function ImageGenerationTab() {
     </div>
   );
 
+  const activeModeLabel = serviceMode === "generate" ? "生成" : "修改";
+  const activeComfyConfig =
+    serviceMode === "generate" ? config.comfyui.generate : config.comfyui.edit;
+  const activeModelscopeModel =
+    serviceMode === "generate"
+      ? config.modelscope.generate.model
+      : config.modelscope.edit.model;
+
+  const updateActiveComfyConfig = (
+    patch: Partial<ComfyuiGenerationDefaults | ComfyuiEditDefaults>,
+  ) => {
+    if (serviceMode === "generate") {
+      updateComfyuiGenerate(patch as Partial<ComfyuiGenerationDefaults>);
+      return;
+    }
+    updateComfyuiEdit(patch as Partial<ComfyuiEditDefaults>);
+  };
+
+  const updateActiveModelscopeModel = (model: string) => {
+    if (serviceMode === "generate") {
+      updateModelscopeGenerate({ model });
+      return;
+    }
+    updateModelscopeEdit({ model });
+  };
+
+  const comfyModelLabelKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiModel"
+      : "settings.imageGeneration.comfyuiEditModel";
+  const comfyModelPlaceholderKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiModelPlaceholder"
+      : "settings.imageGeneration.comfyuiEditModelPlaceholder";
+  const comfyLoraLabelKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiLora"
+      : "settings.imageGeneration.comfyuiEditLora";
+  const comfyLoraPlaceholderKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiLoraPlaceholder"
+      : "settings.imageGeneration.comfyuiEditLoraPlaceholder";
+  const comfyStepsLabelKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiDefaultSteps"
+      : "settings.imageGeneration.comfyuiEditSteps";
+  const comfyCfgLabelKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiCfgScale"
+      : "settings.imageGeneration.comfyuiEditCfgScale";
+  const comfySamplerLabelKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiSamplerName"
+      : "settings.imageGeneration.comfyuiEditSamplerName";
+  const comfySchedulerLabelKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.comfyuiScheduler"
+      : "settings.imageGeneration.comfyuiEditScheduler";
+  const comfyModeDescription =
+    serviceMode === "generate"
+      ? t("settings.imageGeneration.comfyuiGenerateDesc")
+      : t("settings.imageGeneration.comfyuiEditDesc");
+  const modelscopeModeDescription =
+    serviceMode === "generate"
+      ? t("settings.imageGeneration.modelscopeGenerateDesc")
+      : t("settings.imageGeneration.modelscopeEditDesc");
+  const modelscopeModelLabelKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.modelscopeModel"
+      : "settings.imageGeneration.modelscopeEditModel";
+  const modelscopeModelPlaceholderKey =
+    serviceMode === "generate"
+      ? "settings.imageGeneration.modelscopeModelPlaceholder"
+      : "settings.imageGeneration.modelscopeEditModelPlaceholder";
+
   return (
-    <div className="max-w-4xl animate-fade-in opacity-0">
-      <div className="mb-8 flex items-center justify-between gap-4">
+    <div className="max-w-5xl animate-fade-in space-y-5 opacity-0">
+      <div className="flex items-center justify-between gap-4">
         <div className="space-y-2">
           <h2 className="text-xl font-semibold">
             {t("settings.imageGeneration.title")}
           </h2>
           <p className="text-sm text-foreground-secondary">
-            {t("settings.imageGeneration.subtitle")}
+            这里只保留三步：先选图片服务，再选当前用途，最后只配置这一种用途的默认参数。
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Badge variant="outline" className="h-8 px-3 text-xs">
+            {config.provider === "comfyui" ? "ComfyUI" : "ModelScope"}
+          </Badge>
+          <Badge variant="outline" className="h-8 px-3 text-xs">
+            {activeModeLabel}
+          </Badge>
           {config.provider === "comfyui" ? (
             <Button
               variant="outline"
@@ -330,7 +440,7 @@ export function ImageGenerationTab() {
               <RefreshCw
                 className={`h-4 w-4 ${probing ? "animate-spin" : ""}`}
               />
-              {t("settings.imageGeneration.refreshResources")}
+              刷新资源
             </Button>
           ) : null}
           <Button
@@ -345,29 +455,11 @@ export function ImageGenerationTab() {
         </div>
       </div>
 
-      <div className="grid gap-5">
-        <Card className="border-border-light/50 bg-background-secondary/20 shadow-none">
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="space-y-1">
-                <CardTitle className="text-base">
-                  {t("settings.imageGeneration.providerTitle")}
-                </CardTitle>
-                <p className="text-sm text-foreground-secondary">
-                  {t("settings.imageGeneration.providerDesc")}
-                </p>
-              </div>
-              <Badge
-                variant="outline"
-                className="h-6 px-2 text-[11px] font-medium"
-              >
-                {config.provider === "comfyui" ? "ComfyUI" : "ModelScope"}
-              </Badge>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <Label className="mb-2 block text-xs font-medium text-foreground-secondary">
-              {t("settings.imageGeneration.providerLabel")}
+      <Card className="shadow-none">
+        <CardContent className="grid gap-4 p-5 md:grid-cols-2">
+          <div className="grid gap-2">
+            <Label className="text-xs text-foreground-secondary">
+              图片服务
             </Label>
             <Select
               value={config.provider}
@@ -383,48 +475,75 @@ export function ImageGenerationTab() {
                 <SelectItem value="modelscope">ModelScope</SelectItem>
               </SelectContent>
             </Select>
-          </CardContent>
-        </Card>
+            <p className="text-xs leading-6 text-foreground-secondary">
+              本地稳定优先用 ComfyUI，需要云端接口再切到 ModelScope。
+            </p>
+          </div>
 
-        {config.provider === "comfyui" ? (
-          <Card className="border-border-light/50 bg-background-secondary/20 shadow-none">
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between gap-3">
-                <div className="space-y-1">
-                  <CardTitle className="text-base">
-                    {t("settings.imageGeneration.comfyuiTitle")}
-                  </CardTitle>
-                  <p className="text-sm text-foreground-secondary">
-                    {t("settings.imageGeneration.comfyuiDesc")}
-                  </p>
-                </div>
-                <div className="flex flex-wrap items-center justify-end gap-2">
-                  <Badge
-                    variant="outline"
-                    className="h-6 px-2 text-[11px] font-medium"
-                  >
-                    {probing || loading
-                      ? t("settings.loading")
-                      : `${modelOptions.length} ${t("settings.imageGeneration.modelsSuffix")} / ${loraOptions.length} ${t("settings.imageGeneration.lorasSuffix")}`}
-                  </Badge>
-                  <Badge
-                    variant="outline"
-                    className={`h-6 px-2 text-[11px] font-medium ${
-                      probing
-                        ? "border-border-light text-foreground-secondary"
-                        : comfyuiConnected
-                          ? "border-emerald-500/40 text-emerald-600"
-                          : comfyuiConnected === false
-                            ? "border-red-500/40 text-red-500"
-                            : "border-border-light text-foreground-secondary"
-                    }`}
-                  >
-                    {comfyuiStatusLabel}
-                  </Badge>
-                </div>
+          <div className="grid gap-2">
+            <Label className="text-xs text-foreground-secondary">
+              当前用途
+            </Label>
+            <Select
+              value={serviceMode}
+              onValueChange={(value) =>
+                setServiceMode(value as ImageServiceMode)
+              }
+            >
+              <SelectTrigger className="h-10">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="generate">
+                  {t("settings.imageGeneration.generateTab")}
+                </SelectItem>
+                <SelectItem value="edit">
+                  {t("settings.imageGeneration.editTab")}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs leading-6 text-foreground-secondary">
+              当前只会显示“{activeModeLabel}”这一项的默认配置，另一项先不打扰。
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      {config.provider === "comfyui" ? (
+        <Card className="shadow-none">
+          <CardHeader className="pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="space-y-1">
+                <CardTitle className="text-base">ComfyUI</CardTitle>
+                <p className="text-sm text-foreground-secondary">
+                  主页面只放连接、模型和核心参数，采样器与尺寸收进高级设置。
+                </p>
               </div>
-            </CardHeader>
-            <CardContent className="grid gap-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="outline" className="h-7 px-3 text-[11px]">
+                  {loading || probing
+                    ? t("settings.loading")
+                    : `${modelOptions.length} 模型 / ${loraOptions.length} LoRA`}
+                </Badge>
+                <Badge
+                  variant="outline"
+                  className={`h-7 px-3 text-[11px] ${
+                    probing
+                      ? "border-border-light text-foreground-secondary"
+                      : comfyuiConnected
+                        ? "border-emerald-500/40 text-emerald-600"
+                        : comfyuiConnected === false
+                          ? "border-red-500/40 text-red-500"
+                          : "border-border-light text-foreground-secondary"
+                  }`}
+                >
+                  {comfyuiStatusLabel}
+                </Badge>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 md:grid-cols-[1.1fr_0.9fr]">
               <div className="grid gap-2">
                 <Label className="text-xs font-medium text-foreground-secondary">
                   {t("settings.imageGeneration.serverUrl")}
@@ -443,219 +562,162 @@ export function ImageGenerationTab() {
                   />
                 </div>
                 <p className="text-xs leading-6 text-foreground-secondary">
-                  {t("settings.imageGeneration.comfyuiStatus")}:{" "}
+                  当前状态：
                   {comfyuiStatusMessage ||
                     t("settings.imageGeneration.comfyuiStatusUnavailableHint")}
                 </p>
-                <p className="text-xs leading-6 text-foreground-secondary">
-                  {t("settings.imageGeneration.comfyuiBuiltinWorkflowHint")}
+              </div>
+
+              <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 px-4 py-4">
+                <div className="text-sm font-medium">
+                  当前用途：{activeModeLabel}
+                </div>
+                <p className="mt-2 text-xs leading-6 text-foreground-secondary">
+                  {comfyModeDescription}
                 </p>
               </div>
+            </div>
 
-              <div className="grid gap-2">
-                <Label className="text-xs font-medium text-foreground-secondary">
-                  {t("settings.imageGeneration.apiKey")}
-                </Label>
-                <Textarea
-                  value={config.comfyui.apiKey}
-                  onChange={(event) =>
-                    updateComfyuiBase({ apiKey: event.target.value })
-                  }
-                  placeholder={t("settings.imageGeneration.apiKeyPlaceholder")}
-                  className="min-h-[88px]"
-                />
-              </div>
-
-              <Tabs
-                value={serviceMode}
-                onValueChange={(value) =>
-                  setServiceMode(value as ImageServiceMode)
+            <div className="grid gap-2">
+              <Label className="text-xs font-medium text-foreground-secondary">
+                {t("settings.imageGeneration.apiKey")}
+              </Label>
+              <Textarea
+                value={config.comfyui.apiKey}
+                onChange={(event) =>
+                  updateComfyuiBase({ apiKey: event.target.value })
                 }
-              >
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="generate">
-                    {t("settings.imageGeneration.generateTab")}
-                  </TabsTrigger>
-                  <TabsTrigger value="edit">
-                    {t("settings.imageGeneration.editTab")}
-                  </TabsTrigger>
-                </TabsList>
+                placeholder={t("settings.imageGeneration.apiKeyPlaceholder")}
+                className="min-h-[72px]"
+              />
+            </div>
 
-                <TabsContent value="generate" className="grid gap-4">
-                  <p className="rounded-2xl border border-border-light/40 bg-background/40 p-4 text-sm text-foreground-secondary">
-                    {t("settings.imageGeneration.comfyuiGenerateDesc")}
-                  </p>
-                  {renderComfySelect(
-                    "settings.imageGeneration.comfyuiModel",
-                    "settings.imageGeneration.comfyuiModelPlaceholder",
-                    config.comfyui.generate.modelName,
-                    modelOptions,
-                    (next) => updateComfyuiGenerate({ modelName: next }),
-                  )}
-                  {renderComfySelect(
-                    "settings.imageGeneration.comfyuiLora",
-                    "settings.imageGeneration.comfyuiLoraPlaceholder",
-                    config.comfyui.generate.loraName,
-                    loraOptions,
-                    (next) => updateComfyuiGenerate({ loraName: next }),
-                  )}
-                  <div className="grid gap-4 md:grid-cols-2">
-                    {renderComfyNumber(
-                      "settings.imageGeneration.comfyuiDefaultSteps",
-                      config.comfyui.generate.defaultSteps,
-                      (next) => updateComfyuiGenerate({ defaultSteps: next }),
-                      1,
-                      "settings.imageGeneration.comfyuiDefaultStepsPlaceholder",
-                    )}
-                    {renderComfyNumber(
-                      "settings.imageGeneration.comfyuiCfgScale",
-                      config.comfyui.generate.cfgScale,
-                      (next) => updateComfyuiGenerate({ cfgScale: next }),
-                      0.1,
-                      "settings.imageGeneration.comfyuiCfgScalePlaceholder",
-                    )}
+            <div className="grid gap-4 md:grid-cols-2">
+              {renderComfySelect(
+                comfyModelLabelKey,
+                comfyModelPlaceholderKey,
+                activeComfyConfig.modelName,
+                modelOptions,
+                (next) => updateActiveComfyConfig({ modelName: next }),
+              )}
+              {renderComfySelect(
+                comfyLoraLabelKey,
+                comfyLoraPlaceholderKey,
+                activeComfyConfig.loraName,
+                loraOptions,
+                (next) => updateActiveComfyConfig({ loraName: next }),
+              )}
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2">
+              {renderComfyNumber(
+                comfyStepsLabelKey,
+                activeComfyConfig.defaultSteps,
+                (next) => updateActiveComfyConfig({ defaultSteps: next }),
+                1,
+                "settings.imageGeneration.comfyuiDefaultStepsPlaceholder",
+              )}
+              {renderComfyNumber(
+                comfyCfgLabelKey,
+                activeComfyConfig.cfgScale,
+                (next) => updateActiveComfyConfig({ cfgScale: next }),
+                0.1,
+                "settings.imageGeneration.comfyuiCfgScalePlaceholder",
+              )}
+            </div>
+
+            <details className="rounded-2xl border border-border-light/50 bg-background-secondary/10 px-4 py-3">
+              <summary className="cursor-pointer list-none text-sm font-medium">
+                高级设置
+              </summary>
+              <div className="mt-4 grid gap-4">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="grid gap-2">
+                    <Label className="text-xs font-medium text-foreground-secondary">
+                      {t(comfySamplerLabelKey)}
+                    </Label>
+                    <Input
+                      value={activeComfyConfig.samplerName}
+                      onChange={(event) =>
+                        updateActiveComfyConfig({
+                          samplerName: event.target.value,
+                        })
+                      }
+                      placeholder={t(
+                        "settings.imageGeneration.comfyuiSamplerNamePlaceholder",
+                      )}
+                      className="h-10"
+                    />
                   </div>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <div className="grid gap-2">
-                      <Label className="text-xs font-medium text-foreground-secondary">
-                        {t("settings.imageGeneration.comfyuiSamplerName")}
-                      </Label>
-                      <Input
-                        value={config.comfyui.generate.samplerName}
-                        onChange={(event) =>
-                          updateComfyuiGenerate({
-                            samplerName: event.target.value,
-                          })
-                        }
-                        placeholder={t(
-                          "settings.imageGeneration.comfyuiSamplerNamePlaceholder",
-                        )}
-                        className="h-10"
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label className="text-xs font-medium text-foreground-secondary">
-                        {t("settings.imageGeneration.comfyuiScheduler")}
-                      </Label>
-                      <Input
-                        value={config.comfyui.generate.scheduler}
-                        onChange={(event) =>
-                          updateComfyuiGenerate({
-                            scheduler: event.target.value,
-                          })
-                        }
-                        placeholder={t(
-                          "settings.imageGeneration.comfyuiSchedulerPlaceholder",
-                        )}
-                        className="h-10"
-                      />
-                    </div>
+                  <div className="grid gap-2">
+                    <Label className="text-xs font-medium text-foreground-secondary">
+                      {t(comfySchedulerLabelKey)}
+                    </Label>
+                    <Input
+                      value={activeComfyConfig.scheduler}
+                      onChange={(event) =>
+                        updateActiveComfyConfig({
+                          scheduler: event.target.value,
+                        })
+                      }
+                      placeholder={t(
+                        "settings.imageGeneration.comfyuiSchedulerPlaceholder",
+                      )}
+                      className="h-10"
+                    />
                   </div>
+                </div>
+
+                {serviceMode === "generate" ? (
                   <div className="grid gap-4 md:grid-cols-2">
                     {renderComfyNumber(
                       "settings.imageGeneration.comfyuiDefaultWidth",
-                      config.comfyui.generate.defaultWidth,
-                      (next) => updateComfyuiGenerate({ defaultWidth: next }),
+                      (activeComfyConfig as ComfyuiGenerationDefaults)
+                        .defaultWidth,
+                      (next) =>
+                        updateActiveComfyConfig({
+                          defaultWidth: next,
+                        } as Partial<ComfyuiGenerationDefaults>),
                       1,
                       "settings.imageGeneration.comfyuiDefaultWidthPlaceholder",
                     )}
                     {renderComfyNumber(
                       "settings.imageGeneration.comfyuiDefaultHeight",
-                      config.comfyui.generate.defaultHeight,
-                      (next) => updateComfyuiGenerate({ defaultHeight: next }),
+                      (activeComfyConfig as ComfyuiGenerationDefaults)
+                        .defaultHeight,
+                      (next) =>
+                        updateActiveComfyConfig({
+                          defaultHeight: next,
+                        } as Partial<ComfyuiGenerationDefaults>),
                       1,
                       "settings.imageGeneration.comfyuiDefaultHeightPlaceholder",
                     )}
                   </div>
-                  <p className="text-xs leading-6 text-foreground-secondary">
-                    {t("settings.imageGeneration.comfyuiAdvancedHint")}
-                  </p>
-                </TabsContent>
+                ) : null}
 
-                <TabsContent value="edit" className="grid gap-4">
-                  <p className="rounded-2xl border border-border-light/40 bg-background/40 p-4 text-sm text-foreground-secondary">
-                    {t("settings.imageGeneration.comfyuiEditDesc")}
-                  </p>
-                  {renderComfySelect(
-                    "settings.imageGeneration.comfyuiEditModel",
-                    "settings.imageGeneration.comfyuiEditModelPlaceholder",
-                    config.comfyui.edit.modelName,
-                    modelOptions,
-                    (next) => updateComfyuiEdit({ modelName: next }),
-                  )}
-                  {renderComfySelect(
-                    "settings.imageGeneration.comfyuiEditLora",
-                    "settings.imageGeneration.comfyuiEditLoraPlaceholder",
-                    config.comfyui.edit.loraName,
-                    loraOptions,
-                    (next) => updateComfyuiEdit({ loraName: next }),
-                  )}
-                  <div className="grid gap-4 md:grid-cols-2">
-                    {renderComfyNumber(
-                      "settings.imageGeneration.comfyuiEditSteps",
-                      config.comfyui.edit.defaultSteps,
-                      (next) => updateComfyuiEdit({ defaultSteps: next }),
-                      1,
-                      "settings.imageGeneration.comfyuiDefaultStepsPlaceholder",
-                    )}
-                    {renderComfyNumber(
-                      "settings.imageGeneration.comfyuiEditCfgScale",
-                      config.comfyui.edit.cfgScale,
-                      (next) => updateComfyuiEdit({ cfgScale: next }),
-                      0.1,
-                      "settings.imageGeneration.comfyuiCfgScalePlaceholder",
-                    )}
-                  </div>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <div className="grid gap-2">
-                      <Label className="text-xs font-medium text-foreground-secondary">
-                        {t("settings.imageGeneration.comfyuiEditSamplerName")}
-                      </Label>
-                      <Input
-                        value={config.comfyui.edit.samplerName}
-                        onChange={(event) =>
-                          updateComfyuiEdit({ samplerName: event.target.value })
-                        }
-                        placeholder={t(
-                          "settings.imageGeneration.comfyuiSamplerNamePlaceholder",
-                        )}
-                        className="h-10"
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label className="text-xs font-medium text-foreground-secondary">
-                        {t("settings.imageGeneration.comfyuiEditScheduler")}
-                      </Label>
-                      <Input
-                        value={config.comfyui.edit.scheduler}
-                        onChange={(event) =>
-                          updateComfyuiEdit({ scheduler: event.target.value })
-                        }
-                        placeholder={t(
-                          "settings.imageGeneration.comfyuiSchedulerPlaceholder",
-                        )}
-                        className="h-10"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-xs leading-6 text-foreground-secondary">
-                    {t("settings.imageGeneration.comfyuiEditHint")}
-                  </p>
-                </TabsContent>
-              </Tabs>
-            </CardContent>
-          </Card>
-        ) : (
-          <Card className="border-border-light/50 bg-background-secondary/20 shadow-none">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base">
-                {t("settings.imageGeneration.modelscopeTitle")}
-              </CardTitle>
+                <p className="text-xs leading-6 text-foreground-secondary">
+                  一般保持默认即可，只有你明确知道采样器、调度器或尺寸要固定时，再展开这里调整。
+                </p>
+              </div>
+            </details>
+
+            <p className="text-xs leading-6 text-foreground-secondary">
+              {t("settings.imageGeneration.comfyuiBuiltinWorkflowHint")}
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <Card className="shadow-none">
+          <CardHeader className="pb-3">
+            <div className="space-y-1">
+              <CardTitle className="text-base">ModelScope</CardTitle>
               <p className="text-sm text-foreground-secondary">
-                {t("settings.imageGeneration.modelscopeDesc")}
+                云端模式只保留地址、鉴权和当前用途模型，避免一次看见太多字段。
               </p>
-            </CardHeader>
-            <CardContent className="grid gap-4">
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 md:grid-cols-[1.1fr_0.9fr]">
               <div className="grid gap-2">
                 <Label className="text-xs font-medium text-foreground-secondary">
                   {t("settings.imageGeneration.baseUrl")}
@@ -665,13 +727,7 @@ export function ImageGenerationTab() {
                   <Input
                     value={config.modelscope.baseUrl}
                     onChange={(event) =>
-                      setConfig((prev) => ({
-                        ...prev,
-                        modelscope: {
-                          ...prev.modelscope,
-                          baseUrl: event.target.value,
-                        },
-                      }))
+                      updateModelscopeBase({ baseUrl: event.target.value })
                     }
                     placeholder={t(
                       "settings.imageGeneration.baseUrlPlaceholder",
@@ -680,6 +736,18 @@ export function ImageGenerationTab() {
                   />
                 </div>
               </div>
+
+              <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 px-4 py-4">
+                <div className="text-sm font-medium">
+                  当前用途：{activeModeLabel}
+                </div>
+                <p className="mt-2 text-xs leading-6 text-foreground-secondary">
+                  {modelscopeModeDescription}
+                </p>
+              </div>
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2">
               <div className="grid gap-2">
                 <Label className="text-xs font-medium text-foreground-secondary">
                   {t("settings.imageGeneration.apiKey")}
@@ -687,13 +755,7 @@ export function ImageGenerationTab() {
                 <Textarea
                   value={config.modelscope.apiKey}
                   onChange={(event) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      modelscope: {
-                        ...prev.modelscope,
-                        apiKey: event.target.value,
-                      },
-                    }))
+                    updateModelscopeBase({ apiKey: event.target.value })
                   }
                   placeholder={t(
                     "settings.imageGeneration.modelscopeKeyPlaceholder",
@@ -701,6 +763,7 @@ export function ImageGenerationTab() {
                   className="min-h-[72px]"
                 />
               </div>
+
               <div className="grid gap-2">
                 <Label className="text-xs font-medium text-foreground-secondary">
                   {t("settings.imageGeneration.apiSecret")}
@@ -708,13 +771,7 @@ export function ImageGenerationTab() {
                 <Textarea
                   value={config.modelscope.apiSecret}
                   onChange={(event) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      modelscope: {
-                        ...prev.modelscope,
-                        apiSecret: event.target.value,
-                      },
-                    }))
+                    updateModelscopeBase({ apiSecret: event.target.value })
                   }
                   placeholder={t(
                     "settings.imageGeneration.modelscopeSecretPlaceholder",
@@ -722,89 +779,33 @@ export function ImageGenerationTab() {
                   className="min-h-[72px]"
                 />
               </div>
-              <Tabs
-                value={serviceMode}
-                onValueChange={(value) =>
-                  setServiceMode(value as ImageServiceMode)
-                }
-              >
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="generate">
-                    {t("settings.imageGeneration.generateTab")}
-                  </TabsTrigger>
-                  <TabsTrigger value="edit">
-                    {t("settings.imageGeneration.editTab")}
-                  </TabsTrigger>
-                </TabsList>
-                <TabsContent value="generate" className="grid gap-4">
-                  <p className="rounded-2xl border border-border-light/40 bg-background/40 p-4 text-sm text-foreground-secondary">
-                    {t("settings.imageGeneration.modelscopeGenerateDesc")}
-                  </p>
-                  <div className="grid gap-2">
-                    <Label className="text-xs font-medium text-foreground-secondary">
-                      {t("settings.imageGeneration.modelscopeModel")}
-                    </Label>
-                    <Input
-                      value={config.modelscope.generate.model}
-                      onChange={(event) =>
-                        setConfig((prev) => ({
-                          ...prev,
-                          modelscope: {
-                            ...prev.modelscope,
-                            generate: { model: event.target.value },
-                          },
-                        }))
-                      }
-                      placeholder={t(
-                        "settings.imageGeneration.modelscopeModelPlaceholder",
-                      )}
-                      className="h-10"
-                    />
-                  </div>
-                </TabsContent>
-                <TabsContent value="edit" className="grid gap-4">
-                  <p className="rounded-2xl border border-border-light/40 bg-background/40 p-4 text-sm text-foreground-secondary">
-                    {t("settings.imageGeneration.modelscopeEditDesc")}
-                  </p>
-                  <div className="grid gap-2">
-                    <Label className="text-xs font-medium text-foreground-secondary">
-                      {t("settings.imageGeneration.modelscopeEditModel")}
-                    </Label>
-                    <Input
-                      value={config.modelscope.edit.model}
-                      onChange={(event) =>
-                        setConfig((prev) => ({
-                          ...prev,
-                          modelscope: {
-                            ...prev.modelscope,
-                            edit: { model: event.target.value },
-                          },
-                        }))
-                      }
-                      placeholder={t(
-                        "settings.imageGeneration.modelscopeEditModelPlaceholder",
-                      )}
-                      className="h-10"
-                    />
-                  </div>
-                </TabsContent>
-              </Tabs>
-            </CardContent>
-          </Card>
-        )}
-      </div>
+            </div>
 
-      <div className="mt-6 rounded-2xl border border-border-light/40 bg-background-secondary/20 p-4 text-xs text-foreground-secondary">
-        <div className="flex items-center gap-2 text-foreground">
-          <CloudCog className="h-4 w-4" />
-          <span>{t("settings.imageGeneration.hintTitle")}</span>
-        </div>
-        <p className="mt-2 leading-6">{t("settings.imageGeneration.hint")}</p>
-        <div className="mt-3 flex items-start gap-2 text-foreground-secondary">
-          <Sparkles className="mt-0.5 h-4 w-4 shrink-0" />
-          <p>{t("settings.imageGeneration.priorityHint")}</p>
-        </div>
-      </div>
+            <div className="grid gap-2">
+              <Label className="text-xs font-medium text-foreground-secondary">
+                {t(modelscopeModelLabelKey)}
+              </Label>
+              <Input
+                value={activeModelscopeModel}
+                onChange={(event) =>
+                  updateActiveModelscopeModel(event.target.value)
+                }
+                placeholder={t(modelscopeModelPlaceholderKey)}
+                className="h-10"
+              />
+              <p className="text-xs leading-6 text-foreground-secondary">
+                生成场景通常保留默认模型即可；只有云端修图或替换模型时，再单独调整这里。
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card className="shadow-none">
+        <CardContent className="p-4 text-sm text-foreground-secondary">
+          建议先只配一个默认图片服务，把通用图片生成跑通。更细的业务图片流程，继续放到组件技能里，不要把所有场景都堆在这里。
+        </CardContent>
+      </Card>
     </div>
   );
 }

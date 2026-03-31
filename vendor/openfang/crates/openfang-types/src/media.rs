@@ -396,6 +396,18 @@ pub struct ImageEditRequest {
     /// MIME type for `image_base64`.
     #[serde(default)]
     pub mime_type: String,
+    /// Optional reference image path used only for element transfer / fusion.
+    #[serde(default)]
+    pub reference_image_path: String,
+    /// Optional reference image URL used only for element transfer / fusion.
+    #[serde(default)]
+    pub reference_image_url: String,
+    /// Optional reference image base64 used only for element transfer / fusion.
+    #[serde(default)]
+    pub reference_image_base64: String,
+    /// MIME type for `reference_image_base64`.
+    #[serde(default)]
+    pub reference_mime_type: String,
     /// Output image size (e.g. "1024x1024").
     #[serde(default = "default_image_size")]
     pub size: String,
@@ -514,35 +526,70 @@ impl ImageEditRequest {
     }
 
     fn validate_image_source(&self) -> Result<(), String> {
-        let mut count = 0;
-        if !self.image_path.trim().is_empty() {
-            count += 1;
-        }
-        if !self.image_url.trim().is_empty() {
-            count += 1;
-        }
-        if !self.image_base64.trim().is_empty() {
-            count += 1;
-            if self.mime_type.trim().is_empty() {
-                return Err("mime_type is required when image_base64 is provided".to_string());
-            }
-        }
-
-        if count == 0 {
-            return Err(
-                "Exactly one input image source is required: image_path, image_url, or image_base64"
-                    .to_string(),
-            );
-        }
-        if count > 1 {
-            return Err(
-                "Only one input image source may be provided: image_path, image_url, or image_base64"
-                    .to_string(),
-            );
-        }
-
+        validate_image_source_group(
+            "input",
+            &self.image_path,
+            &self.image_url,
+            &self.image_base64,
+            &self.mime_type,
+            true,
+        )?;
+        validate_image_source_group(
+            "reference",
+            &self.reference_image_path,
+            &self.reference_image_url,
+            &self.reference_image_base64,
+            &self.reference_mime_type,
+            false,
+        )?;
         Ok(())
     }
+}
+
+fn validate_image_source_group(
+    label: &str,
+    image_path: &str,
+    image_url: &str,
+    image_base64: &str,
+    mime_type: &str,
+    required: bool,
+) -> Result<(), String> {
+    let field_prefix = if label == "input" {
+        "".to_string()
+    } else {
+        format!("{label}_")
+    };
+    let mut count = 0;
+    if !image_path.trim().is_empty() {
+        count += 1;
+    }
+    if !image_url.trim().is_empty() {
+        count += 1;
+    }
+    if !image_base64.trim().is_empty() {
+        count += 1;
+        if mime_type.trim().is_empty() {
+            return Err(format!(
+                "{}mime_type is required when {}image_base64 is provided",
+                field_prefix, field_prefix
+            ));
+        }
+    }
+
+    if required && count == 0 {
+        return Err(format!(
+            "Exactly one {}image source is required: {}image_path, {}image_url, or {}image_base64",
+            field_prefix, field_prefix, field_prefix, field_prefix
+        ));
+    }
+    if count > 1 {
+        return Err(format!(
+            "Only one {}image source may be provided: {}image_path, {}image_url, or {}image_base64",
+            field_prefix, field_prefix, field_prefix, field_prefix
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_prompt_text(value: &str, field_name: &str) -> Result<(), String> {
@@ -843,6 +890,10 @@ mod tests {
             image_url: "/api/uploads/x".to_string(),
             image_base64: String::new(),
             mime_type: String::new(),
+            reference_image_path: String::new(),
+            reference_image_url: String::new(),
+            reference_image_base64: String::new(),
+            reference_mime_type: String::new(),
             size: "1024x1024".to_string(),
             width: None,
             height: None,
@@ -862,6 +913,10 @@ mod tests {
             image_url: String::new(),
             image_base64: String::new(),
             mime_type: String::new(),
+            reference_image_path: String::new(),
+            reference_image_url: String::new(),
+            reference_image_base64: String::new(),
+            reference_mime_type: String::new(),
             size: "1024x1024".to_string(),
             width: None,
             height: None,
@@ -881,6 +936,33 @@ mod tests {
             image_url: String::new(),
             image_base64: "abc".to_string(),
             mime_type: String::new(),
+            reference_image_path: String::new(),
+            reference_image_url: String::new(),
+            reference_image_base64: String::new(),
+            reference_mime_type: String::new(),
+            size: "1024x1024".to_string(),
+            width: None,
+            height: None,
+            quality: "standard".to_string(),
+            count: 1,
+        };
+        assert!(req.validate_common().is_err());
+    }
+
+    #[test]
+    fn test_image_edit_request_requires_reference_mime_for_reference_base64() {
+        let req = ImageEditRequest {
+            prompt: "把参考图里的衣服合并到主图".to_string(),
+            negative_prompt: String::new(),
+            model: ImageGenModel::GptImage1,
+            image_path: "a.png".to_string(),
+            image_url: String::new(),
+            image_base64: String::new(),
+            mime_type: String::new(),
+            reference_image_path: String::new(),
+            reference_image_url: String::new(),
+            reference_image_base64: "abc".to_string(),
+            reference_mime_type: String::new(),
             size: "1024x1024".to_string(),
             width: None,
             height: None,

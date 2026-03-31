@@ -43,7 +43,7 @@ import { GenUIAudioPlayer } from '@/components/chat/BuiltinAudioComponents';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Agent } from '@/types';
-import type { ChatAttachment, Message, MessageTrace } from '@/data/mock-chats';
+import type { ChatAttachment, Message, MessageToolCall, MessageTrace } from '@/data/mock-chats';
 import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task';
 import type { A2AWorkCardData } from '@/types/a2a';
 import type { AgentTtsSynthesisResult } from '@/types/tts';
@@ -53,7 +53,6 @@ import { Progress } from '@/components/ui/progress';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { uploadManagementAgentChatAsset } from '@/services/management-client';
 import { getTtsStatus, synthesizeAgentTts } from '@/services/tts-client';
-import { analyzeAndCacheChatImageWithLocalVision } from '@/services/local-vision-service';
 import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 import { canOpenAttachmentWithSystem, isDesktopFileOpenSupported, openAttachmentWithSystem } from '@/services/desktop-file-client';
 import { getApiBaseUrl } from '@/services/transport';
@@ -104,6 +103,181 @@ function normalizeLocalManagementAssetUrl(baseUrl: string | undefined, assetUrl:
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
+}
+
+const WATCHDOG_WARNING_TEXT = '响应较慢，仍在等待。';
+
+function getVisibleMessageMeta(meta?: string): string {
+  if (!meta) return '';
+  return meta
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && line !== WATCHDOG_WARNING_TEXT)
+    .join('\n');
+}
+
+function normalizeLogText(value: string): string {
+  return value.replace(/\r/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function clampLogText(value: string, maxLength = 180): string {
+  const normalized = normalizeLogText(value);
+  if (!normalized) return '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function asLogRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function pickLogString(record: Record<string, unknown> | null, ...keys: string[]): string {
+  if (!record) return '';
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+  return '';
+}
+
+function pickLogBoolean(record: Record<string, unknown> | null, ...keys: string[]): boolean | undefined {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'boolean') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function pickLogStringArray(record: Record<string, unknown> | null, ...keys: string[]): string[] {
+  if (!record) return [];
+  for (const key of keys) {
+    const value = record[key];
+    if (Array.isArray(value)) {
+      return value
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function summarizeToolDetail(title: string, detail?: string): string | undefined {
+  const normalizedDetail = detail?.trim();
+  if (!normalizedDetail) {
+    return undefined;
+  }
+  const normalizedTitle = title.trim().toLowerCase();
+  const parsed = parseJsonSafely<unknown>(normalizedDetail);
+  if (parsed && typeof parsed === 'object') {
+    const record = asLogRecord(parsed);
+    const tool = pickLogString(record, 'tool', 'name', 'tool_name');
+    const input = asLogRecord(record?.input);
+    const prompt = pickLogString(input, 'prompt');
+    const model = pickLogString(input, 'model');
+    const provider = pickLogString(input, 'provider');
+    const route = pickLogString(record, 'route');
+    const providerId = pickLogString(record, 'provider_id', 'providerId');
+    const providerType = pickLogString(record, 'provider_type', 'providerType');
+    const providerTool = pickLogString(record, 'provider_tool', 'providerTool');
+    const summary = pickLogString(record, 'summary');
+    const hint = pickLogString(record, 'hint');
+    const attempts = pickLogStringArray(record, 'attempts');
+    const autoInjectedVideoSource = pickLogBoolean(record, 'auto_injected_video_source')
+      ?? pickLogBoolean(input, 'webot_auto_injected_video_source');
+    const autoInjectedVideoSourceUrl = pickLogString(
+      record,
+      'auto_injected_video_source_url',
+      'autoInjectedVideoSourceUrl',
+    ) || pickLogString(input, 'webot_auto_injected_video_source_url');
+    const selfExpression = pickLogBoolean(record, 'self_expression')
+      ?? pickLogBoolean(input, 'webot_self_expression_request');
+    const promptSummary = prompt ? `提示词：${clampLogText(prompt, 96)}` : '';
+    const providerSummary = model || provider ? `模型：${model || provider}` : '';
+    if (tool && !input) {
+      return `已开始调用 ${tool}`;
+    }
+    const structuredLines = [
+      route ? `路径：${route}` : '',
+      providerId ? `Provider：${providerId}${providerType ? ` (${providerType})` : ''}` : '',
+      providerTool ? `命中能力：${providerTool}` : '',
+      autoInjectedVideoSource
+        ? `默认视频源图：已自动注入${autoInjectedVideoSourceUrl ? ` · ${clampLogText(autoInjectedVideoSourceUrl, 88)}` : ''}`
+        : selfExpression && normalizedTitle.includes('video')
+          ? '默认视频源图：未自动注入'
+          : '',
+      summary ? `摘要：${clampLogText(summary, 120)}` : '',
+      promptSummary,
+      providerSummary,
+      attempts.length > 0 ? `尝试路径：${attempts.join(' -> ')}` : '',
+      hint ? `排查建议：${clampLogText(hint, 120)}` : '',
+    ].filter(Boolean);
+    if (structuredLines.length > 0) {
+      return structuredLines.join('\n');
+    }
+    if (promptSummary || providerSummary) {
+      return [providerSummary, promptSummary].filter(Boolean).join('，');
+    }
+  }
+  const query = normalizedDetail.match(/(?:^|\n)\s*query\s*:\s*(.+)$/im)?.[1]?.trim();
+  const hits = normalizedDetail.match(/(?:^|\n)\s*hits\s*:\s*(\d+)/im)?.[1]?.trim();
+  const toolName = normalizedDetail.match(/<(?:[a-z0-9_.-]+:)?tool_call>\s*=?\s*([^\n\r]+)/i)?.[1]?.trim();
+  if (normalizedTitle.includes('记忆')) {
+    return clampLogText([
+      query ? `检索：${query}` : '已执行记忆召回',
+      hits ? `命中 ${hits} 条` : '',
+    ].filter(Boolean).join('，'));
+  }
+  if (toolName) {
+    return clampLogText(query ? `${toolName} · ${query}` : toolName);
+  }
+  if (/^[a-z0-9_-]+:/i.test(normalizedDetail)) {
+    return `模型：${clampLogText(normalizedDetail, 120)}`;
+  }
+  return clampLogText(query || normalizedDetail);
+}
+
+function summarizeThinkingDetail(detail?: string): string | undefined {
+  if (!detail?.trim()) {
+    return undefined;
+  }
+  return clampLogText(detail);
+}
+
+function summarizeFinalOutput(msg: Message): string | undefined {
+  const text = cleanupAssistantText(msg.text || '', msg.spec).trim();
+  if (text && !looksLikeProtocolOnlyText(text)) {
+    return clampLogText(text, 220);
+  }
+  const spec = msg.spec && typeof msg.spec === 'object' ? msg.spec as Record<string, unknown> : null;
+  const specType = typeof spec?.type === 'string' ? spec.type.trim().toLowerCase() : '';
+  if (specType === 'imagecover' || specType === 'imagecarousel') {
+    const title = typeof spec?.props === 'object' && spec.props && typeof (spec.props as Record<string, unknown>).title === 'string'
+      ? ((spec.props as Record<string, unknown>).title as string).trim()
+      : '';
+    return title ? `已生成图片结果：${title}` : '已生成图片结果。';
+  }
+  if (specType) {
+    return '已生成结果卡片。';
+  }
+  return undefined;
+}
+
+function hasVisibleToolDetail(tool: MessageToolCall): boolean {
+  return Boolean(summarizeToolDetail(tool.name || 'tool', tool.result || tool.input));
+}
+
+function hasVisibleTraceDetail(rows: MessageTrace[] | undefined, kind: 'thinking' | 'tool'): boolean {
+  return Boolean(rows?.some((row) => (
+    kind === 'thinking'
+      ? Boolean(summarizeThinkingDetail(row.detail))
+      : Boolean(summarizeToolDetail(row.title, row.detail))
+  )));
 }
 
 function buildClipboardFileName(file: File, index: number): string {
@@ -161,8 +335,8 @@ function collectClipboardFiles(clipboardData: DataTransfer | null): File[] {
 }
 
 export interface ChatSendPayload {
+  rawText: string;
   displayText: string;
-  submitText: string;
   attachments?: ChatAttachment[];
 }
 
@@ -191,12 +365,11 @@ export interface ChatConversationPaneProps {
   inputToolbar?: ReactNode;
   contextUsage?: ChatContextUsageMeter;
   onUserActivity?: (source: UserActivitySource) => void;
-  onSendMessage: (payload: ChatSendPayload) => void;
+  onSendMessage: (payload: ChatSendPayload) => boolean | void | Promise<boolean | void>;
   onSendSilentMessage: (text: string) => void;
   onRegenerateMessage: (messageId: string) => void;
   onStopStreaming: () => void;
   onCreateTaskCard: (messageId: string) => void;
-  onConfirmCreateTaskCard?: (messageId: string) => void;
   onCancelTaskCard: (messageId: string) => void;
   onDeleteTaskCard: (messageId: string) => void;
   onToggleAutoConversation?: () => void;
@@ -206,6 +379,8 @@ export interface ChatConversationPaneProps {
   onCancelGroupUpgrade?: (payload: GroupUpgradeActionPayload, ctx?: { messageId?: string }) => void;
   onConfirmAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
   onCancelAgentManagement?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
+  onConfirmSelfUpgrade?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
+  onCancelSelfUpgrade?: (payload: Record<string, unknown>, ctx?: { messageId?: string }) => void;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
   infoSidebarCollapsed: boolean;
@@ -326,22 +501,151 @@ const MarkdownBlock = memo(function MarkdownBlock({
   );
 });
 
+const CARD_TYPES_THAT_SUPPRESS_MEDIA_MARKDOWN = new Set([
+  'imagecover',
+  'imagecarousel',
+  'videocover',
+  'videogallery',
+  'audioplayer',
+  'audioplaylist',
+  'officepreviewcard',
+  'markdownpreviewcard',
+  'jobprogresscard',
+]);
+
+function getRenderableSpecType(spec: unknown): string {
+  if (!spec || typeof spec !== 'object') {
+    return '';
+  }
+  const value = (spec as Record<string, unknown>).type;
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isComponentInvokeJobProgressSpec(spec: unknown): boolean {
+  if (getRenderableSpecType(spec) !== 'jobprogresscard' || !spec || typeof spec !== 'object') {
+    return false;
+  }
+  const props = (spec as Record<string, unknown>).props;
+  if (!props || typeof props !== 'object') {
+    return false;
+  }
+  const record = props as Record<string, unknown>;
+  const capabilityKey = typeof record.capabilityKey === 'string'
+    ? record.capabilityKey.trim().toLowerCase()
+    : (typeof record.capability_key === 'string' ? record.capability_key.trim().toLowerCase() : '');
+  const route = typeof record.route === 'string'
+    ? record.route.trim().toLowerCase()
+    : '';
+  const providerType = typeof record.providerType === 'string'
+    ? record.providerType.trim().toLowerCase()
+    : (typeof record.provider_type === 'string' ? record.provider_type.trim().toLowerCase() : '');
+  return capabilityKey === 'component_invoke'
+    || route === 'component_invoke'
+    || providerType === 'component_skill';
+}
+
+function shouldRenderStructuredSpec(spec: unknown): boolean {
+  const specType = getRenderableSpecType(spec);
+  if (!specType) {
+    return false;
+  }
+  if (specType !== 'jobprogresscard') {
+    return true;
+  }
+  return isComponentInvokeJobProgressSpec(spec);
+}
+
+function stripMarkdownAssetSyntax(markdown: string): string {
+  return markdown
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, ' ')
+    .replace(/\[[^\]]*\]\((?:https?:\/\/|\/api\/uploads\/)[^)]+\)/g, ' ')
+    .replace(/(?:https?:\/\/|\/api\/uploads\/)\S+/gu, ' ')
+    .replace(/[`>#*\-|]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+function sanitizeMarkdownForRenderableSpec(markdown: string, spec: unknown): string {
+  if (!markdown.trim()) {
+    return markdown;
+  }
+  if (!CARD_TYPES_THAT_SUPPRESS_MEDIA_MARKDOWN.has(getRenderableSpecType(spec))) {
+    return markdown;
+  }
+  return markdown
+    .replace(/!\[[^\]]*\]\([^)]+\)\s*/g, '')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => {
+      const normalized = line.trim().toLowerCase();
+      if (!normalized) {
+        return false;
+      }
+      if (normalized.includes('/api/uploads/')) {
+        return false;
+      }
+      if (normalized.includes('/api/management/agents/')) {
+        return false;
+      }
+      if (/^(图片地址|图片链接|视频地址|视频链接|文档地址|文件地址|下载地址|链接)\s*[:：]/i.test(normalized)) {
+        return false;
+      }
+      if (/^(音频在这|音频地址|语音地址)\s*[:：]/i.test(normalized)) {
+        return false;
+      }
+      return true;
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function hasRuntimeLogData(msg: Message): boolean {
   return Boolean(
-    (msg.thinkingTrace?.length ?? 0) > 0
-    || (msg.toolTrace?.length ?? 0) > 0
-    || (msg.debugNativeFrames || '').trim()
-    || (msg.debugRawStream || '').trim()
-    || (msg.uiRawText || '').trim()
-    || (msg.debugNormalizedUiRawText || '').trim()
-    || (msg.debugRepairedUiRawText || '').trim()
-    || (msg.debugUiContractWarnings || '').trim()
-    || (msg.debugNormalizedSpecText || '').trim()
-    || msg.debugProfileIntroDetected === true
-    || (msg.debugLegacySanitizer || '').trim()
-    || ((msg.debugMixedSegmentCount ?? 0) > 0)
-    || (msg.debugDonePayload || '').trim()
+    (msg.tools ?? []).some((tool) => hasVisibleToolDetail(tool))
+    || hasVisibleTraceDetail(msg.thinkingTrace, 'thinking')
+    || hasVisibleTraceDetail(msg.toolTrace, 'tool')
   );
+}
+
+function hasMeaningfulAgentBridgeText(msg: Message): boolean {
+  const text = cleanupAssistantText(msg.text || '', msg.spec).trim();
+  if (!text) {
+    return false;
+  }
+  if (text.length > 40) {
+    return false;
+  }
+  return /^(好的|我来|我先|这就|马上|稍等|让我|正在).*(生成|制作|处理|安排|执行|帮你)/u.test(text);
+}
+
+function getMessageTimestampMs(msg: Message): number {
+  const timestamp = Date.parse(msg.timestamp || '');
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function canCollapseBridgeMessage(current: Message, next: Message): boolean {
+  if (current.role !== 'agent' || next.role !== 'agent') {
+    return false;
+  }
+  if (current.spec != null || current.taskCard || (current.a2aCards?.length ?? 0) > 0 || (current.attachments?.length ?? 0) > 0) {
+    return false;
+  }
+  if ((current.agentId || current.agentName || '').trim() !== (next.agentId || next.agentName || '').trim()) {
+    return false;
+  }
+  const delta = Math.abs(getMessageTimestampMs(next) - getMessageTimestampMs(current));
+  if (delta > 120_000) {
+    return false;
+  }
+  if (hasRuntimeLogData(current)) {
+    return false;
+  }
+  const nextHasRenderable = next.spec != null || Boolean(cleanupAssistantText(next.text || '', next.spec).trim());
+  if (!nextHasRenderable) {
+    return false;
+  }
+  return hasMeaningfulAgentBridgeText(current) || !cleanupAssistantText(current.text || '', current.spec).trim();
 }
 
 function DeferredUiCard({
@@ -523,67 +827,6 @@ function formatAttachmentSize(size?: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const CHAT_ATTACHMENT_PROMPT_BEGIN = '[WEBOT_CHAT_ATTACHMENTS_BEGIN]';
-const CHAT_ATTACHMENT_PROMPT_END = '[WEBOT_CHAT_ATTACHMENTS_END]';
-
-function normalizeLocalVisionText(text?: string): string {
-  return typeof text === 'string'
-    ? text.replace(/\s+/g, ' ').trim()
-    : '';
-}
-
-function buildAttachmentPrompt(text: string, attachments: ChatAttachment[]): string {
-  const userText = text.trim();
-  const lines = attachments.map((attachment, index) => {
-    const localVisionText = normalizeLocalVisionText(attachment.localVisionSummary);
-    const parts = [
-      `${index + 1}. ${attachment.kind === 'image' ? '图片' : '附件'}：${attachment.name}`,
-      `- 相对路径：${attachment.relativePath}`,
-    ];
-    if (attachment.savedPath?.trim()) {
-      parts.push(`- 绝对路径：${attachment.savedPath.trim()}`);
-    }
-    if (attachment.mimeType?.trim()) {
-      parts.push(`- MIME：${attachment.mimeType.trim()}`);
-    }
-    if (attachment.upstreamFileId?.trim()) {
-      parts.push(`- OpenFang 文件ID：${attachment.upstreamFileId.trim()}`);
-    }
-    if (localVisionText) {
-      parts.push(`- 已完成发送前本地视觉聚焦：是`);
-      parts.push(`- 本地视觉文本：${localVisionText}`);
-      const localVisionSource = [
-        attachment.localVisionProvider?.trim(),
-        attachment.localVisionModel?.trim(),
-      ].filter(Boolean).join(' / ');
-      if (localVisionSource) {
-        parts.push(`- 本地视觉模型：${localVisionSource}`);
-      }
-    }
-    return parts.join('\n');
-  });
-
-  const attachmentBlock = attachments.length > 0
-    ? [
-      CHAT_ATTACHMENT_PROMPT_BEGIN,
-      '以下文件已上传到当前智能体工作区的 data/chat-uploads 目录，请按需读取：',
-      ...lines,
-      '处理要求：',
-      '- 若附件已携带本地视觉文本，请直接把这段文本当作该图片在本轮问题下的可用事实，不要忽略它，也不要脱离它自行猜测。',
-      '- 已完成发送前本地视觉聚焦的图片，本轮不会再作为原始视觉附件发送；若需要继续编辑或读取，请直接使用上面的相对路径或绝对路径。',
-      '- 只有没有本地视觉文本的图片，才需要继续查看图片附件或读取文件。',
-      '- 回复时优先引用文件名和关键结论，无需重复整段路径。',
-      CHAT_ATTACHMENT_PROMPT_END,
-    ].join('\n')
-    : '';
-
-  return [userText || '请先读取我刚上传的附件并继续处理。', attachmentBlock]
-    .filter((item) => item.trim().length > 0)
-    .join('\n\n');
-}
-
-
-
 export function ChatConversationPane({
   agent,
   conversationKey,
@@ -603,7 +846,6 @@ export function ChatConversationPane({
   onRegenerateMessage,
   onStopStreaming,
   onCreateTaskCard,
-  onConfirmCreateTaskCard,
   onCancelTaskCard,
   onDeleteTaskCard,
   onToggleAutoConversation,
@@ -613,6 +855,8 @@ export function ChatConversationPane({
   onCancelGroupUpgrade,
   onConfirmAgentManagement,
   onCancelAgentManagement,
+  onConfirmSelfUpgrade,
+  onCancelSelfUpgrade,
   sidebarCollapsed,
   onToggleSidebar,
   infoSidebarCollapsed,
@@ -625,7 +869,7 @@ export function ChatConversationPane({
   const [copiedTraceKey, setCopiedTraceKey] = useState('');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
-  const [localVisionResolving, setLocalVisionResolving] = useState(false);
+  const [composerSubmitting, setComposerSubmitting] = useState(false);
   const [apiBaseUrl, setApiBaseUrl] = useState<string>('');
   const [messageTtsMap, setMessageTtsMap] = useState<Record<string, MessageTtsPlaybackState>>({});
   const [globalTtsEnabled, setGlobalTtsEnabled] = useState(false);
@@ -667,6 +911,9 @@ export function ChatConversationPane({
     }
     messageTtsAbortControllersRef.current.clear();
   }, [agent.id, conversationKey]);
+  useEffect(() => {
+    setComposerSubmitting(false);
+  }, [conversationKey]);
   useEffect(() => () => {
     for (const controller of messageTtsAbortControllersRef.current.values()) {
       controller.abort();
@@ -859,6 +1106,18 @@ export function ChatConversationPane({
       || normalized === 'agent-management-cancel'
       || normalized === 'agent.management.cancel'
     );
+    const isSelfUpgradeConfirmAction = (
+      normalized === 'confirm_self_upgrade'
+      || normalized === 'self_upgrade_confirm'
+      || normalized === 'self-upgrade-confirm'
+      || normalized === 'self.upgrade.confirm'
+    );
+    const isSelfUpgradeCancelAction = (
+      normalized === 'cancel_self_upgrade'
+      || normalized === 'self_upgrade_cancel'
+      || normalized === 'self-upgrade-cancel'
+      || normalized === 'self.upgrade.cancel'
+    );
     const isOptionSubmitAction = (
       normalized === 'submit_option'
       || normalized === 'option_submit'
@@ -880,6 +1139,8 @@ export function ChatConversationPane({
       && !isGroupUpgradeCancelAction
       && !isAgentManagementConfirmAction
       && !isAgentManagementCancelAction
+      && !isSelfUpgradeConfirmAction
+      && !isSelfUpgradeCancelAction
     ) return;
 
     if (typeof onUserActivity === 'function') {
@@ -892,6 +1153,16 @@ export function ChatConversationPane({
         onConfirmAgentManagement?.(payloadRecord, ctx);
       } else {
         onCancelAgentManagement?.(payloadRecord, ctx);
+      }
+      return;
+    }
+
+    if (isSelfUpgradeConfirmAction || isSelfUpgradeCancelAction) {
+      const payloadRecord = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+      if (isSelfUpgradeConfirmAction) {
+        onConfirmSelfUpgrade?.(payloadRecord, ctx);
+      } else {
+        onCancelSelfUpgrade?.(payloadRecord, ctx);
       }
       return;
     }
@@ -956,32 +1227,34 @@ export function ChatConversationPane({
       if (!prompt) return;
 
       const messageId = (ctx?.messageId || '').trim();
+      const optionIntent = resolveTaskProposalOptionIntent(prompt);
       if (messageId) {
         const owner = messages.find((msg) => msg.id === messageId);
-        const ownerText = `${owner?.text || ''}\n${owner?.uiRawText || ''}`.trim();
         const looksLikeTaskProposal = Boolean(
           owner
           && owner.role === 'agent'
-          && (owner.taskCard?.canCreate === true
-            || /(任务名称|任务内容|执行间隔|总执行次数|定时任务|监控)/i.test(ownerText)),
+          && owner.taskCard
+          && (owner.taskCard.stage === 'proposal' || owner.taskCard.stage === 'failed')
+          && (owner.taskCard.canCreate === true || owner.taskCard.canCancel === true),
         );
 
         if (looksLikeTaskProposal) {
-          const intent = resolveTaskProposalOptionIntent(prompt);
-
-          if (intent === 'confirm') {
-            if (typeof onConfirmCreateTaskCard === 'function') {
-              onConfirmCreateTaskCard(messageId);
-            } else {
-              onCreateTaskCard(messageId);
-            }
+          if (optionIntent === 'confirm') {
+            onCreateTaskCard(messageId);
             return;
           }
 
-          if (intent === 'cancel') {
+          if (optionIntent === 'cancel') {
             onCancelTaskCard(messageId);
             return;
           }
+        }
+
+        // 旧任务确认卡仍可能通过通用 OptionSelector 回传一个裸 "确认/取消" 文本。
+        // 这类输入会重新落回普通聊天链路，导致模型继续走旧的“自由发挥 + 运行日志”分支。
+        // 现在统一收口：非标准 taskCard 的确认/取消按钮不再静默转发给模型。
+        if (owner?.role === 'agent' && optionIntent) {
+          return;
         }
       }
 
@@ -1025,9 +1298,10 @@ export function ChatConversationPane({
     appendVideoToInput,
     messages,
     onCancelAgentManagement,
+    onCancelSelfUpgrade,
     onCancelTaskCard,
     onConfirmAgentManagement,
-    onConfirmCreateTaskCard,
+    onConfirmSelfUpgrade,
     onCreateTaskCard,
     onCancelGroupUpgrade,
     onConfirmGroupUpgrade,
@@ -1124,12 +1398,10 @@ export function ChatConversationPane({
     });
   }, [revokeComposerPreview]);
 
-  const resolveOutgoingAttachments = useCallback(async (
+  const buildOutgoingAttachments = useCallback((
     readyAttachments: ComposerAttachmentDraft[],
-    userText: string,
-  ): Promise<ChatAttachment[]> => {
-    const attachments = await Promise.all(readyAttachments.map(async (item) => {
-      const baseAttachment: ChatAttachment = {
+  ): ChatAttachment[] => (
+    readyAttachments.map((item) => ({
         id: item.id,
         kind: item.kind,
         name: item.name,
@@ -1143,50 +1415,18 @@ export function ChatConversationPane({
         localVisionSummary: item.localVisionSummary,
         localVisionProvider: item.localVisionProvider,
         localVisionModel: item.localVisionModel,
-      };
-      if (
-        item.kind !== 'image'
-        || !item.sha256
-        || !item.savedPath
-        || !item.mimeType
-      ) {
-        return baseAttachment;
-      }
-
-      try {
-        const localVision = await analyzeAndCacheChatImageWithLocalVision({
-          sha256: item.sha256,
-          imageUrl: item.assetUrl || '',
-          mimeType: item.mimeType,
-          relativePath: item.relativePath,
-          savedPath: item.savedPath,
-          upstreamFileId: item.upstreamFileId,
-          fileName: item.name,
-        }, userText);
-        if (!localVision) {
-          return baseAttachment;
-        }
-        return {
-          ...baseAttachment,
-          localVisionSummary: localVision.text,
-          localVisionProvider: localVision.provider,
-          localVisionModel: localVision.model,
-        };
-      } catch (error) {
-        console.warn('[local-vision] 发送前生成聚焦视觉结果失败', error);
-        return baseAttachment;
-      }
-    }));
-    return attachments;
-  }, []);
+      }))
+  ), []);
 
   const handleSend = async () => {
+    const draftInputValue = inputValue;
+    const draftAttachments = composerAttachments.map((item) => ({ ...item }));
     const readyAttachments = composerAttachments.filter((item) => item.status === 'ready');
     const uploadingCount = composerAttachments.filter((item) => item.status === 'uploading').length;
     if (
       (inputValue.trim().length === 0 && readyAttachments.length === 0)
       || inputLocked
-      || localVisionResolving
+      || composerSubmitting
       || uploadingCount > 0
     ) {
       return;
@@ -1195,21 +1435,28 @@ export function ChatConversationPane({
       onUserActivity('send');
     }
     const userText = inputValue.trim();
-    setLocalVisionResolving(true);
+    const attachments = buildOutgoingAttachments(readyAttachments);
+    setInputValue('');
+    setComposerAttachments([]);
+    setComposerSubmitting(true);
+    const payload: ChatSendPayload = {
+      rawText: userText,
+      displayText: userText || `已上传 ${attachments.length} 个附件`,
+      attachments,
+    };
     try {
-      const attachments = await resolveOutgoingAttachments(readyAttachments, userText);
-      onSendMessage({
-        displayText: userText || `已上传 ${attachments.length} 个附件`,
-        submitText: buildAttachmentPrompt(userText, attachments),
-        attachments,
-      });
-      setInputValue('');
-      setComposerAttachments((prev) => {
-        prev.forEach((item) => revokeComposerPreview(item.previewUrl));
-        return [];
-      });
+      const accepted = await onSendMessage(payload);
+      if (accepted === false) {
+        setInputValue(draftInputValue);
+        setComposerAttachments(draftAttachments);
+        return;
+      }
+      draftAttachments.forEach((item) => revokeComposerPreview(item.previewUrl));
+    } catch {
+      setInputValue(draftInputValue);
+      setComposerAttachments(draftAttachments);
     } finally {
-      setLocalVisionResolving(false);
+      setComposerSubmitting(false);
     }
   };
 
@@ -1350,61 +1597,44 @@ export function ChatConversationPane({
   }, []);
 
   const renderLoadingCard = useCallback((msg: Message) => {
-    const stageText = msg.pendingComponentName
-      ? (
-        msg.pendingComponentKind === 'video'
-          ? `组件 ${msg.pendingComponentName} 正在生成视频…`
-          : `组件 ${msg.pendingComponentName} 正在执行中…`
-      )
-      : msg.uiStreamState === 'streaming'
-        ? '正在接收 UI 数据流…'
-        : msg.uiStreamState === 'ready'
-          ? '正在渲染卡片组件…'
-          : msg.uiRawText
-            ? '正在解析卡片结构…'
-            : '等待卡片数据…';
-    const previewUrl = normalizeLocalManagementAssetUrl(apiBaseUrl, msg.pendingComponentPreviewUrl);
+    const stageText = msg.debugWatchdogTriggered
+      ? '响应较慢'
+      : msg.thinking
+        ? '思考中'
+        : msg.streaming
+          ? '等待回复'
+          : msg.uiStreamState === 'streaming'
+            ? '生成卡片中'
+            : msg.uiStreamState === 'ready'
+              ? '渲染中'
+              : msg.uiRawText
+                ? '解析中'
+                : '处理中';
+    const helperText = msg.debugWatchdogTriggered
+      ? '仍在等待返回'
+      : '请稍候';
     const elapsedMs = msg.generationStartedAt != null ? Math.max(0, nowMs - msg.generationStartedAt) : 0;
     return (
       <Card className="mt-2 border-border/60 shadow-none bg-muted/10">
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm text-muted-foreground flex items-center gap-2">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            {stageText}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="pt-0 space-y-3">
-          {previewUrl ? (
-            <div className="relative overflow-hidden rounded-xl border border-border/60 bg-black/85">
-              <img
-                src={previewUrl}
-                alt={msg.pendingComponentName || 'pending-preview'}
-                className="h-44 w-full object-cover opacity-70"
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
-              <div className="absolute inset-0 flex items-center justify-center">
-                <div className="flex items-center gap-2 rounded-full border border-white/20 bg-black/45 px-4 py-2 text-sm text-white shadow-sm backdrop-blur-sm">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>{msg.pendingComponentKind === 'video' ? '视频生成中' : '处理中'}</span>
-                </div>
-              </div>
+        <CardContent className="py-3 px-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span>{stageText}</span>
             </div>
-          ) : (
-            <div className="chat-card-loading-shell">
-              <div className="chat-card-loading-shimmer" />
-              <div className="chat-card-loading-line w-[86%]" />
-              <div className="chat-card-loading-line w-[64%]" />
-              <div className="chat-card-loading-line w-[72%]" />
-            </div>
-          )}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-            <span>{msg.pendingComponentKind === 'video' ? '任务已提交到组件服务，结果会异步回填。' : '任务正在后台执行，结果会自动回填。'}</span>
-            {elapsedMs > 0 ? <span>已等待 {formatElapsed(elapsedMs)}</span> : null}
+            {elapsedMs > 0 ? (
+              <span className="text-xs text-muted-foreground">
+                {formatElapsed(elapsedMs)}
+              </span>
+            ) : null}
+          </div>
+          <div className="mt-1 pl-[1.35rem] text-xs text-muted-foreground/80">
+            {helperText}
           </div>
         </CardContent>
       </Card>
     );
-  }, [apiBaseUrl, formatElapsed, nowMs]);
+  }, [formatElapsed, nowMs]);
 
   const taskStageLabel = useCallback((stage: ChatTaskCardData['stage']): string => {
     if (stage === 'proposal') return '待确认';
@@ -1432,9 +1662,8 @@ export function ChatConversationPane({
 
   const taskReportStatusLabel = useCallback((status?: ChatTaskCardData['reportStatus']): string => {
     if (status === 'acknowledged') return '已同步到当前会话';
-    if (status === 'reported') return '已生成会话回执';
     return '待汇报';
-  }, []);
+  }, [buildOutgoingAttachments, composerAttachments, composerSubmitting, inputLocked, inputValue, onSendMessage, onUserActivity, revokeComposerPreview]);
 
   const taskTimelineLabel = useCallback((kind: ChatTaskLifecycleItem['kind']): string => {
     if (kind === 'created') return '草案';
@@ -1584,13 +1813,7 @@ export function ChatConversationPane({
                 className="h-7 rounded-md px-3 text-[11px] font-bold"
                 disabled={!canCreate}
                 title={canCreate ? '' : createDisabledReason}
-                onClick={() => {
-                  if (typeof onConfirmCreateTaskCard === 'function') {
-                    onConfirmCreateTaskCard(msg.id);
-                    return;
-                  }
-                  onCreateTaskCard(msg.id);
-                }}
+                onClick={() => onCreateTaskCard(msg.id)}
               >
                 {stage === 'failed' ? '重试创建' : '创建任务'}
               </Button>
@@ -1655,7 +1878,6 @@ export function ChatConversationPane({
   }, [
     formatTaskTimelineTime,
     onCancelTaskCard,
-    onConfirmCreateTaskCard,
     onCreateTaskCard,
     onDeleteTaskCard,
     onOpenTaskCardDetails,
@@ -1875,7 +2097,9 @@ export function ChatConversationPane({
 
     const pushAutoRow = (title: string, detail?: string) => {
       const normalizedDetail = detail?.trim();
-      if (!normalizedDetail) return;
+      if (!normalizedDetail) {
+        return;
+      }
       rows.push({
         id: `${msg.id}-runtime-${autoIndex}`,
         title,
@@ -1885,85 +2109,53 @@ export function ChatConversationPane({
       autoIndex += 1;
     };
 
-    const nativeFrames = (msg.debugNativeFrames || '').trim();
-    if (nativeFrames) {
-      const frameBlocks = nativeFrames
-        .split(/\n{2,}/)
-        .map((block) => block.trim())
-        .filter(Boolean);
-      frameBlocks.forEach((block) => {
-        const eventMatch = block.match(/event:\s*([^\n\r]+)/i);
-        const payloadMatch = block.match(/payload:\s*([\s\S]+)/i);
-        const frameMatch = block.match(/frame:\s*([\s\S]+)/i);
-        const eventName = eventMatch?.[1]?.trim() || 'native';
-        const detail = payloadMatch?.[1]?.trim() || frameMatch?.[1]?.trim() || block;
-        pushAutoRow(`事件 · ${eventName}`, detail);
+    if ((msg.toolTrace?.length ?? 0) === 0) {
+      (msg.tools ?? []).forEach((tool) => {
+        const name = (tool.name || 'tool').trim();
+        const detail = summarizeToolDetail(name, tool.result || tool.input);
+        pushAutoRow(`工具调用 · ${name}${tool.running ? ' 运行中' : ''}`.trim(), detail);
       });
     }
 
     (msg.thinkingTrace ?? []).forEach((row) => {
+      const detail = summarizeThinkingDetail(row.detail);
+      if (!detail) return;
       rows.push({
         ...row,
-        title: `思考 · ${row.title}`,
+        title: row.title?.trim() ? `思考过程 · ${row.title}` : '思考过程',
+        detail,
       });
     });
 
     (msg.toolTrace ?? []).forEach((row) => {
+      const detail = summarizeToolDetail(row.title, row.detail);
+      if (!detail) return;
       rows.push({
         ...row,
-        title: `工具 · ${row.title}`,
+        title: row.title?.trim() ? `工具调用 · ${row.title}` : '工具调用',
+        detail,
       });
     });
 
-    if (msg.debugRawStream?.trim()) {
-      pushAutoRow('正文流累计', msg.debugRawStream);
-    }
-    if (msg.uiRawText?.trim()) {
-      pushAutoRow('UI_JSON 原文', msg.uiRawText);
-    }
-    if (msg.debugNormalizedUiRawText?.trim()) {
-      pushAutoRow('UI_JSON 归一后', msg.debugNormalizedUiRawText);
-    }
-    if (msg.debugRepairedUiRawText?.trim()) {
-      pushAutoRow('UI_JSON 修复后', msg.debugRepairedUiRawText);
-    }
-    if (msg.debugUiContractWarnings?.trim()) {
-      pushAutoRow('UI_JSON Contract 警告', msg.debugUiContractWarnings);
-    }
-    if (msg.spec != null) {
-      try {
-        const specText = typeof msg.spec === 'string' ? msg.spec : JSON.stringify(msg.spec, null, 2);
-        pushAutoRow('最终卡片 JSON', specText);
-      } catch {
-        pushAutoRow('最终卡片 JSON', String(msg.spec));
-      }
-    }
-    if (msg.debugNormalizedSpecText?.trim()) {
-      pushAutoRow('归一后 Spec', msg.debugNormalizedSpecText);
-    }
-    if (typeof msg.debugProfileIntroDetected === 'boolean') {
-      pushAutoRow('检测到 ProfileIntroCard', msg.debugProfileIntroDetected ? 'yes' : 'no');
-    }
-    if (msg.debugLegacySanitizer?.trim()) {
-      pushAutoRow('Legacy Sanitizer', msg.debugLegacySanitizer);
-    }
-    if (msg.debugSchemaSanitizer?.trim()) {
-      pushAutoRow('Schema Sanitizer', msg.debugSchemaSanitizer);
-    }
-    if (typeof msg.debugMixedSegmentCount === 'number' && msg.debugMixedSegmentCount > 0) {
-      pushAutoRow('MixedSegments 数量', String(msg.debugMixedSegmentCount));
-    }
-    if (msg.debugDonePayload?.trim()) {
-      pushAutoRow('Done Payload', msg.debugDonePayload);
-    }
-
-    return rows
+    const sortedRows = rows
       .filter((row) => row.detail && row.detail.trim().length > 0)
       .sort((a, b) => {
         const aTime = new Date(a.at).getTime();
         const bTime = new Date(b.at).getTime();
         return aTime - bTime;
       });
+    if (sortedRows.length > 0) {
+      const finalOutput = summarizeFinalOutput(msg);
+      if (finalOutput) {
+        sortedRows.push({
+          id: `${msg.id}-runtime-final`,
+          title: '最终输出',
+          detail: finalOutput,
+          at: new Date(baseAt + 60_000 + autoIndex).toISOString(),
+        });
+      }
+    }
+    return sortedRows;
   }, []);
 
   const buildRuntimeLogRowsForMessages = useCallback((items: Message[]): MessageTrace[] =>
@@ -1981,7 +2173,11 @@ export function ChatConversationPane({
     if (!items.some((item) => hasRuntimeLogData(item))) {
       return null;
     }
-    return renderTraceBlock(`${key}-runtime-log`, '运行日志', buildRuntimeLogRowsForMessages(items));
+    const rows = buildRuntimeLogRowsForMessages(items);
+    if (rows.length === 0) {
+      return null;
+    }
+    return renderTraceBlock(`${key}-runtime-log`, '运行日志', rows);
   }, [buildRuntimeLogRowsForMessages, renderTraceBlock]);
 
   const hasMeaningfulMarkdownText = useCallback((msg: Message): boolean => {
@@ -2012,26 +2208,36 @@ export function ChatConversationPane({
     if ((msg.attachments?.length ?? 0) > 0) return true;
     if (msg.taskCard) return true;
     if ((msg.a2aCards?.length ?? 0) > 0) return true;
-    if (getRenderableUiSpec(msg.spec) != null) return true;
+    if (shouldRenderStructuredSpec(getRenderableUiSpec(msg.spec))) return true;
     if (hasRuntimeLogData(msg)) return true;
     if (msg.role === 'user') return Boolean((msg.text || '').trim());
     if (hasMeaningfulMarkdownText(msg)) return true;
-    const meta = (msg.meta || '').trim();
+    const meta = getVisibleMessageMeta(msg.meta);
     if (meta && !meta.startsWith('auto_dispatch:')) return true;
     return false;
   }, [getRenderableUiSpec, hasMeaningfulMarkdownText]);
 
   const shouldRenderCardForMessage = useCallback((msg: Message, isUser: boolean): boolean => {
     if (isUser) return false;
-    return getRenderableUiSpec(msg.spec) != null;
+    return shouldRenderStructuredSpec(getRenderableUiSpec(msg.spec));
   }, [getRenderableUiSpec]);
 
   const shouldShowLoadingCardForMessage = useCallback((msg: Message, isUser: boolean): boolean => {
     if (isUser) return false;
-    if (msg.spec != null) return false;
-    if (!(msg.cardPending || msg.uiStreamState === 'streaming')) return false;
-    return true;
-  }, []);
+    const hasRenderableContent = Boolean(
+      msg.taskCard
+      || (msg.a2aCards?.length ?? 0) > 0
+      || shouldRenderStructuredSpec(getRenderableUiSpec(msg.spec))
+      || hasMeaningfulMarkdownText(msg),
+    );
+    if ((msg.cardPending && !hasRenderableContent) || (msg.debugWatchdogTriggered && !hasRenderableContent)) {
+      return true;
+    }
+    if (hasRenderableContent) {
+      return false;
+    }
+    return Boolean(msg.thinking || msg.streaming || msg.uiStreamState === 'streaming');
+  }, [getRenderableUiSpec, hasMeaningfulMarkdownText]);
 
   type MixedRenderSegment =
     | { kind: 'markdown'; content: string }
@@ -2110,7 +2316,10 @@ export function ChatConversationPane({
       typeof msg.text === 'string' ? msg.text : '',
     ].find((item) => containsUiJsonTag(item)) || '';
 
-    const mixedSegments = getCachedMixedSegments(msg.id, mixedSource);
+    const mixedSegments = getCachedMixedSegments(msg.id, mixedSource)
+      .filter((segment) => (
+        segment.kind !== 'ui' || shouldRenderStructuredSpec(segment.spec)
+      ));
     msg.debugMixedSegmentCount = mixedSegments.length;
     return mixedSegments;
   }, [getCachedMixedSegments]);
@@ -2132,10 +2341,14 @@ export function ChatConversationPane({
     }
 
     const shouldRenderCard = shouldRenderCardForMessage(msg, isUser);
+    const renderableSpec = getRenderableUiSpec(msg.spec);
     const hasMarkdown = hasMeaningfulMarkdownText(msg);
-    const markdownContent = isUser
+    const rawMarkdownContent = isUser
       ? (msg.text || '')
       : (hasMarkdown ? getDisplayMarkdownText(msg) : '');
+    const markdownContent = !isUser
+      ? sanitizeMarkdownForRenderableSpec(rawMarkdownContent, renderableSpec)
+      : rawMarkdownContent;
 
     return Boolean(
       markdownContent
@@ -2145,6 +2358,7 @@ export function ChatConversationPane({
   }, [
     getDisplayMarkdownText,
     getMessageMixedSegments,
+    getRenderableUiSpec,
     hasMeaningfulMarkdownText,
     shouldRenderCardForMessage,
     shouldShowLoadingCardForMessage,
@@ -2469,7 +2683,9 @@ export function ChatConversationPane({
     msg: Message,
     isUser: boolean,
     options?: { deferHeavyUi?: boolean; includeProcessPanel?: boolean },
-  ) => (
+  ) => {
+    const visibleMeta = getVisibleMessageMeta(msg.meta);
+    return (
     <>
       {!isUser && msg.taskCard ? (
         <>
@@ -2483,9 +2699,15 @@ export function ChatConversationPane({
       (() => {
         const mixedSegments = getMessageMixedSegments(msg, isUser);
         if (!isUser && mixedSegments.length > 0) {
+          const hasLegacyJobProgressMixedSegment = mixedSegments.some((segment) => (
+            segment.kind === 'ui' && getRenderableSpecType(segment.spec) === 'jobprogresscard'
+          ));
+          const showProcessPanel = options?.includeProcessPanel !== false
+            && hasRuntimeLogData(msg)
+            && !hasLegacyJobProgressMixedSegment;
           return (
             <>
-              {!isUser && options?.includeProcessPanel !== false ? renderProcessPanel(msg.id, [msg]) : null}
+              {showProcessPanel ? renderProcessPanel(msg.id, [msg]) : null}
               {mixedSegments.map((segment, index) => (
                 segment.kind === 'markdown' ? (
                   <MarkdownBlock
@@ -2515,12 +2737,20 @@ export function ChatConversationPane({
         const shouldRenderCard = shouldRenderCardForMessage(msg, isUser);
         const renderableSpec = getRenderableUiSpec(msg.spec);
         const hasMarkdown = hasMeaningfulMarkdownText(msg);
-        const markdownContent = isUser
+        const rawMarkdownContent = isUser
           ? (msg.text || '')
           : (hasMarkdown ? getDisplayMarkdownText(msg) : '');
+        const markdownContent = !isUser
+          ? sanitizeMarkdownForRenderableSpec(rawMarkdownContent, renderableSpec)
+          : rawMarkdownContent;
+        const hasLegacyJobProgressSpec = getRenderableSpecType(renderableSpec) === 'jobprogresscard';
+        const showProcessPanel = !isUser
+          && options?.includeProcessPanel !== false
+          && hasRuntimeLogData(msg)
+          && !hasLegacyJobProgressSpec;
         return (
           <>
-            {!isUser && options?.includeProcessPanel !== false ? renderProcessPanel(msg.id, [msg]) : null}
+            {showProcessPanel ? renderProcessPanel(msg.id, [msg]) : null}
             {markdownContent ? (
               <MarkdownBlock
                 className={cn('chat-markdown', isUser ? 'chat-markdown-user' : 'chat-markdown-agent')}
@@ -2549,11 +2779,12 @@ export function ChatConversationPane({
       {shouldShowLoadingCardForMessage(msg, isUser) ? (
         <div className="mt-3">{renderLoadingCard(msg)}</div>
       ) : null}
-      {!isUser && msg.meta && !msg.meta.startsWith('auto_dispatch:')
-        ? <div className="mt-2 text-[11px] text-muted-foreground">{msg.meta}</div>
+      {!isUser && visibleMeta && !visibleMeta.startsWith('auto_dispatch:')
+        ? <div className="mt-2 text-[11px] text-muted-foreground">{visibleMeta}</div>
         : null}
     </>
-  ), [
+    );
+  }, [
     agent.id,
     getDisplayMarkdownText,
     getMessageMixedSegments,
@@ -2569,10 +2800,22 @@ export function ChatConversationPane({
     hasMeaningfulMarkdownText,
   ]);
 
-  const stableMessages = useMemo(
-    () => messages.filter((msg) => !msg.streaming && hasRenderableMessageContent(msg)),
-    [hasRenderableMessageContent, messages],
-  );
+  const stableMessages = useMemo(() => {
+    const working = messages
+      .filter((msg) => !msg.streaming)
+      .map((msg) => msg);
+    for (let index = 0; index < working.length - 1; index += 1) {
+      const current = working[index];
+      const next = working[index + 1];
+      if (!current || !next) {
+        continue;
+      }
+      if (canCollapseBridgeMessage(current, next)) {
+        working[index] = null as unknown as Message;
+      }
+    }
+    return working.filter((msg): msg is Message => Boolean(msg) && hasRenderableMessageContent(msg));
+  }, [hasRenderableMessageContent, messages]);
   const messageIndexMap = useMemo(() => {
     const map = new Map<string, number>();
     messages.forEach((msg, index) => {
@@ -2654,7 +2897,7 @@ export function ChatConversationPane({
 
   const readyAttachmentCount = composerAttachments.filter((item) => item.status === 'ready').length;
   const uploadingAttachmentCount = composerAttachments.filter((item) => item.status === 'uploading').length;
-  const canSendMessage = !inputLocked && !localVisionResolving && uploadingAttachmentCount === 0 && (inputValue.trim().length > 0 || readyAttachmentCount > 0);
+  const canSendMessage = !inputLocked && !composerSubmitting && uploadingAttachmentCount === 0 && (inputValue.trim().length > 0 || readyAttachmentCount > 0);
   const showAutoConversationToggle = typeof onToggleAutoConversation === 'function';
 
   return (
@@ -2777,7 +3020,7 @@ export function ChatConversationPane({
               }}
               placeholder={autoConversationEnabled ? '自动群聊中，点击“自动中”可退出并恢复手动输入。' : t('chat.inputPlaceholder')}
               className="chat-input-field focus-visible:ring-0 focus-visible:ring-offset-0"
-              disabled={inputLocked || localVisionResolving}
+              disabled={inputLocked || composerSubmitting}
             />
             {composerAttachments.length > 0 ? (
               <div className="px-3 pb-3 space-y-2">
@@ -2810,6 +3053,7 @@ export function ChatConversationPane({
                               size="icon"
                               className="h-7 w-7 shrink-0"
                               onClick={() => handleRemoveComposerAttachment(attachment.id)}
+                              disabled={inputLocked || composerSubmitting}
                             >
                               <X className="h-3.5 w-3.5" />
                             </Button>
@@ -2843,7 +3087,7 @@ export function ChatConversationPane({
                   variant="ghost"
                   size="icon"
                   className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
-                  disabled={inputLocked || localVisionResolving}
+                  disabled={inputLocked || composerSubmitting}
                   title={isDesktopRuntime ? '上传图片或 Ctrl+V 粘贴图片' : 'Web 端支持上传或粘贴小图片'}
                   onClick={() => imageInputRef.current?.click()}
                 >
@@ -2854,7 +3098,7 @@ export function ChatConversationPane({
                   variant="ghost"
                   size="icon"
                   className="w-8 h-8 text-muted-foreground hover:text-foreground rounded-lg transition-colors"
-                  disabled={inputLocked || localVisionResolving || !isDesktopRuntime}
+                  disabled={inputLocked || composerSubmitting || !isDesktopRuntime}
                   title={isDesktopRuntime ? '上传附件或 Ctrl+V 粘贴文件' : 'Web 端暂不支持粘贴通用附件'}
                   onClick={() => fileInputRef.current?.click()}
                 >
@@ -2907,12 +3151,6 @@ export function ChatConversationPane({
                 {uploadingAttachmentCount > 0 ? (
                   <span className="text-[11px] text-muted-foreground">
                     附件上传中 {uploadingAttachmentCount}
-                  </span>
-                ) : null}
-                {localVisionResolving ? (
-                  <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    本地视觉聚焦中
                   </span>
                 ) : null}
                 {!isSending && showAutoConversationToggle ? (

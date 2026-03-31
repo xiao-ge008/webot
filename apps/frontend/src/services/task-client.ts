@@ -1,10 +1,7 @@
-import type { AgentTask, AgentTaskLogItem, AgentTaskProgressResult } from '@/main/types';
+import type { AgentTask, AgentTaskLogItem } from '@/main/types';
 import { requestJson } from '@/services/transport';
 import {
-  createAgentTask,
-  deleteAgentTask,
   getAgentSession,
-  getAgentTaskProgress,
   listAgentTasks,
   listAgents,
   type AgentSessionMessage,
@@ -13,13 +10,15 @@ import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord } fr
 
 const TASK_CLIENT_AGENT_ID_KEY = 'webot-task-center-agent-id';
 const TASK_LOCAL_META_KEY = 'webot-task-local-meta-v1';
+const TASK_LIST_TIMEOUT_MS = 4_500;
+const TASK_DELIVERY_TIMEOUT_MS = 3_500;
 
 const taskAgentIndex = new Map<string, string>();
+const taskSnapshotCache = new Map<string, Task>();
 
 interface TaskLocalMeta {
   taskId: string;
   agentId: string;
-  runtimeKey?: string; // chatRuntimeStore 的 key（群聊等场景不等于 agentId）
   sourceType: Task['sourceType'];
   displayName?: string;
   manualStartRequired?: boolean;
@@ -34,16 +33,6 @@ interface TaskLocalMeta {
   deliveryBestEffort?: boolean;
   finalSummaryPrompt?: string;
   notifyOnFinal?: boolean;
-  originConversationType?: TaskConversationType;
-  originConversationId?: string;
-  originChatSessionId?: string;
-  originMessageId?: string;
-  creatorParticipantId?: string;
-  creatorParticipantName?: string;
-  executorAgentId?: string;
-  executorAgentName?: string;
-  reportActorAgentId?: string;
-  reportActorAgentName?: string;
   completionNotifiedRunCount?: number;
   finalSummary?: {
     runCount: number;
@@ -97,9 +86,6 @@ function sanitizeTaskName(name: string): string {
 function inferChatTaskDisplayName(prompt?: string): string | undefined {
   const raw = (prompt || '').trim();
   if (!raw) return undefined;
-  if (/黄金|金价|xau|xauusd|gold/i.test(raw)) {
-    return '监控黄金价格';
-  }
   const lines = raw
     .split('\n')
     .map((line) => line.trim())
@@ -110,9 +96,6 @@ function inferChatTaskDisplayName(prompt?: string): string | undefined {
     .filter((line) => !/^\d+\./.test(line));
   const candidate = lines[0] || '';
   if (!candidate) return undefined;
-  if (/黄金|金价|xau|xauusd|gold/i.test(candidate)) {
-    return '监控黄金价格';
-  }
   return candidate.length > 18 ? `${candidate.slice(0, 18)}...` : candidate;
 }
 
@@ -179,18 +162,33 @@ function mapTaskDelivery(input: unknown): TaskReportDelivery | null {
   const taskId = trimToUndefined(typeof row.task_id === 'string' ? row.task_id : (typeof row.taskId === 'string' ? row.taskId : undefined));
   const ownerAgentId = trimToUndefined(
     typeof row.owner_agent_id === 'string' ? row.owner_agent_id : (typeof row.ownerAgentId === 'string' ? row.ownerAgentId : undefined),
-  );
+  ) || (taskId ? (getTaskMeta(taskId)?.agentId || taskAgentIndex.get(taskId) || '') : '');
   const deliveryKindRaw = trimToUndefined(
-    typeof row.delivery_kind === 'string' ? row.delivery_kind : (typeof row.deliveryKind === 'string' ? row.deliveryKind : undefined),
+    typeof row.delivery_kind === 'string'
+      ? row.delivery_kind
+      : (typeof row.deliveryKind === 'string'
+        ? row.deliveryKind
+        : (isRecord(row.payload) && typeof row.payload.delivery_kind === 'string'
+          ? row.payload.delivery_kind
+          : undefined)),
   );
   const statusRaw = trimToUndefined(typeof row.status === 'string' ? row.status : undefined);
   const createdAt = trimToUndefined(typeof row.created_at === 'string' ? row.created_at : (typeof row.createdAt === 'string' ? row.createdAt : undefined));
   const updatedAt = trimToUndefined(typeof row.updated_at === 'string' ? row.updated_at : (typeof row.updatedAt === 'string' ? row.updatedAt : undefined));
-  if (!id || !taskId || !ownerAgentId || !deliveryKindRaw || !statusRaw || !createdAt || !updatedAt) {
+  if (!id || !taskId || !statusRaw || !createdAt || !updatedAt) {
     return null;
   }
-  const deliveryKind = deliveryKindRaw === 'progress' || deliveryKindRaw === 'anomaly' ? deliveryKindRaw : 'final';
-  const status = statusRaw === 'reported' || statusRaw === 'acknowledged' ? statusRaw : 'pending';
+  const targetKind = trimToUndefined(
+    typeof row.target_kind === 'string' ? row.target_kind : (typeof row.targetKind === 'string' ? row.targetKind : undefined),
+  );
+  const deliveryKind = deliveryKindRaw === 'progress' || deliveryKindRaw === 'anomaly'
+    ? deliveryKindRaw
+    : (deliveryKindRaw === 'final'
+      ? 'final'
+      : (targetKind === 'pc_notice' ? 'anomaly' : 'final'));
+  const status = statusRaw === 'reported' || statusRaw === 'acknowledged' || statusRaw === 'failed'
+    ? statusRaw
+    : 'pending';
   const payload = isRecord(row.payload) ? row.payload : (isRecord(row.payload_json) ? row.payload_json : undefined);
   const runCountRaw = typeof row.run_count === 'number'
     ? row.run_count
@@ -254,8 +252,18 @@ function mapTaskDelivery(input: unknown): TaskReportDelivery | null {
     ),
     taskName: trimToUndefined(typeof row.task_name === 'string' ? row.task_name : (typeof row.taskName === 'string' ? row.taskName : undefined)),
     runCount: typeof runCountRaw === 'number' && Number.isFinite(runCountRaw) ? Math.max(0, Math.floor(runCountRaw)) : undefined,
+    attemptStatus: trimToUndefined(
+      typeof row.attempt_status === 'string' ? row.attempt_status : (typeof row.attemptStatus === 'string' ? row.attemptStatus : undefined),
+    ) as TaskReportDelivery['attemptStatus'],
+    attemptCount: typeof row.attempt_count === 'number'
+      ? Math.max(0, Math.floor(row.attempt_count))
+      : (typeof row.attemptCount === 'number' ? Math.max(0, Math.floor(row.attemptCount)) : undefined),
     summaryText: trimToUndefined(
-      typeof row.summary_text === 'string' ? row.summary_text : (typeof row.summaryText === 'string' ? row.summaryText : undefined),
+      typeof row.summary_text === 'string'
+        ? row.summary_text
+        : (typeof row.summaryText === 'string'
+          ? row.summaryText
+          : (typeof row.body === 'string' ? row.body : undefined)),
     ),
     errorText: trimToUndefined(
       typeof row.error_text === 'string' ? row.error_text : (typeof row.errorText === 'string' ? row.errorText : undefined),
@@ -268,110 +276,240 @@ function mapTaskDelivery(input: unknown): TaskReportDelivery | null {
   };
 }
 
-async function syncTaskMetaToBackend(taskId: string, patch: Partial<TaskLocalMeta>): Promise<void> {
-  const meta = upsertTaskMeta(taskId, patch);
-  if (!meta.agentId.trim()) return;
-  await requestJson<{ meta?: unknown }>('/api/tasks/meta', {
-    method: 'POST',
-    body: {
-      task_id: taskId,
-      owner_agent_id: meta.agentId,
-      runtime_key: meta.runtimeKey,
-      source_type: meta.sourceType,
-      display_name: meta.displayName,
-      origin_conversation_type: meta.originConversationType,
-      origin_conversation_id: meta.originConversationId,
-      origin_chat_session_id: meta.originChatSessionId,
-      origin_message_id: meta.originMessageId,
-      creator_participant_id: meta.creatorParticipantId,
-      creator_participant_name: meta.creatorParticipantName,
-      executor_agent_id: meta.executorAgentId,
-      executor_agent_name: meta.executorAgentName,
-      report_actor_agent_id: meta.reportActorAgentId,
-      report_actor_agent_name: meta.reportActorAgentName,
-      max_runs: meta.maxRuns,
-      final_summary_prompt: meta.finalSummaryPrompt,
-      notify_on_final: meta.notifyOnFinal,
-      metadata: {
-        deliveryMode: meta.deliveryMode,
-        deliveryChannel: meta.deliveryChannel,
-        deliveryTarget: meta.deliveryTarget,
-        deliveryBestEffort: meta.deliveryBestEffort,
-      },
-    },
-  });
+function unwrapTaskDeliveryRows(input: unknown): unknown[] {
+  if (Array.isArray(input)) return input;
+  if (!isRecord(input)) return [];
+  const rows = input.deliveries;
+  return Array.isArray(rows) ? rows : [];
 }
 
-export async function loadTaskRuntimeMeta(taskId: string): Promise<TaskLocalMeta | null> {
-  const id = taskId.trim();
-  if (!id) return null;
-  const existing = getTaskMeta(id);
-  try {
-    const result = await requestJson<{ meta?: Record<string, unknown> }>(
-      `/api/tasks/meta/${encodeURIComponent(id)}`,
-    );
-    const meta = result.meta;
-    if (!meta) {
-      return existing || null;
-    }
-    const next = upsertTaskMeta(id, {
-      agentId: trimToUndefined(typeof meta.owner_agent_id === 'string' ? meta.owner_agent_id : undefined)
-        || existing?.agentId
-        || '',
-      runtimeKey: trimToUndefined(typeof meta.runtime_key === 'string' ? meta.runtime_key : undefined)
-        || existing?.runtimeKey,
-      sourceType:
-        (trimToUndefined(typeof meta.source_type === 'string' ? meta.source_type : undefined) as Task['sourceType'] | undefined)
-        || existing?.sourceType
-        || 'custom',
-      displayName: trimToUndefined(typeof meta.display_name === 'string' ? meta.display_name : undefined)
-        || existing?.displayName,
-      maxRuns:
-        typeof meta.max_runs === 'number' && Number.isFinite(meta.max_runs)
-          ? Math.max(0, Math.floor(meta.max_runs))
-          : existing?.maxRuns,
-      finalSummaryPrompt:
-        trimToUndefined(typeof meta.final_summary_prompt === 'string' ? meta.final_summary_prompt : undefined)
-        || existing?.finalSummaryPrompt,
-      notifyOnFinal:
-        typeof meta.notify_on_final === 'boolean'
-          ? meta.notify_on_final
-          : existing?.notifyOnFinal,
-      originConversationType:
-        normalizeConversationType(typeof meta.origin_conversation_type === 'string' ? meta.origin_conversation_type : undefined)
-        || existing?.originConversationType,
-      originConversationId:
-        trimToUndefined(typeof meta.origin_conversation_id === 'string' ? meta.origin_conversation_id : undefined)
-        || existing?.originConversationId,
-      originChatSessionId:
-        trimToUndefined(typeof meta.origin_chat_session_id === 'string' ? meta.origin_chat_session_id : undefined)
-        || existing?.originChatSessionId,
-      originMessageId:
-        trimToUndefined(typeof meta.origin_message_id === 'string' ? meta.origin_message_id : undefined)
-        || existing?.originMessageId,
-      creatorParticipantId:
-        trimToUndefined(typeof meta.creator_participant_id === 'string' ? meta.creator_participant_id : undefined)
-        || existing?.creatorParticipantId,
-      creatorParticipantName:
-        trimToUndefined(typeof meta.creator_participant_name === 'string' ? meta.creator_participant_name : undefined)
-        || existing?.creatorParticipantName,
-      executorAgentId:
-        trimToUndefined(typeof meta.executor_agent_id === 'string' ? meta.executor_agent_id : undefined)
-        || existing?.executorAgentId,
-      executorAgentName:
-        trimToUndefined(typeof meta.executor_agent_name === 'string' ? meta.executor_agent_name : undefined)
-        || existing?.executorAgentName,
-      reportActorAgentId:
-        trimToUndefined(typeof meta.report_actor_agent_id === 'string' ? meta.report_actor_agent_id : undefined)
-        || existing?.reportActorAgentId,
-      reportActorAgentName:
-        trimToUndefined(typeof meta.report_actor_agent_name === 'string' ? meta.report_actor_agent_name : undefined)
-        || existing?.reportActorAgentName,
-    });
-    return next;
-  } catch {
-    return existing || null;
+function unwrapTaskDeliveryItem(input: unknown): unknown {
+  if (!isRecord(input)) return input;
+  return 'delivery' in input ? input.delivery : input;
+}
+
+function mapManagedTaskSchedule(input: Record<string, unknown>): Task['schedule'] {
+  const kind = trimToUndefined(typeof input.kind === 'string' ? input.kind : undefined);
+  if (kind === 'at') {
+    return {
+      kind: 'at',
+      at: trimToUndefined(typeof input.at === 'string' ? input.at : undefined),
+    };
   }
+  if (kind === 'every') {
+    const everySecs = typeof input.every_secs === 'number'
+      ? input.every_secs
+      : (typeof input.everySecs === 'number' ? input.everySecs : undefined);
+    return {
+      kind: 'every',
+      everyMs: typeof everySecs === 'number' && Number.isFinite(everySecs)
+        ? Math.max(1000, Math.floor(everySecs * 1000))
+        : 60_000,
+    };
+  }
+  return {
+    kind: 'cron',
+    expr: trimToUndefined(typeof input.expr === 'string' ? input.expr : undefined) || '* * * * *',
+    tz: trimToUndefined(typeof input.tz === 'string' ? input.tz : undefined),
+  };
+}
+
+function toFinitePositiveInt(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return Math.max(0, Math.floor(value));
+}
+
+function mapTaskCapabilities(input: unknown): Task['capabilities'] | undefined {
+  if (!isRecord(input)) return undefined;
+  return {
+    publish: Boolean(input.publish),
+    pause: Boolean(input.pause),
+    runOnce: Boolean(input.run_once ?? input.runOnce),
+    delete: Boolean(input.delete),
+  };
+}
+
+function mapTaskDeliveryStats(input: unknown): Task['deliveryStats'] | undefined {
+  if (!isRecord(input)) return undefined;
+  return {
+    total: toFinitePositiveInt(input.total) ?? 0,
+    pending: toFinitePositiveInt(input.pending) ?? 0,
+    reported: toFinitePositiveInt(input.reported) ?? 0,
+    acknowledged: toFinitePositiveInt(input.acknowledged) ?? 0,
+    failed: toFinitePositiveInt(input.failed) ?? 0,
+    attempts: toFinitePositiveInt(input.attempts) ?? 0,
+    attemptFailures: toFinitePositiveInt(input.attempt_failures ?? input.attemptFailures) ?? 0,
+  };
+}
+
+function mapTaskFinalSummary(input: unknown): Task['finalSummary'] | null | undefined {
+  if (!isRecord(input)) return undefined;
+  const content = trimToUndefined(typeof input.content === 'string' ? input.content : undefined);
+  const createdAt = trimToUndefined(typeof input.created_at === 'string' ? input.created_at : (typeof input.createdAt === 'string' ? input.createdAt : undefined));
+  if (!content || !createdAt) return null;
+  return {
+    runCount: toFinitePositiveInt(input.run_count ?? input.runCount) ?? 0,
+    status: trimToUndefined(typeof input.status === 'string' ? input.status : undefined),
+    content,
+    createdAt,
+    runId: trimToUndefined(typeof input.run_id === 'string' ? input.run_id : (typeof input.runId === 'string' ? input.runId : undefined)),
+    eventId: trimToUndefined(typeof input.event_id === 'string' ? input.event_id : (typeof input.eventId === 'string' ? input.eventId : undefined)),
+  };
+}
+
+function mapTaskTimelineEntry(input: unknown): Task['timeline'][number] | null {
+  if (!isRecord(input)) return null;
+  const id = trimToUndefined(typeof input.id === 'string' ? input.id : undefined);
+  const sourceKind = trimToUndefined(typeof input.source_kind === 'string' ? input.source_kind : (typeof input.sourceKind === 'string' ? input.sourceKind : undefined));
+  const sourceId = trimToUndefined(typeof input.source_id === 'string' ? input.source_id : (typeof input.sourceId === 'string' ? input.sourceId : undefined));
+  const taskId = trimToUndefined(typeof input.task_id === 'string' ? input.task_id : (typeof input.taskId === 'string' ? input.taskId : undefined));
+  const createdAt = trimToUndefined(typeof input.created_at === 'string' ? input.created_at : (typeof input.createdAt === 'string' ? input.createdAt : undefined));
+  const summary = trimToUndefined(typeof input.summary === 'string' ? input.summary : undefined);
+  if (!id || !sourceKind || !sourceId || !taskId || !createdAt || !summary) return null;
+  return {
+    id,
+    sourceKind,
+    sourceId,
+    taskId,
+    runId: trimToUndefined(typeof input.run_id === 'string' ? input.run_id : (typeof input.runId === 'string' ? input.runId : undefined)),
+    eventId: trimToUndefined(typeof input.event_id === 'string' ? input.event_id : (typeof input.eventId === 'string' ? input.eventId : undefined)),
+    targetKind: trimToUndefined(typeof input.target_kind === 'string' ? input.target_kind : (typeof input.targetKind === 'string' ? input.targetKind : undefined)),
+    status: trimToUndefined(typeof input.status === 'string' ? input.status : undefined),
+    summary,
+    metadata: isRecord(input.metadata) ? input.metadata : null,
+    createdAt,
+  };
+}
+
+function mapManagedTaskDetail(input: unknown): Task | null {
+  const row = isRecord(input) ? input : null;
+  const spec = row && isRecord(row.spec) ? row.spec : null;
+  const runtime = row && isRecord(row.runtime) ? row.runtime : null;
+  if (!spec || !runtime) return null;
+
+  const id = trimToUndefined(typeof spec.id === 'string' ? spec.id : undefined);
+  const agentId = trimToUndefined(typeof spec.agent_id === 'string' ? spec.agent_id : undefined);
+  const name = trimToUndefined(typeof spec.name === 'string' ? spec.name : undefined);
+  if (!id || !agentId || !name) return null;
+
+  taskAgentIndex.set(id, agentId);
+  const meta = getTaskMeta(id);
+  const schedule = isRecord(spec.schedule) ? mapManagedTaskSchedule(spec.schedule) : { kind: 'cron' as const, expr: '* * * * *' };
+  const action = isRecord(spec.action) ? spec.action : {};
+  const delivery = isRecord(spec.delivery) ? spec.delivery : {};
+  const runtimeStateRaw = trimToUndefined(typeof runtime.state === 'string' ? runtime.state : undefined);
+  const runtimeState: Task['runtimeState'] = runtimeStateRaw === 'draft'
+    || runtimeStateRaw === 'scheduled'
+    || runtimeStateRaw === 'running'
+    || runtimeStateRaw === 'paused'
+    || runtimeStateRaw === 'completed'
+    || runtimeStateRaw === 'failed'
+    || runtimeStateRaw === 'disabled'
+    ? runtimeStateRaw
+    : undefined;
+  const sourceTypeRaw = trimToUndefined(typeof spec.source_type === 'string' ? spec.source_type : undefined);
+  const sourceType: Task['sourceType'] = sourceTypeRaw === 'chat' || sourceTypeRaw === 'manual'
+    ? sourceTypeRaw
+    : 'custom';
+  const maxRunsRaw = typeof spec.max_runs === 'number' ? spec.max_runs : undefined;
+  const runCountRaw = typeof runtime.run_count === 'number' ? runtime.run_count : 0;
+  const preview = trimToUndefined(
+    typeof runtime.latest_summary === 'string'
+      ? runtime.latest_summary
+      : (typeof runtime.last_output === 'string' ? runtime.last_output : undefined),
+  );
+  const mapped: Task = {
+    id,
+    teamId: agentId,
+    name: meta?.displayName?.trim() || sanitizeTaskName(name),
+    sourceType,
+    sourceRef: trimToUndefined(typeof spec.source_ref === 'string' ? spec.source_ref : undefined) || meta?.sourceRef,
+    enabled: Boolean(spec.enabled),
+    createdAt: trimToUndefined(typeof spec.created_at === 'string' ? spec.created_at : undefined) || nowIso(),
+    updatedAt: trimToUndefined(typeof spec.updated_at === 'string' ? spec.updated_at : undefined) || nowIso(),
+    schedule,
+    jobType:
+      trimToUndefined(typeof action.job_type === 'string' ? action.job_type : undefined) === 'shell'
+        ? 'shell'
+        : 'agent',
+    prompt: trimToUndefined(typeof action.prompt === 'string' ? action.prompt : undefined),
+    command: trimToUndefined(typeof action.command === 'string' ? action.command : undefined),
+    sessionTarget:
+      trimToUndefined(typeof action.session_target === 'string' ? action.session_target : undefined) === 'main'
+        ? 'main'
+        : 'isolated',
+    delivery: {
+      mode:
+        trimToUndefined(typeof delivery.mode === 'string' ? delivery.mode : undefined) === 'announce'
+          ? 'announce'
+          : 'none',
+      channel: trimToUndefined(typeof delivery.channel === 'string' ? delivery.channel : undefined),
+      to: trimToUndefined(typeof delivery.to === 'string' ? delivery.to : undefined),
+      bestEffort:
+        typeof delivery.best_effort === 'boolean'
+          ? delivery.best_effort
+          : (typeof delivery.bestEffort === 'boolean' ? delivery.bestEffort : undefined),
+      finalSummaryPrompt: trimToUndefined(
+        typeof delivery.final_summary_prompt === 'string'
+          ? delivery.final_summary_prompt
+          : (typeof delivery.finalSummaryPrompt === 'string' ? delivery.finalSummaryPrompt : undefined),
+      ),
+      notifyOnFinal:
+        typeof delivery.notify_on_final === 'boolean'
+          ? delivery.notify_on_final
+          : (typeof delivery.notifyOnFinal === 'boolean' ? delivery.notifyOnFinal : undefined),
+    },
+    isTemplate: Boolean(meta?.isTemplate),
+    maxRuns: typeof maxRunsRaw === 'number' && Number.isFinite(maxRunsRaw) && maxRunsRaw > 0
+      ? Math.max(1, Math.floor(maxRunsRaw))
+      : undefined,
+    runtimeState,
+    capabilities: mapTaskCapabilities(row.capabilities),
+    deliveryStats: mapTaskDeliveryStats(row.delivery_stats ?? row.deliveryStats),
+    finalSummary: mapTaskFinalSummary(row.final_summary ?? row.finalSummary) ?? null,
+    timeline: Array.isArray(row.timeline)
+      ? row.timeline.map((item) => mapTaskTimelineEntry(item)).filter((item): item is NonNullable<Task['timeline']>[number] => item != null)
+      : [],
+    runInfo: {
+      nextRun: trimToUndefined(typeof runtime.next_run === 'string' ? runtime.next_run : undefined),
+      lastRun: trimToUndefined(typeof runtime.last_run === 'string' ? runtime.last_run : undefined),
+      lastStatus: normalizeStatus(typeof runtime.last_status === 'string' ? runtime.last_status : undefined),
+      lastOutputPreview: preview,
+      runCount: typeof runCountRaw === 'number' && Number.isFinite(runCountRaw)
+        ? Math.max(0, Math.floor(runCountRaw))
+        : 0,
+    },
+  };
+  taskSnapshotCache.set(id, mapped);
+  return mapped;
+}
+
+function mapManagedTaskRun(input: unknown): TaskRunRecord | null {
+  const row = isRecord(input) ? input : null;
+  if (!row) return null;
+  const id = trimToUndefined(typeof row.id === 'string' ? row.id : undefined);
+  const taskId = trimToUndefined(typeof row.task_id === 'string' ? row.task_id : (typeof row.taskId === 'string' ? row.taskId : undefined));
+  const startTime = trimToUndefined(
+    typeof row.start_time === 'string' ? row.start_time : (typeof row.startTime === 'string' ? row.startTime : undefined),
+  );
+  if (!id || !taskId || !startTime) return null;
+  const output = trimToUndefined(
+    typeof row.summary === 'string'
+      ? row.summary
+      : (typeof row.output === 'string'
+        ? row.output
+        : (typeof row.error === 'string' ? row.error : undefined)),
+  ) || '';
+  return {
+    id,
+    taskId,
+    startTime,
+    endTime: trimToUndefined(
+      typeof row.end_time === 'string' ? row.end_time : (typeof row.endTime === 'string' ? row.endTime : undefined),
+    ),
+    status: normalizeStatus(typeof row.status === 'string' ? row.status : undefined),
+    output,
+  };
 }
 
 function readTaskMetaMap(): Record<string, TaskLocalMeta> {
@@ -403,7 +541,6 @@ function upsertTaskMeta(taskId: string, patch: Partial<TaskLocalMeta>): TaskLoca
   const next: TaskLocalMeta = {
     taskId,
     agentId: patch.agentId || existing?.agentId || '',
-    runtimeKey: patch.runtimeKey ?? existing?.runtimeKey,
     sourceType: patch.sourceType || existing?.sourceType || 'custom',
     displayName: patch.displayName ?? existing?.displayName,
     manualStartRequired: patch.manualStartRequired ?? existing?.manualStartRequired,
@@ -418,16 +555,6 @@ function upsertTaskMeta(taskId: string, patch: Partial<TaskLocalMeta>): TaskLoca
     deliveryBestEffort: patch.deliveryBestEffort ?? existing?.deliveryBestEffort,
     finalSummaryPrompt: patch.finalSummaryPrompt ?? existing?.finalSummaryPrompt,
     notifyOnFinal: patch.notifyOnFinal ?? existing?.notifyOnFinal,
-    originConversationType: patch.originConversationType ?? existing?.originConversationType,
-    originConversationId: patch.originConversationId ?? existing?.originConversationId,
-    originChatSessionId: patch.originChatSessionId ?? existing?.originChatSessionId,
-    originMessageId: patch.originMessageId ?? existing?.originMessageId,
-    creatorParticipantId: patch.creatorParticipantId ?? existing?.creatorParticipantId,
-    creatorParticipantName: patch.creatorParticipantName ?? existing?.creatorParticipantName,
-    executorAgentId: patch.executorAgentId ?? existing?.executorAgentId,
-    executorAgentName: patch.executorAgentName ?? existing?.executorAgentName,
-    reportActorAgentId: patch.reportActorAgentId ?? existing?.reportActorAgentId,
-    reportActorAgentName: patch.reportActorAgentName ?? existing?.reportActorAgentName,
     completionNotifiedRunCount:
       patch.completionNotifiedRunCount ?? existing?.completionNotifiedRunCount,
     runLogs: patch.runLogs ?? existing?.runLogs,
@@ -446,11 +573,11 @@ function removeTaskMeta(taskId: string): void {
   writeTaskMetaMap(map);
 }
 
-function isHttp404Message(message?: string): boolean {
+export function isHttp404Message(message?: string): boolean {
   return /HTTP\s*404/i.test((message || '').trim());
 }
 
-function mapAgentTaskToTask(
+export function mapAgentTaskToTask(
   task: AgentTask,
   agentId: string,
   meta: TaskLocalMeta | undefined,
@@ -523,6 +650,20 @@ async function findTaskAgentId(taskId: string): Promise<string | null> {
   const meta = getTaskMeta(taskId);
   if (meta?.agentId) return meta.agentId;
 
+  try {
+    const detail = await requestJson<unknown>(
+      `/api/management/tasks/${encodeURIComponent(taskId)}`,
+    );
+    const mapped = mapManagedTaskDetail(detail);
+    if (mapped?.teamId) {
+      taskAgentIndex.set(taskId, mapped.teamId);
+      upsertTaskMeta(taskId, { agentId: mapped.teamId });
+      return mapped.teamId;
+    }
+  } catch {
+    // ignore and fallback
+  }
+
   const agentIds = await resolveAgentIds('all');
   for (const agentId of agentIds) {
     const listed = await listAgentTasks({ agentId });
@@ -536,7 +677,7 @@ async function findTaskAgentId(taskId: string): Promise<string | null> {
   return null;
 }
 
-function mapLogsToRuns(taskId: string, logs: readonly AgentTaskLogItem[]): TaskRunRecord[] {
+export function mapLogsToRuns(taskId: string, logs: readonly AgentTaskLogItem[]): TaskRunRecord[] {
   return logs.map((log, index) => ({
     id: `${taskId}-${index}-${log.createdAt}`,
     taskId,
@@ -722,7 +863,7 @@ function buildNoSummaryFallbackMessage(log: TaskLocalRunLog): string {
   return '该次执行未返回文本摘要。请在智能体会话中查看原始输出。';
 }
 
-function backfillMissingSummaryLogs(logs: readonly TaskLocalRunLog[]): TaskLocalRunLog[] {
+export function backfillMissingSummaryLogs(logs: readonly TaskLocalRunLog[]): TaskLocalRunLog[] {
   if (logs.length === 0) return [];
   const fallback = logs.find((row) => !isGenericLogMessage(row))?.message?.trim();
   if (!fallback) {
@@ -746,7 +887,7 @@ function backfillMissingSummaryLogs(logs: readonly TaskLocalRunLog[]): TaskLocal
   });
 }
 
-async function enrichLogsFromAgentSession(
+export async function enrichLogsFromAgentSession(
   agentId: string,
   task: AgentTask,
   logs: readonly TaskLocalRunLog[],
@@ -766,7 +907,7 @@ async function enrichLogsFromAgentSession(
   return applyOutputsToLogs(logs, outputs);
 }
 
-function mergeTaskLogs(
+export function mergeTaskLogs(
   existing?: readonly TaskLocalRunLog[],
   incoming?: readonly AgentTaskLogItem[],
   options?: {
@@ -815,7 +956,7 @@ function mergeTaskLogs(
   return rows;
 }
 
-function toAgentTaskLogs(localLogs?: readonly TaskLocalRunLog[]): AgentTaskLogItem[] {
+export function toAgentTaskLogs(localLogs?: readonly TaskLocalRunLog[]): AgentTaskLogItem[] {
   return (localLogs || []).map((item) => ({
     eventId: item.eventId,
     createdAt: item.createdAt,
@@ -824,7 +965,7 @@ function toAgentTaskLogs(localLogs?: readonly TaskLocalRunLog[]): AgentTaskLogIt
   }));
 }
 
-function calculateRunCount(
+export function calculateRunCount(
   meta: TaskLocalMeta | undefined,
   task: AgentTask,
   logs: readonly AgentTaskLogItem[],
@@ -865,80 +1006,14 @@ export function setTaskCenterAgentId(agentId: string): void {
   window.localStorage.setItem(TASK_CLIENT_AGENT_ID_KEY, agentId);
 }
 
-export function bindTaskChatMeta(
-  taskId: string,
-  patch: {
-    agentId?: string;
-    runtimeKey?: string;
-    sourceRef?: string;
-    maxRuns?: number;
-    sourceType?: Task['sourceType'];
-    originConversationType?: TaskConversationType;
-    originConversationId?: string;
-    originChatSessionId?: string;
-    originMessageId?: string;
-    creatorParticipantId?: string;
-    creatorParticipantName?: string;
-    executorAgentId?: string;
-    executorAgentName?: string;
-    reportActorAgentId?: string;
-    reportActorAgentName?: string;
-  },
-): void {
-  const id = taskId.trim();
-  if (!id) return;
-  const safeMaxRuns = typeof patch.maxRuns === 'number' && Number.isFinite(patch.maxRuns) && patch.maxRuns > 0
-    ? Math.min(1000, Math.floor(patch.maxRuns))
-    : undefined;
-  upsertTaskMeta(id, {
-    agentId: patch.agentId,
-    runtimeKey: patch.runtimeKey,
-    sourceRef: patch.sourceRef,
-    maxRuns: safeMaxRuns,
-    sourceType: patch.sourceType,
-    originConversationType: patch.originConversationType,
-    originConversationId: trimToUndefined(patch.originConversationId),
-    originChatSessionId: trimToUndefined(patch.originChatSessionId),
-    originMessageId: trimToUndefined(patch.originMessageId),
-    creatorParticipantId: trimToUndefined(patch.creatorParticipantId),
-    creatorParticipantName: trimToUndefined(patch.creatorParticipantName),
-    executorAgentId: trimToUndefined(patch.executorAgentId),
-    executorAgentName: trimToUndefined(patch.executorAgentName),
-    reportActorAgentId: trimToUndefined(patch.reportActorAgentId),
-    reportActorAgentName: trimToUndefined(patch.reportActorAgentName),
-  });
-  void syncTaskMetaToBackend(id, {
-    agentId: patch.agentId,
-    runtimeKey: patch.runtimeKey,
-    sourceRef: patch.sourceRef,
-    maxRuns: safeMaxRuns,
-    sourceType: patch.sourceType,
-    originConversationType: patch.originConversationType,
-    originConversationId: trimToUndefined(patch.originConversationId),
-    originChatSessionId: trimToUndefined(patch.originChatSessionId),
-    originMessageId: trimToUndefined(patch.originMessageId),
-    creatorParticipantId: trimToUndefined(patch.creatorParticipantId),
-    creatorParticipantName: trimToUndefined(patch.creatorParticipantName),
-    executorAgentId: trimToUndefined(patch.executorAgentId),
-    executorAgentName: trimToUndefined(patch.executorAgentName),
-    reportActorAgentId: trimToUndefined(patch.reportActorAgentId),
-    reportActorAgentName: trimToUndefined(patch.reportActorAgentName),
-  }).catch(() => {
-    // 服务未就绪时保留本地回退，不阻塞聊天。
-  });
-}
-
-export function resolveTaskChatRuntimeKey(taskId: string, fallbackKey: string): string {
-  const meta = getTaskMeta(taskId.trim());
-  const key = (meta?.runtimeKey || '').trim();
-  return key || fallbackKey.trim();
-}
-
 export function hasTaskEverStarted(task: Task): boolean {
   return Boolean(task.runInfo.lastRun) || task.runInfo.runCount > 0;
 }
 
 export function canDeleteTask(task: Task): boolean {
+  if (typeof task.capabilities?.delete === 'boolean') {
+    return task.capabilities.delete;
+  }
   if (task.runInfo.lastStatus === 'running') return false;
   const hasLimit = Boolean(task.maxRuns && task.maxRuns > 0);
   const reachedFinal = hasLimit && task.runInfo.runCount >= (task.maxRuns || 0);
@@ -950,40 +1025,23 @@ export function canDeleteTask(task: Task): boolean {
 
 async function updateTaskEnabledByApi(taskId: string, enabled: boolean): Promise<{ success: boolean; message?: string }> {
   const encoded = encodeURIComponent(taskId);
-  const attempts: Array<{
-    path: string;
-    method: 'PATCH' | 'PUT' | 'POST';
-    body: Record<string, unknown>;
-  }> = [
-      { path: `/api/management/cron/jobs/${encoded}`, method: 'PATCH', body: { enabled } },
-      { path: `/api/management/cron/jobs/${encoded}`, method: 'PUT', body: { enabled } },
-      { path: `/api/management/cron/jobs/${encoded}`, method: 'PATCH', body: { patch: { enabled } } },
-      { path: `/api/management/cron/jobs/${encoded}`, method: 'PUT', body: { patch: { enabled } } },
-      { path: `/api/management/cron/jobs/${encoded}/enable`, method: 'PUT', body: { enabled } },
-      { path: `/api/management/cron/jobs/${encoded}/enable`, method: 'POST', body: { enabled } },
-      { path: `/api/management/cron/jobs/${encoded}/enabled`, method: 'POST', body: { enabled } },
-    ];
-
-  let lastError = '';
-  for (const attempt of attempts) {
-    try {
-      await requestJson<unknown>(attempt.path, {
-        method: attempt.method,
-        body: attempt.body,
-      });
-      return { success: true };
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
+  try {
+    await requestJson<unknown>(
+      enabled
+        ? `/api/management/tasks/${encoded}/publish`
+        : `/api/management/tasks/${encoded}/pause`,
+      {
+        method: 'POST',
+        body: {},
+      },
+    );
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : '更新任务状态失败。',
+    };
   }
-  return { success: false, message: lastError || '更新任务状态失败。' };
-}
-
-async function applyRunLimitIfNeeded(task: Task): Promise<void> {
-  if (!task.id || !task.enabled) return;
-  if (!task.maxRuns || task.maxRuns <= 0) return;
-  if (task.runInfo.runCount < task.maxRuns) return;
-  await updateTask(task.id, { enabled: false, teamId: task.teamId });
 }
 
 export async function listTasks(scope: string): Promise<Task[]> {
@@ -992,51 +1050,35 @@ export async function listTasks(scope: string): Promise<Task[]> {
     return [];
   }
 
-  const buckets = await Promise.all(
+  const buckets = await Promise.allSettled(
     agentIds.map(async (agentId) => {
-      const result = await listAgentTasks({ agentId });
-      if (!result.success) return [];
-
-      const rows = await Promise.all(
-        result.tasks.map(async (task) => {
-          const progress = await getAgentTaskProgress({ agentId, taskId: task.id });
-          const incomingLogs = progress.success ? progress.logs : [];
-          const meta = getTaskMeta(task.id);
-          const sourceType = meta?.sourceType || task.sourceType || 'custom';
-          const inferredDisplayName = sourceType === 'chat' ? inferChatTaskDisplayName(task.prompt) : undefined;
-          const inferredMaxRuns = parseMaxRunsFromPrompt(task.prompt);
-          const mergedLogs = mergeTaskLogs(meta?.runLogs, incomingLogs, {
-            maxRuns: meta?.maxRuns,
-            lastRun: task.lastRun,
-            enabled: task.enabled,
-          });
-          const enrichedLogs = await enrichLogsFromAgentSession(agentId, task, mergedLogs);
-          const logs = toAgentTaskLogs(backfillMissingSummaryLogs(enrichedLogs));
-          const preview = logs[0]?.message || '';
-          const runCount = calculateRunCount(meta, task, logs, progress.success ? progress.runCountHint : undefined);
-          const nextMeta = upsertTaskMeta(task.id, {
-            agentId,
-            sourceType,
-            displayName: meta?.displayName || inferredDisplayName,
-            manualStartRequired:
-              task.lastRun && task.lastRun.trim()
-                ? false
-                : meta?.manualStartRequired,
-            maxRuns: meta?.maxRuns && meta.maxRuns > 0 ? meta.maxRuns : inferredMaxRuns,
-            isTemplate: meta?.isTemplate,
-            runCountCache: runCount,
-            lastRunToken: task.lastRun || meta?.lastRunToken,
-            runLogs: enrichedLogs,
-          });
-          const mapped = mapAgentTaskToTask(task, agentId, nextMeta, runCount, preview);
-          return mapped;
-        }),
+      const rows = await requestJson<unknown[]>(
+        `/api/compose/tasks/overview?agent_id=${encodeURIComponent(agentId)}`,
+        {
+          timeoutMs: TASK_LIST_TIMEOUT_MS,
+        },
       );
-      return rows;
+      return Array.isArray(rows)
+        ? rows.map((item) => mapManagedTaskDetail(item)).filter((item): item is Task => item != null)
+        : [];
     }),
   );
+  const fulfilledBuckets = buckets
+    .filter((result): result is PromiseFulfilledResult<Task[]> => result.status === 'fulfilled')
+    .map((result) => result.value);
+  if (fulfilledBuckets.length === 0) {
+    const rejected = buckets.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    throw rejected?.reason instanceof Error
+      ? rejected.reason
+      : new Error('任务列表读取失败。');
+  }
+  buckets
+    .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+    .forEach((result) => {
+      console.warn('[TaskClient] listTasks partial failure:', result.reason);
+    });
 
-  const tasks = buckets
+  const tasks = fulfilledBuckets
     .flat()
     .sort((a, b) => {
       const ta = Date.parse(a.runInfo.nextRun || a.runInfo.lastRun || a.updatedAt);
@@ -1044,22 +1086,15 @@ export async function listTasks(scope: string): Promise<Task[]> {
       return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
     });
 
-  await Promise.all(
-    tasks.map(async (task) => {
-      try {
-        await applyRunLimitIfNeeded(task);
-      } catch {
-        // ignore auto-limit failures
-      }
-    }),
-  );
-
   return tasks;
 }
 
 export async function createTask(
   task: Partial<Task> & {
-    runtimeKey?: string;
+    remoteChatSessionId?: string;
+    remoteChatSessionOwnerAgentId?: string;
+    reportCondition?: string;
+    summaryStyle?: string;
     originConversationType?: TaskConversationType;
     originConversationId?: string;
     originChatSessionId?: string;
@@ -1081,37 +1116,75 @@ export async function createTask(
   const sourceType: Task['sourceType'] = task.sourceType || 'custom';
   const inputName = task.name || '未命名任务';
   const persistedName = toBackendSafeTaskName(inputName, sourceType);
-
-  const created = await createAgentTask({
-    agentId,
-    sourceType,
-    name: persistedName,
-    scheduleKind,
-    scheduleExpression: scheduleKind === 'cron' ? task.schedule?.expr : undefined,
-    runAt: scheduleKind === 'at' ? task.schedule?.at : undefined,
-    everyMs: scheduleKind === 'every' ? task.schedule?.everyMs : undefined,
-    timezone: task.schedule?.tz,
-    jobType: task.jobType || 'agent',
-    prompt: task.prompt,
-    command: task.command,
-    sessionTarget: task.sessionTarget,
-    deliveryMode: task.delivery?.mode === 'announce' ? 'announce' : 'none',
-    deliveryChannel: task.delivery?.channel,
-    deliveryTarget: task.delivery?.to,
-    deliveryBestEffort: task.delivery?.bestEffort,
-    enabled: false,
-  });
-
-  if (!created.success || !created.task) {
+  let createdTask: Task | null = null;
+  try {
+    const created = await requestJson<unknown>('/api/management/tasks', {
+      method: 'POST',
+      body: {
+        agent_id: agentId,
+        name: persistedName,
+        source_type: sourceType === 'chat' ? 'chat' : (sourceType === 'manual' ? 'manual' : 'custom'),
+        source_ref: trimToUndefined(task.sourceRef),
+        report_condition: trimToUndefined(task.reportCondition),
+        summary_style: trimToUndefined(task.summaryStyle),
+        schedule: {
+          kind: scheduleKind,
+          expr: scheduleKind === 'cron' ? trimToUndefined(task.schedule?.expr) : undefined,
+          tz: trimToUndefined(task.schedule?.tz),
+          at: scheduleKind === 'at' ? trimToUndefined(task.schedule?.at) : undefined,
+          every_secs:
+            scheduleKind === 'every' && typeof task.schedule?.everyMs === 'number'
+              ? Math.max(1, Math.floor(task.schedule.everyMs / 1000))
+              : undefined,
+        },
+        action: {
+          job_type: task.jobType || 'agent',
+          prompt: trimToUndefined(task.prompt),
+          command: trimToUndefined(task.command),
+          session_target: task.sessionTarget,
+        },
+        delivery: {
+          mode: task.delivery?.mode === 'announce' ? 'announce' : 'none',
+          channel: trimToUndefined(task.delivery?.channel),
+          to: trimToUndefined(task.delivery?.to),
+          best_effort: task.delivery?.bestEffort,
+          final_summary_prompt: trimToUndefined(task.delivery?.finalSummaryPrompt),
+          notify_on_final: task.delivery?.notifyOnFinal,
+        },
+        max_runs:
+          typeof task.maxRuns === 'number' && Number.isFinite(task.maxRuns) && task.maxRuns > 0
+            ? Math.floor(task.maxRuns)
+            : undefined,
+        binding: {
+          origin_conversation_type: task.originConversationType,
+          origin_conversation_id: trimToUndefined(task.originConversationId),
+          origin_chat_session_id: trimToUndefined(task.originChatSessionId),
+          origin_message_id: trimToUndefined(task.originMessageId),
+          remote_chat_session_id: trimToUndefined(task.remoteChatSessionId),
+          remote_chat_session_owner_agent_id: trimToUndefined(task.remoteChatSessionOwnerAgentId),
+          creator_participant_id: trimToUndefined(task.creatorParticipantId),
+          creator_participant_name: trimToUndefined(task.creatorParticipantName),
+          executor_agent_id: trimToUndefined(task.executorAgentId),
+          executor_agent_name: trimToUndefined(task.executorAgentName),
+          report_actor_agent_id: trimToUndefined(task.reportActorAgentId),
+          report_actor_agent_name: trimToUndefined(task.reportActorAgentName),
+        },
+        enabled: false,
+      },
+    });
+    createdTask = mapManagedTaskDetail(created);
+  } catch (error) {
     return {
       success: false,
-      message: created.message || '创建任务失败。',
+      message: error instanceof Error ? error.message : '创建任务失败。',
     };
   }
+  if (!createdTask) {
+    return { success: false, message: '创建任务失败。' };
+  }
 
-  const localMeta = upsertTaskMeta(created.task.id, {
+  const localMeta = upsertTaskMeta(createdTask.id, {
     agentId,
-    runtimeKey: task.runtimeKey,
     sourceType,
     displayName: inputName,
     manualStartRequired: true,
@@ -1124,63 +1197,18 @@ export async function createTask(
     deliveryBestEffort: task.delivery?.bestEffort,
     finalSummaryPrompt: task.delivery?.finalSummaryPrompt,
     notifyOnFinal: task.delivery?.notifyOnFinal,
-    originConversationType: task.originConversationType,
-    originConversationId: trimToUndefined(task.originConversationId),
-    originChatSessionId: trimToUndefined(task.originChatSessionId),
-    originMessageId: trimToUndefined(task.originMessageId),
-    creatorParticipantId: trimToUndefined(task.creatorParticipantId),
-    creatorParticipantName: trimToUndefined(task.creatorParticipantName),
-    executorAgentId: trimToUndefined(task.executorAgentId),
-    executorAgentName: trimToUndefined(task.executorAgentName),
-    reportActorAgentId: trimToUndefined(task.reportActorAgentId),
-    reportActorAgentName: trimToUndefined(task.reportActorAgentName),
     runCountCache: 0,
-    lastRunToken: created.task.lastRun,
+    lastRunToken: createdTask.runInfo.lastRun,
     runLogs: [],
   });
-  try {
-    await syncTaskMetaToBackend(created.task.id, {
-      agentId,
-      runtimeKey: task.runtimeKey,
-      sourceType,
-      displayName: inputName,
-      isTemplate: Boolean(task.isTemplate),
-      sourceRef: task.sourceRef,
-      maxRuns: task.maxRuns,
-      deliveryMode: task.delivery?.mode,
-      deliveryChannel: task.delivery?.channel,
-      deliveryTarget: task.delivery?.to,
-      deliveryBestEffort: task.delivery?.bestEffort,
-      finalSummaryPrompt: task.delivery?.finalSummaryPrompt,
-      notifyOnFinal: task.delivery?.notifyOnFinal,
-      originConversationType: task.originConversationType,
-      originConversationId: trimToUndefined(task.originConversationId),
-      originChatSessionId: trimToUndefined(task.originChatSessionId),
-      originMessageId: trimToUndefined(task.originMessageId),
-      creatorParticipantId: trimToUndefined(task.creatorParticipantId),
-      creatorParticipantName: trimToUndefined(task.creatorParticipantName),
-      executorAgentId: trimToUndefined(task.executorAgentId),
-      executorAgentName: trimToUndefined(task.executorAgentName),
-      reportActorAgentId: trimToUndefined(task.reportActorAgentId),
-      reportActorAgentName: trimToUndefined(task.reportActorAgentName),
-    });
-  } catch {
-    // 本地元数据已写入，这里不中断任务创建。
-  }
-  const mapped = mapAgentTaskToTask(created.task, agentId, localMeta, 0, '');
-
-  // 新建后默认处于“待执行”，必要时补一次禁用调用
-  const disableResult = mapped.enabled
-    ? await updateTaskEnabledByApi(created.task.id, false)
-    : { success: true as const };
-  const disabledMapped: Task = { ...mapped, enabled: false };
   return {
     success: true,
-    data: disabledMapped,
-    message:
-      disableResult.success
-        ? created.message
-        : `任务已创建，但禁用发布接口失败，已按待执行展示：${disableResult.message || '-'}`,
+    data: {
+      ...createdTask,
+      name: localMeta.displayName?.trim() || createdTask.name,
+      enabled: false,
+    },
+    message: '任务已创建。',
   };
 }
 
@@ -1205,43 +1233,11 @@ export async function updateTask(
   } else {
     return { success: false, message: '当前仅支持更新任务启停状态。' };
   }
-
-  const latest = await listAgentTasks({ agentId });
-  if (!latest.success) {
-    return { success: true, message: '任务状态已更新。' };
-  }
-  const hit = latest.tasks.find((item) => item.id === taskId);
-  if (!hit) {
-    return { success: true, message: '任务状态已更新。' };
-  }
-
-  const progress = await getAgentTaskProgress({ agentId, taskId });
-  const existingMeta = getTaskMeta(taskId);
-  const sourceType = existingMeta?.sourceType || hit.sourceType || 'custom';
-  const inferredDisplayName = sourceType === 'chat' ? inferChatTaskDisplayName(hit.prompt) : undefined;
-  const inferredMaxRuns = parseMaxRunsFromPrompt(hit.prompt);
-  let mergedLogs = mergeTaskLogs(existingMeta?.runLogs, progress.success ? progress.logs : [], {
-    maxRuns: existingMeta?.maxRuns,
-    lastRun: hit.lastRun,
-    enabled: hit.enabled,
-  });
-  mergedLogs = await enrichLogsFromAgentSession(agentId, hit, mergedLogs);
-  const logs = toAgentTaskLogs(backfillMissingSummaryLogs(mergedLogs));
-  const meta = upsertTaskMeta(taskId, {
-    agentId,
-    sourceType,
-    displayName: existingMeta?.displayName || inferredDisplayName,
-    maxRuns: existingMeta?.maxRuns && existingMeta.maxRuns > 0 ? existingMeta.maxRuns : inferredMaxRuns,
-    manualStartRequired:
-      typeof updates.enabled === 'boolean' && updates.enabled ? false : getTaskMeta(taskId)?.manualStartRequired,
-    runCountCache: calculateRunCount(getTaskMeta(taskId), hit, logs, progress.success ? progress.runCountHint : undefined),
-    lastRunToken: hit.lastRun,
-    runLogs: mergedLogs,
-  });
-  const mapped = mapAgentTaskToTask(hit, agentId, meta, meta.runCountCache || 0, logs[0]?.message || '');
+  const mapped = await getTaskDetail(taskId);
   return {
     success: true,
     data: mapped,
+    message: mapped ? undefined : '任务状态已更新。',
   };
 }
 
@@ -1250,101 +1246,43 @@ export async function deleteTask(taskId: string): Promise<{ success: boolean; me
   if (detail && !canDeleteTask(detail)) {
     return { success: false, message: '任务已运行过，不能删除。' };
   }
-
-  const agentId = await findTaskAgentId(taskId);
-  if (!agentId) {
-    return { success: false, message: `未找到任务所属智能体：${taskId}` };
-  }
-  const result = await deleteAgentTask({ agentId, taskId });
-  if (result.success) {
+  try {
+    await requestJson<unknown>(`/api/management/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'DELETE',
+    });
+    taskSnapshotCache.delete(taskId);
     removeTaskMeta(taskId);
-  }
-  return { success: result.success, message: result.message };
-}
-
-export async function runTaskNow(taskId: string): Promise<{ success: boolean; message?: string; activeTaskId?: string }> {
-  // “运行”语义改为发布任务（enabled=true）
-  const updated = await updateTask(taskId, { enabled: true });
-  if (updated.success || !isHttp404Message(updated.message)) {
-    return {
-      ...updated,
-      activeTaskId: updated.success ? (updated.data?.id || taskId) : undefined,
-    };
-  }
-
-  // 兼容部分后端未暴露启停接口：通过“重建为已发布”回退启动
-  const detail = await getTaskDetail(taskId);
-  if (!detail) {
-    return updated;
-  }
-  const agentId = detail.teamId || (await findTaskAgentId(taskId));
-  if (!agentId) {
-    return updated;
-  }
-  const sourceType: Task['sourceType'] = detail.sourceType || 'custom';
-  const persistedName = toBackendSafeTaskName(detail.name, sourceType);
-
-  const scheduleKind = detail.schedule.kind;
-  const created = await createAgentTask({
-    agentId,
-    sourceType,
-    name: persistedName,
-    scheduleKind,
-    scheduleExpression: scheduleKind === 'cron' ? detail.schedule.expr : undefined,
-    runAt: scheduleKind === 'at' ? detail.schedule.at : undefined,
-    everyMs: scheduleKind === 'every' ? detail.schedule.everyMs : undefined,
-    timezone: detail.schedule.tz,
-    jobType: detail.jobType || 'agent',
-    prompt: detail.prompt,
-    command: detail.command,
-    sessionTarget: detail.sessionTarget,
-    deliveryMode: detail.delivery?.mode === 'announce' ? 'announce' : 'none',
-    deliveryChannel: detail.delivery?.channel,
-    deliveryTarget: detail.delivery?.to,
-    deliveryBestEffort: detail.delivery?.bestEffort,
-    enabled: true,
-  });
-
-  if (!created.success || !created.task) {
+    return { success: true };
+  } catch (error) {
     return {
       success: false,
-      message: `${updated.message || '任务状态更新失败。'}；回退启动失败：${created.message || '-'}`,
+      message: error instanceof Error ? error.message : '删除任务失败。',
     };
   }
+}
 
-  const nextMeta = upsertTaskMeta(created.task.id, {
-    agentId,
-    sourceType,
-    displayName: detail.name,
-    manualStartRequired: false,
-    isTemplate: Boolean(detail.isTemplate),
-    sourceRef: detail.sourceRef,
-    maxRuns: detail.maxRuns,
-    deliveryMode: detail.delivery?.mode,
-    deliveryChannel: detail.delivery?.channel,
-    deliveryTarget: detail.delivery?.to,
-    deliveryBestEffort: detail.delivery?.bestEffort,
-    finalSummaryPrompt: detail.delivery?.finalSummaryPrompt,
-    notifyOnFinal: detail.delivery?.notifyOnFinal,
-    runCountCache: detail.runInfo.runCount,
-    lastRunToken: created.task.lastRun,
-    runLogs: getTaskMeta(taskId)?.runLogs || [],
-  });
-  mapAgentTaskToTask(created.task, agentId, nextMeta, nextMeta.runCountCache || 0, '');
-
-  const removed = await deleteTask(taskId);
-  if (!removed.success) {
-    return {
-      success: true,
-      activeTaskId: created.task.id,
-      message: '任务已通过回退方式发布运行，但旧任务删除失败，请手动清理。',
-    };
-  }
+export async function publishTask(taskId: string): Promise<{ success: boolean; message?: string; activeTaskId?: string }> {
+  const updated = await updateTask(taskId, { enabled: true });
   return {
-    success: true,
-    activeTaskId: created.task.id,
-    message: '任务已通过回退方式发布运行。',
+    success: updated.success,
+    message: updated.message,
+    activeTaskId: updated.success ? taskId : undefined,
   };
+}
+
+export async function runTaskOnce(taskId: string): Promise<{ success: boolean; message?: string }> {
+  try {
+    await requestJson<unknown>(`/api/management/tasks/${encodeURIComponent(taskId)}/run-once`, {
+      method: 'POST',
+      body: {},
+    });
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : '立即执行失败。',
+    };
+  }
 }
 
 export async function pauseTask(taskId: string): Promise<{ success: boolean; message?: string }> {
@@ -1359,156 +1297,95 @@ export async function resumeTask(taskId: string): Promise<{ success: boolean; me
   return updateTask(taskId, { enabled: true });
 }
 
+export async function writeTaskDeliveryToChatSession(input: {
+  deliveryId: string;
+  taskId: string;
+  messageText: string;
+}): Promise<{ success: boolean; message?: string }> {
+  const deliveryId = input.deliveryId.trim();
+  const taskId = input.taskId.trim();
+  const messageText = input.messageText.trim();
+  if (!deliveryId || !taskId || !messageText) {
+    return { success: false, message: '任务回写参数不完整。' };
+  }
+  try {
+    await requestJson<unknown>(
+      `/api/management/tasks/deliveries/${encodeURIComponent(deliveryId)}/chat-writeback`,
+      {
+        method: 'POST',
+        body: {
+          task_id: taskId,
+          message_text: messageText,
+        },
+      },
+    );
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : '任务回写失败。',
+    };
+  }
+}
+
 export async function listTaskRuns(taskId: string): Promise<TaskRunRecord[]> {
-  const agentId = await findTaskAgentId(taskId);
-  if (!agentId) return [];
-  const progress: AgentTaskProgressResult = await getAgentTaskProgress({ agentId, taskId });
-  const meta = getTaskMeta(taskId);
-  let mergedLogs = mergeTaskLogs(meta?.runLogs, progress.success ? progress.logs : [], {
-    maxRuns: meta?.maxRuns,
-    lastRun: progress.task?.lastRun,
-    enabled: progress.task?.enabled,
-  });
-  if (progress.task) {
-    mergedLogs = await enrichLogsFromAgentSession(agentId, progress.task, mergedLogs);
+  try {
+    const full = await requestJson<{ runs?: unknown[] }>(
+      `/api/compose/tasks/${encodeURIComponent(taskId)}/full`,
+    );
+    return Array.isArray(full?.runs)
+      ? full.runs.map((item) => mapManagedTaskRun(item)).filter((item): item is TaskRunRecord => item != null)
+      : [];
+  } catch {
+    return [];
   }
-  if (mergedLogs.length > 0) {
-    upsertTaskMeta(taskId, { agentId, runLogs: mergedLogs });
-  }
-  return mapLogsToRuns(taskId, toAgentTaskLogs(backfillMissingSummaryLogs(mergedLogs)));
 }
 
 export async function getTaskDetail(taskId: string): Promise<Task | undefined> {
-  const agentId = await findTaskAgentId(taskId);
-  if (!agentId) return undefined;
-
-  const listed = await listAgentTasks({ agentId });
-  if (!listed.success) return undefined;
-  const task = listed.tasks.find((item) => item.id === taskId);
-  if (!task) return undefined;
-  const progress = await getAgentTaskProgress({ agentId, taskId });
-  const existingMeta = getTaskMeta(taskId);
-  const sourceType = existingMeta?.sourceType || task.sourceType || 'custom';
-  const inferredDisplayName = sourceType === 'chat' ? inferChatTaskDisplayName(task.prompt) : undefined;
-  const inferredMaxRuns = parseMaxRunsFromPrompt(task.prompt);
-  let logsMerged = mergeTaskLogs(existingMeta?.runLogs, progress.success ? progress.logs : [], {
-    maxRuns: existingMeta?.maxRuns,
-    lastRun: task.lastRun,
-    enabled: task.enabled,
-  });
-  logsMerged = await enrichLogsFromAgentSession(agentId, task, logsMerged);
-  const logs = toAgentTaskLogs(backfillMissingSummaryLogs(logsMerged));
-  const runCount = calculateRunCount(existingMeta, task, logs, progress.success ? progress.runCountHint : undefined);
-  const meta = upsertTaskMeta(taskId, {
-    agentId,
-    sourceType,
-    displayName: existingMeta?.displayName || inferredDisplayName,
-    maxRuns: existingMeta?.maxRuns && existingMeta.maxRuns > 0 ? existingMeta.maxRuns : inferredMaxRuns,
-    manualStartRequired:
-      task.lastRun && task.lastRun.trim()
-        ? false
-        : existingMeta?.manualStartRequired,
-    runCountCache: runCount,
-    lastRunToken: task.lastRun || existingMeta?.lastRunToken,
-    runLogs: logsMerged,
-  });
-  return mapAgentTaskToTask(task, agentId, meta, runCount, logs[0]?.message || '');
-}
-
-export async function createTaskReportDelivery(input: {
-  taskId: string;
-  ownerAgentId: string;
-  runtimeKey?: string;
-  deliveryKind?: 'progress' | 'final' | 'anomaly';
-  dedupeKey: string;
-  status?: 'pending' | 'reported' | 'acknowledged';
-  originConversationType?: TaskConversationType;
-  originConversationId?: string;
-  originChatSessionId?: string;
-  originMessageId?: string;
-  creatorParticipantId?: string;
-  creatorParticipantName?: string;
-  executorAgentId?: string;
-  executorAgentName?: string;
-  reportActorAgentId?: string;
-  reportActorAgentName?: string;
-  taskName?: string;
-  runCount?: number;
-  summaryText?: string;
-  errorText?: string;
-  payload?: Record<string, unknown>;
-}): Promise<TaskReportDelivery | null> {
-  const taskId = input.taskId.trim();
-  const ownerAgentId = input.ownerAgentId.trim();
-  const dedupeKey = input.dedupeKey.trim();
-  if (!taskId || !ownerAgentId || !dedupeKey) return null;
-  const result = await requestJson<{ delivery?: unknown }>('/api/tasks/deliveries', {
-    method: 'POST',
-    body: {
-      task_id: taskId,
-      owner_agent_id: ownerAgentId,
-      runtime_key: trimToUndefined(input.runtimeKey),
-      delivery_kind: input.deliveryKind || 'final',
-      dedupe_key: dedupeKey,
-      status: input.status || 'pending',
-      origin_conversation_type: input.originConversationType,
-      origin_conversation_id: trimToUndefined(input.originConversationId),
-      origin_chat_session_id: trimToUndefined(input.originChatSessionId),
-      origin_message_id: trimToUndefined(input.originMessageId),
-      creator_participant_id: trimToUndefined(input.creatorParticipantId),
-      creator_participant_name: trimToUndefined(input.creatorParticipantName),
-      executor_agent_id: trimToUndefined(input.executorAgentId),
-      executor_agent_name: trimToUndefined(input.executorAgentName),
-      report_actor_agent_id: trimToUndefined(input.reportActorAgentId),
-      report_actor_agent_name: trimToUndefined(input.reportActorAgentName),
-      task_name: trimToUndefined(input.taskName),
-      run_count: typeof input.runCount === 'number' ? Math.max(0, Math.floor(input.runCount)) : undefined,
-      summary_text: trimToUndefined(input.summaryText),
-      error_text: trimToUndefined(input.errorText),
-      payload: input.payload || {},
-    },
-  });
-  return mapTaskDelivery(result.delivery);
+  try {
+    const full = await requestJson<{ task?: unknown }>(
+      `/api/compose/tasks/${encodeURIComponent(taskId)}/full`,
+    );
+    return mapManagedTaskDetail(full?.task) || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function listPendingTaskReportDeliveries(input: {
-  runtimeKey?: string;
   chatSessionId?: string;
-  conversationType?: TaskConversationType;
-  conversationId?: string;
 }): Promise<TaskReportDelivery[]> {
   const params = new URLSearchParams();
-  const runtimeKey = trimToUndefined(input.runtimeKey);
   const chatSessionId = trimToUndefined(input.chatSessionId);
-  const conversationType = normalizeConversationType(input.conversationType);
-  const conversationId = trimToUndefined(input.conversationId);
-  if (runtimeKey) params.set('runtime_key', runtimeKey);
-  if (chatSessionId) params.set('chat_session_id', chatSessionId);
-  if (conversationType) params.set('conversation_type', conversationType);
-  if (conversationId) params.set('conversation_id', conversationId);
+  params.set('target_kind', 'chat_message');
+  if (chatSessionId) params.set('origin_chat_session_id', chatSessionId);
   const suffix = params.toString();
-  const result = await requestJson<{ deliveries?: unknown[] }>(
-    `/api/tasks/deliveries/pending${suffix ? `?${suffix}` : ''}`,
+  const result = await requestJson<unknown>(
+    `/api/management/tasks/deliveries/pending${suffix ? `?${suffix}` : ''}`,
+    {
+      timeoutMs: TASK_DELIVERY_TIMEOUT_MS,
+    },
   );
-  return Array.isArray(result.deliveries)
-    ? result.deliveries.map((item) => mapTaskDelivery(item)).filter((item): item is TaskReportDelivery => item != null)
-    : [];
+  return unwrapTaskDeliveryRows(result)
+    .map((item) => mapTaskDelivery(item))
+    .filter((item): item is TaskReportDelivery => item != null);
 }
 
 export async function updateTaskReportDeliveryStatus(
   deliveryId: string,
-  status: 'pending' | 'reported' | 'acknowledged',
+  status: 'pending' | 'reported' | 'acknowledged' | 'failed',
 ): Promise<TaskReportDelivery | null> {
   const id = deliveryId.trim();
   if (!id) return null;
-  const result = await requestJson<{ delivery?: unknown }>(
-    `/api/tasks/deliveries/${encodeURIComponent(id)}/status`,
+  const result = await requestJson<unknown>(
+    `/api/management/tasks/deliveries/${encodeURIComponent(id)}/status`,
     {
       method: 'POST',
       body: { status },
+      timeoutMs: TASK_DELIVERY_TIMEOUT_MS,
     },
   );
-  return mapTaskDelivery(result.delivery);
+  return mapTaskDelivery(unwrapTaskDeliveryItem(result));
 }
 
 export function hasTaskFinalSummaryDelivered(taskId: string, runCount: number): boolean {
@@ -1537,15 +1414,12 @@ export function storeTaskFinalSummary(taskId: string, runCount: number, content:
 }
 
 export function getTaskFinalSummary(taskId: string): { runCount: number; content: string; createdAt: string } | null {
-  const meta = getTaskMeta(taskId);
-  if (!meta?.finalSummary) return null;
-  const safeRunCount = Math.max(0, Math.floor(meta.finalSummary.runCount ?? 0));
-  const content = (meta.finalSummary.content || '').trim();
-  const createdAt = (meta.finalSummary.createdAt || '').trim();
-  if (!content) return null;
+  const task = taskSnapshotCache.get(taskId);
+  const summary = task?.finalSummary;
+  if (!summary?.content?.trim()) return null;
   return {
-    runCount: safeRunCount,
-    content,
-    createdAt: createdAt || nowIso(),
+    runCount: summary.runCount,
+    content: summary.content,
+    createdAt: summary.createdAt || nowIso(),
   };
 }

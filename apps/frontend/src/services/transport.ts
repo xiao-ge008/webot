@@ -125,6 +125,64 @@ export interface RequestJsonOptions {
   body?: unknown;
   headers?: Record<string, string>;
   signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
+
+function prepareAbortSignal(
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): {
+  signal?: AbortSignal;
+  cleanup: () => void;
+  didTimeout: () => boolean;
+} {
+  if (!signal && (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+    return {
+      signal: undefined,
+      cleanup: () => {},
+      didTimeout: () => false,
+    };
+  }
+
+  const controller = new AbortController();
+  let timeoutHandle: number | null = null;
+  let timeoutTriggered = false;
+
+  const abortFromParent = () => {
+    controller.abort();
+  };
+
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener('abort', abortFromParent);
+    }
+  }
+
+  if (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutHandle = window.setTimeout(() => {
+      timeoutTriggered = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timeoutHandle != null) {
+        window.clearTimeout(timeoutHandle);
+      }
+      if (signal) {
+        signal.removeEventListener('abort', abortFromParent);
+      }
+    },
+    didTimeout: () => timeoutTriggered,
+  };
 }
 
 async function requestJsonWithBaseUrl<TResponse>(
@@ -145,23 +203,37 @@ async function requestJsonWithBaseUrl<TResponse>(
     bodyText = JSON.stringify(options.body);
   }
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: bodyText,
-    signal: options?.signal,
-  });
-
-  const responseText = await response.text();
-  if (!response.ok) {
-    throw new Error(makeErrorMessage(response.status, responseText));
+  const abortState = prepareAbortSignal(options?.signal, options?.timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: bodyText,
+      signal: abortState.signal,
+    });
+  } catch (error) {
+    abortState.cleanup();
+    if (abortState.didTimeout() && isAbortError(error)) {
+      throw new Error(`Request timed out after ${Math.round(options?.timeoutMs || 0)}ms`);
+    }
+    throw error;
   }
 
-  if (!responseText.trim()) {
-    return undefined as TResponse;
-  }
+  try {
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(makeErrorMessage(response.status, responseText));
+    }
 
-  return JSON.parse(responseText) as TResponse;
+    if (!responseText.trim()) {
+      return undefined as TResponse;
+    }
+
+    return JSON.parse(responseText) as TResponse;
+  } finally {
+    abortState.cleanup();
+  }
 }
 
 export async function getOpenFangBaseUrl(): Promise<string> {

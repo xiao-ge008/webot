@@ -57,6 +57,24 @@ function buildScopedGroupSessionLabel(groupId: string, sessionId: string): strin
     return `groupmem_web_${conversation}_${session || 'default'}`;
 }
 
+function isGroupSessionLabelForGroup(label: string, groupId: string): boolean {
+    const normalized = label.trim().toLowerCase();
+    if (!normalized) return false;
+    const legacyLabel = buildGroupSessionLabel(groupId).toLowerCase();
+    const scopedPrefix = `${legacyLabel}_`;
+    return normalized === legacyLabel || normalized.startsWith(scopedPrefix);
+}
+
+function filterGroupSessionsForGroup(
+    sessions: StoredChatSession[],
+    groupId: string,
+): StoredChatSession[] {
+    return sessions.filter((session) => {
+        const label = (session.sessionLabel || '').trim();
+        return isGroupSessionLabelForGroup(label, groupId);
+    });
+}
+
 function normalizeGroupSessionIdentity(
     session: StoredChatSession,
     groupId: string,
@@ -85,7 +103,7 @@ function normalizeGroupSessions(
     leaderAgentId: string,
 ): StoredChatSession[] {
     const seenIds = new Set<string>();
-    return sessions.map((session, index) => {
+    return filterGroupSessionsForGroup(sessions, groupId).map((session, index) => {
         let next = normalizeGroupSessionIdentity(session, groupId, leaderAgentId, index);
         if (seenIds.has(next.id)) {
             const dedupedId = `${next.id}_${index + 1}`;
@@ -653,10 +671,18 @@ export function GroupChatPage() {
     );
     const responderQueueLimit = Math.min(3, Math.max(1, groupLimits.maxSpeakers));
     const maxTalkTargets = Math.max(groupMembers.length, Math.max(1, groupLimits.maxMentions));
-    const activeSessionLabel = useMemo(() => {
-        if (!group || !activeSession) return '';
-        return normalizeGroupSessionIdentity(activeSession, group.groupId, group.leaderAgentId, 0).sessionLabel || '';
-    }, [activeSession, group]);
+    const resolveGroupSessionLabel = useMemo(() => {
+        if (!group) {
+            return undefined;
+        }
+        return (sessionId: string) => buildScopedGroupSessionLabel(group.groupId, sessionId);
+    }, [group]);
+    const matchGroupSessionLabel = useMemo(() => {
+        if (!group) {
+            return undefined;
+        }
+        return (label: string) => isGroupSessionLabelForGroup(label, group.groupId);
+    }, [group]);
 
     const syncTargetScrollControls = () => {
         const node = targetScrollRef.current;
@@ -955,6 +981,13 @@ export function GroupChatPage() {
     }, [group, initialState, runtimeKey]);
 
     useEffect(() => {
+        if (!group || !runtimeKey) {
+            return;
+        }
+        chatRuntimeStore.updateSessions(runtimeKey, (prev) => normalizeGroupSessions(prev, group.groupId, group.leaderAgentId));
+    }, [group, runtimeKey]);
+
+    useEffect(() => {
         let cancelled = false;
         if (!group) {
             return () => { cancelled = true; };
@@ -1017,6 +1050,8 @@ export function GroupChatPage() {
     const handleCreateSession = () => {
         if (!runtimeKey || !group) return;
         setAutoConversationEnabled(false);
+        setSessionKeyword('');
+        setPendingDeleteSessionId(null);
         const nextId = generateId();
         chatRuntimeStore.updateSessions(runtimeKey, (prev) => {
             const index = prev.length + 1;
@@ -1684,7 +1719,8 @@ export function GroupChatPage() {
                             runtimeKey={runtimeKey}
                             sessionOwnerAgentId={group.leaderAgentId}
                             fixedSessionTitle={group.name}
-                            sessionLabel={activeSessionLabel}
+                            sessionLabelResolver={resolveGroupSessionLabel}
+                            sessionLabelMatcher={matchGroupSessionLabel}
                             systemPreamble={group.systemPrompt}
                             groupUpgradeEnabled={false}
                             uiVariant="embedded"

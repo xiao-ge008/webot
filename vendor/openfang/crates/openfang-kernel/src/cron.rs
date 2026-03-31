@@ -143,11 +143,41 @@ impl CronScheduler {
         }
         let data = std::fs::read_to_string(&self.persist_path)
             .map_err(|e| OpenFangError::Internal(format!("Failed to read cron jobs: {e}")))?;
-        let metas: Vec<JobMeta> = serde_json::from_str(&data)
+        let mut metas: Vec<JobMeta> = serde_json::from_str(&data)
             .map_err(|e| OpenFangError::Internal(format!("Failed to parse cron jobs: {e}")))?;
+        let now = Utc::now();
+        let mut normalized_overdue = 0usize;
         let count = metas.len();
+        for meta in &mut metas {
+            if !meta.job.enabled {
+                continue;
+            }
+
+            if let Some(next_run) = meta.job.next_run {
+                if next_run <= now {
+                    meta.job.next_run = Some(compute_next_run_after(&meta.job.schedule, now));
+                    normalized_overdue += 1;
+                }
+            } else {
+                meta.job.next_run = Some(compute_next_run_after(&meta.job.schedule, now));
+                normalized_overdue += 1;
+            }
+        }
+
         for meta in metas {
             self.jobs.insert(meta.job.id, meta);
+        }
+        if normalized_overdue > 0 {
+            info!(
+                normalized = normalized_overdue,
+                "Normalized overdue cron job next_run values on load"
+            );
+            if let Err(error) = self.persist() {
+                warn!(
+                    error = %error,
+                    "Failed to persist normalized cron job schedule after load"
+                );
+            }
         }
         info!(count, "Loaded cron jobs from disk");
         Ok(count)

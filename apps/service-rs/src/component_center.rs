@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,8 +11,14 @@ use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::Digest;
 use tokio::time::sleep;
+use uuid::Uuid;
 
+use crate::assignment_store::{
+    self, CapabilityDescriptorRecord, CapabilityJobRecord, CapabilityProviderBindingRecord,
+    CapabilityProviderRecord, ProviderHealthStateRecord,
+};
 use crate::error::ApiError;
 use crate::path_resolver;
 use crate::AppState;
@@ -21,6 +28,12 @@ const COMPONENT_MANIFEST_FILE: &str = "components.manifest.json";
 const COMPONENT_SKILL_FILE: &str = "SKILL.md";
 const COMPONENT_PROMPT_CONTEXT_FILE: &str = "prompt_context.md";
 const COMPONENT_SKILL_TOML_FILE: &str = "skill.toml";
+const COMPONENT_TOOL_ADAPTER_FILE: &str = "tool-adapter.js";
+const RUNNINGHUB_STATUS_ENDPOINT: &str = "/task/openapi/status";
+const RUNNINGHUB_OUTPUTS_ENDPOINT: &str = "/task/openapi/outputs";
+const COMFYUI_JOB_QUERY_TIMEOUT_SECS: u64 = 15;
+const RUNNINGHUB_JOB_QUERY_TIMEOUT_SECS: u64 = 15;
+const AGENT_PROFILE_DIR_NAME: &str = "agent_profile";
 
 fn default_comfyui_server_url() -> String {
     "http://127.0.0.1:8188".to_string()
@@ -185,6 +198,46 @@ pub struct ComponentWorkflowConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct ComponentCapabilityBinding {
+    #[serde(default)]
+    pub capability_key: String,
+    #[serde(default)]
+    pub capability_scope: String,
+    #[serde(default)]
+    pub base_tool: String,
+    #[serde(default)]
+    pub tool_mode: String,
+    #[serde(default)]
+    pub source_policy: String,
+    #[serde(default)]
+    pub fallback_policy: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub priority: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentSelectorMeta {
+    #[serde(default)]
+    pub specialization: String,
+    #[serde(default)]
+    pub intent_tags: Vec<String>,
+    #[serde(default)]
+    pub subject_policy: String,
+    #[serde(default)]
+    pub supports_text_only: bool,
+    #[serde(default)]
+    pub requires_slots: Vec<String>,
+    #[serde(default)]
+    pub optional_slots: Vec<String>,
+    #[serde(default)]
+    pub preferred_mime_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ComponentDefinition {
     #[serde(default)]
     pub provider_type: ComponentProviderType,
@@ -198,6 +251,10 @@ pub struct ComponentDefinition {
     pub description: String,
     #[serde(default)]
     pub return_type: ComponentReturnType,
+    #[serde(default)]
+    pub capability_binding: ComponentCapabilityBinding,
+    #[serde(default)]
+    pub selector_meta: ComponentSelectorMeta,
     #[serde(default)]
     pub workflow: ComponentWorkflowConfig,
     #[serde(default)]
@@ -215,7 +272,18 @@ pub struct ComponentInvokeRequest {
     pub agent_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentCapabilityInvokeRequest {
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default, alias = "agentId")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentInvokeItem {
     pub kind: String,
@@ -231,6 +299,26 @@ pub struct ComponentInvokeResult {
     pub text: String,
     pub items: Vec<ComponentInvokeItem>,
     pub raw: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentable_result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_meta: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ComponentVideoLocalizationResult {
+    raw: Value,
+    items: Vec<ComponentInvokeItem>,
+}
+
+#[derive(Debug, Clone)]
+struct ComponentVideoSavePlan {
+    canonical_dir: PathBuf,
+    public_dir: PathBuf,
+    public_relative_dir: String,
+    save_target: String,
+    owner_scope: String,
+    meta_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,7 +405,50 @@ pub async fn invoke_component_definition(
             .await?
         }
         ComponentProviderType::Runninghub => {
-            invoke_runninghub_component(&item, &configs.runninghub, &payload.params).await?
+            invoke_runninghub_component(
+                &item,
+                &configs.runninghub,
+                &payload.params,
+                payload.agent_id.as_deref(),
+            )
+            .await?
+        }
+    };
+    Ok(Json(result))
+}
+
+pub async fn invoke_component_capability_definition(
+    State(state): State<Arc<AppState>>,
+    AxumPath(component_key): AxumPath<String>,
+    Json(payload): Json<ComponentCapabilityInvokeRequest>,
+) -> Result<Json<ComponentInvokeResult>, ApiError> {
+    let item = load_component_definition_by_lookup_key(&component_key)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "组件不存在"))?;
+    let tool_name = payload.tool_name.trim();
+    if tool_name.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "toolName 不能为空"));
+    }
+    let params = build_component_params_from_capability_input(&item, tool_name, &payload.input)?;
+    let configs = read_component_provider_configs().map_err(internal_error)?;
+    let result = match item.provider_type {
+        ComponentProviderType::Comfyui => {
+            invoke_comfyui_component(
+                &state,
+                &item,
+                &configs.comfyui,
+                &params,
+                payload.agent_id.as_deref(),
+            )
+            .await?
+        }
+        ComponentProviderType::Runninghub => {
+            invoke_runninghub_component(
+                &item,
+                &configs.runninghub,
+                &params,
+                payload.agent_id.as_deref(),
+            )
+            .await?
         }
     };
     Ok(Json(result))
@@ -325,6 +456,1334 @@ pub async fn invoke_component_definition(
 
 fn internal_error(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message.into())
+}
+
+fn component_return_type_to_media_kind(value: &ComponentReturnType) -> Option<&'static str> {
+    match value {
+        ComponentReturnType::Image => Some("image"),
+        ComponentReturnType::Video => Some("video"),
+        ComponentReturnType::Audio => Some("audio"),
+        ComponentReturnType::Text => None,
+    }
+}
+
+fn component_return_type_to_capability(value: &ComponentReturnType) -> Option<&'static str> {
+    match value {
+        ComponentReturnType::Image => Some("generate.image"),
+        ComponentReturnType::Video => Some("generate.video"),
+        ComponentReturnType::Audio => Some("generate.audio"),
+        ComponentReturnType::Text => None,
+    }
+}
+
+fn component_capability_key_to_media_kind(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "generate.image" | "edit.image" => Some("image"),
+        "generate.video" | "edit.video" => Some("video"),
+        "generate.audio" | "transcribe.audio" => Some("audio"),
+        _ => None,
+    }
+}
+
+fn is_document_capability_key(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "parse.document"
+            | "extract.document"
+            | "summarize.document"
+            | "convert.document"
+            | "compare.document"
+            | "preview.document"
+            | "chunk.document"
+    )
+}
+
+fn build_document_component_capability_binding(
+    capability_key: &str,
+) -> Option<ComponentCapabilityBinding> {
+    let (base_tool, tool_mode) = match capability_key.trim() {
+        "parse.document" => ("document_parse", "parse"),
+        "extract.document" => ("document_extract", "extract"),
+        "summarize.document" => ("document_summarize", "summarize"),
+        "convert.document" => ("document_convert", "convert"),
+        "compare.document" => ("document_compare", "compare"),
+        "preview.document" => ("document_preview", "preview"),
+        "chunk.document" => ("document_chunk", "chunk"),
+        _ => return None,
+    };
+    Some(ComponentCapabilityBinding {
+        capability_key: capability_key.trim().to_string(),
+        capability_scope: "generic".to_string(),
+        base_tool: base_tool.to_string(),
+        tool_mode: tool_mode.to_string(),
+        source_policy: "required".to_string(),
+        fallback_policy: "allow_generic_provider".to_string(),
+        enabled: true,
+        priority: 100,
+    })
+}
+
+fn infer_document_component_capability_key(item: &ComponentDefinition) -> Option<&'static str> {
+    if item.return_type != ComponentReturnType::Text {
+        return None;
+    }
+    let mapping_hints = item
+        .workflow
+        .parameter_mappings
+        .iter()
+        .map(|mapping| {
+            format!(
+                "{} {} {} {}",
+                mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let combined = format!(
+        "{} {} {} {} {}",
+        item.name, item.english_name, item.component_type, item.description, mapping_hints
+    )
+    .to_ascii_lowercase();
+    if combined.is_empty() {
+        return None;
+    }
+    if combined.contains("compare")
+        || combined.contains("diff")
+        || combined.contains("比较")
+        || combined.contains("对比")
+    {
+        return Some("compare.document");
+    }
+    if combined.contains("convert")
+        || combined.contains("conversion")
+        || combined.contains("export")
+        || combined.contains("转换")
+        || combined.contains("导出")
+    {
+        return Some("convert.document");
+    }
+    if combined.contains("preview")
+        || combined.contains("viewer")
+        || combined.contains("render")
+        || combined.contains("预览")
+        || combined.contains("浏览")
+    {
+        return Some("preview.document");
+    }
+    if combined.contains("chunk")
+        || combined.contains("segment")
+        || combined.contains("split")
+        || combined.contains("分块")
+        || combined.contains("切片")
+    {
+        return Some("chunk.document");
+    }
+    if combined.contains("summary")
+        || combined.contains("summarize")
+        || combined.contains("摘要")
+        || combined.contains("总结")
+        || combined.contains("概括")
+    {
+        return Some("summarize.document");
+    }
+    if combined.contains("extract")
+        || combined.contains("extractor")
+        || combined.contains("抽取")
+        || combined.contains("提取")
+    {
+        return Some("extract.document");
+    }
+    if combined.contains("parse")
+        || combined.contains("parser")
+        || combined.contains("reader")
+        || combined.contains("ocr")
+        || combined.contains("pdf")
+        || combined.contains("docx")
+        || combined.contains("xlsx")
+        || combined.contains("pptx")
+        || combined.contains("word")
+        || combined.contains("excel")
+        || combined.contains("office")
+        || combined.contains("markdown")
+        || combined.contains("json")
+        || combined.contains("txt")
+        || combined.contains("csv")
+        || combined.contains("文档")
+        || combined.contains("解析")
+        || combined.contains("识别")
+    {
+        return Some("parse.document");
+    }
+    None
+}
+
+fn default_component_capability_binding(
+    item: &ComponentDefinition,
+) -> Option<ComponentCapabilityBinding> {
+    if let Some(capability_key) = infer_document_component_capability_key(item) {
+        return build_document_component_capability_binding(capability_key);
+    }
+    match item.return_type {
+        ComponentReturnType::Image => Some(ComponentCapabilityBinding {
+            capability_key: "generate.image".to_string(),
+            capability_scope: "generic".to_string(),
+            base_tool: "image_generate".to_string(),
+            tool_mode: "generate".to_string(),
+            source_policy: "optional".to_string(),
+            fallback_policy: "allow_generic_provider".to_string(),
+            enabled: true,
+            priority: 100,
+        }),
+        ComponentReturnType::Video => Some(ComponentCapabilityBinding {
+            capability_key: "generate.video".to_string(),
+            capability_scope: "generic".to_string(),
+            base_tool: "video_generate".to_string(),
+            tool_mode: "generate".to_string(),
+            source_policy: "optional".to_string(),
+            fallback_policy: "allow_generic_provider".to_string(),
+            enabled: true,
+            priority: 100,
+        }),
+        ComponentReturnType::Audio => Some(ComponentCapabilityBinding {
+            capability_key: "generate.audio".to_string(),
+            capability_scope: "generic".to_string(),
+            base_tool: "text_to_speech".to_string(),
+            tool_mode: "generate".to_string(),
+            source_policy: "text_only".to_string(),
+            fallback_policy: "allow_generic_provider".to_string(),
+            enabled: true,
+            priority: 100,
+        }),
+        ComponentReturnType::Text => Some(ComponentCapabilityBinding {
+            capability_key: "generate.text".to_string(),
+            capability_scope: "generic".to_string(),
+            base_tool: "component_invoke".to_string(),
+            tool_mode: "generate".to_string(),
+            source_policy: "optional".to_string(),
+            fallback_policy: "manual_only".to_string(),
+            enabled: true,
+            priority: 100,
+        }),
+    }
+}
+
+fn normalized_mapping_search_text(mapping: &ComponentParameterMapping) -> String {
+    format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .trim()
+    .to_ascii_lowercase()
+}
+
+fn infer_mapping_slot(
+    item: &ComponentDefinition,
+    mapping: &ComponentParameterMapping,
+) -> Option<&'static str> {
+    let combined = normalized_mapping_search_text(mapping);
+    if combined.is_empty() {
+        return None;
+    }
+    if combined.contains("left_document")
+        || combined.contains("left file")
+        || combined.contains("左文档")
+    {
+        return Some("left_document");
+    }
+    if combined.contains("right_document")
+        || combined.contains("right file")
+        || combined.contains("右文档")
+    {
+        return Some("right_document");
+    }
+    if combined.contains("target_format")
+        || combined.contains("target format")
+        || combined.contains("目标格式")
+    {
+        return Some("target_format");
+    }
+    if combined.contains("document_type") || combined.contains("文档类型") {
+        return Some("document_type");
+    }
+    if combined.contains("left_type") {
+        return Some("left_type");
+    }
+    if combined.contains("right_type") {
+        return Some("right_type");
+    }
+    if combined.contains("document")
+        || combined.contains("file")
+        || combined.contains("pdf")
+        || combined.contains("docx")
+        || combined.contains("xlsx")
+        || combined.contains("pptx")
+        || combined.contains("markdown")
+        || combined.contains("文档")
+        || combined.contains("文件")
+    {
+        return Some("document");
+    }
+    if combined.contains("source_image")
+        || combined.contains("reference_image")
+        || combined.contains("image")
+        || combined.contains("photo")
+        || combined.contains("poster")
+        || combined.contains("cover")
+        || combined.contains("图片")
+        || combined.contains("图像")
+    {
+        return Some("image");
+    }
+    if combined.contains("source_video")
+        || combined.contains("video")
+        || combined.contains("clip")
+        || combined.contains("movie")
+        || combined.contains("视频")
+    {
+        return Some("video");
+    }
+    if combined.contains("voice") || combined.contains("speaker") || combined.contains("音色") {
+        return Some("voice");
+    }
+    if combined.contains("audio")
+        || combined.contains("record")
+        || combined.contains("speech")
+        || combined.contains("音频")
+        || combined.contains("录音")
+    {
+        return Some("audio");
+    }
+    if combined.contains("prompt")
+        || combined.contains("text")
+        || combined.contains("message")
+        || combined.contains("description")
+        || combined.contains("question")
+        || combined.contains("content")
+        || combined.contains("script")
+        || combined.contains("story")
+        || combined.contains("tag")
+        || combined.contains("lyrics")
+        || combined.contains("提示词")
+        || combined.contains("文本")
+        || combined.contains("描述")
+    {
+        return Some(match item.return_type {
+            ComponentReturnType::Audio => "text",
+            _ => "prompt",
+        });
+    }
+    None
+}
+
+fn is_selector_system_slot(slot: &str) -> bool {
+    matches!(
+        slot.trim().to_ascii_lowercase().as_str(),
+        "prompt"
+            | "text"
+            | "image"
+            | "video"
+            | "audio"
+            | "voice"
+            | "document"
+            | "left_document"
+            | "right_document"
+            | "document_type"
+            | "left_type"
+            | "right_type"
+            | "target_format"
+    )
+}
+
+fn push_unique_slot(slots: &mut Vec<String>, slot: &str) {
+    if slots.iter().any(|item| item.eq_ignore_ascii_case(slot)) {
+        return;
+    }
+    slots.push(slot.to_string());
+}
+
+fn apply_mapping_selector_inference(item: &mut ComponentDefinition) {
+    let mut required_slots = item
+        .selector_meta
+        .requires_slots
+        .iter()
+        .filter(|slot| !is_selector_system_slot(slot))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut optional_slots = item
+        .selector_meta
+        .optional_slots
+        .iter()
+        .filter(|slot| !is_selector_system_slot(slot))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut has_required_text = false;
+    let mut has_required_image = false;
+    let mut has_required_video = false;
+    let mut has_required_audio = false;
+
+    for mapping in &item.workflow.parameter_mappings {
+        let Some(slot) = infer_mapping_slot(item, mapping) else {
+            continue;
+        };
+        if mapping.required {
+            push_unique_slot(&mut required_slots, slot);
+            optional_slots.retain(|current| !current.eq_ignore_ascii_case(slot));
+            match slot {
+                "prompt" | "text" => has_required_text = true,
+                "image" => has_required_image = true,
+                "video" => has_required_video = true,
+                "audio" => has_required_audio = true,
+                _ => {}
+            }
+        } else {
+            push_unique_slot(&mut optional_slots, slot);
+        }
+    }
+
+    item.selector_meta.requires_slots = normalize_string_vec(&required_slots);
+    item.selector_meta.optional_slots = normalize_string_vec(&optional_slots);
+
+    let requires_source = has_required_image || has_required_video || has_required_audio;
+    if requires_source {
+        item.selector_meta.supports_text_only = false;
+    } else if has_required_text {
+        item.selector_meta.supports_text_only = true;
+    }
+
+    let inferred_source_policy = if has_required_image {
+        Some("requires_image")
+    } else if has_required_video {
+        Some("requires_video")
+    } else if has_required_audio {
+        Some("requires_audio")
+    } else if has_required_text
+        && matches!(
+            item.return_type,
+            ComponentReturnType::Audio | ComponentReturnType::Video
+        )
+    {
+        Some("text_only")
+    } else {
+        None
+    };
+    if let Some(policy) = inferred_source_policy {
+        let current = item
+            .capability_binding
+            .source_policy
+            .trim()
+            .to_ascii_lowercase();
+        let should_replace = current.is_empty()
+            || (matches!(
+                current.as_str(),
+                "optional" | "text_only" | "requires_image" | "requires_video" | "requires_audio"
+            ) && current != policy);
+        if should_replace {
+            item.capability_binding.source_policy = policy.to_string();
+        }
+    }
+}
+
+fn build_document_selector_meta(capability_key: &str) -> ComponentSelectorMeta {
+    let (specialization, requires_slots, optional_slots, supports_text_only) =
+        match capability_key.trim() {
+            "compare.document" => (
+                "compare",
+                vec!["left_document".to_string(), "right_document".to_string()],
+                vec!["left_type".to_string(), "right_type".to_string()],
+                false,
+            ),
+            "convert.document" => (
+                "convert",
+                vec!["document".to_string(), "target_format".to_string()],
+                vec!["document_type".to_string()],
+                false,
+            ),
+            "summarize.document" => (
+                "summarize",
+                vec!["document".to_string()],
+                vec!["document_type".to_string()],
+                true,
+            ),
+            "extract.document" => (
+                "extract",
+                vec!["document".to_string()],
+                vec!["document_type".to_string()],
+                false,
+            ),
+            "preview.document" => (
+                "preview",
+                vec!["document".to_string()],
+                vec!["document_type".to_string()],
+                false,
+            ),
+            "chunk.document" => (
+                "chunk",
+                vec!["document".to_string()],
+                vec!["document_type".to_string(), "chunk_size".to_string()],
+                true,
+            ),
+            _ => (
+                "parse",
+                vec!["document".to_string()],
+                vec!["document_type".to_string()],
+                false,
+            ),
+        };
+    ComponentSelectorMeta {
+        specialization: specialization.to_string(),
+        intent_tags: vec!["document".to_string(), specialization.to_string()],
+        subject_policy: "document".to_string(),
+        supports_text_only,
+        requires_slots,
+        optional_slots,
+        preferred_mime_types: vec![
+            "application/pdf".to_string(),
+            "application/msword".to_string(),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string(),
+            "application/vnd.ms-excel".to_string(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+            "text/csv".to_string(),
+            "application/vnd.ms-powerpoint".to_string(),
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string(),
+            "text/plain".to_string(),
+            "text/markdown".to_string(),
+            "application/json".to_string(),
+        ],
+    }
+}
+
+fn default_selector_meta_for_component(item: &ComponentDefinition) -> ComponentSelectorMeta {
+    let capability_key = item.capability_binding.capability_key.trim();
+    if is_document_capability_key(capability_key) {
+        return build_document_selector_meta(capability_key);
+    }
+    if let Some(inferred_document_key) = infer_document_component_capability_key(item) {
+        return build_document_selector_meta(inferred_document_key);
+    }
+    match item.return_type {
+        ComponentReturnType::Image => ComponentSelectorMeta {
+            specialization: "general".to_string(),
+            intent_tags: Vec::new(),
+            subject_policy: "generic".to_string(),
+            supports_text_only: true,
+            requires_slots: vec!["prompt".to_string()],
+            optional_slots: Vec::new(),
+            preferred_mime_types: vec!["image/*".to_string()],
+        },
+        ComponentReturnType::Video => ComponentSelectorMeta {
+            specialization: "general".to_string(),
+            intent_tags: Vec::new(),
+            subject_policy: "generic".to_string(),
+            supports_text_only: true,
+            requires_slots: vec!["prompt".to_string()],
+            optional_slots: vec!["image".to_string()],
+            preferred_mime_types: vec!["video/*".to_string()],
+        },
+        ComponentReturnType::Audio => ComponentSelectorMeta {
+            specialization: "general".to_string(),
+            intent_tags: Vec::new(),
+            subject_policy: "generic".to_string(),
+            supports_text_only: true,
+            requires_slots: vec!["text".to_string()],
+            optional_slots: vec!["voice".to_string()],
+            preferred_mime_types: vec!["audio/*".to_string()],
+        },
+        ComponentReturnType::Text => ComponentSelectorMeta {
+            specialization: "general".to_string(),
+            intent_tags: Vec::new(),
+            subject_policy: "generic".to_string(),
+            supports_text_only: true,
+            requires_slots: Vec::new(),
+            optional_slots: Vec::new(),
+            preferred_mime_types: vec!["text/plain".to_string()],
+        },
+    }
+}
+
+fn infer_document_type_from_hint(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("application/pdf") || normalized.ends_with(".pdf") || normalized == "pdf"
+    {
+        return Some("pdf");
+    }
+    if normalized.contains("wordprocessingml")
+        || normalized.ends_with(".docx")
+        || normalized == "docx"
+    {
+        return Some("docx");
+    }
+    if normalized.contains("msword") || normalized.ends_with(".doc") || normalized == "doc" {
+        return Some("doc");
+    }
+    if normalized.contains("spreadsheetml") || normalized.ends_with(".xlsx") || normalized == "xlsx"
+    {
+        return Some("xlsx");
+    }
+    if normalized.contains("ms-excel") || normalized.ends_with(".xls") || normalized == "xls" {
+        return Some("xls");
+    }
+    if normalized.contains("text/csv") || normalized.ends_with(".csv") || normalized == "csv" {
+        return Some("csv");
+    }
+    if normalized.contains("presentationml")
+        || normalized.ends_with(".pptx")
+        || normalized == "pptx"
+    {
+        return Some("pptx");
+    }
+    if normalized.contains("powerpoint") || normalized.ends_with(".ppt") || normalized == "ppt" {
+        return Some("ppt");
+    }
+    if normalized.contains("markdown") || normalized.ends_with(".md") || normalized == "md" {
+        return Some("md");
+    }
+    if normalized.contains("application/json")
+        || normalized.ends_with(".json")
+        || normalized == "json"
+    {
+        return Some("json");
+    }
+    if normalized.contains("text/plain") || normalized.ends_with(".txt") || normalized == "txt" {
+        return Some("txt");
+    }
+    None
+}
+
+fn infer_asset_ref_kind(uri: &str) -> &'static str {
+    let normalized = uri.trim().to_ascii_lowercase();
+    if normalized.starts_with("data:") {
+        return "data_url";
+    }
+    if normalized.starts_with("/api/uploads/") {
+        return "upload_url";
+    }
+    if normalized.starts_with("/api/management/") {
+        return "management_media_url";
+    }
+    if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        return "remote_url";
+    }
+    if normalized.starts_with("file://")
+        || normalized.starts_with('/')
+        || normalized
+            .as_bytes()
+            .get(1)
+            .map(|byte| *byte == b':')
+            .unwrap_or(false)
+    {
+        return "absolute_file";
+    }
+    "workspace_file"
+}
+
+fn infer_file_name_from_uri(uri: &str) -> Option<String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    let candidate = without_query
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
+}
+
+fn build_asset_ref(
+    uri: &str,
+    mime_type: &str,
+    file_name: Option<&str>,
+    extra_metadata: Option<Value>,
+) -> Value {
+    let mut asset = Map::new();
+    asset.insert(
+        "kind".to_string(),
+        Value::String(infer_asset_ref_kind(uri).to_string()),
+    );
+    asset.insert("uri".to_string(), Value::String(uri.trim().to_string()));
+    if !mime_type.trim().is_empty() {
+        asset.insert(
+            "mimeType".to_string(),
+            Value::String(mime_type.trim().to_string()),
+        );
+    }
+    let resolved_file_name = file_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| infer_file_name_from_uri(uri));
+    if let Some(name) = resolved_file_name {
+        asset.insert("fileName".to_string(), Value::String(name));
+    }
+    if let Some(Value::Object(metadata)) = extra_metadata {
+        if !metadata.is_empty() {
+            asset.insert("metadata".to_string(), Value::Object(metadata));
+        }
+    }
+    Value::Object(asset)
+}
+
+fn build_component_provider_meta(item: &ComponentDefinition) -> Value {
+    let provider_id = format!(
+        "component_skill:{}",
+        if item.english_name.trim().is_empty() {
+            item.component_type.trim()
+        } else {
+            item.english_name.trim()
+        }
+    );
+    let mut meta = Map::new();
+    meta.insert("providerId".to_string(), Value::String(provider_id));
+    meta.insert(
+        "providerType".to_string(),
+        Value::String("component_skill".to_string()),
+    );
+    let capability_key = if item.capability_binding.capability_key.trim().is_empty() {
+        component_return_type_to_capability(&item.return_type)
+            .map(str::to_string)
+            .unwrap_or_default()
+    } else {
+        item.capability_binding.capability_key.trim().to_string()
+    };
+    let capability_scope = if item.capability_binding.capability_scope.trim().is_empty() {
+        "generic".to_string()
+    } else {
+        item.capability_binding.capability_scope.trim().to_string()
+    };
+    if !capability_key.is_empty() {
+        meta.insert("capability".to_string(), Value::String(capability_key));
+        meta.insert("scope".to_string(), Value::String(capability_scope));
+    }
+    meta.insert(
+        "capabilityBinding".to_string(),
+        serde_json::to_value(&item.capability_binding).unwrap_or(Value::Null),
+    );
+    meta.insert(
+        "selectorMeta".to_string(),
+        serde_json::to_value(&item.selector_meta).unwrap_or(Value::Null),
+    );
+    if !item.component_type.trim().is_empty() {
+        meta.insert(
+            "componentType".to_string(),
+            Value::String(item.component_type.trim().to_string()),
+        );
+    }
+    if !item.english_name.trim().is_empty() {
+        meta.insert(
+            "componentEnglishName".to_string(),
+            Value::String(item.english_name.trim().to_string()),
+        );
+    }
+    if !item.name.trim().is_empty() {
+        meta.insert(
+            "componentName".to_string(),
+            Value::String(item.name.trim().to_string()),
+        );
+    }
+    meta.insert(
+        "componentProvider".to_string(),
+        Value::String(
+            match item.provider_type {
+                ComponentProviderType::Comfyui => "comfyui",
+                ComponentProviderType::Runninghub => "runninghub",
+            }
+            .to_string(),
+        ),
+    );
+    Value::Object(meta)
+}
+
+fn component_capability_provider_id(item: &ComponentDefinition) -> String {
+    format!(
+        "component_skill:{}",
+        if item.english_name.trim().is_empty() {
+            item.component_type.trim()
+        } else {
+            item.english_name.trim()
+        }
+    )
+}
+
+fn build_component_input_contract(item: &ComponentDefinition) -> Value {
+    let properties = item
+        .workflow
+        .parameter_mappings
+        .iter()
+        .map(|mapping| {
+            let value_type = match mapping.value_type {
+                ComponentParamValueType::String => "string",
+                ComponentParamValueType::Number => "number",
+                ComponentParamValueType::Boolean => "boolean",
+                ComponentParamValueType::Json => "object",
+            };
+            (
+                mapping.parameter_name.clone(),
+                json!({
+                    "type": value_type,
+                    "required": mapping.required,
+                    "label": mapping.label,
+                    "description": mapping.description,
+                    "default": mapping.default_value,
+                }),
+            )
+        })
+        .collect::<Map<String, Value>>();
+    json!({
+        "type": "object",
+        "baseTool": item.capability_binding.base_tool,
+        "properties": properties,
+    })
+}
+
+fn build_component_output_contract(item: &ComponentDefinition) -> Value {
+    json!({
+        "returnType": item.return_type,
+        "componentType": item.component_type,
+        "presentableResultKind": match item.return_type {
+            ComponentReturnType::Image | ComponentReturnType::Video | ComponentReturnType::Audio => "media_result",
+            ComponentReturnType::Text => "text_result",
+        },
+        "capabilityBinding": item.capability_binding,
+        "selectorMeta": item.selector_meta,
+    })
+}
+
+fn sync_component_capability_provider(item: &ComponentDefinition) -> Result<(), String> {
+    if item.capability_binding.capability_key.trim().is_empty() {
+        return Ok(());
+    }
+    let provider_id = component_capability_provider_id(item);
+    let provider = assignment_store::upsert_capability_provider(CapabilityProviderRecord {
+        provider_id: provider_id.clone(),
+        provider_type: "component_skill".to_string(),
+        display_name: Some(item.name.trim().to_string()),
+        capabilities: vec![CapabilityDescriptorRecord {
+            key: item.capability_binding.capability_key.trim().to_string(),
+            scope: item.capability_binding.capability_scope.trim().to_string(),
+        }],
+        supported_scopes: vec![item.capability_binding.capability_scope.trim().to_string()],
+        priority: item.capability_binding.priority,
+        requirements: json!({
+            "baseTool": item.capability_binding.base_tool,
+            "toolMode": item.capability_binding.tool_mode,
+            "sourcePolicy": item.capability_binding.source_policy,
+            "fallbackPolicy": item.capability_binding.fallback_policy,
+        }),
+        supports_job: false,
+        enabled: item.capability_binding.enabled,
+        health_state: if item.capability_binding.enabled {
+            "ready".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        input_contract: build_component_input_contract(item),
+        output_contract: build_component_output_contract(item),
+        metadata: json!({
+            "componentName": item.name,
+            "componentEnglishName": item.english_name,
+            "componentType": item.component_type,
+            "providerType": match item.provider_type {
+                ComponentProviderType::Comfyui => "comfyui",
+                ComponentProviderType::Runninghub => "runninghub",
+            },
+            "capabilityBinding": item.capability_binding,
+            "selectorMeta": item.selector_meta,
+        }),
+        is_removed: false,
+        updated_at: String::new(),
+    })?;
+    assignment_store::upsert_capability_provider_binding(CapabilityProviderBindingRecord {
+        capability_key: item.capability_binding.capability_key.trim().to_string(),
+        capability_scope: item.capability_binding.capability_scope.trim().to_string(),
+        provider_id: provider.provider_id.clone(),
+        enabled: item.capability_binding.enabled,
+        updated_at: String::new(),
+    })?;
+    let _ = assignment_store::upsert_provider_health_state(ProviderHealthStateRecord {
+        provider_id: provider.provider_id.clone(),
+        health_state: provider.health_state.clone(),
+        message: if provider.enabled {
+            Some("组件能力 provider 已同步".to_string())
+        } else {
+            Some("组件能力 provider 已禁用".to_string())
+        },
+        checked_at: current_unix_timestamp_string(),
+        updated_at: String::new(),
+    });
+    let _ = assignment_store::append_capability_audit_log(
+        "sync_component_provider",
+        Some(&provider.provider_id),
+        None,
+        Some(&item.capability_binding.capability_key),
+        Some(&item.capability_binding.capability_scope),
+        &json!({
+            "baseTool": item.capability_binding.base_tool,
+            "enabled": item.capability_binding.enabled,
+            "selectorMeta": item.selector_meta,
+        }),
+    );
+    Ok(())
+}
+
+fn remove_component_capability_provider(item: &ComponentDefinition) -> Result<(), String> {
+    if item.capability_binding.capability_key.trim().is_empty() {
+        return Ok(());
+    }
+    let provider_id = component_capability_provider_id(item);
+    let _ = assignment_store::delete_capability_provider_binding(
+        &item.capability_binding.capability_key,
+        &item.capability_binding.capability_scope,
+        &provider_id,
+    );
+    let _ = assignment_store::upsert_provider_health_state(ProviderHealthStateRecord {
+        provider_id: provider_id.clone(),
+        health_state: "unavailable".to_string(),
+        message: Some("组件能力 provider 已删除".to_string()),
+        checked_at: current_unix_timestamp_string(),
+        updated_at: String::new(),
+    });
+    if let Some(existing) = assignment_store::get_capability_provider(&provider_id)? {
+        let _ = assignment_store::upsert_capability_provider(CapabilityProviderRecord {
+            enabled: false,
+            health_state: "unavailable".to_string(),
+            is_removed: true,
+            updated_at: String::new(),
+            ..existing
+        });
+    }
+    let _ = assignment_store::append_capability_audit_log(
+        "remove_component_provider",
+        Some(&provider_id),
+        None,
+        Some(&item.capability_binding.capability_key),
+        Some(&item.capability_binding.capability_scope),
+        &json!({
+            "componentEnglishName": item.english_name,
+        }),
+    );
+    Ok(())
+}
+
+fn build_component_presentable_result(
+    item: &ComponentDefinition,
+    text: &str,
+    raw: &Value,
+    items: &[ComponentInvokeItem],
+    provider_meta: &Value,
+) -> Option<Value> {
+    let title = if item.name.trim().is_empty() {
+        if item.component_type.trim().is_empty() {
+            "组件结果".to_string()
+        } else {
+            item.component_type.trim().to_string()
+        }
+    } else {
+        item.name.trim().to_string()
+    };
+    let summary = text.trim();
+    let capability_key = item.capability_binding.capability_key.trim();
+    if is_document_capability_key(capability_key) {
+        let document_type = match capability_key {
+            "compare.document" => "compare".to_string(),
+            "convert.document" => "convert".to_string(),
+            _ => {
+                let explicit_hint = pick_component_text(
+                    raw,
+                    &[
+                        "document_type",
+                        "documentType",
+                        "file_type",
+                        "fileType",
+                        "mime_type",
+                        "mimeType",
+                        "file_name",
+                        "fileName",
+                        "url",
+                        "path",
+                        "downloadUrl",
+                        "download_url",
+                        "previewUrl",
+                        "preview_url",
+                    ],
+                );
+                explicit_hint
+                    .as_deref()
+                    .and_then(infer_document_type_from_hint)
+                    .or_else(|| {
+                        items.iter().find_map(|entry| {
+                            infer_document_type_from_hint(&entry.mime_type)
+                                .or_else(|| infer_document_type_from_hint(&entry.url))
+                        })
+                    })
+                    .unwrap_or("unknown")
+                    .to_string()
+            }
+        };
+        let title = if item.name.trim().is_empty() {
+            if item.component_type.trim().is_empty() {
+                "文档处理结果".to_string()
+            } else {
+                item.component_type.trim().to_string()
+            }
+        } else {
+            item.name.trim().to_string()
+        };
+        let source_uri =
+            pick_component_text(raw, &["sourceUrl", "source_url", "url", "path", "file"]).or_else(
+                || {
+                    items.iter().find_map(|entry| {
+                        if entry.url.trim().is_empty() {
+                            None
+                        } else {
+                            Some(entry.url.clone())
+                        }
+                    })
+                },
+            );
+        let preview_uri = pick_component_text(
+            raw,
+            &[
+                "previewUrl",
+                "preview_url",
+                "previewPath",
+                "preview_path",
+                "renderUrl",
+                "render_url",
+            ],
+        )
+        .or_else(|| source_uri.clone());
+        let download_uri = pick_component_text(
+            raw,
+            &[
+                "downloadUrl",
+                "download_url",
+                "outputFile",
+                "output_file",
+                "resultUrl",
+                "result_url",
+            ],
+        )
+        .or_else(|| source_uri.clone());
+        let compare_diff = raw
+            .get("compareDiff")
+            .cloned()
+            .or_else(|| raw.get("compare_diff").cloned());
+        let conversion_outputs = if capability_key == "convert.document" {
+            let mut outputs = raw
+                .get("conversionOutputs")
+                .and_then(Value::as_array)
+                .cloned()
+                .or_else(|| {
+                    raw.get("conversion_outputs")
+                        .and_then(Value::as_array)
+                        .cloned()
+                })
+                .unwrap_or_default();
+            if outputs.is_empty() {
+                outputs = items
+                    .iter()
+                    .filter(|entry| !entry.url.trim().is_empty())
+                    .map(|entry| {
+                        json!({
+                            "format": infer_document_type_from_hint(&entry.url).unwrap_or("output"),
+                            "asset": build_asset_ref(&entry.url, &entry.mime_type, None, Some(json!({ "source": "component_center" }))),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            }
+            outputs
+        } else {
+            Vec::new()
+        };
+        if source_uri.is_none()
+            && preview_uri.is_none()
+            && download_uri.is_none()
+            && summary.is_empty()
+            && !raw.get("text").is_some()
+            && compare_diff.is_none()
+            && conversion_outputs.is_empty()
+        {
+            return None;
+        }
+        let mut object = Map::new();
+        object.insert(
+            "kind".to_string(),
+            Value::String("document_result".to_string()),
+        );
+        object.insert("title".to_string(), Value::String(title));
+        object.insert(
+            "documentType".to_string(),
+            Value::String(document_type.clone()),
+        );
+        if let Some(source_uri) = source_uri {
+            object.insert(
+                "sourceAsset".to_string(),
+                build_asset_ref(
+                    &source_uri,
+                    "",
+                    None,
+                    Some(json!({ "source": "component_center" })),
+                ),
+            );
+        }
+        if let Some(preview_uri) = preview_uri {
+            object.insert(
+                "previewAsset".to_string(),
+                build_asset_ref(
+                    &preview_uri,
+                    "",
+                    None,
+                    Some(json!({ "source": "component_center" })),
+                ),
+            );
+        }
+        if let Some(download_uri) = download_uri {
+            object.insert(
+                "downloadAsset".to_string(),
+                build_asset_ref(
+                    &download_uri,
+                    "",
+                    None,
+                    Some(json!({ "source": "component_center" })),
+                ),
+            );
+        }
+        if let Some(page_count) = pick_component_number(raw, &["pageCount", "page_count"]) {
+            object.insert(
+                "pageCount".to_string(),
+                Value::Number(serde_json::Number::from(page_count.round() as i64)),
+            );
+        }
+        if !summary.is_empty() {
+            object.insert(
+                "summaryText".to_string(),
+                Value::String(summary.to_string()),
+            );
+        }
+        if let Some(extracted_text) =
+            pick_component_text(raw, &["extractedText", "extracted_text", "text", "content"])
+        {
+            object.insert("extractedText".to_string(), Value::String(extracted_text));
+        }
+        if let Some(compare_diff) = compare_diff {
+            object.insert("compareDiff".to_string(), compare_diff);
+        }
+        if !conversion_outputs.is_empty() {
+            object.insert(
+                "conversionOutputs".to_string(),
+                Value::Array(conversion_outputs),
+            );
+        }
+        object.insert("providerMeta".to_string(), provider_meta.clone());
+        return Some(Value::Object(object));
+    }
+
+    let media_type = component_capability_key_to_media_kind(capability_key)
+        .or_else(|| component_return_type_to_media_kind(&item.return_type));
+    if let Some(media_type) = media_type {
+        if items.is_empty() {
+            if summary.is_empty() {
+                return None;
+            }
+            return Some(json!({
+                "kind": "text_result",
+                "title": title,
+                "text": summary,
+                "providerMeta": provider_meta.clone(),
+            }));
+        }
+        let poster_candidates = if media_type == "video" {
+            let mut posters = raw
+                .get("poster_urls")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            posters.extend(items.iter().filter_map(|entry| {
+                let mime = entry.mime_type.trim().to_ascii_lowercase();
+                if entry.kind.eq_ignore_ascii_case("image") || mime.starts_with("image/") {
+                    let trimmed = entry.url.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                } else {
+                    None
+                }
+            }));
+            posters
+        } else {
+            Vec::new()
+        };
+        let normalized_items = items
+            .iter()
+            .filter(|entry| {
+                if media_type != "video" {
+                    return true;
+                }
+                let mime = entry.mime_type.trim().to_ascii_lowercase();
+                entry.kind.eq_ignore_ascii_case("video") || mime.starts_with("video/")
+            })
+            .enumerate()
+            .map(|entry| {
+                let (index, entry) = entry;
+                json!({
+                    "mediaType": media_type,
+                    "asset": build_asset_ref(
+                        &entry.url,
+                        &entry.mime_type,
+                        None,
+                        Some(json!({
+                            "source": "component_center",
+                            "kind": entry.kind,
+                        })),
+                    ),
+                    "posterAsset": if media_type == "video" {
+                        poster_candidates
+                            .get(index)
+                            .or_else(|| poster_candidates.first())
+                            .map(|url| build_asset_ref(
+                                url,
+                                "image/png",
+                                None,
+                                Some(json!({
+                                    "source": "component_center",
+                                    "kind": "image",
+                                })),
+                            ))
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    },
+                    "caption": if entry.text.trim().is_empty() {
+                        Value::String(title.clone())
+                    } else {
+                        Value::String(entry.text.trim().to_string())
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        if normalized_items.is_empty() {
+            return None;
+        }
+        return Some(json!({
+            "kind": "media_result",
+            "mediaType": media_type,
+            "title": title,
+            "summary": if summary.is_empty() { Value::Null } else { Value::String(summary.to_string()) },
+            "items": normalized_items,
+            "providerMeta": provider_meta.clone(),
+        }));
+    }
+
+    if summary.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "kind": "text_result",
+        "title": title,
+        "text": summary,
+        "providerMeta": provider_meta.clone(),
+    }))
+}
+
+fn pick_component_text(value: &Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn pick_component_number(value: &Value, keys: &[&str]) -> Option<f64> {
+    let object = value.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_f64))
+}
+
+fn build_component_async_job_presentable_result(
+    item: &ComponentDefinition,
+    raw: &Value,
+    text: &str,
+    provider_meta: &Value,
+) -> Option<Value> {
+    let raw_object = raw.as_object()?;
+    let job_id = pick_component_text(raw, &["job_id", "jobId", "task_id", "taskId", "id"])?;
+    let status = pick_component_text(
+        raw,
+        &["status", "state", "task_status", "taskStatus", "phase"],
+    )
+    .unwrap_or_else(|| "queued".to_string());
+    let normalized_status = status.trim().to_ascii_lowercase();
+    let has_async_marker = raw_object.contains_key("job_id")
+        || raw_object.contains_key("jobId")
+        || raw_object.contains_key("task_id")
+        || raw_object.contains_key("taskId")
+        || matches!(
+            normalized_status.as_str(),
+            "queued" | "pending" | "running" | "processing" | "progress" | "submitted" | "waiting"
+        );
+    if !has_async_marker {
+        return None;
+    }
+    let title = if item.name.trim().is_empty() {
+        if item.component_type.trim().is_empty() {
+            "组件任务".to_string()
+        } else {
+            item.component_type.trim().to_string()
+        }
+    } else {
+        item.name.trim().to_string()
+    };
+    let summary = if text.trim().is_empty() {
+        pick_component_text(raw, &["message", "msg", "detail", "summary"])
+            .unwrap_or_else(|| format!("{title} 已提交，等待异步执行完成"))
+    } else {
+        text.trim().to_string()
+    };
+    Some(json!({
+        "kind": "job_result",
+        "title": title,
+        "summary": summary,
+        "status": normalized_status,
+        "progress_percent": pick_component_number(raw, &["progress_percent", "progressPercent", "progress", "percent"]),
+        "stage": pick_component_text(raw, &["stage", "current_stage", "currentStage", "phase"]),
+        "job_type": item.return_type,
+        "job_id": job_id,
+        "capability_key": item.capability_binding.capability_key,
+        "capability_scope": item.capability_binding.capability_scope,
+        "provider_id": component_capability_provider_id(item),
+        "provider_type": "component_skill",
+        "route": "component_skill",
+        "providerMeta": provider_meta.clone(),
+        "resultPayload": raw.clone(),
+        "metadata": {
+            "componentName": item.name,
+            "componentEnglishName": item.english_name,
+            "componentType": item.component_type,
+            "providerRequestId": pick_component_text(raw, &["request_id", "requestId", "task_id", "taskId"]),
+        }
+    }))
 }
 
 fn map_upsert_error(message: String) -> ApiError {
@@ -428,6 +1887,13 @@ fn load_all_component_definitions() -> Result<Vec<ComponentDefinition>, String> 
     Ok(items)
 }
 
+pub(crate) fn sync_component_capability_providers_from_disk() -> Result<(), String> {
+    for item in load_all_component_definitions()? {
+        sync_component_capability_provider(&item)?;
+    }
+    Ok(())
+}
+
 fn load_component_definition_by_name(
     english_name: &str,
 ) -> Result<Option<ComponentDefinition>, ApiError> {
@@ -447,10 +1913,7 @@ fn load_component_definition_by_lookup_key(
 ) -> Result<Option<ComponentDefinition>, ApiError> {
     let trimmed = component_key.trim();
     if trimmed.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "组件标识不能为空",
-        ));
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "组件标识不能为空"));
     }
 
     if let Ok(validated) = validate_english_name(trimmed) {
@@ -606,6 +2069,8 @@ fn load_legacy_component_definition(dir: &Path) -> Result<Option<ComponentDefini
         component_type,
         description,
         return_type,
+        capability_binding: ComponentCapabilityBinding::default(),
+        selector_meta: ComponentSelectorMeta::default(),
         workflow: ComponentWorkflowConfig {
             request_url: String::new(),
             app_id: String::new(),
@@ -928,6 +2393,10 @@ fn upsert_component_definition(
     }
 
     persist_component_definition(&payload, &target_dir, previous_component_type.as_deref())?;
+    if let Some(previous) = previous_item.as_ref() {
+        remove_component_capability_provider(previous)?;
+    }
+    sync_component_capability_provider(&payload)?;
     Ok(payload)
 }
 
@@ -939,6 +2408,9 @@ fn delete_component_definition_impl(english_name: &str) -> Result<(), String> {
     }
     if !is_component_skill_dir(&dir)? {
         return Err("目标目录不是组件中心生成的组件".to_string());
+    }
+    if let Some(item) = load_component_definition_from_dir_internal(&dir)? {
+        remove_component_capability_provider(&item)?;
     }
     fs::remove_dir_all(&dir).map_err(|err| format!("删除组件目录失败({}): {err}", dir.display()))
 }
@@ -999,10 +2471,103 @@ fn normalize_component_definition(item: &mut ComponentDefinition) -> Result<(), 
             mapping.id = mapping.id.trim().to_string();
         }
     }
+    if let Some(default_binding) = default_component_capability_binding(&item) {
+        if item.capability_binding.capability_key.trim().is_empty() {
+            item.capability_binding.capability_key = default_binding.capability_key;
+        } else {
+            item.capability_binding.capability_key =
+                item.capability_binding.capability_key.trim().to_string();
+        }
+        if item.capability_binding.capability_scope.trim().is_empty() {
+            item.capability_binding.capability_scope = default_binding.capability_scope;
+        } else {
+            item.capability_binding.capability_scope =
+                item.capability_binding.capability_scope.trim().to_string();
+        }
+        if item.capability_binding.base_tool.trim().is_empty() {
+            item.capability_binding.base_tool = default_binding.base_tool;
+        } else {
+            item.capability_binding.base_tool =
+                item.capability_binding.base_tool.trim().to_string();
+        }
+        if item.capability_binding.tool_mode.trim().is_empty() {
+            item.capability_binding.tool_mode = default_binding.tool_mode;
+        } else {
+            item.capability_binding.tool_mode =
+                item.capability_binding.tool_mode.trim().to_string();
+        }
+        if item.capability_binding.source_policy.trim().is_empty() {
+            item.capability_binding.source_policy = default_binding.source_policy;
+        } else {
+            item.capability_binding.source_policy =
+                item.capability_binding.source_policy.trim().to_string();
+        }
+        if item.capability_binding.fallback_policy.trim().is_empty() {
+            item.capability_binding.fallback_policy = default_binding.fallback_policy;
+        } else {
+            item.capability_binding.fallback_policy =
+                item.capability_binding.fallback_policy.trim().to_string();
+        }
+        if item.capability_binding.priority <= 0 {
+            item.capability_binding.priority = default_binding.priority;
+        }
+        if !item.capability_binding.enabled {
+            item.capability_binding.enabled = default_binding.enabled;
+        }
+    }
+    let default_selector = default_selector_meta_for_component(&item);
+    if item.selector_meta.specialization.trim().is_empty() {
+        item.selector_meta.specialization = default_selector.specialization;
+    } else {
+        item.selector_meta.specialization = item.selector_meta.specialization.trim().to_string();
+    }
+    if item.selector_meta.subject_policy.trim().is_empty() {
+        item.selector_meta.subject_policy = default_selector.subject_policy;
+    } else {
+        item.selector_meta.subject_policy = item.selector_meta.subject_policy.trim().to_string();
+    }
+    if item.selector_meta.requires_slots.is_empty() {
+        item.selector_meta.requires_slots = default_selector.requires_slots;
+    } else {
+        item.selector_meta.requires_slots =
+            normalize_string_vec(&item.selector_meta.requires_slots);
+    }
+    if item.selector_meta.optional_slots.is_empty() {
+        item.selector_meta.optional_slots = default_selector.optional_slots;
+    } else {
+        item.selector_meta.optional_slots =
+            normalize_string_vec(&item.selector_meta.optional_slots);
+    }
+    if item.selector_meta.preferred_mime_types.is_empty() {
+        item.selector_meta.preferred_mime_types = default_selector.preferred_mime_types;
+    } else {
+        item.selector_meta.preferred_mime_types =
+            normalize_string_vec(&item.selector_meta.preferred_mime_types);
+    }
+    item.selector_meta.intent_tags = normalize_string_vec(&item.selector_meta.intent_tags);
+    apply_mapping_selector_inference(item);
     if item.workflow.parameter_mappings.is_empty() {
         return Err("组件参数映射不能为空".to_string());
     }
     Ok(())
+}
+
+fn normalize_string_vec(values: &[String]) -> Vec<String> {
+    let mut output = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if output
+            .iter()
+            .any(|item: &String| item.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        output.push(trimmed.to_string());
+    }
+    output
 }
 
 fn validate_english_name(value: &str) -> Result<String, String> {
@@ -1078,6 +2643,7 @@ fn persist_component_definition(
     let skill_path = dir.join(COMPONENT_SKILL_FILE);
     let prompt_context_path = dir.join(COMPONENT_PROMPT_CONTEXT_FILE);
     let skill_toml_path = dir.join(COMPONENT_SKILL_TOML_FILE);
+    let tool_adapter_path = dir.join(COMPONENT_TOOL_ADAPTER_FILE);
     let component_tsx_path = dir.join(format!("{}.tsx", item.component_type));
 
     let definition_content =
@@ -1087,6 +2653,7 @@ fn persist_component_definition(
     let manifest_content = serde_json::to_string_pretty(&build_manifest_value(item))
         .map_err(|err| format!("序列化组件清单失败: {err}"))?;
     let skill_toml = build_skill_toml(item, &prompt_context);
+    let tool_adapter = build_component_tool_adapter_script(item);
     let component_tsx = build_component_runtime_tsx(item);
 
     fs::write(&definition_path, definition_content)
@@ -1103,6 +2670,12 @@ fn persist_component_definition(
     })?;
     fs::write(&skill_toml_path, skill_toml)
         .map_err(|err| format!("写入 skill.toml 失败({}): {err}", skill_toml_path.display()))?;
+    fs::write(&tool_adapter_path, tool_adapter).map_err(|err| {
+        format!(
+            "写入组件工具适配器失败({}): {err}",
+            tool_adapter_path.display()
+        )
+    })?;
     fs::write(&component_tsx_path, component_tsx).map_err(|err| {
         format!(
             "写入组件运行文件失败({}): {err}",
@@ -1171,9 +2744,13 @@ fn build_manifest_value(item: &ComponentDefinition) -> Value {
                 },
                 "example": render_example,
                 "invokeExample": build_component_invoke_example(item),
+                "capabilityBinding": serde_json::to_value(&item.capability_binding).unwrap_or(Value::Null),
+                "selectorMeta": serde_json::to_value(&item.selector_meta).unwrap_or(Value::Null),
                 "invokeGuide": {
                     "renderType": item.component_type,
                     "componentName": item.english_name,
+                    "baseTool": item.capability_binding.base_tool,
+                    "capabilityKey": item.capability_binding.capability_key,
                     "requiredParams": build_required_parameter_names(item),
                     "strictSourceParams": item.workflow.parameter_mappings.iter().filter(|mapping| is_strict_source_parameter(mapping)).map(|mapping| mapping.parameter_name.clone()).collect::<Vec<_>>(),
                     "descriptiveParams": item.workflow.parameter_mappings.iter().filter(|mapping| is_descriptive_parameter(mapping)).map(|mapping| mapping.parameter_name.clone()).collect::<Vec<_>>(),
@@ -1269,7 +2846,10 @@ fn parameter_role_label(mapping: &ComponentParameterMapping) -> &'static str {
         "核心内容/源数据"
     } else if is_descriptive_parameter(mapping) {
         "描述承接"
-    } else if mapping.parameter_name.trim().eq_ignore_ascii_case("language")
+    } else if mapping
+        .parameter_name
+        .trim()
+        .eq_ignore_ascii_case("language")
         || mapping.parameter_name.trim().eq_ignore_ascii_case("lang")
     {
         "语言控制"
@@ -1295,7 +2875,10 @@ fn parameter_role_guidance(mapping: &ComponentParameterMapping) -> &'static str 
         "应直接传入真实内容本身，不要用主题简介、情绪概述或自动生成占位来代替。"
     } else if is_descriptive_parameter(mapping) {
         "适合承接风格、氛围、乐器、节奏、主题等额外要求；组件未声明的同类要求可合并到这里。"
-    } else if mapping.parameter_name.trim().eq_ignore_ascii_case("language")
+    } else if mapping
+        .parameter_name
+        .trim()
+        .eq_ignore_ascii_case("language")
         || mapping.parameter_name.trim().eq_ignore_ascii_case("lang")
     {
         "只建议传语言代码，例如 zh、en、ja。"
@@ -1502,13 +3085,21 @@ fn build_skill_markdown(item: &ComponentDefinition) -> String {
     lines.push("- `params` 里只保留组件声明过的参数；用户多给的字段不要原样塞进去，也不要因为存在额外字段就拒绝调用。".to_string());
     lines.push("- 可选参数缺失不会阻止调用；只要必填参数齐了就可以执行。".to_string());
     lines.push("- 如果用户给了额外的风格、氛围、约束、主题等要求，但组件没有同名字段，可把这类要求合并进最接近的描述型字符串参数（例如 `tags` / `prompt` / `description` / `text`）；若没有合适字段，就忽略这些额外字段，不要因此拒绝。".to_string());
-    lines.push("- 如果仍然走渲染通道并且参数已齐，可设置 `props.autoRun=true` 让组件打开后自动执行。".to_string());
-    lines.push("- 不要把 `english_name` 写进渲染 `type`，也不要把 `component_type` 写进 `componentName`。".to_string());
+    lines.push(
+        "- 如果仍然走渲染通道并且参数已齐，可设置 `props.autoRun=true` 让组件打开后自动执行。"
+            .to_string(),
+    );
+    lines.push(
+        "- 不要把 `english_name` 写进渲染 `type`，也不要把 `component_type` 写进 `componentName`。"
+            .to_string(),
+    );
     lines.push(String::new());
     lines.push("## 输出示例".to_string());
     lines.push(String::new());
     lines.push(format!("- 打开组件：`<UI_JSON>{render_example}</UI_JSON>`"));
-    lines.push(format!("- 直接调用并回填结果：`<UI_JSON>{invoke_example}</UI_JSON>`"));
+    lines.push(format!(
+        "- 直接调用并回填结果：`<UI_JSON>{invoke_example}</UI_JSON>`"
+    ));
     lines.join("\n")
 }
 
@@ -1576,18 +3167,27 @@ fn build_prompt_context_markdown(item: &ComponentDefinition) -> String {
     lines.push("- 调用通道：输出 `ComponentInvokeAction`，其中 `props.componentName` 必须精确等于 `直接调用名`。".to_string());
     lines.push(format!("- {}", build_required_parameters_line(item)));
     lines.push("- 对图片/视频/音频这类直接产出媒体结果的请求，只要参数已经齐全，就优先走调用通道，并设置 `renderResult=true`。".to_string());
-    lines.push("- 对参数还不完整、需要用户补充或希望用户手动确认的请求，优先走渲染通道。".to_string());
+    lines.push(
+        "- 对参数还不完整、需要用户补充或希望用户手动确认的请求，优先走渲染通道。".to_string(),
+    );
     lines.push("- 当用户已经明确要求“直接生成 / 直接调用 / 直接执行”时，只要必填参数齐了，就必须直接输出 `ComponentInvokeAction`，不要解释自己不会用组件，也不要说当前上下文没有入口。".to_string());
     lines.push("- `params` 中只能放当前组件声明过的参数；用户额外提到的 title / style / prompt / note 等字段，如果组件未声明，不要原样塞进去，也不要因为它们不存在映射就拒绝调用。".to_string());
-    lines.push("- 可选参数缺失不会阻止执行；判断是否能直调时，只看必填参数是否已满足。".to_string());
+    lines
+        .push("- 可选参数缺失不会阻止执行；判断是否能直调时，只看必填参数是否已满足。".to_string());
     lines.push("- 若用户多给的是风格、氛围、主题、补充要求，而组件存在描述型字符串参数（如 `tags` / `prompt` / `description` / `text`），可把这些额外要求合并进去；否则忽略这些额外字段，继续调用。".to_string());
-    lines.push("- 若用户要求直接执行，并且你仍选择渲染通道，可设置 `props.autoRun=true`。".to_string());
+    lines.push(
+        "- 若用户要求直接执行，并且你仍选择渲染通道，可设置 `props.autoRun=true`。".to_string(),
+    );
     lines.push("- 不要混淆 `component_type` 与 `english_name`：前者只用于渲染 `type`，后者只用于 `componentName`。".to_string());
     lines.push(String::new());
     lines.push("## 输出规范".to_string());
     lines.push(String::new());
-    lines.push(format!("- 仅打开组件：`<UI_JSON>{render_example}</UI_JSON>`"));
-    lines.push(format!("- 直接调用并回填结果：`<UI_JSON>{invoke_example}</UI_JSON>`"));
+    lines.push(format!(
+        "- 仅打开组件：`<UI_JSON>{render_example}</UI_JSON>`"
+    ));
+    lines.push(format!(
+        "- 直接调用并回填结果：`<UI_JSON>{invoke_example}</UI_JSON>`"
+    ));
     lines.join("\n")
 }
 
@@ -1595,8 +3195,7 @@ fn build_component_skill_tags(item: &ComponentDefinition) -> Vec<String> {
     let provider_tag = component_provider_tag(&item.provider_type);
     let capability_tag = component_capability_tag(&item.return_type);
     let capability_label = component_capability_label(&item.return_type);
-
-    vec![
+    let mut tags = vec![
         "generated".to_string(),
         "component-center".to_string(),
         "component-skill".to_string(),
@@ -1604,18 +3203,157 @@ fn build_component_skill_tags(item: &ComponentDefinition) -> Vec<String> {
         format!("provider:{provider_tag}"),
         capability_tag.to_string(),
         capability_label.to_string(),
-    ]
+    ];
+    if !item.capability_binding.base_tool.trim().is_empty() {
+        tags.push(format!(
+            "base-tool:{}",
+            item.capability_binding.base_tool.trim()
+        ));
+    }
+    if !item.capability_binding.capability_key.trim().is_empty() {
+        tags.push(format!(
+            "capability-key:{}",
+            item.capability_binding.capability_key.trim()
+        ));
+    }
+    if !item.capability_binding.capability_scope.trim().is_empty() {
+        tags.push(format!(
+            "capability-scope:{}",
+            item.capability_binding.capability_scope.trim()
+        ));
+    }
+    if !item.capability_binding.source_policy.trim().is_empty() {
+        tags.push(format!(
+            "source-policy:{}",
+            item.capability_binding.source_policy.trim()
+        ));
+    }
+    if !item.selector_meta.specialization.trim().is_empty() {
+        tags.push(format!(
+            "specialization:{}",
+            item.selector_meta.specialization.trim()
+        ));
+    }
+    if !item.selector_meta.subject_policy.trim().is_empty() {
+        tags.push(format!(
+            "subject-policy:{}",
+            item.selector_meta.subject_policy.trim()
+        ));
+    }
+    if item.selector_meta.supports_text_only {
+        tags.push("supports-text-only".to_string());
+    }
+    for tag in &item.selector_meta.intent_tags {
+        let trimmed = tag.trim();
+        if !trimmed.is_empty() {
+            tags.push(format!("intent:{trimmed}"));
+        }
+    }
+    for slot in &item.selector_meta.requires_slots {
+        let trimmed = slot.trim();
+        if !trimmed.is_empty() {
+            tags.push(format!("requires-slot:{trimmed}"));
+        }
+    }
+    for mime in &item.selector_meta.preferred_mime_types {
+        let trimmed = mime.trim();
+        if !trimmed.is_empty() {
+            tags.push(format!("preferred-mime:{trimmed}"));
+        }
+    }
+    tags
 }
 
 fn build_skill_toml(item: &ComponentDefinition, prompt_context: &str) -> String {
     let prompt_literal = prompt_context.replace("'''", "'''\"\"\"'''");
     let tags_literal = serde_json::to_string(&build_component_skill_tags(item))
         .unwrap_or_else(|_| "[]".to_string());
+    let description =
+        serde_json::to_string(&item.description).unwrap_or_else(|_| "\"\"".to_string());
+    let base_tool = item.capability_binding.base_tool.trim();
+    if base_tool.is_empty() || base_tool == "component_invoke" {
+        return format!(
+            "prompt_context = '''\n{prompt_literal}\n'''\n\n[skill]\nname = \"{skill_name}\"\nversion = \"0.1.0\"\ndescription = {description}\nauthor = \"\"\nlicense = \"\"\ntags = {tags_literal}\n\n[runtime]\ntype = \"promptonly\"\nentry = \"\"\n\n[tools]\nprovided = []\n\n[requirements]\ntools = []\ncapabilities = []\n\n[source]\ntype = \"native\"\n",
+            skill_name = item.english_name,
+            description = description,
+            tags_literal = tags_literal
+        );
+    }
+
+    let tool_description = serde_json::to_string(&format!(
+        "组件中心能力适配器：{}。绑定基础工具 {}，由 runtime selector 选择后执行。",
+        item.name.trim(),
+        base_tool
+    ))
+    .unwrap_or_else(|_| "\"组件中心能力适配器\"".to_string());
+
     format!(
-        "prompt_context = '''\n{prompt_literal}\n'''\n\n[skill]\nname = \"{skill_name}\"\nversion = \"0.1.0\"\ndescription = {description}\nauthor = \"\"\nlicense = \"\"\ntags = {tags_literal}\n\n[runtime]\ntype = \"promptonly\"\nentry = \"\"\n\n[tools]\nprovided = []\n\n[requirements]\ntools = []\ncapabilities = []\n\n[source]\ntype = \"native\"\n",
+        "prompt_context = '''\n{prompt_literal}\n'''\n\n[skill]\nname = \"{skill_name}\"\nversion = \"0.1.0\"\ndescription = {description}\nauthor = \"\"\nlicense = \"\"\ntags = {tags_literal}\n\n[runtime]\ntype = \"node\"\nentry = \"{entry}\"\n\n[[tools.provided]]\nname = \"{base_tool}\"\ndescription = {tool_description}\ninput_schema = {{ type = \"object\", additionalProperties = true }}\n\n[requirements]\ntools = []\ncapabilities = []\n\n[source]\ntype = \"native\"\n",
         skill_name = item.english_name,
-        description = serde_json::to_string(&item.description).unwrap_or_else(|_| "\"\"".to_string()),
-        tags_literal = tags_literal
+        description = description,
+        tags_literal = tags_literal,
+        entry = COMPONENT_TOOL_ADAPTER_FILE,
+        base_tool = base_tool,
+        tool_description = tool_description,
+    )
+}
+
+fn build_component_tool_adapter_script(item: &ComponentDefinition) -> String {
+    let component_key =
+        serde_json::to_string(&item.english_name).unwrap_or_else(|_| "\"\"".to_string());
+    let base_tool = serde_json::to_string(&item.capability_binding.base_tool)
+        .unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"const COMPONENT_KEY = {component_key};
+const DEFAULT_TOOL = {base_tool};
+
+function readStdin() {{
+  return new Promise((resolve, reject) => {{
+    const chunks = [];
+    process.stdin.on('data', (chunk) => chunks.push(chunk));
+    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    process.stdin.on('error', reject);
+  }});
+}}
+
+async function main() {{
+  const raw = await readStdin();
+  const payload = raw.trim() ? JSON.parse(raw) : {{}};
+  const toolName = typeof payload.tool === 'string' && payload.tool.trim() ? payload.tool.trim() : DEFAULT_TOOL;
+  const input = payload && typeof payload.input === 'object' && payload.input !== null ? payload.input : {{}};
+  const baseUrl = String(process.env.WEBOT_SERVICE_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (!baseUrl) {{
+    throw new Error('WEBOT_SERVICE_BASE_URL 未配置，组件能力适配器无法调用管理服务');
+  }}
+  const agentId = typeof input.agentId === 'string' && input.agentId.trim()
+    ? input.agentId.trim()
+    : (typeof input.callerAgentId === 'string' && input.callerAgentId.trim() ? input.callerAgentId.trim() : undefined);
+  const response = await fetch(`${{baseUrl}}/api/management/components/${{encodeURIComponent(COMPONENT_KEY)}}/capability-invoke`, {{
+    method: 'POST',
+    headers: {{
+      'content-type': 'application/json',
+      'accept': 'application/json',
+    }},
+    body: JSON.stringify({{
+      toolName,
+      input,
+      ...(agentId ? {{ agentId }} : {{}}),
+    }}),
+  }});
+  const text = await response.text();
+  if (!response.ok) {{
+    throw new Error(text || `HTTP ${{response.status}}`);
+  }}
+  process.stdout.write(text.trim() ? text : '{{}}');
+}}
+
+main().catch((error) => {{
+  process.stdout.write(JSON.stringify({{
+    error: error instanceof Error ? error.message : String(error || '组件能力适配器执行失败'),
+  }}));
+  process.exitCode = 1;
+}});
+"#
     )
 }
 
@@ -1955,10 +3693,12 @@ fn validate_component_invoke_params(
         .parameter_mappings
         .iter()
         .filter(|mapping| mapping.required)
-        .filter_map(|mapping| match resolve_component_param_value(mapping, params) {
-            Some(value) if !is_effectively_empty_value(&value) => None,
-            _ => Some(mapping.parameter_name.clone()),
-        })
+        .filter_map(
+            |mapping| match resolve_component_param_value(mapping, params) {
+                Some(value) if !is_effectively_empty_value(&value) => None,
+                _ => Some(mapping.parameter_name.clone()),
+            },
+        )
         .collect::<Vec<_>>();
     if !missing_required.is_empty() {
         return Err(ApiError::new(
@@ -1999,6 +3739,183 @@ fn resolve_runtime_component_param_value(
     Ok(None)
 }
 
+fn build_component_params_from_capability_input(
+    item: &ComponentDefinition,
+    tool_name: &str,
+    input: &Value,
+) -> Result<Map<String, Value>, ApiError> {
+    let raw = input
+        .as_object()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "组件能力调用的 input 必须是对象"))?;
+    let mut params = Map::new();
+    let prompt_like = pick_first_non_empty_value(
+        raw,
+        &[
+            "prompt",
+            "text",
+            "message",
+            "description",
+            "question",
+            "instructions",
+        ],
+    );
+    let image_like = pick_first_non_empty_value(
+        raw,
+        &[
+            "image",
+            "image_url",
+            "imageUrl",
+            "image_path",
+            "imagePath",
+            "source_image",
+            "sourceImage",
+            "reference_image",
+            "referenceImage",
+        ],
+    );
+    let video_like = pick_first_non_empty_value(
+        raw,
+        &[
+            "video",
+            "video_url",
+            "videoUrl",
+            "video_path",
+            "videoPath",
+            "source_video",
+            "sourceVideo",
+        ],
+    );
+    let audio_like = pick_first_non_empty_value(
+        raw,
+        &[
+            "audio",
+            "audio_url",
+            "audioUrl",
+            "audio_path",
+            "audioPath",
+            "path",
+            "url",
+        ],
+    );
+
+    for mapping in &item.workflow.parameter_mappings {
+        if let Some(value) = resolve_component_param_value(mapping, raw) {
+            params.insert(mapping.parameter_name.clone(), value);
+            continue;
+        }
+
+        let mapping_key = mapping.parameter_name.trim().to_ascii_lowercase();
+        let inferred = if is_component_video_mapping(mapping) {
+            video_like.clone()
+        } else if is_component_audio_mapping(mapping) {
+            audio_like.clone()
+        } else if is_component_image_mapping(mapping) {
+            image_like.clone()
+        } else if is_component_voice_mapping(mapping) {
+            pick_first_non_empty_value(
+                raw,
+                &["voice", "speaker", "speaker_profile_id", "speakerProfileId"],
+            )
+        } else if is_component_language_mapping(mapping) {
+            pick_first_non_empty_value(raw, &["language", "lang"])
+        } else if is_component_duration_mapping(mapping) {
+            raw.get("duration")
+                .cloned()
+                .or_else(|| raw.get("duration_secs").cloned())
+                .or_else(|| raw.get("seconds").cloned())
+        } else if tool_name == "speech_to_text"
+            || tool_name == "image_analyze"
+            || tool_name == "media_describe"
+        {
+            if is_strict_source_parameter(mapping) {
+                image_like
+                    .clone()
+                    .or_else(|| audio_like.clone())
+                    .or_else(|| video_like.clone())
+            } else {
+                prompt_like.clone()
+            }
+        } else if mapping_key.contains("negative") {
+            raw.get("negative_prompt")
+                .cloned()
+                .or_else(|| raw.get("negativePrompt").cloned())
+        } else if is_descriptive_parameter(mapping) || is_component_text_mapping(mapping) {
+            prompt_like.clone()
+        } else {
+            None
+        };
+
+        if let Some(value) = inferred {
+            params.insert(mapping.parameter_name.clone(), value);
+        }
+    }
+
+    validate_component_invoke_params(item, &params)?;
+    Ok(params)
+}
+
+fn pick_first_non_empty_value(params: &Map<String, Value>, keys: &[&str]) -> Option<Value> {
+    keys.iter().find_map(|key| {
+        let value = params.get(*key)?;
+        if is_effectively_empty_value(value) {
+            return None;
+        }
+        Some(value.clone())
+    })
+}
+
+fn is_component_video_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    combined.contains("video")
+        || mapping.label.contains("视频")
+        || mapping.description.contains("视频")
+}
+
+fn is_component_audio_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    combined.contains("audio")
+        || combined.contains("voice")
+        || combined.contains("speech")
+        || mapping.label.contains("音频")
+        || mapping.label.contains("语音")
+        || mapping.description.contains("音频")
+        || mapping.description.contains("语音")
+}
+
+fn is_component_voice_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    combined.contains("voice")
+        || combined.contains("speaker")
+        || mapping.label.contains("音色")
+        || mapping.label.contains("音源")
+}
+
+fn is_component_language_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let key = mapping.parameter_name.trim().to_ascii_lowercase();
+    key == "language" || key == "lang"
+}
+
+fn is_component_duration_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let combined = format!(
+        "{} {} {} {}",
+        mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
+    )
+    .to_ascii_lowercase();
+    combined.contains("duration") || combined.contains("second") || mapping.label.contains("时长")
+}
+
 async fn invoke_comfyui_component(
     state: &Arc<AppState>,
     item: &ComponentDefinition,
@@ -2025,8 +3942,53 @@ async fn invoke_comfyui_component(
             "组件缺少原始 ComfyUI 工作流，请重新在组件中心导入并保存工作流",
         ));
     }
-    let base_url = normalize_url_or_default(&config.server_url, &default_comfyui_server_url());
-    let client = reqwest::Client::builder()
+    let owner_agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
+    let (_, headers, base_url, prompt) =
+        prepare_comfyui_component_prompt(state, item, config, params, agent_id).await?;
+    if should_run_comfyui_component_as_background_job(item, owner_agent_id) {
+        return enqueue_comfyui_component_job(item, config, params, prompt, owner_agent_id);
+    }
+    let client = build_comfyui_client()?;
+    let (prompt_id, _) = submit_comfyui_prompt(&client, &headers, &base_url, &prompt).await?;
+
+    let history = poll_comfyui_history(
+        &client,
+        &headers,
+        &base_url,
+        &prompt_id,
+        comfyui_poll_attempts_for_component(item),
+    )
+    .await?;
+    let localized = localize_component_video_outputs(
+        item,
+        &history,
+        &extract_comfyui_items(&base_url, &history, &item.return_type),
+        owner_agent_id,
+        Some(&Value::Object(params.clone())),
+    )
+    .await
+    .map_err(internal_error)?;
+    let items = localized.items;
+    let text = if items.is_empty() {
+        "ComfyUI 已完成，但未发现可展示输出".to_string()
+    } else {
+        String::new()
+    };
+    let provider_meta = build_component_provider_meta(item);
+    let presentable_result =
+        build_component_presentable_result(item, &text, &localized.raw, &items, &provider_meta);
+    Ok(ComponentInvokeResult {
+        output_type: item.return_type.clone(),
+        text,
+        items,
+        raw: localized.raw,
+        presentable_result,
+        provider_meta: Some(provider_meta),
+    })
+}
+
+fn build_comfyui_client() -> Result<reqwest::Client, ApiError> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|err| {
@@ -2034,7 +3996,18 @@ async fn invoke_comfyui_component(
                 StatusCode::BAD_GATEWAY,
                 format!("创建 ComfyUI 客户端失败: {err}"),
             )
-        })?;
+        })
+}
+
+async fn prepare_comfyui_component_prompt(
+    state: &Arc<AppState>,
+    item: &ComponentDefinition,
+    config: &ComponentServiceConfig,
+    params: &Map<String, Value>,
+    agent_id: Option<&str>,
+) -> Result<(reqwest::Client, HeaderMap, String, Value), ApiError> {
+    let base_url = normalize_url_or_default(&config.server_url, &default_comfyui_server_url());
+    let client = build_comfyui_client()?;
     let headers = build_provider_headers(config)?;
     let mut prompt = normalize_comfy_prompt_payload(&item.workflow.raw_payload)?;
     apply_component_params_to_prompt(
@@ -2049,7 +4022,15 @@ async fn invoke_comfyui_component(
         agent_id,
     )
     .await?;
+    Ok((client, headers, base_url, prompt))
+}
 
+async fn submit_comfyui_prompt(
+    client: &reqwest::Client,
+    headers: &HeaderMap,
+    base_url: &str,
+    prompt: &Value,
+) -> Result<(String, Value), ApiError> {
     let enqueue_response = client
         .post(format!("{base_url}/prompt"))
         .headers(headers.clone())
@@ -2091,27 +4072,7 @@ async fn invoke_comfyui_component(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "ComfyUI 未返回 prompt_id"))?;
-
-    let history = poll_comfyui_history(
-        &client,
-        &headers,
-        &base_url,
-        prompt_id,
-        comfyui_poll_attempts_for_component(item),
-    )
-    .await?;
-    let items = extract_comfyui_items(&base_url, &history, &item.return_type);
-    let text = if items.is_empty() {
-        "ComfyUI 已完成，但未发现可展示输出".to_string()
-    } else {
-        String::new()
-    };
-    Ok(ComponentInvokeResult {
-        output_type: item.return_type.clone(),
-        text,
-        items,
-        raw: history,
-    })
+    Ok((prompt_id.to_string(), enqueue_json))
 }
 
 fn normalize_comfy_prompt_payload(raw_payload: &Value) -> Result<Value, ApiError> {
@@ -2224,13 +4185,17 @@ fn resolve_component_param_value(
     let exact_key = mapping.parameter_name.trim();
     if !exact_key.is_empty() {
         if let Some(value) = params.get(exact_key).cloned() {
-            return Some(value);
+            if !is_effectively_empty_value(&value) {
+                return Some(value);
+            }
         }
     }
 
     for alias in infer_component_param_aliases(mapping) {
         if let Some(value) = params.get(alias).cloned() {
-            return Some(value);
+            if !is_effectively_empty_value(&value) {
+                return Some(value);
+            }
         }
     }
 
@@ -2246,6 +4211,12 @@ fn infer_component_param_aliases(mapping: &ComponentParameterMapping) -> Vec<&'s
             "imageUrl",
             "image_path",
             "imagePath",
+            "image_base64",
+            "imageBase64",
+            "source_image",
+            "sourceImage",
+            "reference_image",
+            "referenceImage",
             "src",
             "url",
             "path",
@@ -2255,7 +4226,16 @@ fn infer_component_param_aliases(mapping: &ComponentParameterMapping) -> Vec<&'s
         ]);
     }
     if is_component_text_mapping(mapping) {
-        aliases.extend(["prompt", "text", "message", "description"]);
+        aliases.extend([
+            "prompt",
+            "text",
+            "message",
+            "description",
+            "instructions",
+            "question",
+            "script",
+            "caption",
+        ]);
     }
     if is_component_width_mapping(mapping) {
         aliases.extend(["width", "w"]);
@@ -2275,6 +4255,17 @@ fn infer_component_param_aliases(mapping: &ComponentParameterMapping) -> Vec<&'s
 }
 
 fn is_component_image_mapping(mapping: &ComponentParameterMapping) -> bool {
+    let parameter_name = mapping.parameter_name.trim().to_ascii_lowercase();
+    let field_name = mapping.field_name.trim().to_ascii_lowercase();
+    if matches!(
+        parameter_name.as_str(),
+        "text" | "prompt" | "message" | "description" | "question" | "instructions"
+    ) || matches!(
+        field_name.as_str(),
+        "text" | "prompt" | "message" | "description" | "question" | "instructions"
+    ) {
+        return false;
+    }
     let combined = format!(
         "{} {} {} {}",
         mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
@@ -2293,7 +4284,10 @@ fn is_component_text_mapping(mapping: &ComponentParameterMapping) -> bool {
         mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
     )
     .to_ascii_lowercase();
-    if combined.contains("negative") || mapping.label.contains("负") || mapping.description.contains("负") {
+    if combined.contains("negative")
+        || mapping.label.contains("负")
+        || mapping.description.contains("负")
+    {
         return false;
     }
     combined.contains("prompt")
@@ -2318,7 +4312,9 @@ fn is_component_height_mapping(mapping: &ComponentParameterMapping) -> bool {
         mapping.parameter_name, mapping.field_name, mapping.label, mapping.description
     )
     .to_ascii_lowercase();
-    combined.contains("height") || mapping.label.contains('高') || mapping.description.contains('高')
+    combined.contains("height")
+        || mapping.label.contains('高')
+        || mapping.description.contains('高')
 }
 
 fn comfyui_poll_attempts_for_component(item: &ComponentDefinition) -> u32 {
@@ -2338,7 +4334,8 @@ fn is_video_like_component(item: &ComponentDefinition) -> bool {
         item.english_name, item.name, item.component_type
     )
     .to_ascii_lowercase();
-    if summary.contains("video") || item.name.contains("视频") || item.description.contains("视频") {
+    if summary.contains("video") || item.name.contains("视频") || item.description.contains("视频")
+    {
         return true;
     }
     stringify_value_compact(&item.workflow.raw_payload)
@@ -2363,8 +4360,7 @@ async fn maybe_normalize_comfyui_asset_value(
         return Ok(Value::String(text));
     }
 
-    let (bytes, mime_type) =
-        resolve_component_image_source(state, client, agent_id, &text).await?;
+    let (bytes, mime_type) = resolve_component_image_source(state, client, agent_id, &text).await?;
     let uploaded_name =
         upload_image_to_comfyui(client, headers, comfyui_base_url, &bytes, &mime_type).await?;
     Ok(Value::String(uploaded_name))
@@ -2416,6 +4412,16 @@ fn looks_like_relative_image_source_path(value: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+        || trimmed.starts_with("blob:")
+        || trimmed.starts_with("/api/")
+        || trimmed.starts_with("api/")
+        || trimmed.contains("://")
+    {
+        return false;
+    }
     let path = Path::new(trimmed);
     if path.is_absolute() || path.components().count() == 0 {
         return false;
@@ -2425,22 +4431,116 @@ fn looks_like_relative_image_source_path(value: &str) -> bool {
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     let has_image_extension = normalize_image_mime_type(extension).is_some();
-    has_image_extension
-        && (trimmed.contains('/') || trimmed.contains('\\'))
+    has_image_extension && (trimmed.contains('/') || trimmed.contains('\\'))
 }
 
-fn resolve_relative_component_image_path(
-    roots: &[PathBuf],
-    source: &str,
-) -> Option<PathBuf> {
+fn resolve_relative_component_image_path(roots: &[PathBuf], source: &str) -> Option<PathBuf> {
     let trimmed = source.trim();
     if !looks_like_relative_image_source_path(trimmed) {
         return None;
     }
     let relative = Path::new(trimmed);
-    roots.iter()
+    roots
+        .iter()
         .map(|root| root.join(relative))
         .find(|candidate| candidate.is_file())
+}
+
+fn parse_component_management_media_reference(
+    source_url: &str,
+) -> Option<(String, &'static str, String)> {
+    let trimmed = source_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path_like = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let index = trimmed.find("/api/management/agents/")?;
+        &trimmed[index..]
+    } else {
+        trimmed
+    };
+    let path_only = path_like
+        .split('#')
+        .next()
+        .unwrap_or(path_like)
+        .split('?')
+        .next()
+        .unwrap_or(path_like);
+    let rest = path_only.strip_prefix("/api/management/agents/")?;
+    let (agent_id, tail) = rest.split_once('/')?;
+    if let Some(filename) = tail.strip_prefix("avatar/") {
+        let normalized = filename.trim();
+        if !normalized.is_empty() {
+            return Some((agent_id.to_string(), "avatar", normalized.to_string()));
+        }
+    }
+    if let Some(filename) = tail.strip_prefix("portrait/") {
+        let normalized = filename.trim();
+        if !normalized.is_empty() {
+            return Some((agent_id.to_string(), "portrait", normalized.to_string()));
+        }
+    }
+    None
+}
+
+fn normalize_component_management_asset_url(service_base: &str, source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("/api/management/") {
+        return Some(format!(
+            "{}{}",
+            service_base.trim_end_matches('/'),
+            trimmed
+        ));
+    }
+    if trimmed.starts_with("api/management/") {
+        return Some(format!(
+            "{}/{}",
+            service_base.trim_end_matches('/'),
+            trimmed
+        ));
+    }
+    let marker = "/api/management/";
+    let index = trimmed.find(marker)?;
+    Some(format!(
+        "{}{}",
+        service_base.trim_end_matches('/'),
+        &trimmed[index..]
+    ))
+}
+
+async fn resolve_component_management_image_path(
+    state: &Arc<AppState>,
+    source: &str,
+) -> Result<Option<PathBuf>, ApiError> {
+    let Some((source_agent_id, kind, filename)) = parse_component_management_media_reference(source)
+    else {
+        return Ok(None);
+    };
+
+    let binding =
+        crate::routes::resolve_agent_workspace_binding(state, &source_agent_id, None).await?;
+    for workspace_root in binding.all_workspaces() {
+        let candidate = workspace_root
+            .join(AGENT_PROFILE_DIR_NAME)
+            .join(kind)
+            .join(&filename);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    if let Ok(root) = path_resolver::workspaces_root() {
+        let legacy_candidate = root.join(&source_agent_id).join(kind).join(&filename);
+        if legacy_candidate.is_file() {
+            return Ok(Some(legacy_candidate));
+        }
+    }
+
+    Ok(None)
 }
 
 async fn resolve_component_workspace_image_path(
@@ -2470,6 +4570,40 @@ async fn resolve_component_image_source(
     }
 
     let trimmed = source.trim();
+    if let Some(path) = resolve_component_management_image_path(state, trimmed).await? {
+        let bytes = tokio::fs::read(&path).await.map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("读取组件管理媒体图片参数失败({}): {err}", path.display()),
+            )
+        })?;
+        let mime_type =
+            detect_image_mime_from_path_or_bytes(path.to_str(), &bytes).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("无法识别组件管理媒体图片格式: {}", path.display()),
+                )
+            })?;
+        return Ok((bytes, mime_type.to_string()));
+    }
+
+    if let Some(path) = resolve_component_uploaded_image_path(state, agent_id, trimmed).await? {
+        let bytes = tokio::fs::read(&path).await.map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("读取组件上传图片参数失败({}): {err}", path.display()),
+            )
+        })?;
+        let mime_type =
+            detect_image_mime_from_path_or_bytes(path.to_str(), &bytes).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("无法识别组件上传图片格式: {}", path.display()),
+                )
+            })?;
+        return Ok((bytes, mime_type.to_string()));
+    }
+
     if Path::new(trimmed).is_file() {
         let bytes = tokio::fs::read(trimmed).await.map_err(|err| {
             ApiError::new(
@@ -2477,12 +4611,13 @@ async fn resolve_component_image_source(
                 format!("读取组件图片参数失败({trimmed}): {err}"),
             )
         })?;
-        let mime_type = detect_image_mime_from_path_or_bytes(Some(trimmed), &bytes).ok_or_else(|| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("无法识别组件图片格式: {trimmed}"),
-            )
-        })?;
+        let mime_type =
+            detect_image_mime_from_path_or_bytes(Some(trimmed), &bytes).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("无法识别组件图片格式: {trimmed}"),
+                )
+            })?;
         return Ok((bytes, mime_type.to_string()));
     }
 
@@ -2493,25 +4628,23 @@ async fn resolve_component_image_source(
                 format!("读取组件工作区图片参数失败({}): {err}", path.display()),
             )
         })?;
-        let mime_type = detect_image_mime_from_path_or_bytes(
-            path.to_str(),
-            &bytes,
-        )
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("无法识别组件工作区图片格式: {}", path.display()),
-            )
-        })?;
+        let mime_type =
+            detect_image_mime_from_path_or_bytes(path.to_str(), &bytes).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("无法识别组件工作区图片格式: {}", path.display()),
+                )
+            })?;
         return Ok((bytes, mime_type.to_string()));
     }
 
     if looks_like_relative_image_source_path(trimmed) {
-        let detail = if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
-            format!("无法在智能体 {agent_id} 的工作区中找到图片文件: {trimmed}")
-        } else {
-            format!("组件图片参数是相对工作区路径，但缺少 agentId 无法解析: {trimmed}")
-        };
+        let detail =
+            if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+                format!("无法在智能体 {agent_id} 的工作区中找到图片文件: {trimmed}")
+            } else {
+                format!("组件图片参数是相对工作区路径，但缺少 agentId 无法解析: {trimmed}")
+            };
         return Err(ApiError::new(StatusCode::BAD_REQUEST, detail));
     }
 
@@ -2572,6 +4705,163 @@ async fn resolve_component_image_source(
     Ok((body.to_vec(), mime_type.to_string()))
 }
 
+fn extract_local_upload_id(source: &str) -> Option<&str> {
+    let trimmed = source.trim();
+    trimmed
+        .strip_prefix("/api/uploads/")
+        .or_else(|| trimmed.strip_prefix("api/uploads/"))
+        .or_else(|| {
+            let marker = "/api/uploads/";
+            let index = trimmed.find(marker)?;
+            let rest = &trimmed[index + marker.len()..];
+            let id = rest.split(['/', '?', '#']).next()?;
+            if id.is_empty() {
+                None
+            } else {
+                Some(id)
+            }
+        })
+        .filter(|value| !value.is_empty())
+}
+
+async fn resolve_component_uploaded_image_path(
+    state: &Arc<AppState>,
+    agent_id: Option<&str>,
+    source: &str,
+) -> Result<Option<PathBuf>, ApiError> {
+    let Some(file_id) = extract_local_upload_id(source) else {
+        return Ok(None);
+    };
+
+    let cache_path = std::env::temp_dir().join("openfang_uploads").join(file_id);
+    if cache_path.is_file() {
+        return Ok(Some(cache_path));
+    }
+
+    let mut roots = Vec::new();
+    if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+        let binding = crate::routes::resolve_agent_workspace_binding(state, agent_id, None).await?;
+        roots.extend(binding.all_workspaces());
+    }
+    if let Ok(root) = crate::path_resolver::workspaces_root() {
+        roots.push(root);
+    }
+    if let Ok(root) = crate::path_resolver::legacy_openfang_home_dir() {
+        roots.push(root.join("workspaces"));
+    }
+
+    let mut deduped = Vec::new();
+    for root in roots {
+        if deduped.iter().any(|existing: &PathBuf| existing == &root) {
+            continue;
+        }
+        deduped.push(root);
+    }
+
+    Ok(recover_uploaded_image_path_from_roots(&deduped, file_id))
+}
+
+fn recover_uploaded_image_path_from_roots(roots: &[PathBuf], file_id: &str) -> Option<PathBuf> {
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+
+        let direct_sessions_dir = root.join("sessions");
+        if direct_sessions_dir.exists() {
+            if let Some(saved_path) =
+                recover_uploaded_image_path_from_sessions(&direct_sessions_dir, file_id)
+            {
+                return Some(saved_path);
+            }
+        }
+
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let sessions_dir = path.join("sessions");
+            if !sessions_dir.exists() {
+                continue;
+            }
+            if let Some(saved_path) =
+                recover_uploaded_image_path_from_sessions(&sessions_dir, file_id)
+            {
+                return Some(saved_path);
+            }
+        }
+    }
+    None
+}
+
+fn recover_uploaded_image_path_from_sessions(
+    sessions_dir: &Path,
+    file_id: &str,
+) -> Option<PathBuf> {
+    let entries = fs::read_dir(sessions_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let file = fs::File::open(&path).ok()?;
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(saved_path) = recover_uploaded_image_path_from_session_line(&line, file_id)
+            {
+                return Some(saved_path);
+            }
+        }
+    }
+    None
+}
+
+fn recover_uploaded_image_path_from_session_line(line: &str, file_id: &str) -> Option<PathBuf> {
+    let payload = serde_json::from_str::<Value>(line).ok()?;
+    let tool_use_entries = payload.get("tool_use")?.as_array()?;
+    for entry in tool_use_entries {
+        let Some(content) = entry.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(saved_path) = recover_uploaded_image_path_from_tool_result(content, file_id) {
+            return Some(saved_path);
+        }
+    }
+    None
+}
+
+fn recover_uploaded_image_path_from_tool_result(content: &str, file_id: &str) -> Option<PathBuf> {
+    let payload = serde_json::from_str::<Value>(content).ok()?;
+    let image_urls = payload.get("image_urls")?.as_array()?;
+    let saved_to = payload.get("saved_to")?.as_array()?;
+
+    for (image_url, saved_path) in image_urls.iter().zip(saved_to.iter()) {
+        let Some(image_url) = image_url.as_str() else {
+            continue;
+        };
+        let Some(saved_path) = saved_path.as_str() else {
+            continue;
+        };
+        if extract_local_upload_id(image_url) != Some(file_id) {
+            continue;
+        }
+        let path = PathBuf::from(saved_path.trim());
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn build_component_asset_request_url(
     state: &Arc<AppState>,
     source: &str,
@@ -2600,6 +4890,11 @@ fn build_component_asset_request_url(
         return Ok((format!("{service_base}/{trimmed}"), false));
     }
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        if let Some(local_management_url) =
+            normalize_component_management_asset_url(&service_base, trimmed)
+        {
+            return Ok((local_management_url, false));
+        }
         let requires_openfang_auth = trimmed.starts_with(openfang_base)
             && trimmed[openfang_base.len()..].starts_with("/api/uploads/");
         return Ok((trimmed.to_string(), requires_openfang_auth));
@@ -2633,9 +4928,9 @@ fn decode_image_data_url(source: &str) -> Result<Option<(Vec<u8>, String)>, ApiE
         return Ok(None);
     }
 
-    let (header, encoded) = trimmed.split_once(',').ok_or_else(|| {
-        ApiError::new(StatusCode::BAD_REQUEST, "data:image 参数格式无效")
-    })?;
+    let (header, encoded) = trimmed
+        .split_once(',')
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "data:image 参数格式无效"))?;
     if !header.to_ascii_lowercase().contains(";base64") {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -2702,10 +4997,7 @@ async fn upload_image_to_comfyui(
         .text("overwrite", "true")
         .part("image", part);
     let response = client
-        .post(format!(
-            "{}/upload/image",
-            base_url.trim_end_matches('/')
-        ))
+        .post(format!("{}/upload/image", base_url.trim_end_matches('/')))
         .headers(headers.clone())
         .multipart(form)
         .send()
@@ -2987,6 +5279,7 @@ async fn invoke_runninghub_component(
     item: &ComponentDefinition,
     config: &ComponentServiceConfig,
     params: &Map<String, Value>,
+    agent_id: Option<&str>,
 ) -> Result<ComponentInvokeResult, ApiError> {
     validate_component_invoke_params(item, params)?;
     if item
@@ -3056,59 +5349,1579 @@ async fn invoke_runninghub_component(
         "usePersonalQueue".to_string(),
         Value::Bool(item.workflow.runninghub_use_personal_queue),
     );
+    let request_payload = Value::Object(payload);
+    let owner_agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
+    if should_run_runninghub_component_as_background_job(item, owner_agent_id) {
+        return enqueue_runninghub_component_job(
+            item,
+            config,
+            params,
+            request_payload,
+            owner_agent_id,
+        );
+    }
+    let raw = request_runninghub_component_raw(item, config, &request_payload)
+        .await
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    build_runninghub_component_invoke_result(item, params, owner_agent_id, &raw).await
+}
 
+fn should_run_runninghub_component_as_background_job(
+    item: &ComponentDefinition,
+    owner_agent_id: Option<&str>,
+) -> bool {
+    owner_agent_id.is_some() && matches!(item.return_type, ComponentReturnType::Video)
+}
+
+fn should_run_comfyui_component_as_background_job(
+    item: &ComponentDefinition,
+    owner_agent_id: Option<&str>,
+) -> bool {
+    owner_agent_id.is_some() && matches!(item.return_type, ComponentReturnType::Video)
+}
+
+fn enqueue_comfyui_component_job(
+    item: &ComponentDefinition,
+    config: &ComponentServiceConfig,
+    params: &Map<String, Value>,
+    prompt_payload: Value,
+    owner_agent_id: Option<&str>,
+) -> Result<ComponentInvokeResult, ApiError> {
+    let owner_agent_id = owner_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "异步组件任务缺少 agent id"))?;
+    let provider_meta = build_component_provider_meta(item);
+    let title = if item.name.trim().is_empty() {
+        "组件任务".to_string()
+    } else {
+        item.name.trim().to_string()
+    };
+    let summary = format!("{title} 已提交，正在生成视频");
+    let capability_key = if item.capability_binding.capability_key.trim().is_empty() {
+        "generate.video".to_string()
+    } else {
+        item.capability_binding.capability_key.trim().to_string()
+    };
+    let capability_scope = if item.capability_binding.capability_scope.trim().is_empty() {
+        "generic".to_string()
+    } else {
+        item.capability_binding.capability_scope.trim().to_string()
+    };
+    let provider_id = component_capability_provider_id(item);
+    let job_type = component_return_type_to_media_kind(&item.return_type)
+        .unwrap_or("video")
+        .to_string();
+    let local_job_id = format!("component-job-{}", Uuid::new_v4().simple());
+    let initial_presentable = json!({
+        "kind": "job_result",
+        "title": title,
+        "summary": summary,
+        "status": "queued",
+        "stage": "dispatching",
+        "job_type": job_type,
+        "job_id": local_job_id,
+        "capability_key": capability_key,
+        "capability_scope": capability_scope,
+        "provider_id": provider_id,
+        "provider_type": "component_skill",
+        "route": "component_skill",
+        "providerMeta": provider_meta.clone(),
+        "metadata": {
+            "componentName": item.name,
+            "componentEnglishName": item.english_name,
+            "componentType": item.component_type,
+            "dispatchPending": true,
+        }
+    });
+    let persisted = assignment_store::upsert_capability_job(CapabilityJobRecord {
+        job_id: local_job_id.clone(),
+        owner_agent_id: owner_agent_id.to_string(),
+        capability_key: capability_key.clone(),
+        capability_scope: capability_scope.clone(),
+        provider_id: Some(provider_id.clone()),
+        provider_type: Some("component_skill".to_string()),
+        route: Some("component_skill".to_string()),
+        title: Some(title.clone()),
+        summary: Some(summary.clone()),
+        status: "queued".to_string(),
+        progress_percent: None,
+        stage: Some("dispatching".to_string()),
+        job_type: Some(job_type.clone()),
+        input_payload: Value::Object(params.clone()),
+        result_payload: json!({
+            "presentable_result": initial_presentable.clone(),
+            "request_payload": prompt_payload.clone(),
+        }),
+        error_message: None,
+        metadata: json!({
+            "componentName": item.name,
+            "componentEnglishName": item.english_name,
+            "componentType": item.component_type,
+            "dispatchPending": true,
+        }),
+        created_at: String::new(),
+        updated_at: String::new(),
+        started_at: Some(current_unix_timestamp_string()),
+        finished_at: None,
+        last_heartbeat_at: Some(current_unix_timestamp_string()),
+    })
+    .map_err(|err| internal_error(format!("创建组件任务失败: {err}")))?;
+
+    let item_owned = item.clone();
+    let config_owned = config.clone();
+    let prompt_payload_owned = prompt_payload.clone();
+    let job_id_owned = local_job_id.clone();
+    let owner_agent_id_owned = owner_agent_id.to_string();
+    let capability_key_owned = capability_key.clone();
+    let capability_scope_owned = capability_scope.clone();
+    let provider_id_owned = provider_id.clone();
+    let job_type_owned = job_type.clone();
+    tokio::spawn(async move {
+        let _ = assignment_store::upsert_capability_job(CapabilityJobRecord {
+            status: "running".to_string(),
+            stage: Some("submitting".to_string()),
+            summary: Some(format!(
+                "{} 正在提交到 ComfyUI",
+                if item_owned.name.trim().is_empty() {
+                    "组件任务"
+                } else {
+                    item_owned.name.trim()
+                }
+            )),
+            last_heartbeat_at: Some(current_unix_timestamp_string()),
+            ..persisted.clone()
+        });
+
+        let submit_result = async {
+            let client = build_comfyui_client().map_err(|err| err.message)?;
+            let headers = build_provider_headers(&config_owned).map_err(|err| err.message)?;
+            let base_url =
+                normalize_url_or_default(&config_owned.server_url, &default_comfyui_server_url());
+            submit_comfyui_prompt(&client, &headers, &base_url, &prompt_payload_owned)
+                .await
+                .map_err(|err| err.message)
+        }
+        .await;
+
+        match submit_result {
+            Ok((provider_request_id, enqueue_raw)) => {
+                let submitted_summary = format!(
+                    "{} 已提交到 ComfyUI，正在生成视频",
+                    if item_owned.name.trim().is_empty() {
+                        "组件任务"
+                    } else {
+                        item_owned.name.trim()
+                    }
+                );
+                let queued_presentable = bind_component_job_result_to_local_job(
+                    &json!({
+                        "kind": "job_result",
+                        "title": persisted.title.clone().unwrap_or_else(|| "组件任务".to_string()),
+                        "summary": submitted_summary,
+                        "status": "running",
+                        "stage": "submitted",
+                        "job_type": job_type_owned,
+                        "job_id": provider_request_id,
+                        "capability_key": capability_key_owned,
+                        "capability_scope": capability_scope_owned,
+                        "provider_id": provider_id_owned,
+                        "provider_type": "component_skill",
+                        "route": "component_skill",
+                        "providerMeta": build_component_provider_meta(&item_owned),
+                        "metadata": {
+                            "componentName": item_owned.name,
+                            "componentEnglishName": item_owned.english_name,
+                            "componentType": item_owned.component_type,
+                            "providerRequestId": provider_request_id,
+                        }
+                    }),
+                    &job_id_owned,
+                    Some(&provider_request_id),
+                );
+                let _ = assignment_store::upsert_capability_job(CapabilityJobRecord {
+                    job_id: job_id_owned,
+                    owner_agent_id: owner_agent_id_owned,
+                    capability_key: capability_key_owned,
+                    capability_scope: capability_scope_owned,
+                    provider_id: Some(provider_id_owned),
+                    provider_type: Some("component_skill".to_string()),
+                    route: Some("component_skill".to_string()),
+                    title: persisted.title.clone(),
+                    summary: Some(submitted_summary),
+                    status: "running".to_string(),
+                    progress_percent: None,
+                    stage: Some("submitted".to_string()),
+                    job_type: Some(job_type_owned),
+                    input_payload: persisted.input_payload.clone(),
+                    result_payload: json!({
+                        "raw": enqueue_raw,
+                        "presentable_result": queued_presentable,
+                        "request_payload": prompt_payload_owned,
+                    }),
+                    error_message: None,
+                    metadata: json!({
+                        "componentName": item_owned.name,
+                        "componentEnglishName": item_owned.english_name,
+                        "componentType": item_owned.component_type,
+                        "dispatchPending": false,
+                        "providerRequestId": provider_request_id,
+                    }),
+                    created_at: persisted.created_at.clone(),
+                    updated_at: String::new(),
+                    started_at: persisted.started_at.clone(),
+                    finished_at: None,
+                    last_heartbeat_at: Some(current_unix_timestamp_string()),
+                });
+            }
+            Err(error) => {
+                let _ = assignment_store::upsert_capability_job(CapabilityJobRecord {
+                    job_id: job_id_owned,
+                    owner_agent_id: owner_agent_id_owned,
+                    capability_key: capability_key_owned,
+                    capability_scope: capability_scope_owned,
+                    provider_id: Some(provider_id_owned),
+                    provider_type: Some("component_skill".to_string()),
+                    route: Some("component_skill".to_string()),
+                    title: persisted.title.clone(),
+                    summary: Some("视频生成失败".to_string()),
+                    status: "failed".to_string(),
+                    progress_percent: None,
+                    stage: Some("failed".to_string()),
+                    job_type: Some(job_type_owned),
+                    input_payload: persisted.input_payload.clone(),
+                    result_payload: json!({
+                        "presentable_result": {
+                            "kind": "error_result",
+                            "title": persisted.title.clone().unwrap_or_else(|| "视频生成失败".to_string()),
+                            "message": error.clone(),
+                        },
+                        "request_payload": prompt_payload_owned,
+                    }),
+                    error_message: Some(error),
+                    metadata: json!({
+                        "componentName": item_owned.name,
+                        "componentEnglishName": item_owned.english_name,
+                        "componentType": item_owned.component_type,
+                        "dispatchPending": false,
+                    }),
+                    created_at: persisted.created_at.clone(),
+                    updated_at: String::new(),
+                    started_at: persisted.started_at.clone(),
+                    finished_at: Some(current_unix_timestamp_string()),
+                    last_heartbeat_at: Some(current_unix_timestamp_string()),
+                });
+            }
+        }
+    });
+
+    Ok(ComponentInvokeResult {
+        output_type: item.return_type.clone(),
+        text: summary.clone(),
+        items: Vec::new(),
+        raw: json!({
+            "job_id": local_job_id,
+            "status": "queued",
+            "message": summary,
+            "provider_id": provider_id,
+            "provider_type": "component_skill",
+            "route": "component_skill",
+        }),
+        presentable_result: Some(initial_presentable),
+        provider_meta: Some(provider_meta),
+    })
+}
+
+fn enqueue_runninghub_component_job(
+    item: &ComponentDefinition,
+    config: &ComponentServiceConfig,
+    params: &Map<String, Value>,
+    request_payload: Value,
+    owner_agent_id: Option<&str>,
+) -> Result<ComponentInvokeResult, ApiError> {
+    let owner_agent_id = owner_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "异步组件任务缺少 agent id"))?;
+    let provider_meta = build_component_provider_meta(item);
+    let title = if item.name.trim().is_empty() {
+        "组件任务".to_string()
+    } else {
+        item.name.trim().to_string()
+    };
+    let summary = format!("{title} 已提交，正在生成视频");
+    let capability_key = if item.capability_binding.capability_key.trim().is_empty() {
+        "generate.video".to_string()
+    } else {
+        item.capability_binding.capability_key.trim().to_string()
+    };
+    let capability_scope = if item.capability_binding.capability_scope.trim().is_empty() {
+        "generic".to_string()
+    } else {
+        item.capability_binding.capability_scope.trim().to_string()
+    };
+    let provider_id = component_capability_provider_id(item);
+    let job_type = component_return_type_to_media_kind(&item.return_type)
+        .unwrap_or("video")
+        .to_string();
+    let local_job_id = format!("component-job-{}", Uuid::new_v4().simple());
+    let initial_presentable = json!({
+        "kind": "job_result",
+        "title": title,
+        "summary": summary,
+        "status": "queued",
+        "stage": "dispatching",
+        "job_type": job_type,
+        "job_id": local_job_id,
+        "capability_key": capability_key,
+        "capability_scope": capability_scope,
+        "provider_id": provider_id,
+        "provider_type": "component_skill",
+        "route": "component_skill",
+        "providerMeta": provider_meta.clone(),
+        "metadata": {
+            "componentName": item.name,
+            "componentEnglishName": item.english_name,
+            "componentType": item.component_type,
+            "dispatchPending": true,
+        }
+    });
+    let persisted = assignment_store::upsert_capability_job(CapabilityJobRecord {
+        job_id: local_job_id.clone(),
+        owner_agent_id: owner_agent_id.to_string(),
+        capability_key: capability_key.clone(),
+        capability_scope: capability_scope.clone(),
+        provider_id: Some(provider_id.clone()),
+        provider_type: Some("component_skill".to_string()),
+        route: Some("component_skill".to_string()),
+        title: Some(title.clone()),
+        summary: Some(summary.clone()),
+        status: "queued".to_string(),
+        progress_percent: None,
+        stage: Some("dispatching".to_string()),
+        job_type: Some(job_type.clone()),
+        input_payload: Value::Object(params.clone()),
+        result_payload: json!({
+            "presentable_result": initial_presentable.clone(),
+            "request_payload": request_payload.clone(),
+        }),
+        error_message: None,
+        metadata: json!({
+            "componentName": item.name,
+            "componentEnglishName": item.english_name,
+            "componentType": item.component_type,
+            "dispatchPending": true,
+        }),
+        created_at: String::new(),
+        updated_at: String::new(),
+        started_at: Some(current_unix_timestamp_string()),
+        finished_at: None,
+        last_heartbeat_at: Some(current_unix_timestamp_string()),
+    })
+    .map_err(|err| internal_error(format!("创建组件任务失败: {err}")))?;
+
+    let item_owned = item.clone();
+    let config_owned = config.clone();
+    let request_payload_owned = request_payload.clone();
+    let job_id_owned = local_job_id.clone();
+    let owner_agent_id_owned = owner_agent_id.to_string();
+    let capability_key_owned = capability_key.clone();
+    let capability_scope_owned = capability_scope.clone();
+    let provider_id_owned = provider_id.clone();
+    let job_type_owned = job_type.clone();
+    tokio::spawn(async move {
+        let _ = assignment_store::upsert_capability_job(CapabilityJobRecord {
+            status: "running".to_string(),
+            stage: Some("submitting".to_string()),
+            summary: Some(format!(
+                "{} 正在提交到云端",
+                if item_owned.name.trim().is_empty() {
+                    "组件任务"
+                } else {
+                    item_owned.name.trim()
+                }
+            )),
+            last_heartbeat_at: Some(current_unix_timestamp_string()),
+            ..persisted.clone()
+        });
+
+        match request_runninghub_component_raw(&item_owned, &config_owned, &request_payload_owned)
+            .await
+        {
+            Ok(raw) => {
+                let provider_meta = build_component_provider_meta(&item_owned);
+                let response_text =
+                    extract_generic_text(&raw).unwrap_or_else(|| stringify_value_compact(&raw));
+                let async_presentable = build_component_async_job_presentable_result(
+                    &item_owned,
+                    &raw,
+                    &response_text,
+                    &provider_meta,
+                );
+                let provider_request_id = pick_component_text(
+                    &raw,
+                    &[
+                        "request_id",
+                        "requestId",
+                        "task_id",
+                        "taskId",
+                        "id",
+                        "job_id",
+                        "jobId",
+                    ],
+                );
+                let async_presentable = async_presentable.as_ref().map(|value| {
+                    bind_component_job_result_to_local_job(
+                        value,
+                        &job_id_owned,
+                        provider_request_id.as_deref(),
+                    )
+                });
+                let items = extract_generic_output_items(&raw, &item_owned.return_type);
+                let final_presentable = async_presentable.clone().or_else(|| {
+                    build_component_presentable_result(
+                        &item_owned,
+                        &response_text,
+                        &raw,
+                        &items,
+                        &provider_meta,
+                    )
+                });
+                let remote_status = async_presentable
+                    .as_ref()
+                    .and_then(|value| pick_component_text(value, &["status", "state"]))
+                    .unwrap_or_else(|| {
+                        if final_presentable.is_some() {
+                            "completed".to_string()
+                        } else {
+                            "running".to_string()
+                        }
+                    });
+                let summary = if remote_status == "completed" && async_presentable.is_none() {
+                    summarize_component_job_completion(
+                        final_presentable.as_ref(),
+                        &response_text,
+                        persisted.summary.as_deref(),
+                    )
+                } else {
+                    Some(response_text.clone())
+                        .filter(|value| is_meaningful_component_output_text(value))
+                        .or_else(|| persisted.summary.clone())
+                };
+                let _ = assignment_store::upsert_capability_job(CapabilityJobRecord {
+                    job_id: job_id_owned,
+                    owner_agent_id: owner_agent_id_owned,
+                    capability_key: capability_key_owned,
+                    capability_scope: capability_scope_owned,
+                    provider_id: Some(provider_id_owned),
+                    provider_type: Some("component_skill".to_string()),
+                    route: Some("component_skill".to_string()),
+                    title: persisted.title.clone(),
+                    summary,
+                    status: remote_status.clone(),
+                    progress_percent: final_presentable.as_ref().and_then(|value| {
+                        pick_component_number(
+                            value,
+                            &["progress_percent", "progressPercent", "progress", "percent"],
+                        )
+                    }),
+                    stage: final_presentable
+                        .as_ref()
+                        .and_then(|value| {
+                            pick_component_text(value, &["stage", "current_stage", "currentStage"])
+                        })
+                        .or_else(|| {
+                            if remote_status == "completed" && async_presentable.is_none() {
+                                Some("completed".to_string())
+                            } else {
+                                Some("submitted".to_string())
+                            }
+                        }),
+                    job_type: Some(job_type_owned),
+                    input_payload: persisted.input_payload.clone(),
+                    result_payload: json!({
+                        "raw": raw,
+                        "presentable_result": final_presentable,
+                        "request_payload": request_payload_owned,
+                    }),
+                    error_message: None,
+                    metadata: json!({
+                        "componentName": item_owned.name,
+                        "componentEnglishName": item_owned.english_name,
+                        "componentType": item_owned.component_type,
+                        "dispatchPending": false,
+                        "providerRequestId": provider_request_id,
+                    }),
+                    created_at: persisted.created_at.clone(),
+                    updated_at: String::new(),
+                    started_at: persisted.started_at.clone(),
+                    finished_at: if remote_status == "completed" && async_presentable.is_none() {
+                        Some(current_unix_timestamp_string())
+                    } else {
+                        None
+                    },
+                    last_heartbeat_at: Some(current_unix_timestamp_string()),
+                });
+            }
+            Err(error) => {
+                let _ = assignment_store::upsert_capability_job(CapabilityJobRecord {
+                    job_id: job_id_owned,
+                    owner_agent_id: owner_agent_id_owned,
+                    capability_key: capability_key_owned,
+                    capability_scope: capability_scope_owned,
+                    provider_id: Some(provider_id_owned),
+                    provider_type: Some("component_skill".to_string()),
+                    route: Some("component_skill".to_string()),
+                    title: persisted.title.clone(),
+                    summary: Some("视频生成失败".to_string()),
+                    status: "failed".to_string(),
+                    progress_percent: None,
+                    stage: Some("failed".to_string()),
+                    job_type: Some(job_type_owned),
+                    input_payload: persisted.input_payload.clone(),
+                    result_payload: json!({
+                        "presentable_result": {
+                            "kind": "error_result",
+                            "title": persisted.title.clone().unwrap_or_else(|| "视频生成失败".to_string()),
+                            "message": error.clone(),
+                        },
+                        "request_payload": request_payload_owned,
+                    }),
+                    error_message: Some(error),
+                    metadata: json!({
+                        "componentName": item_owned.name,
+                        "componentEnglishName": item_owned.english_name,
+                        "componentType": item_owned.component_type,
+                        "dispatchPending": false,
+                    }),
+                    created_at: persisted.created_at.clone(),
+                    updated_at: String::new(),
+                    started_at: persisted.started_at.clone(),
+                    finished_at: Some(current_unix_timestamp_string()),
+                    last_heartbeat_at: Some(current_unix_timestamp_string()),
+                });
+            }
+        }
+    });
+
+    Ok(ComponentInvokeResult {
+        output_type: item.return_type.clone(),
+        text: summary.clone(),
+        items: Vec::new(),
+        raw: json!({
+            "job_id": local_job_id,
+            "status": "queued",
+            "message": summary,
+            "provider_id": provider_id,
+            "provider_type": "component_skill",
+            "route": "component_skill",
+        }),
+        presentable_result: Some(initial_presentable),
+        provider_meta: Some(provider_meta),
+    })
+}
+
+async fn request_runninghub_component_raw(
+    item: &ComponentDefinition,
+    config: &ComponentServiceConfig,
+    payload: &Value,
+) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
-        .map_err(|err| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("创建 RunningHub 客户端失败: {err}"),
-            )
-        })?;
+        .map_err(|err| format!("创建 RunningHub 客户端失败: {err}"))?;
     let request_url = item.workflow.request_url.trim().to_string();
-    let mut headers = build_provider_headers(config)?;
+    let mut headers = build_provider_headers(config).map_err(|err| err.message)?;
     if !headers.contains_key(CONTENT_TYPE) {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
     let response = client
         .post(&request_url)
         .headers(headers)
-        .json(&Value::Object(payload))
+        .json(payload)
         .send()
         .await
-        .map_err(|err| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("请求 RunningHub 失败: {err}"),
-            )
-        })?;
+        .map_err(|err| format!("请求 RunningHub 失败: {err}"))?;
     let status = response.status();
-    let text = response.text().await.map_err(|err| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("读取 RunningHub 响应失败: {err}"),
-        )
-    })?;
+    let text = response
+        .text()
+        .await
+        .map_err(|err| format!("读取 RunningHub 响应失败: {err}"))?;
     if !status.is_success() {
-        return Err(ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("RunningHub 返回错误({status}): {}", text.trim()),
-        ));
+        return Err(format!("RunningHub 返回错误({status}): {}", text.trim()));
     }
-    let raw = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text.clone()));
-    let items = extract_generic_output_items(&raw, &item.return_type);
+    Ok(serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text)))
+}
+
+async fn build_runninghub_component_invoke_result(
+    item: &ComponentDefinition,
+    params: &Map<String, Value>,
+    owner_agent_id: Option<&str>,
+    raw: &Value,
+) -> Result<ComponentInvokeResult, ApiError> {
+    let localized = localize_component_video_outputs(
+        item,
+        raw,
+        &extract_generic_output_items(raw, &item.return_type),
+        owner_agent_id,
+        Some(&Value::Object(params.clone())),
+    )
+    .await
+    .map_err(internal_error)?;
+    let items = localized.items;
     let response_text = if items.is_empty() {
-        extract_generic_text(&raw).unwrap_or_else(|| stringify_value_compact(&raw))
+        extract_generic_text(&localized.raw)
+            .unwrap_or_else(|| stringify_value_compact(&localized.raw))
     } else {
-        extract_generic_text(&raw).unwrap_or_default()
+        extract_generic_text(&localized.raw).unwrap_or_default()
     };
+    let provider_meta = build_component_provider_meta(item);
+    let presentable_result = build_component_async_job_presentable_result(
+        item,
+        &localized.raw,
+        &response_text,
+        &provider_meta,
+    )
+    .or_else(|| {
+        build_component_presentable_result(
+            item,
+            &response_text,
+            &localized.raw,
+            &items,
+            &provider_meta,
+        )
+    });
     Ok(ComponentInvokeResult {
         output_type: item.return_type.clone(),
         text: response_text,
         items,
-        raw,
+        raw: localized.raw,
+        presentable_result,
+        provider_meta: Some(provider_meta),
     })
+}
+
+fn bind_component_job_result_to_local_job(
+    value: &Value,
+    local_job_id: &str,
+    provider_request_id: Option<&str>,
+) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut output = object.clone();
+    output.insert(
+        "job_id".to_string(),
+        Value::String(local_job_id.to_string()),
+    );
+    output.insert("jobId".to_string(), Value::String(local_job_id.to_string()));
+    let mut metadata = output
+        .get("metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(remote_id) = provider_request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert(
+            "providerRequestId".to_string(),
+            Value::String(remote_id.to_string()),
+        );
+    }
+    metadata.insert(
+        "localJobId".to_string(),
+        Value::String(local_job_id.to_string()),
+    );
+    output.insert("metadata".to_string(), Value::Object(metadata));
+    Value::Object(output)
+}
+
+pub(crate) async fn refresh_component_capability_job(
+    record: &CapabilityJobRecord,
+) -> Result<Option<CapabilityJobRecord>, String> {
+    let provider_type = record.provider_type.as_deref().unwrap_or_default().trim();
+    let route = record.route.as_deref().unwrap_or_default().trim();
+    if !provider_type.eq_ignore_ascii_case("component_skill")
+        && !route.eq_ignore_ascii_case("component_skill")
+    {
+        return Ok(None);
+    }
+    let Some(component_key) = extract_component_job_component_key(record) else {
+        return Ok(None);
+    };
+    let item = load_component_definition_by_lookup_key(&component_key)
+        .map_err(|err| err.message)?
+        .ok_or_else(|| format!("未找到组件定义: {component_key}"))?;
+    let dispatch_pending = record
+        .metadata
+        .get("dispatchPending")
+        .or_else(|| record.metadata.get("dispatch_pending"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_provider_request_id = extract_component_job_provider_request_id(record).is_some();
+    if dispatch_pending && !has_provider_request_id {
+        return Ok(None);
+    }
+
+    let Some(provider_request_id) = extract_component_job_provider_request_id(record) else {
+        return Ok(None);
+    };
+    let configs = read_component_provider_configs()?;
+    if item.provider_type == ComponentProviderType::Comfyui {
+        let history_raw =
+            request_comfyui_job_history(&configs.comfyui, &provider_request_id).await?;
+        let base_url =
+            normalize_url_or_default(&configs.comfyui.server_url, &default_comfyui_server_url());
+        let localized = localize_component_video_outputs(
+            &item,
+            &history_raw,
+            &extract_comfyui_items(&base_url, &history_raw, &item.return_type),
+            Some(record.owner_agent_id.as_str()),
+            Some(&record.input_payload),
+        )
+        .await?;
+        let history_raw = localized.raw;
+        let output_items = localized.items;
+        let output_text = pick_component_text_deep(
+            &history_raw,
+            &["summary", "detail", "message", "msg", "status_str"],
+        )
+        .unwrap_or_default();
+        let provider_meta = build_component_provider_meta(&item);
+        let candidate_presentable_result = build_component_presentable_result(
+            &item,
+            &output_text,
+            &history_raw,
+            &output_items,
+            &provider_meta,
+        );
+        let normalized_status = derive_comfyui_job_status(&history_raw, record.status.as_str());
+        let error_message = extract_comfyui_job_error_message(Some(&history_raw)).or_else(|| {
+            if normalized_status == "failed" {
+                Some("ComfyUI 执行失败".to_string())
+            } else {
+                None
+            }
+        });
+        let has_presentable_content = !output_items.is_empty()
+            || is_meaningful_component_output_text(&output_text)
+            || candidate_presentable_result
+                .as_ref()
+                .map(has_meaningful_component_presentable_result)
+                .unwrap_or(false);
+        let is_completed = normalized_status == "completed" && has_presentable_content;
+
+        let mut refreshed = record.clone();
+        refreshed.title = refreshed
+            .title
+            .clone()
+            .or_else(|| Some(item.name.trim().to_string()).filter(|value| !value.is_empty()));
+        refreshed.job_type = refreshed.job_type.clone().or_else(|| {
+            component_return_type_to_media_kind(&item.return_type)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    Some(
+                        match item.return_type {
+                            ComponentReturnType::Text => "text",
+                            ComponentReturnType::Image => "image",
+                            ComponentReturnType::Video => "video",
+                            ComponentReturnType::Audio => "audio",
+                        }
+                        .to_string(),
+                    )
+                })
+        });
+        refreshed.progress_percent = if is_completed {
+            Some(100.0)
+        } else {
+            refreshed.progress_percent
+        };
+        refreshed.stage = pick_component_text_deep(
+            &history_raw,
+            &[
+                "stage",
+                "currentStage",
+                "current_stage",
+                "phase",
+                "status_str",
+            ],
+        )
+        .or_else(|| refreshed.stage.clone());
+        refreshed.status = if is_completed {
+            "completed".to_string()
+        } else {
+            normalized_status.clone()
+        };
+        refreshed.last_heartbeat_at = Some(current_unix_timestamp_string());
+        if matches!(
+            refreshed.status.as_str(),
+            "running" | "processing" | "progress"
+        ) && refreshed
+            .started_at
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            refreshed.started_at = Some(current_unix_timestamp_string());
+        }
+        if matches!(refreshed.status.as_str(), "failed" | "error" | "cancelled") {
+            refreshed.finished_at = Some(current_unix_timestamp_string());
+            refreshed.error_message = error_message
+                .clone()
+                .or_else(|| refreshed.error_message.clone());
+        } else if is_completed {
+            refreshed.finished_at = Some(current_unix_timestamp_string());
+            refreshed.error_message = None;
+        }
+        let mut result_payload = merge_component_job_result_payload(
+            &record.result_payload,
+            Some(&history_raw),
+            if is_completed {
+                Some(&history_raw)
+            } else {
+                None
+            },
+            if is_completed {
+                candidate_presentable_result.as_ref()
+            } else {
+                None
+            },
+        );
+        if let Some(object) = result_payload.as_object_mut() {
+            object.insert("history_response".to_string(), history_raw.clone());
+        }
+        refreshed.result_payload = result_payload;
+        refreshed.summary = if is_completed {
+            summarize_component_job_completion(
+                candidate_presentable_result.as_ref(),
+                &output_text,
+                refreshed.summary.as_deref(),
+            )
+            .or_else(|| refreshed.summary.clone())
+        } else if matches!(refreshed.status.as_str(), "failed" | "error" | "cancelled") {
+            error_message.or_else(|| refreshed.summary.clone())
+        } else {
+            summarize_component_job_progress(
+                &history_raw,
+                refreshed.summary.as_deref(),
+                item.name.as_str(),
+            )
+            .or_else(|| refreshed.summary.clone())
+        };
+
+        let changed = refreshed.status != record.status
+            || refreshed.progress_percent != record.progress_percent
+            || refreshed.stage != record.stage
+            || refreshed.summary != record.summary
+            || refreshed.error_message != record.error_message
+            || refreshed.finished_at != record.finished_at
+            || refreshed.started_at != record.started_at
+            || refreshed.result_payload != record.result_payload;
+        if !changed {
+            return Ok(None);
+        }
+        return assignment_store::upsert_capability_job(refreshed).map(Some);
+    }
+    if item.provider_type != ComponentProviderType::Runninghub {
+        return Ok(None);
+    }
+    let outputs_raw = request_runninghub_job_endpoint(
+        &configs.runninghub,
+        RUNNINGHUB_OUTPUTS_ENDPOINT,
+        &provider_request_id,
+    )
+    .await?;
+    let localized = localize_component_video_outputs(
+        &item,
+        &outputs_raw,
+        &extract_generic_output_items(&outputs_raw, &item.return_type),
+        Some(record.owner_agent_id.as_str()),
+        Some(&record.input_payload),
+    )
+    .await?;
+    let outputs_raw = localized.raw;
+    let output_items = localized.items;
+    let output_text = extract_generic_text(&outputs_raw).unwrap_or_default();
+    let provider_meta = build_component_provider_meta(&item);
+    let candidate_presentable_result = build_component_presentable_result(
+        &item,
+        &output_text,
+        &outputs_raw,
+        &output_items,
+        &provider_meta,
+    );
+    let should_query_status = output_items.is_empty()
+        && !is_meaningful_component_output_text(&output_text)
+        && !matches!(
+            normalize_runninghub_job_status_from_value(&outputs_raw).as_deref(),
+            Some("failed" | "cancelled")
+        );
+    let status_raw = if should_query_status {
+        request_runninghub_job_endpoint(
+            &configs.runninghub,
+            RUNNINGHUB_STATUS_ENDPOINT,
+            &provider_request_id,
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+
+    let normalized_status = derive_runninghub_job_status(
+        &outputs_raw,
+        status_raw.as_ref(),
+        output_items.is_empty(),
+        record.status.as_str(),
+    );
+    let stage = pick_component_text_deep(
+        status_raw.as_ref().unwrap_or(&outputs_raw),
+        &[
+            "stage",
+            "currentStage",
+            "current_stage",
+            "phase",
+            "statusText",
+            "status_text",
+        ],
+    )
+    .or_else(|| {
+        pick_component_text_deep(
+            &outputs_raw,
+            &[
+                "stage",
+                "currentStage",
+                "current_stage",
+                "phase",
+                "statusText",
+                "status_text",
+            ],
+        )
+    });
+    let progress_percent = pick_component_number_deep(
+        status_raw.as_ref().unwrap_or(&outputs_raw),
+        &["progressPercent", "progress_percent", "progress", "percent"],
+    )
+    .or_else(|| {
+        pick_component_number_deep(
+            &outputs_raw,
+            &["progressPercent", "progress_percent", "progress", "percent"],
+        )
+    });
+    let error_message = extract_runninghub_job_error_message(status_raw.as_ref())
+        .or_else(|| extract_runninghub_job_error_message(Some(&outputs_raw)));
+    let has_presentable_content = !output_items.is_empty()
+        || is_meaningful_component_output_text(&output_text)
+        || candidate_presentable_result
+            .as_ref()
+            .map(has_meaningful_component_presentable_result)
+            .unwrap_or(false);
+    let is_completed = normalized_status == "completed" && has_presentable_content;
+
+    let mut refreshed = record.clone();
+    refreshed.title = refreshed
+        .title
+        .clone()
+        .or_else(|| Some(item.name.trim().to_string()).filter(|value| !value.is_empty()));
+    refreshed.job_type = refreshed.job_type.clone().or_else(|| {
+        component_return_type_to_media_kind(&item.return_type)
+            .map(ToString::to_string)
+            .or_else(|| {
+                Some(
+                    match item.return_type {
+                        ComponentReturnType::Text => "text",
+                        ComponentReturnType::Image => "image",
+                        ComponentReturnType::Video => "video",
+                        ComponentReturnType::Audio => "audio",
+                    }
+                    .to_string(),
+                )
+            })
+    });
+    refreshed.progress_percent = if is_completed {
+        Some(100.0)
+    } else {
+        progress_percent.or(refreshed.progress_percent)
+    };
+    refreshed.stage = stage.or_else(|| refreshed.stage.clone());
+    refreshed.status = if is_completed {
+        "completed".to_string()
+    } else {
+        normalized_status.clone()
+    };
+    refreshed.last_heartbeat_at = Some(current_unix_timestamp_string());
+    if matches!(
+        refreshed.status.as_str(),
+        "running" | "processing" | "progress"
+    ) && refreshed
+        .started_at
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        refreshed.started_at = Some(current_unix_timestamp_string());
+    }
+    if matches!(refreshed.status.as_str(), "failed" | "error" | "cancelled") {
+        refreshed.finished_at = Some(current_unix_timestamp_string());
+        refreshed.error_message = error_message
+            .clone()
+            .or_else(|| refreshed.error_message.clone());
+    } else if is_completed {
+        refreshed.finished_at = Some(current_unix_timestamp_string());
+        refreshed.error_message = None;
+    }
+    refreshed.result_payload = merge_component_job_result_payload(
+        &record.result_payload,
+        status_raw.as_ref(),
+        Some(&outputs_raw),
+        if is_completed {
+            candidate_presentable_result.as_ref()
+        } else {
+            None
+        },
+    );
+    refreshed.summary = if is_completed {
+        summarize_component_job_completion(
+            candidate_presentable_result.as_ref(),
+            &output_text,
+            refreshed.summary.as_deref(),
+        )
+        .or_else(|| refreshed.summary.clone())
+    } else if matches!(refreshed.status.as_str(), "failed" | "error" | "cancelled") {
+        error_message.or_else(|| refreshed.summary.clone())
+    } else {
+        summarize_component_job_progress(
+            status_raw.as_ref().unwrap_or(&outputs_raw),
+            refreshed.summary.as_deref(),
+            item.name.as_str(),
+        )
+        .or_else(|| refreshed.summary.clone())
+    };
+
+    let changed = refreshed.status != record.status
+        || refreshed.progress_percent != record.progress_percent
+        || refreshed.stage != record.stage
+        || refreshed.summary != record.summary
+        || refreshed.error_message != record.error_message
+        || refreshed.finished_at != record.finished_at
+        || refreshed.started_at != record.started_at
+        || refreshed.result_payload != record.result_payload;
+    if !changed {
+        return Ok(None);
+    }
+    assignment_store::upsert_capability_job(refreshed).map(Some)
+}
+
+fn extract_component_job_component_key(record: &CapabilityJobRecord) -> Option<String> {
+    pick_component_text_deep(
+        &record.metadata,
+        &[
+            "componentEnglishName",
+            "component_english_name",
+            "componentName",
+            "component_name",
+        ],
+    )
+    .or_else(|| {
+        pick_component_text_deep(
+            &record.result_payload,
+            &[
+                "componentEnglishName",
+                "component_english_name",
+                "componentName",
+                "component_name",
+            ],
+        )
+    })
+}
+
+fn extract_component_job_provider_request_id(record: &CapabilityJobRecord) -> Option<String> {
+    pick_component_text_deep(
+        &record.metadata,
+        &[
+            "providerRequestId",
+            "provider_request_id",
+            "taskId",
+            "task_id",
+            "requestId",
+            "request_id",
+        ],
+    )
+    .or_else(|| {
+        pick_component_text_deep(
+            &record.result_payload,
+            &[
+                "providerRequestId",
+                "provider_request_id",
+                "taskId",
+                "task_id",
+                "requestId",
+                "request_id",
+            ],
+        )
+    })
+}
+
+async fn request_runninghub_job_endpoint(
+    config: &ComponentServiceConfig,
+    endpoint: &str,
+    provider_request_id: &str,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(RUNNINGHUB_JOB_QUERY_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| format!("创建 RunningHub 查询客户端失败: {err}"))?;
+    let mut headers = build_provider_headers(config).map_err(|err| err.message)?;
+    if !headers.contains_key(CONTENT_TYPE) {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    let url = format!("{}{}", config.server_url.trim_end_matches('/'), endpoint);
+    let mut payload = Map::new();
+    payload.insert(
+        "taskId".to_string(),
+        Value::String(provider_request_id.to_string()),
+    );
+    let api_key = config.api_key.trim();
+    if !api_key.is_empty() {
+        payload.insert("apiKey".to_string(), Value::String(api_key.to_string()));
+    }
+    let response = client
+        .post(&url)
+        .headers(headers)
+        .json(&Value::Object(payload))
+        .send()
+        .await
+        .map_err(|err| format!("请求 RunningHub 任务接口失败({url}): {err}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| format!("读取 RunningHub 任务接口响应失败({url}): {err}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "RunningHub 任务接口返回错误({status}, {url}): {}",
+            text.trim()
+        ));
+    }
+    Ok(serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text)))
+}
+
+async fn request_comfyui_job_history(
+    config: &ComponentServiceConfig,
+    provider_request_id: &str,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(COMFYUI_JOB_QUERY_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| format!("创建 ComfyUI 查询客户端失败: {err}"))?;
+    let headers = build_provider_headers(config).map_err(|err| err.message)?;
+    let base_url = normalize_url_or_default(&config.server_url, &default_comfyui_server_url());
+    let history_url = format!("{base_url}/history/{provider_request_id}");
+    let response = client
+        .get(&history_url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|err| format!("请求 ComfyUI 历史失败({history_url}): {err}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| format!("读取 ComfyUI 历史响应失败({history_url}): {err}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "ComfyUI 历史接口返回错误({status}, {history_url}): {}",
+            text.trim()
+        ));
+    }
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|err| format!("ComfyUI 历史接口返回非 JSON({history_url}): {err}; body={text}"))?;
+    Ok(payload.get(provider_request_id).cloned().unwrap_or(payload))
+}
+
+fn find_nested_value_by_keys<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    match value {
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(hit) = object.get(*key) {
+                    return Some(hit);
+                }
+            }
+            for nested in object.values() {
+                if let Some(hit) = find_nested_value_by_keys(nested, keys) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(hit) = find_nested_value_by_keys(item, keys) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn pick_component_text_deep(value: &Value, keys: &[&str]) -> Option<String> {
+    let hit = find_nested_value_by_keys(value, keys)?;
+    match hit {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+fn pick_component_number_deep(value: &Value, keys: &[&str]) -> Option<f64> {
+    let hit = find_nested_value_by_keys(value, keys)?;
+    match hit {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn normalize_runninghub_job_status(raw_status: &str) -> String {
+    let lowered = raw_status.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return "queued".to_string();
+    }
+    match lowered.as_str() {
+        "success" | "succeeded" | "succeed" | "done" | "completed" | "complete" | "finished"
+        | "finish" => "completed".to_string(),
+        "failed" | "fail" | "error" | "exception" => "failed".to_string(),
+        "cancelled" | "canceled" | "cancel" | "aborted" => "cancelled".to_string(),
+        "running" | "processing" | "progress" | "executing" | "working" | "in_progress"
+        | "started" => "running".to_string(),
+        "pending" | "queued" | "waiting" | "submitted" | "created" | "init" | "initializing" => {
+            "queued".to_string()
+        }
+        _ if lowered.contains("fail") || lowered.contains("error") => "failed".to_string(),
+        _ if lowered.contains("cancel") => "cancelled".to_string(),
+        _ if lowered.contains("finish")
+            || lowered.contains("complete")
+            || lowered.contains("success") =>
+        {
+            "completed".to_string()
+        }
+        _ if lowered.contains("run")
+            || lowered.contains("process")
+            || lowered.contains("progress")
+            || lowered.contains("execut") =>
+        {
+            "running".to_string()
+        }
+        _ if lowered.contains("queue")
+            || lowered.contains("wait")
+            || lowered.contains("pend")
+            || lowered.contains("submit") =>
+        {
+            "queued".to_string()
+        }
+        _ => lowered,
+    }
+}
+
+fn normalize_comfyui_job_status(raw_status: &str) -> String {
+    let lowered = raw_status.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return "queued".to_string();
+    }
+    match lowered.as_str() {
+        "success" | "succeeded" | "done" | "completed" | "complete" | "finished" | "finish" => {
+            "completed".to_string()
+        }
+        "error" | "failed" | "failure" | "cancelled" | "canceled" => "failed".to_string(),
+        _ if lowered.contains("error")
+            || lowered.contains("fail")
+            || lowered.contains("cancel")
+            || lowered.contains("timeout") =>
+        {
+            "failed".to_string()
+        }
+        _ if lowered.contains("queue")
+            || lowered.contains("wait")
+            || lowered.contains("pend")
+            || lowered.contains("submit") =>
+        {
+            "queued".to_string()
+        }
+        _ if lowered.contains("run")
+            || lowered.contains("process")
+            || lowered.contains("progress")
+            || lowered.contains("execut") =>
+        {
+            "running".to_string()
+        }
+        _ => lowered,
+    }
+}
+
+fn normalize_runninghub_job_status_from_value(value: &Value) -> Option<String> {
+    pick_component_text_deep(
+        value,
+        &["taskStatus", "task_status", "status", "state", "phase"],
+    )
+    .map(|status| normalize_runninghub_job_status(&status))
+}
+
+fn normalize_comfyui_job_status_from_value(value: &Value) -> Option<String> {
+    pick_component_text_deep(
+        value,
+        &[
+            "status_str",
+            "status",
+            "state",
+            "phase",
+            "execution_status",
+            "executionStatus",
+        ],
+    )
+    .map(|status| normalize_comfyui_job_status(&status))
+}
+
+fn extract_runninghub_job_error_message(value: Option<&Value>) -> Option<String> {
+    let Some(value) = value else {
+        return None;
+    };
+    let message = pick_component_text_deep(
+        value,
+        &[
+            "errorMessage",
+            "error_message",
+            "error",
+            "reason",
+            "detail",
+            "message",
+            "msg",
+        ],
+    )?;
+    let code = pick_component_number_deep(value, &["code", "statusCode", "status_code"]);
+    let success = find_nested_value_by_keys(value, &["success"]).and_then(Value::as_bool);
+    let lowered = message.trim().to_ascii_lowercase();
+    if lowered.is_empty()
+        || lowered == "success"
+        || lowered == "ok"
+        || lowered == "queued"
+        || lowered == "pending"
+        || lowered == "running"
+        || lowered == "processing"
+    {
+        return None;
+    }
+    if lowered.contains("fail")
+        || lowered.contains("error")
+        || lowered.contains("cancel")
+        || lowered.contains("timeout")
+        || lowered.contains("expired")
+        || code.map(|item| item.abs() > f64::EPSILON).unwrap_or(false)
+        || matches!(success, Some(false))
+    {
+        return Some(message);
+    }
+    None
+}
+
+fn extract_comfyui_job_error_message(value: Option<&Value>) -> Option<String> {
+    let Some(value) = value else {
+        return None;
+    };
+    let message = pick_component_text_deep(
+        value,
+        &[
+            "exception_message",
+            "exceptionMessage",
+            "errorMessage",
+            "error_message",
+            "error",
+            "reason",
+            "detail",
+            "message",
+            "msg",
+        ],
+    )?;
+    let lowered = message.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return None;
+    }
+    if lowered.contains("fail")
+        || lowered.contains("error")
+        || lowered.contains("cancel")
+        || lowered.contains("timeout")
+        || lowered.contains("exception")
+    {
+        return Some(message);
+    }
+    None
+}
+
+fn derive_runninghub_job_status(
+    outputs_raw: &Value,
+    status_raw: Option<&Value>,
+    outputs_are_empty: bool,
+    fallback_status: &str,
+) -> String {
+    if !outputs_are_empty {
+        return "completed".to_string();
+    }
+    if let Some(status) = normalize_runninghub_job_status_from_value(outputs_raw) {
+        return status;
+    }
+    if let Some(status) = status_raw.and_then(normalize_runninghub_job_status_from_value) {
+        return status;
+    }
+    if extract_runninghub_job_error_message(Some(outputs_raw)).is_some()
+        || status_raw
+            .and_then(|value| extract_runninghub_job_error_message(Some(value)))
+            .is_some()
+    {
+        return "failed".to_string();
+    }
+    normalize_runninghub_job_status(fallback_status)
+}
+
+fn derive_comfyui_job_status(history_raw: &Value, fallback_status: &str) -> String {
+    let has_outputs = history_raw
+        .get("outputs")
+        .and_then(Value::as_object)
+        .map(|outputs| !outputs.is_empty())
+        .unwrap_or(false);
+    if has_outputs {
+        return "completed".to_string();
+    }
+    if let Some(status) = normalize_comfyui_job_status_from_value(history_raw) {
+        return status;
+    }
+    if extract_comfyui_job_error_message(Some(history_raw)).is_some() {
+        return "failed".to_string();
+    }
+    let fallback = normalize_comfyui_job_status(fallback_status);
+    if fallback == "queued" {
+        "running".to_string()
+    } else {
+        fallback
+    }
+}
+
+fn merge_component_job_result_payload(
+    existing: &Value,
+    status_raw: Option<&Value>,
+    outputs_raw: Option<&Value>,
+    presentable_result: Option<&Value>,
+) -> Value {
+    let mut object = existing.as_object().cloned().unwrap_or_default();
+    if let Some(previous_presentable) = object.get("presentable_result").cloned() {
+        if previous_presentable
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(|kind| kind.eq_ignore_ascii_case("job_result"))
+            .unwrap_or(false)
+        {
+            object.insert("job_result".to_string(), previous_presentable);
+        }
+    }
+    if let Some(status_raw) = status_raw {
+        object.insert("status_response".to_string(), status_raw.clone());
+    }
+    if let Some(outputs_raw) = outputs_raw {
+        object.insert("outputs_response".to_string(), outputs_raw.clone());
+    }
+    if let Some(presentable_result) = presentable_result {
+        object.insert("presentable_result".to_string(), presentable_result.clone());
+    }
+    Value::Object(object)
+}
+
+fn summarize_component_job_completion(
+    presentable_result: Option<&Value>,
+    output_text: &str,
+    fallback_summary: Option<&str>,
+) -> Option<String> {
+    if let Some(presentable_result) = presentable_result {
+        if let Some(summary) = pick_component_text(
+            presentable_result,
+            &["summary", "summaryText", "summary_text", "text", "title"],
+        ) {
+            if is_meaningful_component_output_text(&summary) {
+                return Some(summary);
+            }
+        }
+    }
+    if is_meaningful_component_output_text(output_text) {
+        return Some(output_text.trim().to_string());
+    }
+    fallback_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn summarize_component_job_progress(
+    value: &Value,
+    fallback_summary: Option<&str>,
+    component_name: &str,
+) -> Option<String> {
+    if let Some(summary) = pick_component_text_deep(
+        value,
+        &["summary", "detail", "message", "msg", "stage", "phase"],
+    ) {
+        let normalized = normalize_runninghub_job_status(&summary);
+        if normalized != "completed" && normalized != "failed" && normalized != "cancelled" {
+            return Some(summary);
+        }
+    }
+    fallback_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            let trimmed = component_name.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(format!("{trimmed} 正在处理中"))
+            }
+        })
+}
+
+fn is_meaningful_component_output_text(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    !matches!(
+        lowered.as_str(),
+        "success" | "ok" | "queued" | "pending" | "running" | "processing" | "completed"
+    )
+}
+
+fn has_meaningful_component_presentable_result(value: &Value) -> bool {
+    match value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "text_result" => pick_component_text(value, &["text", "summary", "summaryText"])
+            .map(|text| is_meaningful_component_output_text(&text))
+            .unwrap_or(false),
+        "media_result" | "document_result" => true,
+        _ => false,
+    }
 }
 
 fn build_provider_headers(config: &ComponentServiceConfig) -> Result<HeaderMap, ApiError> {
@@ -3146,6 +6959,530 @@ fn extract_generic_output_items(
             mime_type: mime_type.to_string(),
         })
         .collect()
+}
+
+fn build_component_agent_chat_asset_url(agent_id: &str, relative_path: &str) -> String {
+    format!("/api/management/agents/{agent_id}/chat-assets/file?path={relative_path}")
+}
+
+fn normalize_component_media_meta_label(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_')
+            || matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF)
+        {
+            output.push(ch);
+        } else if (ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | '：' | '|'))
+            && !output.ends_with('_')
+        {
+            output.push('_');
+        }
+    }
+    let normalized = output.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn normalize_component_media_save_target(raw: Option<&str>) -> &'static str {
+    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "agent_profile_meta" | "agent-profile-meta" | "profile_meta" | "self_media"
+        | "agent_profile" => "agent_profile_meta",
+        _ => "output",
+    }
+}
+
+fn resolve_component_video_save_plan(
+    owner_agent_id: &str,
+    input_payload: Option<&Value>,
+) -> Result<ComponentVideoSavePlan, String> {
+    let workspace_root = path_resolver::workspaces_root()?.join(owner_agent_id.trim());
+    let source_mode = input_payload
+        .and_then(|value| pick_component_text_deep(value, &["source_mode", "sourceMode"]))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let explicit_save_target = input_payload.and_then(|value| {
+        pick_component_text_deep(value, &["asset_save_target", "save_target", "saveTarget"])
+    });
+    let save_target = if normalize_component_media_save_target(explicit_save_target.as_deref())
+        == "agent_profile_meta"
+        || source_mode == "self_default"
+    {
+        "agent_profile_meta"
+    } else {
+        "output"
+    };
+    let explicit_owner_scope = input_payload.and_then(|value| {
+        pick_component_text_deep(value, &["asset_owner_scope", "owner_scope", "ownerScope"])
+    });
+    let owner_scope = if explicit_owner_scope
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("self"))
+        || save_target == "agent_profile_meta"
+        || source_mode == "self_default"
+    {
+        "self".to_string()
+    } else {
+        "other".to_string()
+    };
+    let meta_label = input_payload
+        .and_then(|value| {
+            pick_component_text_deep(value, &["asset_meta_label", "meta_label", "metaLabel"])
+                .or_else(|| pick_component_text_deep(value, &["purpose", "asset_purpose"]))
+        })
+        .or_else(|| {
+            if owner_scope.eq_ignore_ascii_case("self") {
+                Some("self_video".to_string())
+            } else {
+                None
+            }
+        });
+    let normalized_label = normalize_component_media_meta_label(meta_label.as_deref())
+        .unwrap_or_else(|| {
+            if owner_scope.eq_ignore_ascii_case("self") {
+                "self_video".to_string()
+            } else {
+                "component_video".to_string()
+            }
+        });
+    let canonical_dir = if save_target == "agent_profile_meta" {
+        workspace_root
+            .join("agent_profile")
+            .join("meta")
+            .join("videos")
+            .join(&normalized_label)
+    } else {
+        workspace_root.join("output")
+    };
+    let day_bucket = chrono::Local::now().format("%Y%m%d").to_string();
+    let public_relative_dir = format!("uploads/component-center/videos/{day_bucket}");
+    let public_dir = workspace_root.join("data").join(&public_relative_dir);
+    Ok(ComponentVideoSavePlan {
+        canonical_dir,
+        public_dir,
+        public_relative_dir,
+        save_target: save_target.to_string(),
+        owner_scope,
+        meta_label: Some(normalized_label),
+    })
+}
+
+fn infer_component_media_extension(
+    url: &str,
+    content_type: Option<&str>,
+    fallback: &str,
+) -> String {
+    let content_type = content_type
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if content_type.contains("webm") {
+        return "webm".to_string();
+    }
+    if content_type.contains("quicktime") || content_type.contains("mov") {
+        return "mov".to_string();
+    }
+    if content_type.contains("gif") {
+        return "gif".to_string();
+    }
+    if content_type.contains("mpeg")
+        || content_type.contains("mp4")
+        || content_type.contains("video/")
+    {
+        return "mp4".to_string();
+    }
+    let trimmed = url.trim();
+    let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    let ext = Path::new(without_query)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    ext.unwrap_or_else(|| fallback.to_string())
+}
+
+async fn download_component_public_asset(
+    client: &reqwest::Client,
+    url: &str,
+    public_dir: &Path,
+    public_relative_dir: &str,
+    agent_id: &str,
+    file_prefix: &str,
+    fallback_ext: &str,
+) -> Result<Option<String>, String> {
+    let response = match client.get(url).send().await {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::warn!(
+                url = %url,
+                status = %response.status(),
+                "component public asset download returned non-success status"
+            );
+            return Ok(None);
+        }
+        Err(err) => {
+            tracing::warn!(url = %url, error = %err, "component public asset download failed");
+            return Ok(None);
+        }
+    };
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                url = %url,
+                error = %err,
+                "component public asset download body read failed"
+            );
+            return Ok(None);
+        }
+    };
+    let ext = infer_component_media_extension(url, content_type.as_deref(), fallback_ext);
+    let file_name = format!(
+        "{file_prefix}_{}_{}.{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        Uuid::new_v4().simple(),
+        ext
+    );
+    let public_relative_path = format!("{public_relative_dir}/{file_name}");
+    let public_path = public_dir.join(&file_name);
+    fs::write(&public_path, &bytes)
+        .map_err(|err| format!("写入组件公共资源失败({}): {err}", public_path.display()))?;
+    Ok(Some(build_component_agent_chat_asset_url(
+        agent_id,
+        &public_relative_path,
+    )))
+}
+
+async fn best_effort_index_component_video_asset(
+    agent_id: &str,
+    item: &ComponentDefinition,
+    source_url: &str,
+    public_url: &str,
+    saved_path: &Path,
+    relative_path: &str,
+    bytes: &[u8],
+    mime_type: &str,
+    owner_scope: &str,
+    meta_label: Option<&str>,
+    input_payload: Option<&Value>,
+) {
+    let prompt_text = input_payload
+        .and_then(|value| pick_component_text_deep(value, &["prompt", "text", "message"]));
+    let purpose = meta_label
+        .map(ToString::to_string)
+        .or_else(|| {
+            input_payload
+                .and_then(|value| pick_component_text_deep(value, &["purpose", "asset_purpose"]))
+        })
+        .or_else(|| Some(item.english_name.clone()).filter(|value| !value.trim().is_empty()));
+    let metadata = json!({
+        "componentName": item.name,
+        "componentEnglishName": item.english_name,
+        "providerType": match item.provider_type {
+            ComponentProviderType::Comfyui => "comfyui",
+            ComponentProviderType::Runninghub => "runninghub",
+        },
+        "remoteUrl": source_url,
+        "localAssetUrl": public_url,
+        "meta_label": meta_label,
+        "save_target": if owner_scope.eq_ignore_ascii_case("self") { "agent_profile_meta" } else { "output" },
+    });
+    let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
+    let byte_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let file_name = saved_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string);
+    let relative_path = Some(relative_path.replace('\\', "/"));
+    let _ = assignment_store::upsert_media_asset(assignment_store::UpsertMediaAssetRecord {
+        agent_id: Some(agent_id.to_string()),
+        owner_scope: owner_scope.to_string(),
+        asset_family: "video".to_string(),
+        media_kind: "video".to_string(),
+        source_tool: Some("component_center".to_string()),
+        purpose,
+        prompt_text,
+        negative_prompt: input_payload.and_then(|value| {
+            pick_component_text_deep(value, &["negative_prompt", "negativePrompt"])
+        }),
+        model: None,
+        mime_type: mime_type.to_string(),
+        sha256,
+        width: None,
+        height: None,
+        byte_size,
+        file_name,
+        saved_path: Some(saved_path.to_string_lossy().to_string()),
+        image_url: Some(public_url.to_string()),
+        relative_path,
+        vision_summary: None,
+        tags: vec![
+            "component".to_string(),
+            "video".to_string(),
+            owner_scope.to_ascii_lowercase(),
+        ],
+        metadata,
+    });
+}
+
+async fn localize_component_video_outputs(
+    item: &ComponentDefinition,
+    raw: &Value,
+    items: &[ComponentInvokeItem],
+    owner_agent_id: Option<&str>,
+    input_payload: Option<&Value>,
+) -> Result<ComponentVideoLocalizationResult, String> {
+    if !matches!(item.return_type, ComponentReturnType::Video) {
+        return Ok(ComponentVideoLocalizationResult {
+            raw: raw.clone(),
+            items: items.to_vec(),
+        });
+    }
+    let Some(agent_id) = owner_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(ComponentVideoLocalizationResult {
+            raw: raw.clone(),
+            items: items.to_vec(),
+        });
+    };
+    let remote_items = items
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind.eq_ignore_ascii_case("video")
+                && (entry.url.starts_with("http://") || entry.url.starts_with("https://"))
+        })
+        .collect::<Vec<_>>();
+    let remote_poster_items = items
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.kind.eq_ignore_ascii_case("image")
+                && (entry.url.starts_with("http://") || entry.url.starts_with("https://"))
+        })
+        .collect::<Vec<_>>();
+    if remote_items.is_empty() && remote_poster_items.is_empty() {
+        return Ok(ComponentVideoLocalizationResult {
+            raw: raw.clone(),
+            items: items.to_vec(),
+        });
+    }
+
+    let plan = resolve_component_video_save_plan(agent_id, input_payload)?;
+    fs::create_dir_all(&plan.canonical_dir).map_err(|err| {
+        format!(
+            "创建组件视频保存目录失败({}): {err}",
+            plan.canonical_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&plan.public_dir).map_err(|err| {
+        format!(
+            "创建组件视频公开目录失败({}): {err}",
+            plan.public_dir.display()
+        )
+    })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|err| format!("创建组件视频下载客户端失败: {err}"))?;
+    let mut next_items = items.to_vec();
+    let mut saved_paths = Vec::new();
+    let mut public_urls = Vec::new();
+    let mut remote_urls = Vec::new();
+    let mut next_poster_urls = Vec::new();
+
+    for (index, entry) in remote_items {
+        remote_urls.push(entry.url.clone());
+        let response = match client.get(&entry.url).send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                tracing::warn!(
+                    component = %item.english_name,
+                    url = %entry.url,
+                    status = %response.status(),
+                    "component video download returned non-success status"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    component = %item.english_name,
+                    url = %entry.url,
+                    error = %err,
+                    "component video download failed"
+                );
+                continue;
+            }
+        };
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| entry.mime_type.clone());
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    component = %item.english_name,
+                    url = %entry.url,
+                    error = %err,
+                    "component video download body read failed"
+                );
+                continue;
+            }
+        };
+        let ext = infer_component_media_extension(&entry.url, Some(&content_type), "mp4");
+        let file_name = format!(
+            "component_video_{}_{}.{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            index,
+            ext
+        );
+        let canonical_path = plan.canonical_dir.join(&file_name);
+        let public_relative_path = format!("{}/{}", plan.public_relative_dir, file_name);
+        let public_path = plan.public_dir.join(&file_name);
+        fs::write(&canonical_path, &bytes)
+            .map_err(|err| format!("写入组件视频文件失败({}): {err}", canonical_path.display()))?;
+        fs::write(&public_path, &bytes)
+            .map_err(|err| format!("写入组件视频公开缓存失败({}): {err}", public_path.display()))?;
+        let public_url = build_component_agent_chat_asset_url(agent_id, &public_relative_path);
+        if let Some(target) = next_items.get_mut(index) {
+            target.url = public_url.clone();
+            target.mime_type = if content_type.trim().is_empty() {
+                entry.mime_type.clone()
+            } else {
+                content_type.clone()
+            };
+        }
+        best_effort_index_component_video_asset(
+            agent_id,
+            item,
+            &entry.url,
+            &public_url,
+            &canonical_path,
+            &public_relative_path,
+            bytes.as_ref(),
+            if content_type.trim().is_empty() {
+                &entry.mime_type
+            } else {
+                &content_type
+            },
+            &plan.owner_scope,
+            plan.meta_label.as_deref(),
+            input_payload,
+        )
+        .await;
+        saved_paths.push(canonical_path.to_string_lossy().to_string());
+        public_urls.push(public_url);
+    }
+
+    let localized_poster_urls = raw
+        .get("poster_urls")
+        .and_then(Value::as_array)
+        .map(|posters| posters.to_vec())
+        .unwrap_or_default();
+    for poster in localized_poster_urls {
+        let Some(url) = poster
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            next_poster_urls.push(Value::String(url.to_string()));
+            continue;
+        }
+        if let Some(local_url) = download_component_public_asset(
+            &client,
+            url,
+            &plan.public_dir,
+            &plan.public_relative_dir,
+            agent_id,
+            "component_video_poster",
+            "png",
+        )
+        .await?
+        {
+            next_poster_urls.push(Value::String(local_url));
+        } else {
+            next_poster_urls.push(Value::String(url.to_string()));
+        }
+    }
+
+    for (_, entry) in remote_poster_items {
+        if let Some(local_url) = download_component_public_asset(
+            &client,
+            &entry.url,
+            &plan.public_dir,
+            &plan.public_relative_dir,
+            agent_id,
+            "component_video_poster",
+            "png",
+        )
+        .await?
+        {
+            next_poster_urls.push(Value::String(local_url));
+        } else {
+            next_poster_urls.push(Value::String(entry.url.clone()));
+        }
+    }
+
+    next_items.retain(|entry| !entry.kind.eq_ignore_ascii_case("image"));
+
+    if saved_paths.is_empty() {
+        let mut next_raw = raw.clone();
+        if let Some(object) = next_raw.as_object_mut() {
+            if !next_poster_urls.is_empty() {
+                object.insert("poster_urls".to_string(), Value::Array(next_poster_urls));
+            }
+        }
+        return Ok(ComponentVideoLocalizationResult {
+            raw: next_raw,
+            items: next_items,
+        });
+    }
+
+    let mut next_raw = raw.clone();
+    if let Some(object) = next_raw.as_object_mut() {
+        object.insert("saved_to".to_string(), json!(saved_paths));
+        object.insert("video_urls".to_string(), json!(public_urls));
+        object.insert("remote_video_urls".to_string(), json!(remote_urls));
+        object.insert("save_target".to_string(), Value::String(plan.save_target));
+        object.insert("owner_scope".to_string(), Value::String(plan.owner_scope));
+        if !next_poster_urls.is_empty() {
+            object.insert("poster_urls".to_string(), Value::Array(next_poster_urls));
+        }
+        if let Some(meta_label) = plan.meta_label {
+            object.insert("meta_label".to_string(), Value::String(meta_label));
+        }
+    }
+
+    Ok(ComponentVideoLocalizationResult {
+        raw: next_raw,
+        items: next_items,
+    })
 }
 
 fn collect_urls(value: &Value, output: &mut Vec<String>) {
@@ -3219,6 +7556,41 @@ fn urlencoding(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_component_mapping(
+        parameter_name: &str,
+        label: &str,
+        description: &str,
+        required: bool,
+    ) -> ComponentParameterMapping {
+        ComponentParameterMapping {
+            id: parameter_name.to_string(),
+            node_id: "node".to_string(),
+            field_name: parameter_name.to_string(),
+            parameter_name: parameter_name.to_string(),
+            label: label.to_string(),
+            value_type: ComponentParamValueType::String,
+            description: description.to_string(),
+            default_value: Value::Null,
+            required,
+            options: Vec::new(),
+        }
+    }
+
+    fn test_component_with_mappings(
+        mappings: Vec<ComponentParameterMapping>,
+    ) -> ComponentDefinition {
+        ComponentDefinition {
+            english_name: "image2video".to_string(),
+            name: "图片生成视频".to_string(),
+            return_type: ComponentReturnType::Video,
+            workflow: ComponentWorkflowConfig {
+                parameter_mappings: mappings,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn derive_component_type_from_slug() {
         assert_eq!(derive_component_type("myphotos"), "Myphotos");
@@ -3262,6 +7634,357 @@ mod tests {
         assert_eq!(
             build_mapping_example_value(&mapping),
             Value::String("请填写真正的歌词正文，支持分段换行".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_runninghub_job_status_variants() {
+        assert_eq!(normalize_runninghub_job_status("success"), "completed");
+        assert_eq!(normalize_runninghub_job_status("FAILED"), "failed");
+        assert_eq!(normalize_runninghub_job_status("in_progress"), "running");
+        assert_eq!(normalize_runninghub_job_status("pending"), "queued");
+        assert_eq!(normalize_runninghub_job_status("cancelled"), "cancelled");
+    }
+
+    #[test]
+    fn build_component_params_for_video_generate_prefers_non_empty_aliases() {
+        let item = test_component_with_mappings(vec![
+            test_component_mapping("image", "源图", "视频源图", true),
+            test_component_mapping("text", "描述", "视频提示词", true),
+        ]);
+        let input = serde_json::json!({
+            "image": "",
+            "text": "",
+            "image_url": "https://example.com/portrait.png",
+            "prompt": "让她从远处走来并向主人请安"
+        });
+
+        let params = build_component_params_from_capability_input(&item, "video_generate", &input)
+            .expect("params");
+
+        assert_eq!(
+            params.get("image"),
+            Some(&Value::String(
+                "https://example.com/portrait.png".to_string()
+            ))
+        );
+        assert_eq!(
+            params.get("text"),
+            Some(&Value::String("让她从远处走来并向主人请安".to_string()))
+        );
+    }
+
+    #[test]
+    fn build_component_params_for_video_generate_does_not_push_image_into_numeric_video_param() {
+        let mut image_mapping = test_component_mapping("image", "源图", "视频源图", true);
+        image_mapping.value_type = ComponentParamValueType::String;
+        let mut width_mapping = test_component_mapping("value", "value", "视频宽度默认就好", false);
+        width_mapping.value_type = ComponentParamValueType::Number;
+        let item = test_component_with_mappings(vec![image_mapping, width_mapping]);
+        let input = serde_json::json!({
+            "image_url": "/api/uploads/demo-file-id",
+            "prompt": "让她微笑着鞠躬"
+        });
+
+        let params = build_component_params_from_capability_input(&item, "video_generate", &input)
+            .expect("params");
+
+        assert_eq!(
+            params.get("image"),
+            Some(&Value::String("/api/uploads/demo-file-id".to_string()))
+        );
+        assert!(!params.contains_key("value"));
+    }
+
+    #[test]
+    fn build_component_params_for_video_generate_keeps_prompt_text_out_of_image_aliases() {
+        let item = test_component_with_mappings(vec![
+            test_component_mapping("image", "image", "加载上传图片，要求图像的分辨率清晰", true),
+            test_component_mapping("text", "text", "图片生成视频提示词，要求描述详细 最好英文描述", true),
+        ]);
+        let input = serde_json::json!({
+            "image_url": "http://127.0.0.1:60466/api/management/agents/demo/portrait/test.png",
+            "prompt": "A graceful maid smiles at the camera and bows politely."
+        });
+
+        let params = build_component_params_from_capability_input(&item, "video_generate", &input)
+            .expect("params");
+
+        assert_eq!(
+            params.get("image"),
+            Some(&Value::String(
+                "http://127.0.0.1:60466/api/management/agents/demo/portrait/test.png".to_string()
+            ))
+        );
+        assert_eq!(
+            params.get("text"),
+            Some(&Value::String(
+                "A graceful maid smiles at the camera and bows politely.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_component_param_value_skips_empty_exact_value_and_uses_alias() {
+        let mapping = test_component_mapping("image", "源图", "视频源图", true);
+        let params = serde_json::json!({
+            "image": "  ",
+            "source_image": "https://example.com/source.png"
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+
+        assert_eq!(
+            resolve_component_param_value(&mapping, &params),
+            Some(Value::String("https://example.com/source.png".to_string()))
+        );
+    }
+
+    #[test]
+    fn looks_like_relative_image_source_path_rejects_http_and_management_urls() {
+        assert!(!looks_like_relative_image_source_path(
+            "http://127.0.0.1:63453/api/management/agents/demo/portrait/test.png"
+        ));
+        assert!(!looks_like_relative_image_source_path(
+            "/api/management/agents/demo/portrait/test.png"
+        ));
+        assert!(!looks_like_relative_image_source_path(
+            "https://example.com/test.png"
+        ));
+        assert!(looks_like_relative_image_source_path(
+            "agent_profile/portrait/test.png"
+        ));
+    }
+
+    #[test]
+    fn parse_component_management_media_reference_supports_full_and_relative_urls() {
+        assert_eq!(
+            parse_component_management_media_reference(
+                "http://127.0.0.1:60466/api/management/agents/demo-agent/portrait/test.png?x=1"
+            ),
+            Some((
+                "demo-agent".to_string(),
+                "portrait",
+                "test.png".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_component_management_media_reference(
+                "/api/management/agents/demo-agent/avatar/avatar.png"
+            ),
+            Some(("demo-agent".to_string(), "avatar", "avatar.png".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalize_component_management_asset_url_rewrites_random_frontend_port() {
+        assert_eq!(
+            normalize_component_management_asset_url(
+                "http://127.0.0.1:4310",
+                "http://127.0.0.1:60466/api/management/agents/demo-agent/portrait/test.png?x=1"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:4310/api/management/agents/demo-agent/portrait/test.png?x=1")
+        );
+        assert_eq!(
+            normalize_component_management_asset_url(
+                "http://127.0.0.1:4310",
+                "/api/management/agents/demo-agent/portrait/test.png"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:4310/api/management/agents/demo-agent/portrait/test.png")
+        );
+    }
+
+    #[test]
+    fn resolve_component_video_save_plan_defaults_self_video_to_agent_profile_meta() {
+        let plan = resolve_component_video_save_plan(
+            "agent-self",
+            Some(&json!({
+                "source_mode": "self_default",
+                "meta_label": "今日自拍视频"
+            })),
+        )
+        .expect("plan");
+
+        assert_eq!(plan.save_target, "agent_profile_meta");
+        assert_eq!(plan.owner_scope, "self");
+        assert!(plan.canonical_dir.ends_with(
+            Path::new("agent-self")
+                .join("agent_profile")
+                .join("meta")
+                .join("videos")
+                .join("今日自拍视频")
+        ));
+    }
+
+    #[test]
+    fn resolve_component_video_save_plan_keeps_normal_video_in_output() {
+        let plan = resolve_component_video_save_plan(
+            "agent-other",
+            Some(&json!({
+                "source_mode": "image_to_video"
+            })),
+        )
+        .expect("plan");
+
+        assert_eq!(plan.save_target, "output");
+        assert_eq!(plan.owner_scope, "other");
+        assert!(plan
+            .canonical_dir
+            .ends_with(Path::new("agent-other").join("output")));
+    }
+
+    #[test]
+    fn build_component_presentable_result_for_video_uses_image_as_poster_only() {
+        let item = ComponentDefinition {
+            name: "问安视频".to_string(),
+            english_name: "image2video".to_string(),
+            return_type: ComponentReturnType::Video,
+            capability_binding: ComponentCapabilityBinding {
+                capability_key: "generate.video".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = build_component_presentable_result(
+            &item,
+            "视频已生成",
+            &json!({
+                "poster_urls": [
+                    "/api/management/agents/demo-agent/chat-assets/file?path=uploads/component-center/videos/20260327/poster.png"
+                ]
+            }),
+            &[
+                ComponentInvokeItem {
+                    kind: "image".to_string(),
+                    url: "http://127.0.0.1:8188/view?filename=preview.png".to_string(),
+                    text: String::new(),
+                    mime_type: "image/png".to_string(),
+                },
+                ComponentInvokeItem {
+                    kind: "video".to_string(),
+                    url: "/api/management/agents/demo-agent/chat-assets/file?path=uploads/component-center/videos/20260327/result.mp4".to_string(),
+                    text: "问安视频".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                },
+            ],
+            &json!({
+                "providerType": "component_skill"
+            }),
+        )
+        .expect("presentable result");
+
+        let object = result.as_object().expect("object");
+        assert_eq!(
+            object.get("kind").and_then(Value::as_str),
+            Some("media_result")
+        );
+        assert_eq!(
+            object.get("mediaType").and_then(Value::as_str),
+            Some("video")
+        );
+        let items = object
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items");
+        assert_eq!(items.len(), 1);
+        let first = items[0].as_object().expect("first item");
+        assert_eq!(
+            first
+                .get("asset")
+                .and_then(Value::as_object)
+                .and_then(|asset| asset.get("uri"))
+                .and_then(Value::as_str),
+            Some(
+                "/api/management/agents/demo-agent/chat-assets/file?path=uploads/component-center/videos/20260327/result.mp4"
+            )
+        );
+        assert_eq!(
+            first
+                .get("posterAsset")
+                .and_then(Value::as_object)
+                .and_then(|asset| asset.get("uri"))
+                .and_then(Value::as_str),
+            Some(
+                "/api/management/agents/demo-agent/chat-assets/file?path=uploads/component-center/videos/20260327/poster.png"
+            )
+        );
+    }
+
+    #[test]
+    fn bind_component_job_result_keeps_local_job_id() {
+        let source = serde_json::json!({
+            "kind": "job_result",
+            "job_id": "remote-task-1",
+            "status": "queued",
+            "metadata": {
+                "componentEnglishName": "image2video"
+            }
+        });
+        let bound =
+            bind_component_job_result_to_local_job(&source, "local-job-1", Some("remote-task-1"));
+        assert_eq!(
+            bound.get("job_id").and_then(Value::as_str),
+            Some("local-job-1")
+        );
+        assert_eq!(
+            bound.get("jobId").and_then(Value::as_str),
+            Some("local-job-1")
+        );
+        assert_eq!(
+            bound
+                .get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get("providerRequestId"))
+                .and_then(Value::as_str),
+            Some("remote-task-1")
+        );
+    }
+
+    #[test]
+    fn runninghub_video_component_uses_background_job_when_agent_present() {
+        let item = ComponentDefinition {
+            return_type: ComponentReturnType::Video,
+            ..Default::default()
+        };
+        assert!(should_run_runninghub_component_as_background_job(
+            &item,
+            Some("agent-1"),
+        ));
+        assert!(!should_run_runninghub_component_as_background_job(
+            &item, None
+        ));
+    }
+
+    #[test]
+    fn comfyui_video_component_uses_background_job_when_agent_present() {
+        let item = ComponentDefinition {
+            return_type: ComponentReturnType::Video,
+            ..Default::default()
+        };
+        assert!(should_run_comfyui_component_as_background_job(
+            &item,
+            Some("agent-1"),
+        ));
+        assert!(!should_run_comfyui_component_as_background_job(&item, None));
+    }
+
+    #[test]
+    fn derive_comfyui_job_status_prefers_outputs_completion() {
+        let history = serde_json::json!({
+            "outputs": {
+                "9": {
+                    "videos": [
+                        { "filename": "demo.mp4", "subfolder": "", "type": "output" }
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            derive_comfyui_job_status(&history, "running"),
+            "completed".to_string()
         );
     }
 }

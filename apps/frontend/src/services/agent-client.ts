@@ -49,7 +49,6 @@ import {
   listManagementA2aAgents,
   listManagementAgents,
 } from "@/services/management-client";
-import { CHAT_TASK_TRIGGER_KEYWORDS_HINT } from "@/services/chat-task-intent";
 
 interface SettingsApiResult<T> {
   ok: boolean;
@@ -193,12 +192,41 @@ const collaborationHintCache = new Map<
   { expiresAt: number; hint: string }
 >();
 const COLLABORATION_HINT_TTL_MS = 5_000;
-const STREAM_IDLE_TIMEOUT_MS = 540_000;
+const STREAM_FIRST_EVENT_TIMEOUT_MS = 20_000;
+const STREAM_IDLE_TIMEOUT_MS = 60_000;
+const STREAM_TOOL_IDLE_TIMEOUT_MS = 10 * 60_000;
+const STREAM_IMAGE_TOOL_IDLE_TIMEOUT_MS = 20 * 60_000;
 const STREAM_MAX_TIMEOUT_MS = 3_600_000;
 const CHAT_RECOVERY_SETTLE_MS = 500;
 const COLLAB_TAG_DISPATCH = "webot:collab_dispatcher";
 const COLLAB_CONFIG_BEGIN = "[WEBOT_COLLAB_CONFIG_BEGIN]";
 const COLLAB_CONFIG_END = "[WEBOT_COLLAB_CONFIG_END]";
+
+function normalizeStreamToolName(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isLikelyLongRunningImageTool(toolName: string): boolean {
+  const normalized = normalizeStreamToolName(toolName);
+  if (!normalized) {
+    return false;
+  }
+  if (
+    normalized === "image_generate" ||
+    normalized === "image_edit" ||
+    normalized === "my_photo_generate" ||
+    normalized === "my_photo_edit"
+  ) {
+    return true;
+  }
+  const hasImageScope =
+    /(image|photo|avatar|portrait|poster|cover)/.test(normalized);
+  const hasGenerationVerb =
+    /(generate|edit|render|upscale|inpaint|outpaint|variation)/.test(
+      normalized,
+    );
+  return hasImageScope && hasGenerationVerb;
+}
 
 export function invalidateComponentSkillRuntimeCaches(): void {
   skillPromptContextCache.clear();
@@ -774,6 +802,41 @@ function parseSpecFromEventPayload(
   return parseSpecFromText(textCandidate);
 }
 
+function parseTaskDraftMetaFromPayload(
+  payload: Record<string, unknown> | null | undefined,
+): {
+  taskCard?: unknown;
+  taskDraftState?: unknown;
+  taskDraftMatched?: boolean;
+  taskDraftCancelled?: boolean;
+  taskDraftReadyToConfirm?: boolean;
+} {
+  if (!payload) {
+    return {};
+  }
+  const taskDraftMatched = toBooleanValue(
+    payload.task_draft_matched,
+    toBooleanValue(payload.taskDraftMatched, false),
+  );
+  const taskDraftCancelled = toBooleanValue(
+    payload.task_draft_cancelled,
+    toBooleanValue(payload.taskDraftCancelled, false),
+  );
+  const taskDraftReadyToConfirm = toBooleanValue(
+    payload.task_draft_ready_to_confirm,
+    toBooleanValue(payload.taskDraftReadyToConfirm, false),
+  );
+  const taskDraftState = payload.task_draft ?? payload.taskDraftState;
+  const taskCard = payload.task_card ?? payload.taskCard;
+  return {
+    ...(taskCard !== undefined ? { taskCard } : {}),
+    ...(taskDraftState !== undefined ? { taskDraftState } : {}),
+    ...(taskDraftMatched ? { taskDraftMatched } : {}),
+    ...(taskDraftCancelled ? { taskDraftCancelled } : {}),
+    ...(taskDraftReadyToConfirm ? { taskDraftReadyToConfirm } : {}),
+  };
+}
+
 function createRequestId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -851,11 +914,21 @@ function isQuotaExceededFailure(message: string): boolean {
 function isRecoverableStreamingFailure(message: string): boolean {
   const text = message.trim().toLowerCase();
   if (!text) return false;
-  if (text.includes("streaming message failed")) return true;
+  if (text.includes("no stream events received within")) return false;
+  if (
+    text.includes("session conflict") ||
+    text.includes("already running") ||
+    text.includes("another request") ||
+    text.includes("active request")
+  ) {
+    return true;
+  }
   if (text.includes("response failed") && text.includes("500")) return true;
   return (
     text.includes("http 500") &&
-    (text.includes("/message/stream") || text.includes("openfang"))
+    (text.includes("/message/stream") ||
+      text.includes("openfang") ||
+      text.includes("sse"))
   );
 }
 
@@ -1029,11 +1102,12 @@ function getToolResultPayload(
   if (input !== undefined) serialized.input = input;
   if (result !== undefined) {
     serialized.output = result;
-  } else {
-    for (const [key, value] of Object.entries(payload)) {
-      if (key === "type" || key === "tool" || key === "input") continue;
-      serialized[key] = value;
-    }
+  }
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "type" || key === "tool" || key === "input") continue;
+    if (key === "result" && result !== undefined) continue;
+    if (key === "output" && result !== undefined) continue;
+    serialized[key] = value;
   }
   return serialized;
 }
@@ -1233,7 +1307,6 @@ async function buildUiEnvironmentSystemPrompt(
   const supportsSelfManagementAgent =
     !isNuwaManagementAgent && normalizedAgentId.length > 0;
   let components: string[] = [];
-  let customSkillNames: string[] = [];
   try {
     const assignments = await getAgentSkillAssignments(input.agentId);
     const skillNames = Array.from(
@@ -1248,10 +1321,6 @@ async function buildUiEnvironmentSystemPrompt(
           .map((item) => item.trim()),
       ),
     ).sort();
-    customSkillNames = (assignments.custom_available ?? []).filter(
-      (item): item is string =>
-        typeof item === "string" && item.trim().length > 0,
-    );
     if (skillNames.length > 0) {
       components = await listAvailableSkillComponents(
         input.agentId,
@@ -1305,163 +1374,74 @@ async function buildUiEnvironmentSystemPrompt(
     "[system:ui-environment]",
     `Current UI environment: channel=${channel}, renderMode=${renderMode}, A2UI rendering is available.`,
     "You are replying in chat mode for a json-render capable client, not a pure generation-only mode.",
-    "Render priority in this chat is fixed and strict: custom dynamic components declared by available skill manifests > built-in system components > pure Markdown text.",
-    "Priority override rule: when skill-component manifests or skill-local component contexts are present in this prompt, those component rules override any conflicting guidance from other generic/custom skills, writing styles, collaboration habits, or fallback habits.",
     components.length > 0
-      ? `Available custom dynamic components with the highest priority right now: ${components.join(", ")}.`
-      : "No custom dynamic component is currently available, so you may fall back to built-in components or Markdown.",
-    customSkillNames.length > 0
-      ? `Global custom skills discovered for this agent session: ${customSkillNames.join(", ")}. Their manifest-declared components are callable in chat even when the user does not mention a button or entry explicitly.`
-      : "",
-    "If the user intent can be satisfied by an available custom dynamic component and you can produce manifest-compliant props, prefer that custom component over any built-in component.",
-    "Use built-in system components only when no suitable custom dynamic component is available for the task, or when the custom component manifest clearly does not fit the requested output.",
-    "Use pure Markdown only when neither a valid custom component nor a valid built-in component can be emitted safely.",
-    "Default to a normal helpful chat reply in Markdown only after the custom-component and built-in-component options have both been ruled out.",
-    "It is normal for a reply to contain zero UI blocks only when no valid custom or built-in component should be used.",
-    "When using UI, prefer a mixed response: short Markdown explanation plus a small focused UI block.",
-    "Do not convert the whole answer into UI unless the user explicitly asks for a fully structured card.",
-    "When user intent is ambiguous and multiple follow-up directions are possible, prefer using the built-in `OptionSelector` component to ask for intent instead of asking the user to type a free-form clarification.",
-    "Common built-in components you should actively consider when useful: `OptionSelector`, `LineChartCard`, `BarChartCard`, `AreaChartCard`, `PieChartCard`, `ImageCover`, `ImageAlbum`, `ImageCarousel`, `ComfyUIImageCard`, `VideoCover`, `VideoGallery`, `VideoCarousel`, `ComfyUIVideoCard`, `WebViewCard`, `MarkdownPreviewCard`, `OfficePreviewCard`, `AgentManagementConfirmCard`.",
-    "For disambiguation, intent routing, next-step choices, or asking what the user wants to do next, `OptionSelector` is preferred over plain text questions whenever the options are clear.",
-    "Within built-in system components only, the preference order is: 1) `OptionSelector` for intent clarification and next-step choice, 2) ordinary image answers including `image_generate` and `image_edit` results should prefer `ImageCover` / `ImageAlbum` / `ImageCarousel` with visible cover in chat, 3) ordinary video answers should prefer `VideoCover` / `VideoGallery` / `VideoCarousel` with visible cover in chat, 4) component-generated image outputs must use `ComfyUIImageCard`, 5) component-generated video outputs must use `ComfyUIVideoCard`, 6) trend/comparison/numeric answers should prefer chart components such as `LineChartCard` / `BarChartCard` / `AreaChartCard` / `PieChartCard`.",
-    "Critical distinction: `ComfyUIImageCard` is a component execution card, not a generic image preview card.",
-    "Use `ComfyUIImageCard` only when you are intentionally invoking a known image component/skill and you know its exact `componentName`.",
-    'The minimum valid `ComfyUIImageCard` is `<UI_JSON>{"type":"ComfyUIImageCard","props":{"componentName":"exact-component-name"}}</UI_JSON>`.',
-    "If you already have generated or edited image results to show in chat, prefer `ImageCover` / `ImageAlbum` / `ImageCarousel` and pass real image data via `src` / `url` / `path` / `images`.",
-    "Never use `ComfyUIImageCard` with only prompt, width, height, count, style, or other generation request params. Those props alone are invalid for that card.",
-    "When using `ComfyUIImageCard`, put recognized runtime inputs under `props.initialValues`, not at the top level, and always keep `props.componentName`.",
-    "If an image task is executed but you do not have a valid previewable image URL/path/base64 to show, do not force a UI card. Fall back to Markdown or plain downloadable output.",
-    "Both `image_generate` and `image_edit` follow the same resolution order: enabled skill/provider first, then configured generic image service, then the current model capability as the last fallback.",
-    "For `image_edit`, prefer passing a single workspace file via `image_path` when the source image already exists in the agent workdir; only use `image_url` or `image_base64` when no local workspace path is available.",
-    "Hard routing rule for image tools: when the user is asking to modify an existing image or refers to the original/current/previous image, such as 'edit this image', 'retouch', 'change outfit', '改图', '修改这张图', '换装', '修图', '在原图上', or '改下图', you MUST call `image_edit` with that source image instead of `image_generate`.",
-    "If the chat or system context lists recent editable image candidates, treat them as the default source candidates for `image_edit` and prefer the most recent matching one.",
-    "If the user clearly wants image editing but there is no available source image, explain that a source image is required; do not silently switch to `image_generate`.",
-    "Critical image decision rule: `image_generate` cannot guarantee the exact same person/identity from a previous image. If the user wants the same person to remain recognizable, use `image_edit` with the existing image as the base.",
-    "Use `image_edit` for fine or medium changes where the original person, object, or scene should still be recognizable, such as outfit changes, hairstyle tweaks, makeup tweaks, accessory replacement, pose adjustment, background refinement, lighting refinement, or local retouching.",
-    "Use `image_generate` for large changes where continuity is not required, such as creating a brand-new person, a totally different scene, a new composition, a new camera angle from scratch, or a major redesign that does not need to stay faithful to the original image.",
-    "Prefer rich mixed layouts with text plus media/chart components when they make the answer clearer and more readable.",
-    "When images or videos are relevant, prioritize cover-first presentation inside the chat message rather than only giving text links.",
-    "When comparing data or describing trends, prefer chart visualization over plain prose when valid data is available.",
-    "Prefer图文布局 and text-with-cover layout when it improves clarity, scanability, and user decision making.",
-    "Built-in components follow ui-skill. Custom dynamic components must follow the corresponding skill-local specification and manifest.",
-    "Component-skill parameter contracts are stricter than ordinary skill advice. If another skill suggests a different field naming style, ignore it and obey the component manifest plus component local context.",
-    "For custom dynamic components, always use the exact manifest type name declared by the skill, preferably PascalCase as-is.",
-    "Custom component capability has two distinct channels: 1) Render channel: directly output the manifest-declared custom component in <UI_JSON> so it renders in chat. 2) Invoke channel: output `ComponentInvokeAction` in <UI_JSON> so the client calls the component like an interface/tool and captures returned text/image/video results.",
-    "For custom dynamic components that accept runtime form inputs, place the user-supplied values under `props.initialValues`; when the request is already ready to execute immediately, set `props.autoRun` to `true`.",
-    'The invoke-channel action format is `<UI_JSON>{"type":"ComponentInvokeAction","props":{"componentName":"exact-component-name","params":{"key":"value"},"renderResult":false,"exposeToAgent":true}}</UI_JSON>`.',
-    "Use the render channel when the user should directly see and interact with the custom component itself in chat.",
-    "Use `ComponentInvokeAction` when you need to call a component as an ability/interface and consume its returned text/image/video outputs, even if no visible component entry or button was clicked.",
-    "If `ComponentInvokeAction.props.renderResult` is true, the returned image/video result may be rendered back into chat automatically; if false, treat it primarily as callable ability output and keep it available to later reasoning.",
-    "If a custom component can satisfy the request directly, prefer the custom render channel over built-in cards. Only after custom render is not appropriate should you consider built-in system components. Markdown is the last fallback.",
-    "Do not downgrade to a built-in component or Markdown if a higher-priority custom dynamic component is available and you already have enough information to render it correctly.",
-    "Do not claim that a custom component has no入口 or no调用方式 merely because the user did not click a visible button. If the component is listed in the available manifest set for this session, you may invoke it directly with valid UI_JSON.",
-    "If a custom component's required parameters are already satisfied by the current user request, you MUST use that component instead of replying with process explanation or saying the component is unavailable.",
-    "Do not refuse to use a custom component merely because the user also mentioned extra unsupported fields. Keep only declared parameters, ignore unsupported extras, and omit optional parameters when necessary.",
-    "For media-generation custom components such as image/video/audio generation, if the user clearly asks to directly generate now and the required parameters are available, prefer `ComponentInvokeAction` with `renderResult=true`.",
-    "The reply must follow exactly one of these formats only:",
-    "A) Pure Markdown only, with no <UI_JSON> block at all.",
-    "B) Mixed content made from Markdown and one or more <UI_JSON>...</UI_JSON> blocks in any order.",
-    "C) Mixed content made from Markdown plus SpecStream JSONL patch lines for the UI state.",
-    "In format B, Markdown may appear before UI_JSON, between multiple UI_JSON blocks, and after UI_JSON.",
-    "It is valid to explain the card before rendering it, and also valid to continue with notes after the card.",
-    "In chat mode, format A and format B are preferred. Use format C only when a streamed UI patch is truly needed.",
-    "In format C, every JSON line used for UI must be a standalone JSON object patch line, suitable for compileSpecStream().",
-    "If the answer is mostly prose, keep it as Markdown instead of forcing SpecStream patches.",
-    "Each <UI_JSON> block must contain exactly one complete valid JSON object and nothing else.",
+      ? `Available custom dynamic components right now: ${components.join(", ")}.`
+      : "No custom dynamic component is currently available.",
+    "Use plain Markdown unless a valid UI block is required.",
+    "Custom dynamic UI components are compatibility-only local render helpers; they are not the primary capability protocol.",
+    "Prefer runtime tools and standardized `presentable_result` / `job_result`; only use UI_JSON when an explicit local interactive card is truly required.",
+    "Standard media/document outputs are provided by runtime `presentable_result`; do not synthesize preview cards in UI_JSON.",
+    "[system:video-tool-routing]",
+    "For video creation, prefer runtime `video_generate` / `video_edit` and let the runtime own the placeholder -> job_result -> media_result(video) chain.",
+    "When the user asks for the current agent itself to appear in the video, call `video_generate` with the prompt and `source_mode=\"self_default\"`; do not manually pass image/video source fields unless the user explicitly supplied a different source asset. The runtime will inject the current agent default portrait/video source automatically.",
+    "When the user supplied a source image or wants image-to-video, call `video_generate` with `source_mode=\"image_to_video\"` and pass exactly one of `image_path`, `image_url`, or `image_base64` (`mime_type` is required for base64).",
+    "When the user wants pure text-to-video, call `video_generate` with `source_mode=\"text_to_video\"` and do not pass any image/video source fields.",
+    "Use `video_edit` only when transforming an existing source video or a source-image-conditioned edit flow; in that case pass the matching `video_*` or `image_*` source field.",
+    "Only use `save_target=\"agent_profile_meta\"` for the current agent's own personal media; ordinary user-requested videos should stay on the default `output` path. `meta_label` is only needed for agent personal media labeling.",
+    "[system:image-tool-routing]",
+    "For image creation, distinguish three workflows clearly: text-only new image, single-image edit, and base-plus-reference merge.",
+    "Use `image_generate` only for pure text-to-image requests where a brand-new picture is needed and identity continuity with an existing image is not required.",
+    "Use `image_edit` with exactly one image when the user wants to modify that same image. The first image is always the base image that must remain the main subject.",
+    "Use `image_edit` with a second `reference_image` / `reference_image_path` / `reference_image_url` / `reference_image_base64` only when the user wants to merge elements from another picture into the first picture. In that case, the first image stays the base, and the second image is only a reference/material source.",
+    "Never let the second reference image replace the identity, framing, or ownership of the first base image unless the user explicitly asked for that replacement.",
+    "For requests about the current agent itself, prefer `my_photo_generate` or `my_photo_edit` instead of the generic image tools.",
+    "If the user wants the current agent to wear, hold, or adopt something from another image, keep the current agent default portrait/self photo as the identity anchor and pass the external picture only as `reference_image*`.",
+    "When using UI_JSON, each block must contain exactly one complete valid JSON object and nothing else.",
     "Never output response envelopes, result JSON, tool_call XML, YAML, comments, explanations about the schema, or any wrapper object around the UI object.",
-    "Never output legacy XML component tags such as <image2video ...></image2video>; custom components must be emitted only as <UI_JSON>{\"type\":\"ExactManifestType\",\"props\":{...}}</UI_JSON>.",
-    "If you output UI_JSON, it must be directly parseable by JSON.parse without any preprocessing.",
-    'JSON strings must use escaped double quotes inside values, for example: "value":"A \\"quoted\\" word".',
-    "JSON punctuation must use ASCII characters only. Never use full-width punctuation such as ： ， （ ） 【 】.",
-    "[system:a2ui-hard-rules]",
+    "If you output UI_JSON, it must be directly parseable by JSON.parse without any preprocessing and must use ASCII punctuation.",
     "Never wrap the whole reply as response JSON.",
     "Never put <UI_JSON> inside a fenced code block.",
-    "Each <UI_JSON> block must contain one complete valid JSON object.",
-    "JSON must use ASCII punctuation only.",
-    "If you are not sure the type is valid, do not output UI_JSON.",
-    "If you are not sure a prop is supported, omit it.",
     "If valid JSON cannot be guaranteed, fall back to pure Markdown.",
-    "[system:ui-json-self-check]",
-    "Before outputting any <UI_JSON> block, silently self-check:",
-    "1) Is it valid JSON.parse JSON?",
-    "2) Does the type exactly match a built-in component or a manifest-declared custom component?",
-    "3) Do the props match the corresponding built-in catalog or skill-local prompt context?",
-    "4) Are all strings valid and all internal double quotes escaped?",
-    "5) If any answer is no, do not output UI_JSON and fall back to Markdown.",
-    "[system:specstream-preferred-example]",
-    "Example SpecStream JSONL patch lines:",
-    '{"op":"replace","path":"/type","value":"YourComponentType"}',
-    '{"op":"replace","path":"/props","value":{"key":"value"}}',
-    "Preferred chat example: a short Markdown paragraph, then one <UI_JSON>{...}</UI_JSON> block, then optional Markdown notes.",
-    "Valid mixed example: Markdown intro + <UI_JSON>{...}</UI_JSON> + Markdown explanation.",
-    "Output either valid Markdown, or valid mixed Markdown/UI_JSON content. Do not output almost-JSON.",
-    supportsSelfManagementAgent ? "[system:self-management-confirm-card]" : "",
+    supportsSelfManagementAgent ? "[system:self-management-protocol]" : "",
     supportsSelfManagementAgent
-      ? `如果用户要求你检查、优化或修改你自己的头像、立绘、人设或身份文件，你只允许修改你自己；当前智能体 ID 是 ${input.agentId}。`
+      ? `selfAgentId=${input.agentId}`
       : "",
     supportsSelfManagementAgent
-      ? "你的身份文件固定在工作区根目录：IDENTITY.md / SOUL.md / USER.md / MEMORY.md / TOOLS.md / AGENTS.md / BOOTSTRAP.md / HEARTBEAT.md。需要检查内容时优先使用 file_read。"
+      ? "selfManagement.scope=self_only"
       : "",
     supportsSelfManagementAgent
-      ? "你的头像目录是 agent_profile/avatar/，立绘目录是 agent_profile/portrait/。需要先查看当前视觉素材时，先用 file_list 找文件，再用 media_describe 分析图片。"
+      ? 'selfManagement.resultKinds=["review_result","confirm_result","patch_result"]'
       : "",
     supportsSelfManagementAgent
-      ? "当用户上传了新的头像或立绘候选图时，你可以先用 media_describe 分析，再把该图片在当前会话里可访问的资源 URL 直接填入 avatarUrl 或 portraitUrl。"
+      ? "selfManagement.upgradeFlow=review_then_confirm_then_apply"
       : "",
     supportsSelfManagementAgent
-      ? "更换你自己的头像或立绘时，绝对禁止调用 shell_exec、apply_patch、write_file、move_file、delete_file，或任何 mcp_agent_workspace_* 文件移动/覆盖命令来直接修改 agent_profile。唯一允许流程是：先分析候选图，再输出自我外观动作，由前端独立接口自动执行真正写入。"
+      ? "identityWrites.requireConfirmCard=true"
       : "",
     supportsSelfManagementAgent
-      ? "如果候选图来自当前聊天上传、图片生成结果、预览卡或 /api/uploads/... 这类会话资源，不要把它转换成 output/ 本地路径，也不要尝试复制工作区文件；直接把可访问的资源 URL 原样填入 avatarUrl 或 portraitUrl。"
+      ? 'managementConfirm.type=AgentManagementConfirmCard'
       : "",
     supportsSelfManagementAgent
-      ? '当你只是在修改你自己的头像、立绘、换装图、表情图或外观形象时，不需要再弹确认卡；直接输出 <UI_JSON>{"type":"AgentSelfAppearanceAction","props":{"avatarUrl":"可访问图片URL","portraitUrl":"可访问图片URL","reason":"一句话说明本次换装或外观变化"}}</UI_JSON>。avatarUrl / portraitUrl 至少提供一个。'
+      ? 'managementConfirm.actions=["confirm_agent_management","cancel_agent_management"]'
       : "",
-    supportsSelfManagementAgent
-      ? "AgentSelfAppearanceAction 必须是单行合法 JSON，type 名必须精确为 AgentSelfAppearanceAction。不要额外包裹确认按钮，不要输出 OptionSelector，不要要求用户再次点击确认。"
-      : "",
-    supportsSelfManagementAgent
-      ? "聊天中的沉浸式动作也适用这条规则：只要用户当前意图是修改你自己的外观，而不是修改别人或改身份文件，就应该优先走 AgentSelfAppearanceAction。"
-      : "",
-    supportsSelfManagementAgent
-      ? "当用户的真实意图是“采用一张已经存在的候选图作为你当前的头像、立绘或新外观”时，应直接复用当前会话中最近相关的候选图、上传图、预览图或刚生成出来的图片 URL，输出 AgentSelfAppearanceAction；不要因为措辞简短就默认重新生成。"
-      : "",
-    supportsSelfManagementAgent
-      ? "只有在用户的真实意图是“创建一张新的图”“要求新版本/新方案”“要求改变现有图里尚未存在的视觉内容”，或者当前会话根本没有可复用的候选图时，才允许调用 image_generate 或图片编辑能力。若“复用已有图”与“重新生成新图”两种解释都成立且你无法确定，先追问一句，不要擅自重新生成。"
-      : "",
-    supportsSelfManagementAgent
-      ? "如果这次要修改的是身份文件、人设设定、SYSTEM_PROMPT 或 IDENTITY.md / SOUL.md / USER.md / MEMORY.md / TOOLS.md / AGENTS.md / BOOTSTRAP.md / HEARTBEAT.md，仍然必须走 AgentManagementConfirmCard，并等待用户确认后再写入。"
-      : "",
-    supportsSelfManagementAgent
-      ? "如果只是局部修改身份文件，就把变更后的文件内容放进 payload.contextFiles 的对应文件；如果要整套重写人格身份证，就把 8 个身份文件和 SYSTEM_PROMPT 一次性完整放进 payload.contextFiles，并把 rewriteContextFiles=true。"
-      : "",
-    supportsSelfManagementAgent
-      ? '涉及身份文件写入时，AgentManagementConfirmCard 必须写成 <UI_JSON>{"type":"AgentManagementConfirmCard","props":{...}}</UI_JSON>，并使用 confirm_agent_management / cancel_agent_management 作为动作名。'
-      : "",
-    supportsSelfManagementAgent
-      ? "如果信息还不够，继续追问；头像/立绘可直接执行，身份文件写入仍需先确认。"
-      : "",
-    isNuwaManagementAgent ? "[system:nuwa-management-confirm-card]" : "",
+    isNuwaManagementAgent ? "[system:nuwa-management-protocol]" : "",
     isNuwaManagementAgent
-      ? "当你已经进入“请确认创建/修改智能体”的阶段，必须输出 AgentManagementConfirmCard，不允许只输出“现在输出确认卡，请确认是否创建”这类纯文本收尾。"
+      ? 'managementConfirm.type=AgentManagementConfirmCard'
       : "",
     isNuwaManagementAgent
-      ? 'AgentManagementConfirmCard 必须写成 <UI_JSON>{"type":"AgentManagementConfirmCard","props":{...}}</UI_JSON>，type 名称必须精确匹配。'
+      ? 'managementConfirm.actions=["confirm_agent_management","cancel_agent_management"]'
       : "",
     isNuwaManagementAgent
-      ? "创建智能体时，payload.nickname 只能填写一个最终显示昵称，不要把多个别名一起塞进 nickname；其他别名请写进 IDENTITY.md。"
+      ? 'managementConfirm.mode=["create","update"]'
       : "",
     isNuwaManagementAgent
-      ? "创建智能体或整套重写身份文件时，payload.contextFiles 或 payload.items[].contextFiles 必须直接携带完整的 IDENTITY.md / SOUL.md / USER.md / MEMORY.md / TOOLS.md / AGENTS.md / BOOTSTRAP.md / HEARTBEAT.md / SYSTEM_PROMPT。不要依赖后续再调用模型生成。"
+      ? 'managementConfirm.allowedFields=["mode","agentId","targetName","englishName","nickname","description","tags","workspaces","provider","model","avatarUrl","portraitUrl","color","rewriteContextFiles","contextFiles","items"]'
       : "",
     isNuwaManagementAgent
-      ? "如果身份文件内容还没准备完整，就继续追问，不要输出确认卡。"
+      ? 'managementConfirm.requiredContextFiles=["IDENTITY.md","SOUL.md","USER.md","MEMORY.md","TOOLS.md","AGENTS.md","BOOTSTRAP.md","HEARTBEAT.md","SYSTEM_PROMPT"]'
       : "",
     collaborationHint ? "[system:multi-agent-collaboration]" : "",
     collaborationHint,
-    "[system:task-trigger-keywords]",
-    `如果用户表达定时任务意图（触发关键词示例：${CHAT_TASK_TRIGGER_KEYWORDS_HINT}），请先给出“任务创建草案”，并等待用户确认后再创建。\n输出尽量遵循以下固定模板（便于前端识别生成任务卡片）：\n任务名称: <简短名称>\n任务内容: <一句话要做什么>\n执行间隔: 每 <数字> <秒/分钟/小时/天>\n总执行次数: <数字> 次\n请确认是否创建任务（优先引导用户点击任务卡片里的“创建任务/取消”，不要只让用户输入文字确认）。\n注意：即使间隔为 1 分钟，也必须写成“每 1 分钟”，不要写“每分钟”。`,
-    "在确认前不要直接执行 cron_add/cron_update/cron_remove/cron_run/cron_list。若用户取消，明确回复“已取消任务创建”。",
     injectedManifestContexts.length > 0
       ? "[system:skill-component-manifests]"
       : "",
@@ -1691,6 +1671,11 @@ async function loadManagementComponentInvokeContext(
     const item = isRecord(payload) && isRecord(payload.item) ? payload.item : null;
     const workflow = item && isRecord(item.workflow) ? item.workflow : null;
     const returnType = toStringValue(item?.returnType).trim().toLowerCase();
+    const capabilityBinding = item && isRecord(item.capabilityBinding) ? item.capabilityBinding : null;
+    const selectorMeta = item && isRecord(item.selectorMeta) ? item.selectorMeta : null;
+    const baseTool = toStringValue(capabilityBinding?.baseTool).trim();
+    const capabilityKey = toStringValue(capabilityBinding?.capabilityKey).trim();
+    const specialization = toStringValue(selectorMeta?.specialization).trim();
     const parameterMappings = Array.isArray(workflow?.parameterMappings)
       ? workflow.parameterMappings.filter(isRecord)
       : [];
@@ -1700,6 +1685,9 @@ async function loadManagementComponentInvokeContext(
     }
     const requiredParams = parameterMappings
       .filter((mapping) => Boolean(mapping.required))
+      .map((mapping) => toStringValue(mapping.parameterName).trim())
+      .filter(Boolean);
+    const declaredParams = parameterMappings
       .map((mapping) => toStringValue(mapping.parameterName).trim())
       .filter(Boolean);
     const descriptiveParams = parameterMappings
@@ -1713,17 +1701,12 @@ async function loadManagementComponentInvokeContext(
       .filter((mapping) => isStrictSourceComponentMapping(mapping))
       .map((mapping) => toStringValue(mapping.parameterName).trim())
       .filter(Boolean);
-    const hasImageLikeSource = strictSourceParams.some((name) =>
-      /image|photo|avatar|portrait|mask|reference|src|url|path/i.test(name),
-    );
-    const capabilityLine = returnType
-      ? `Component capability for ${normalized}: returnType=${returnType}.`
-      : "";
-    const videoRoutingLine = returnType === "video"
-      ? (strictSourceParams.length > 0
-        ? `Video routing for ${normalized}: this is a source-conditioned video component. A scene description alone does NOT satisfy source params [${strictSourceParams.join(", ")}]. If those source inputs are missing, ask for them or render the component instead of direct invoke.`
-        : `Video routing for ${normalized}: this component can generate video directly from descriptive parameters when required params are satisfied, so prefer direct invoke for immediate generation.`)
-      : "";
+    const capabilityLine = [
+      returnType ? `returnType=${returnType}` : '',
+      capabilityKey ? `capability=${capabilityKey}` : '',
+      baseTool ? `baseTool=${baseTool}` : '',
+      specialization ? `specialization=${specialization}` : '',
+    ].filter(Boolean).join(', ');
     const lines = parameterMappings.map((mapping) =>
       JSON.stringify({
         parameterName: toStringValue(mapping.parameterName).trim(),
@@ -1736,23 +1719,18 @@ async function loadManagementComponentInvokeContext(
     );
     const context = [
       `[component-invoke:${normalized}]`,
-      capabilityLine,
-      `When emitting ComponentInvokeAction for ${normalized}, use these exact parameter mappings as the primary source of truth. Do not rename a declared parameter unless the component context explicitly says an alias is acceptable.`,
+      capabilityLine ? `Component capability for ${normalized}: ${capabilityLine}.` : '',
+      `componentName=${normalized}`,
+      `declaredParams: ${JSON.stringify(declaredParams)}`,
       requiredParams.length > 0
-        ? `Direct invoke gate for ${normalized}: if the current user request already provides enough information to fill required params [${requiredParams.join(", ")}], invoke immediately. Do not fall back to a prose explanation just because optional params are missing.`
-        : `Direct invoke gate for ${normalized}: there are no required params, so you may invoke it directly whenever the user intent matches.`,
+        ? `requiredParams: ${JSON.stringify(requiredParams)}`
+        : "requiredParams: []",
       strictSourceParams.length > 0
-        ? `Strict source gate for ${normalized}: params [${strictSourceParams.join(", ")}] are source/content inputs. Only direct invoke when the user has explicitly provided the real source value for them, such as an actual image/url/path/lyrics body. A scene description alone does not satisfy these params. If they are missing, render the component or ask for the missing source input instead of invoking.`
+        ? `sourceParams: ${JSON.stringify(strictSourceParams)}`
         : "",
-      videoRoutingLine,
-      hasImageLikeSource
-        ? `Local workspace media paths such as agent_profile/portrait/xxx.png are valid source values for ${normalized}. Pass that path as-is under the declared source parameter instead of inventing a new URL or placeholder text.`
-        : "",
-      "Only include declared parameterName keys in ComponentInvokeAction.props.params. Unsupported extra user fields must be ignored instead of becoming a reason to refuse the invocation.",
       descriptiveParams.length > 0
-        ? `If the user provides extra stylistic constraints without an exact same parameter name, you may merge them into the nearest descriptive string parameter among [${descriptiveParams.join(", ")}].`
-        : "If the user provides extra stylistic constraints without an exact matching parameter, ignore those extra fields and continue with the declared params.",
-      `Never say that ${normalized} has no usable entry, no callable route, or no safe schema when this prompt block is present.`,
+        ? `descriptiveParams: ${JSON.stringify(descriptiveParams)}`
+        : "",
       ...lines,
     ].join("\n");
     managementComponentInvokeContextCache.set(normalized, context);
@@ -2095,14 +2073,21 @@ async function sendAgentChatStreamOnce(
   let doneSpec: unknown;
   let donePayload: Record<string, unknown> | null = null;
   let appearanceUpdated: AgentAppearanceUpdated | undefined;
+  let resolvedSessionId = "";
+  let resolvedSessionLabel = "";
   let streamErrorMessage = "";
   let sawTerminalEvent = false;
   let sawPhaseDone = false;
   let sawTypingStop = false;
   let sawToolResultEvent = false;
+  let sawAnyStreamEvent = false;
+  let firstEventTimeoutTriggered = false;
   let idleTimeoutTriggered = false;
   let maxTimeoutTriggered = false;
+  let activeToolName = "";
+  let currentIdleTimeoutMs = STREAM_IDLE_TIMEOUT_MS;
   let completionAbortTimer: ReturnType<typeof setTimeout> | null = null;
+  let firstEventAbortTimer: ReturnType<typeof setTimeout> | null = null;
   let idleAbortTimer: ReturnType<typeof setTimeout> | null = null;
   let maxAbortTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -2135,11 +2120,27 @@ async function sendAgentChatStreamOnce(
     }
   };
 
+  const clearFirstEventAbortTimer = () => {
+    if (firstEventAbortTimer != null) {
+      clearTimeout(firstEventAbortTimer);
+      firstEventAbortTimer = null;
+    }
+  };
+
+  const markFirstStreamEvent = () => {
+    if (sawAnyStreamEvent) {
+      return;
+    }
+    sawAnyStreamEvent = true;
+    clearFirstEventAbortTimer();
+  };
+
   const touchStreamActivity = () => {
     clearIdleAbortTimer();
     if (sawTerminalEvent) {
       return;
     }
+    const idleWindowMs = currentIdleTimeoutMs;
     idleAbortTimer = setTimeout(() => {
       if (sawTerminalEvent) {
         return;
@@ -2150,7 +2151,24 @@ async function sendAgentChatStreamOnce(
       } catch {
         // ignore
       }
-    }, STREAM_IDLE_TIMEOUT_MS);
+    }, idleWindowMs);
+  };
+
+  const extendIdleWindowForTool = (toolName?: string) => {
+    const normalized = normalizeStreamToolName(toolName);
+    activeToolName = normalized;
+    currentIdleTimeoutMs = normalized
+      ? isLikelyLongRunningImageTool(normalized)
+        ? STREAM_IMAGE_TOOL_IDLE_TIMEOUT_MS
+        : STREAM_TOOL_IDLE_TIMEOUT_MS
+      : STREAM_TOOL_IDLE_TIMEOUT_MS;
+    touchStreamActivity();
+  };
+
+  const restoreDefaultIdleWindow = () => {
+    activeToolName = "";
+    currentIdleTimeoutMs = STREAM_IDLE_TIMEOUT_MS;
+    touchStreamActivity();
   };
 
   maxAbortTimer = setTimeout(() => {
@@ -2164,6 +2182,13 @@ async function sendAgentChatStreamOnce(
       // ignore
     }
   }, STREAM_MAX_TIMEOUT_MS);
+
+  firstEventAbortTimer = setTimeout(() => {
+    if (sawTerminalEvent || sawAnyStreamEvent) {
+      return;
+    }
+    firstEventTimeoutTriggered = true;
+  }, STREAM_FIRST_EVENT_TIMEOUT_MS);
 
   touchStreamActivity();
 
@@ -2180,169 +2205,240 @@ async function sendAgentChatStreamOnce(
     const sessionLabel =
       typeof input.sessionLabel === "string" ? input.sessionLabel.trim() : "";
     const requestOrigin = input.requestOrigin;
+    const currentTaskDraft = input.currentTaskDraft;
+    let taskDraftMeta: ReturnType<typeof parseTaskDraftMetaFromPayload> = {};
 
-    // Tauri 下默认走 WS；但会话隔离需要 session_id/session_label 时，强制走 service-rs SSE 代理，确保命中目标会话。
-    if (!isTauriRuntime() || sessionId || sessionLabel) {
-      await requestSse(
-        `/api/chat/${encodeURIComponent(agentId)}/message/stream`,
-        (frame) => {
-          if (sawTerminalEvent) {
-            return;
-          }
-          touchStreamActivity();
+    // 聊天统一走 service-rs SSE 代理，避免桌面端直连 OpenFang WS 时绕过
+    // blocked_tools、聊天安全守卫与会话绑定逻辑。
+    const forceServiceRsChatProxy = true;
+    if (forceServiceRsChatProxy) {
+      try {
+        await requestSse(
+          `/api/chat/${encodeURIComponent(agentId)}/message/stream`,
+          (frame) => {
+            if (sawTerminalEvent) {
+              return;
+            }
+            markFirstStreamEvent();
+            touchStreamActivity();
 
-          const eventName = toStringValue(frame.event, "message")
-            .trim()
-            .toLowerCase();
-          const parsedPayload = parseJsonSafely<unknown>(frame.data);
-          const payload = isRecord(parsedPayload) ? parsedPayload : null;
+            const eventName = toStringValue(frame.event, "message")
+              .trim()
+              .toLowerCase();
+            const parsedPayload = parseJsonSafely<unknown>(frame.data);
+            const payload = isRecord(parsedPayload) ? parsedPayload : null;
 
-          if (eventName === "chunk" || eventName === "message") {
-            const textDelta = payload
-              ? toStringValue(payload.content)
-              : frame.data;
-            if (textDelta) {
-              fullText += textDelta;
+            if (eventName === "chunk" || eventName === "message") {
+              const textDelta = payload
+                ? toStringValue(payload.content)
+                : frame.data;
+              if (textDelta) {
+                fullText += textDelta;
+                emitChunk({
+                  requestId,
+                  kind: "text",
+                  value: textDelta,
+                  meta: {
+                    rawEvent: eventName,
+                    rawPayload: frame.data,
+                  },
+                });
+              }
+              if (payload && payload.done === true) {
+                sawTerminalEvent = true;
+                clearCompletionAbortTimer();
+                donePayload = payload;
+              }
+              return;
+            }
+
+            if (eventName === "spec_patch") {
+              const patchText = payload
+                ? toStringValue(payload.patch, toStringValue(payload.content))
+                : frame.data;
+              if (patchText) {
+                emitChunk({
+                  requestId,
+                  kind: "patch",
+                  value: patchText,
+                  event: "spec_patch",
+                  meta: {
+                    rawEvent: eventName,
+                    rawPayload: frame.data,
+                  },
+                });
+              }
+              return;
+            }
+
+            if (
+              eventName === "phase" ||
+              eventName === "typing" ||
+              eventName === "tool_use" ||
+              eventName === "tool_result" ||
+              eventName === "delegate_call" ||
+              eventName === "ipc_call" ||
+              eventName === "runtime_log"
+            ) {
+              if (
+                eventName === "phase" &&
+                payload &&
+                toStringValue(payload.phase).trim().toLowerCase() === "done"
+              ) {
+                sawPhaseDone = true;
+                restoreDefaultIdleWindow();
+              }
+              if (
+                eventName === "phase" &&
+                payload &&
+                toStringValue(payload.phase).trim().toLowerCase() === "tool_use"
+              ) {
+                extendIdleWindowForTool();
+              }
+              if (
+                eventName === "typing" &&
+                payload &&
+                toStringValue(payload.state).trim().toLowerCase() === "stop"
+              ) {
+                sawTypingStop = true;
+              }
+              if (payload) {
+                resolvedSessionId =
+                  toStringValue(payload.session_id, resolvedSessionId).trim() ||
+                  resolvedSessionId;
+                resolvedSessionLabel =
+                  toStringValue(
+                    payload.session_label,
+                    resolvedSessionLabel,
+                  ).trim() || resolvedSessionLabel;
+              }
+              if (eventName === "tool_result") {
+                sawToolResultEvent = true;
+                restoreDefaultIdleWindow();
+              }
+              if (eventName === "tool_use") {
+                extendIdleWindowForTool(
+                  payload ? toStringValue(payload.tool) : "",
+                );
+              }
               emitChunk({
                 requestId,
-                kind: "text",
-                value: textDelta,
+                kind: "log",
+                value: frame.data,
+                event: eventName,
                 meta: {
                   rawEvent: eventName,
                   rawPayload: frame.data,
                 },
               });
+              if (!sawTerminalEvent && sawPhaseDone && sawTypingStop) {
+                ensureCompletionAbortTimer();
+              }
+              return;
             }
-            if (payload && payload.done === true) {
+
+            if (eventName === "appearance_updated") {
+              appearanceUpdated =
+                parseAgentAppearanceUpdated(payload) ?? appearanceUpdated;
+              return;
+            }
+
+            if (eventName === "done") {
               sawTerminalEvent = true;
               clearCompletionAbortTimer();
-              donePayload = payload;
+              restoreDefaultIdleWindow();
+              donePayload = payload ?? {};
+              taskDraftMeta = parseTaskDraftMetaFromPayload(payload);
+              if (payload) {
+                resolvedSessionId =
+                  toStringValue(payload.session_id, resolvedSessionId).trim() ||
+                  resolvedSessionId;
+                resolvedSessionLabel =
+                  toStringValue(
+                    payload.session_label,
+                    resolvedSessionLabel,
+                  ).trim() || resolvedSessionLabel;
+              }
+              const responseText = payload
+                ? toStringValue(payload.content).trim()
+                : "";
+              if (responseText) {
+                fullText = responseText;
+              }
+              doneSpec = parseSpecFromEventPayload(payload ?? {});
+              if (!doneSpec) {
+                doneSpec = parseSpecFromText(fullText);
+              }
+              return;
             }
-            return;
-          }
 
-          if (eventName === "spec_patch") {
-            const patchText = payload
-              ? toStringValue(payload.patch, toStringValue(payload.content))
-              : frame.data;
-            if (patchText) {
-              emitChunk({
-                requestId,
-                kind: "patch",
-                value: patchText,
-                event: "spec_patch",
-                meta: {
-                  rawEvent: eventName,
-                  rawPayload: frame.data,
-                },
-              });
+            if (eventName === "error") {
+              sawTerminalEvent = true;
+              clearCompletionAbortTimer();
+              restoreDefaultIdleWindow();
+              streamErrorMessage = payload
+                ? toStringValue(
+                    payload.error,
+                    toStringValue(
+                      payload.message,
+                      toStringValue(payload.content),
+                    ),
+                  )
+                : frame.data;
+              return;
             }
-            return;
-          }
 
-          if (
-            eventName === "phase" ||
-            eventName === "typing" ||
-            eventName === "tool_use" ||
-            eventName === "tool_result" ||
-            eventName === "delegate_call" ||
-            eventName === "ipc_call" ||
-            eventName === "runtime_log"
-          ) {
-            if (
-              eventName === "phase" &&
-              payload &&
-              toStringValue(payload.phase).trim().toLowerCase() === "done"
-            ) {
-              sawPhaseDone = true;
-            }
-            if (
-              eventName === "typing" &&
-              payload &&
-              toStringValue(payload.state).trim().toLowerCase() === "stop"
-            ) {
-              sawTypingStop = true;
-            }
-            if (eventName === "tool_result") {
-              sawToolResultEvent = true;
-            }
             emitChunk({
               requestId,
               kind: "log",
               value: frame.data,
-              event: eventName,
+              event: eventName || "message",
               meta: {
                 rawEvent: eventName,
                 rawPayload: frame.data,
               },
             });
-            if (!sawTerminalEvent && sawPhaseDone && sawTypingStop) {
-              ensureCompletionAbortTimer();
-            }
-            return;
-          }
-
-          if (eventName === "appearance_updated") {
-            appearanceUpdated =
-              parseAgentAppearanceUpdated(payload) ?? appearanceUpdated;
-            return;
-          }
-
-          if (eventName === "done") {
-            sawTerminalEvent = true;
-            clearCompletionAbortTimer();
-            donePayload = payload ?? {};
-            const responseText = payload
-              ? toStringValue(payload.content).trim()
-              : "";
-            if (responseText) {
-              fullText = responseText;
-            }
-            doneSpec = parseSpecFromEventPayload(payload ?? {});
-            if (!doneSpec) {
-              doneSpec = parseSpecFromText(fullText);
-            }
-            return;
-          }
-
-          if (eventName === "error") {
-            sawTerminalEvent = true;
-            clearCompletionAbortTimer();
-            streamErrorMessage = payload
-              ? toStringValue(
-                  payload.error,
-                  toStringValue(
-                    payload.message,
-                    toStringValue(payload.content),
-                  ),
-                )
-              : frame.data;
-            return;
-          }
-
-          emitChunk({
-            requestId,
-            kind: "log",
-            value: frame.data,
-            event: eventName || "message",
-            meta: {
-              rawEvent: eventName,
-              rawPayload: frame.data,
-            },
-          });
-        },
-        {
-          method: "POST",
-          body: {
-            message: outgoingMessage,
-            attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
-            session_id: sessionId || undefined,
-            session_label: sessionLabel || undefined,
-            request_origin: requestOrigin,
           },
-          signal: controller.signal,
-        },
-      );
+          {
+            method: "POST",
+              body: {
+                message: outgoingMessage,
+                attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
+                session_id: sessionId || undefined,
+                session_label: sessionLabel || undefined,
+                request_origin: requestOrigin,
+                current_task_draft: currentTaskDraft ?? undefined,
+              },
+              signal: controller.signal,
+            },
+        );
+      } catch (sseError) {
+        const abortedForCompletion =
+          controller.signal.aborted &&
+          sawPhaseDone &&
+          sawTypingStop &&
+          !sawTerminalEvent;
+        const abortedByFirstEventTimeout =
+          controller.signal.aborted &&
+          firstEventTimeoutTriggered &&
+          !sawTerminalEvent;
+        const abortedByIdleTimeout =
+          controller.signal.aborted &&
+          idleTimeoutTriggered &&
+          !sawTerminalEvent;
+        const abortedByMaxTimeout =
+          controller.signal.aborted &&
+          maxTimeoutTriggered &&
+          !sawTerminalEvent;
+        if (
+          !abortedForCompletion &&
+          !abortedByFirstEventTimeout &&
+          !abortedByIdleTimeout &&
+          !abortedByMaxTimeout
+        ) {
+          throw sseError;
+        }
+      }
 
       if (!sawTerminalEvent && fullText.trim()) {
         donePayload = {
@@ -2358,6 +2454,7 @@ async function sendAgentChatStreamOnce(
           (frame) => {
             const payload = parseWsMessageFrame(frame.data);
             if (!payload) return false;
+            markFirstStreamEvent();
             touchStreamActivity();
 
             const type = toStringValue(payload.type).trim().toLowerCase();
@@ -2413,6 +2510,13 @@ async function sendAgentChatStreamOnce(
                 toStringValue(payload.phase).trim().toLowerCase() === "done"
               ) {
                 sawPhaseDone = true;
+                restoreDefaultIdleWindow();
+              }
+              if (
+                type === "phase" &&
+                toStringValue(payload.phase).trim().toLowerCase() === "tool_use"
+              ) {
+                extendIdleWindowForTool();
               }
               if (
                 type === "typing" &&
@@ -2437,6 +2541,7 @@ async function sendAgentChatStreamOnce(
             }
 
             if (type === "tool_start") {
+              extendIdleWindowForTool(toStringValue(payload.tool));
               emitChunk({
                 requestId,
                 kind: "log",
@@ -2452,6 +2557,7 @@ async function sendAgentChatStreamOnce(
 
             if (type === "tool_end") {
               sawToolResultEvent = true;
+              restoreDefaultIdleWindow();
               emitChunk({
                 requestId,
                 kind: "log",
@@ -2467,6 +2573,7 @@ async function sendAgentChatStreamOnce(
 
             if (type === "tool_result") {
               sawToolResultEvent = true;
+              restoreDefaultIdleWindow();
               emitChunk({
                 requestId,
                 kind: "log",
@@ -2483,7 +2590,9 @@ async function sendAgentChatStreamOnce(
             if (type === "response") {
               sawTerminalEvent = true;
               clearCompletionAbortTimer();
+              restoreDefaultIdleWindow();
               donePayload = payload;
+              taskDraftMeta = parseTaskDraftMetaFromPayload(payload);
               const responseText = toStringValue(payload.content).trim();
               if (responseText) {
                 fullText = responseText;
@@ -2498,6 +2607,7 @@ async function sendAgentChatStreamOnce(
             if (type === "silent_complete") {
               sawTerminalEvent = true;
               clearCompletionAbortTimer();
+              restoreDefaultIdleWindow();
               donePayload = payload;
               return true;
             }
@@ -2505,6 +2615,7 @@ async function sendAgentChatStreamOnce(
             if (type === "error") {
               sawTerminalEvent = true;
               clearCompletionAbortTimer();
+              restoreDefaultIdleWindow();
               streamErrorMessage =
                 toStringValue(payload.content) ||
                 toStringValue(payload.message) ||
@@ -2527,6 +2638,10 @@ async function sendAgentChatStreamOnce(
           sawPhaseDone &&
           sawTypingStop &&
           !sawTerminalEvent;
+        const abortedByFirstEventTimeout =
+          controller.signal.aborted &&
+          firstEventTimeoutTriggered &&
+          !sawTerminalEvent;
         const abortedByIdleTimeout =
           controller.signal.aborted &&
           idleTimeoutTriggered &&
@@ -2535,6 +2650,7 @@ async function sendAgentChatStreamOnce(
           controller.signal.aborted && maxTimeoutTriggered && !sawTerminalEvent;
         if (
           !abortedForCompletion &&
+          !abortedByFirstEventTimeout &&
           !abortedByIdleTimeout &&
           !abortedByMaxTimeout
         ) {
@@ -2556,6 +2672,7 @@ async function sendAgentChatStreamOnce(
                 message: outgoingMessage,
                 attachments:
                   attachmentRefs.length > 0 ? attachmentRefs : undefined,
+                current_task_draft: currentTaskDraft ?? undefined,
               },
               signal: controller.signal,
             },
@@ -2566,6 +2683,7 @@ async function sendAgentChatStreamOnce(
             toStringValue(response.content),
           );
           donePayload = response;
+          taskDraftMeta = parseTaskDraftMetaFromPayload(response);
           doneSpec = parseSpecFromEventPayload(response);
         }
       }
@@ -2574,14 +2692,18 @@ async function sendAgentChatStreamOnce(
     if (!sawTerminalEvent && (idleTimeoutTriggered || maxTimeoutTriggered)) {
       if (!fullText.trim()) {
         fullText = idleTimeoutTriggered
-          ? "Streaming request ended after a long idle period. Please retry."
+          ? activeToolName
+            ? `Tool "${activeToolName}" was still running with no new stream events for too long. Please retry.`
+            : "Streaming request ended after a long idle period. Please retry."
           : "This task timed out after 60 minutes and was ended automatically.";
       }
       donePayload = {
         type: "response_fallback",
         content: fullText,
         fallback: idleTimeoutTriggered
-          ? "stream_idle_timeout"
+          ? activeToolName
+            ? `stream_idle_timeout:${activeToolName}`
+            : "stream_idle_timeout"
           : "stream_max_timeout",
       };
     }
@@ -2646,10 +2768,14 @@ async function sendAgentChatStreamOnce(
             `/api/chat/${encodeURIComponent(agentId)}/message`,
             {
               method: "POST",
-              body: { message: outgoingMessage },
+              body: {
+                message: outgoingMessage,
+                current_task_draft: currentTaskDraft ?? undefined,
+              },
               signal: controller.signal,
             },
           );
+          taskDraftMeta = parseTaskDraftMetaFromPayload(retryResponse);
           const retryText = toStringValue(
             retryResponse.response,
             toStringValue(retryResponse.content),
@@ -2683,6 +2809,15 @@ async function sendAgentChatStreamOnce(
       appearanceUpdated ??
       parseAgentAppearanceUpdatedFromPayload(donePayload);
 
+    resolvedSessionId =
+      toStringValue(donePayload?.session_id, resolvedSessionId).trim() ||
+      resolvedSessionId;
+    resolvedSessionLabel =
+      toStringValue(
+        donePayload?.session_label,
+        resolvedSessionLabel,
+      ).trim() || resolvedSessionLabel;
+
     emitChunk({
       requestId,
       kind: "done",
@@ -2694,6 +2829,7 @@ async function sendAgentChatStreamOnce(
         rawPayload: JSON.stringify(
           donePayload ?? { text: fullText, spec: doneSpec ?? null },
         ),
+        ...taskDraftMeta,
         ...(appearanceUpdated ? { appearanceUpdated } : {}),
       },
     });
@@ -2704,7 +2840,10 @@ async function sendAgentChatStreamOnce(
       text: fullText,
       uiRawText: extractUiRawText(fullText),
       spec: doneSpec,
+      ...taskDraftMeta,
       appearanceUpdated,
+      sessionId: resolvedSessionId || undefined,
+      sessionLabel: resolvedSessionLabel || undefined,
     };
   } catch (error) {
     const message =
@@ -2716,6 +2855,7 @@ async function sendAgentChatStreamOnce(
     };
   } finally {
     clearCompletionAbortTimer();
+    clearFirstEventAbortTimer();
     clearIdleAbortTimer();
     if (maxAbortTimer != null) {
       clearTimeout(maxAbortTimer);
@@ -2831,16 +2971,21 @@ export async function sendAgentChat(
             session_id: nextSessionId || undefined,
             session_label: nextSessionLabel || undefined,
             request_origin: requestOrigin,
+            current_task_draft: requestInput.currentTaskDraft ?? undefined,
           },
           signal: controller.signal,
         },
       );
       const body = isRecord(result) ? result : {};
       const content = toStringValue(body.response, toStringValue(body.content));
+      const taskDraftMeta = parseTaskDraftMetaFromPayload(body);
       return {
         success: true,
         content,
         text: content,
+        ...taskDraftMeta,
+        sessionId: toStringValue(body.session_id) || undefined,
+        sessionLabel: toStringValue(body.session_label) || undefined,
         recoveredRemoteSessionId: toStringValue(body.session_id) || undefined,
       };
     };

@@ -13,6 +13,8 @@ import { GenUIWebViewCard } from '@/components/chat/BuiltinWebViewComponents';
 import { GenUIAudioPlayer, GenUIAudioPlaylist } from '@/components/chat/BuiltinAudioComponents';
 import { GenUIMarkdownPreviewCard } from '@/components/chat/BuiltinMarkdownPreviewComponents';
 import { GenUIOfficePreviewCard } from '@/components/chat/BuiltinOfficePreviewComponents';
+import { GenUIJobProgressCard } from '@/components/chat/BuiltinJobComponents';
+import { GenUIConfirmResultCard, GenUIPatchResultCard, GenUIReviewResultCard } from '@/components/chat/BuiltinCapabilityResultComponents';
 import { GenUIOptionSelector } from '@/components/chat/BuiltinOptionComponents';
 import { GenUIAgentManagementConfirmCard } from '@/components/chat/AgentManagementConfirmCard';
 import { GenUIGroupUpgradeCard } from '@/components/chat/GroupUpgradeCard';
@@ -238,6 +240,26 @@ export const genUiComponents: any = {
     office_preview: GenUIOfficePreviewCard,
     'office.preview': GenUIOfficePreviewCard,
     office: GenUIOfficePreviewCard,
+    JobProgressCard: GenUIJobProgressCard,
+    jobprogresscard: GenUIJobProgressCard,
+    job_progress_card: GenUIJobProgressCard,
+    'job.progress': GenUIJobProgressCard,
+    'job-progress': GenUIJobProgressCard,
+    ReviewResultCard: GenUIReviewResultCard,
+    reviewresultcard: GenUIReviewResultCard,
+    review_result_card: GenUIReviewResultCard,
+    'review.result': GenUIReviewResultCard,
+    review: GenUIReviewResultCard,
+    ConfirmResultCard: GenUIConfirmResultCard,
+    confirmresultcard: GenUIConfirmResultCard,
+    confirm_result_card: GenUIConfirmResultCard,
+    'confirm.result': GenUIConfirmResultCard,
+    confirm: GenUIConfirmResultCard,
+    PatchResultCard: GenUIPatchResultCard,
+    patchresultcard: GenUIPatchResultCard,
+    patch_result_card: GenUIPatchResultCard,
+    'patch.result': GenUIPatchResultCard,
+    patch: GenUIPatchResultCard,
     OptionSelector: GenUIOptionSelector,
     optionselector: GenUIOptionSelector,
     option_selector: GenUIOptionSelector,

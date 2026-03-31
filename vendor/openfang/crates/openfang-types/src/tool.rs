@@ -98,6 +98,22 @@ fn normalize_schema_recursive(schema: &serde_json::Value) -> serde_json::Value {
         result.insert(key.clone(), value.clone());
     }
 
+    // OpenAI-compatible function calling currently rejects object schemas that
+    // omit the `properties` field entirely, even when the object is intentionally
+    // open-ended via `additionalProperties = true`.
+    if result
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "object")
+        .unwrap_or(false)
+        && !result.contains_key("properties")
+    {
+        result.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+    }
+
     serde_json::Value::Object(result)
 }
 
@@ -257,5 +273,18 @@ mod tests {
         assert!(result["properties"]["outer"]["properties"]["inner"]
             .get("$schema")
             .is_none());
+    }
+
+    #[test]
+    fn test_normalize_schema_inserts_empty_properties_for_open_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": true
+        });
+        let result = normalize_schema_for_provider(&schema, "openai");
+        assert_eq!(result["type"], "object");
+        assert!(result.get("properties").is_some());
+        assert!(result["properties"].is_object());
+        assert_eq!(result["additionalProperties"], true);
     }
 }

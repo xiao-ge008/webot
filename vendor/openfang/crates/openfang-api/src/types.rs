@@ -40,6 +40,9 @@ pub struct MessageRequest {
     /// Optional request-origin hint used for quota routing.
     #[serde(default)]
     pub request_origin: Option<String>,
+    /// Optional tool blocklist applied only for this chat turn.
+    #[serde(default)]
+    pub blocked_tools: Vec<String>,
 }
 
 /// Response from sending a message.
@@ -98,4 +101,43 @@ pub struct MigrateScanRequest {
 pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManagedTaskListQuery {
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManagedTaskPendingDeliveriesQuery {
+    #[serde(default)]
+    pub target_kind: Option<String>,
+    #[serde(default)]
+    pub origin_chat_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManagedTaskDeliveryStatusUpdateRequest {
+    pub status: openfang_types::tasks::ManagedTaskDeliveryStatus,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManagedTaskDeliveryAttemptCreateRequest {
+    pub task_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub event_id: Option<String>,
+    pub target_kind: openfang_types::tasks::ManagedTaskDeliveryTargetKind,
+    pub consumer_kind: openfang_types::tasks::ManagedTaskDeliveryConsumerKind,
+    pub status: openfang_types::tasks::ManagedTaskDeliveryAttemptStatus,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub metadata_json: serde_json::Value,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
 }

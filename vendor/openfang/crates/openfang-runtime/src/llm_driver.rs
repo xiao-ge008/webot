@@ -120,6 +120,7 @@ pub enum StreamEvent {
     ToolExecutionResult {
         name: String,
         result_preview: String,
+        structured_result: Option<serde_json::Value>,
         is_error: bool,
         input: Option<serde_json::Value>,
     },

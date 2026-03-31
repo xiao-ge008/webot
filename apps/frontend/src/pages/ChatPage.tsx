@@ -21,7 +21,7 @@ import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog';
 import type { TaskDetailsTask } from '@/components/tasks/TaskDetailsDialog';
 import { A2AWorkDetailsDialog } from '@/components/tasks/A2AWorkDetailsDialog';
 import type { Agent } from '@/types';
-import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord } from '@/types/tasks';
+import type { Task, TaskConversationType, TaskRunRecord } from '@/types/tasks';
 import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import type { GroupQueueItem, GroupQueueReason, GroupQueueStatus, GroupSessionRuntime } from '@/types/group';
@@ -41,12 +41,16 @@ import {
 } from '@/services/agent-management-workflow';
 import {
     applyManagementAgentAppearance,
+    getManagementCapabilityJob,
     getManagementAgentDetail,
     listManagementAgents,
+    upsertManagementCapabilityJob,
+    type ManagementCapabilityJobRecord,
 } from '@/services/management-client';
 import { emitAgentAppearanceUpdated } from '@/services/agent-appearance-events';
 import { createChatGroup } from '@/services/group-client';
 import { requestJson } from '@/services/transport';
+import { analyzeAndCacheChatImageWithLocalVision } from '@/services/local-vision-service';
 import {
     createTask,
     deleteTask,
@@ -55,11 +59,19 @@ import {
     hasTaskFinalSummaryDelivered,
     listPendingTaskReportDeliveries,
     listTaskRuns,
+    markTaskFinalSummaryDelivered,
     pauseTask,
-    runTaskNow,
+    publishTask,
+    runTaskOnce,
     setTaskCenterAgentId,
+    storeTaskFinalSummary,
     updateTaskReportDeliveryStatus,
 } from '@/services/task-client';
+import {
+    normalizeChatTaskDraftState,
+    normalizeChatTaskDraftTaskCard,
+} from '@/services/chat-task-draft-client';
+import type { ChatTaskDraftStatePayload } from '@/services/chat-task-draft-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import { useResolvedRuntimeAssetSrc } from '@/lib/runtime-asset-url';
 import {
@@ -68,9 +80,12 @@ import {
     extractAgentSelfAppearanceActionFromSpec,
     extractComponentInvokeActionFromSpec,
     appendThinkingStream,
+    buildRenderableSpecFromMarkdownMedia,
     buildHistory,
     buildInitialMessages,
     buildFallbackSpecFromToolTrace,
+    buildPresentableResultFromToolLog,
+    buildRenderableSpecFromPresentableResult,
     buildRenderableSpecFromToolLog,
     cleanupAssistantText,
     extractLatestToolReadableText,
@@ -84,7 +99,6 @@ import {
     mapManagementAgentToUi,
     normalizeIncomingSpec,
     normalizeAgentSelfAppearanceActionPayload,
-    isRecordValue,
     parseJsonSafely,
     parseTraceFromLog,
     pushTrace,
@@ -98,6 +112,7 @@ import {
 type StreamState = 'idle' | 'streaming' | 'waiting';
 
 const STREAM_VISUAL_FLUSH_MIN_INTERVAL_MS = 24;
+const WATCHDOG_WARNING_TEXT = '响应较慢，仍在等待。';
 type ChatSession = StoredChatSession;
 type IdleAutoScope = 'agent' | 'group';
 
@@ -112,18 +127,27 @@ interface IdleAutoConfig {
     agentOverride?: Agent;
 }
 
+interface PendingChatTaskDraftState {
+    objective?: string;
+    reportCondition?: string;
+    everyMs?: number;
+    maxRuns?: number;
+    durationMs?: number;
+    scheduleText?: string;
+    taskName?: string;
+    executionPrompt?: string;
+    sourceMessageText: string;
+    createdAt: string;
+}
+
 const GROUP_UPGRADE_SYSTEM_PREAMBLE = [
     '[system:group-upgrade]',
     '当你判断需要引入其他智能体协作时，不要自动拉群，必须先征求用户同意。',
-    '请输出 UI_JSON 卡片，type=GroupUpgradeCard，并在 props 中填写：',
-    '- reason: 说明为何需要多人协作',
-    '- memberAgentIds 或 members: 拟邀请的成员（可填成员 id 或 name）',
-    '- 可选 groupName/description/tags',
-    '用户点击“同意拉群”后系统会自动创建群聊；若用户拒绝，则停止拉人。',
-    '示例：',
-    '<UI_JSON>',
-    '{"type":"GroupUpgradeCard","props":{"title":"建议升级为群聊","reason":"需要前端与后端协作","memberAgentIds":["agent_frontend","agent_backend"],"groupName":"临时协作群"}}',
-    '</UI_JSON>',
+    'groupUpgrade.type=GroupUpgradeCard',
+    'groupUpgrade.requiredProps=["reason","memberAgentIds|members"]',
+    'groupUpgrade.optionalProps=["title","groupName","description","tags","leaderAgentId","confirmLabel","cancelLabel","confirmAction","cancelAction"]',
+    'groupUpgrade.actions=["confirm_group_upgrade","cancel_group_upgrade"]',
+    '用户点击确认后系统会自动创建群聊；若用户拒绝，则停止拉人。',
 ].join('\n');
 
 const REMOTE_SESSION_INITIAL_BATCH = 20;
@@ -155,7 +179,13 @@ function areMessagesEquivalent(left: Message[], right: Message[]): boolean {
             l.text !== r.text ||
             l.streaming !== r.streaming ||
             l.cardPending !== r.cardPending ||
+            l.uiRawText !== r.uiRawText ||
+            l.uiStreamState !== r.uiStreamState ||
             JSON.stringify(l.attachments ?? null) !== JSON.stringify(r.attachments ?? null) ||
+            JSON.stringify(l.spec ?? null) !== JSON.stringify(r.spec ?? null) ||
+            JSON.stringify(l.tools ?? null) !== JSON.stringify(r.tools ?? null) ||
+            JSON.stringify(l.thinkingTrace ?? null) !== JSON.stringify(r.thinkingTrace ?? null) ||
+            JSON.stringify(l.toolTrace ?? null) !== JSON.stringify(r.toolTrace ?? null) ||
             JSON.stringify(l.taskCard ?? null) !== JSON.stringify(r.taskCard ?? null) ||
             JSON.stringify(l.a2aCards ?? null) !== JSON.stringify(r.a2aCards ?? null)
         ) {
@@ -260,6 +290,334 @@ function shouldSuppressConsecutiveAgentDuplicate(
     return false;
 }
 
+function asUnknownRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function pickJobText(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed) return trimmed;
+        }
+    }
+    return undefined;
+}
+
+function pickJobNumber(...values: unknown[]): number | undefined {
+    for (const value of values) {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+        }
+    }
+    return undefined;
+}
+
+function normalizeCapabilityJobStatus(status: unknown): string {
+    return typeof status === 'string' ? status.trim().toLowerCase() : '';
+}
+
+function normalizeSpecType(value: unknown): string {
+    const record = asUnknownRecord(value);
+    const type = pickJobText(record?.type, record?.component);
+    return (type || '').trim().toLowerCase();
+}
+
+function isCapabilityJobTerminalStatus(status: unknown): boolean {
+    switch (normalizeCapabilityJobStatus(status)) {
+        case 'completed':
+        case 'done':
+        case 'success':
+        case 'failed':
+        case 'error':
+        case 'cancelled':
+        case 'canceled':
+            return true;
+        default:
+            return false;
+    }
+}
+
+function buildCapabilityJobResultPayload(
+    payload: Record<string, unknown> | null,
+    presentableResult: Record<string, unknown>,
+): Record<string, unknown> {
+    if (!payload) {
+        return { presentable_result: presentableResult };
+    }
+    const next = { ...payload };
+    if (!asUnknownRecord(next.presentable_result) && !asUnknownRecord(next.presentableResult)) {
+        next.presentable_result = presentableResult;
+    }
+    return next;
+}
+
+function shouldPromotePresentableResultToMessageSpec(
+    currentSpec: unknown,
+    presentableResult: Record<string, unknown>,
+): boolean {
+    const kind = (pickJobText(presentableResult.kind) || '').trim().toLowerCase();
+    if (!kind) {
+        return false;
+    }
+    if (!currentSpec) {
+        return kind !== 'job_result' || isComponentInvokePresentableResult(presentableResult);
+    }
+    const currentType = normalizeSpecType(currentSpec);
+    if (kind === 'job_result') {
+        return isComponentInvokePresentableResult(presentableResult);
+    }
+    if (kind === 'media_result' || kind === 'error_result') {
+        return currentType === 'jobprogresscard';
+    }
+    return false;
+}
+
+function isComponentInvokePresentableResult(
+    presentableResult: Record<string, unknown>,
+): boolean {
+    const capabilityKey = pickJobText(
+        presentableResult.capabilityKey,
+        presentableResult.capability_key,
+    )?.trim().toLowerCase() || '';
+    const route = pickJobText(presentableResult.route)?.trim().toLowerCase() || '';
+    const providerType = pickJobText(
+        presentableResult.providerType,
+        presentableResult.provider_type,
+    )?.trim().toLowerCase() || '';
+    return capabilityKey === 'component_invoke'
+        || route === 'component_invoke'
+        || providerType === 'component_skill';
+}
+
+function shouldRenderPresentableResultAsMessageSpec(
+    presentableResult: Record<string, unknown>,
+): boolean {
+    const kind = (pickJobText(presentableResult.kind) || '').trim().toLowerCase();
+    if (kind !== 'job_result') {
+        return true;
+    }
+    return isComponentInvokePresentableResult(presentableResult);
+}
+
+function buildCapabilityJobPresentableResult(record: ManagementCapabilityJobRecord): Record<string, unknown> {
+    const resultPayload = asUnknownRecord(record.result_payload);
+    const embeddedPresentableResult = asUnknownRecord(
+        resultPayload?.presentable_result ?? resultPayload?.presentableResult,
+    );
+    if (embeddedPresentableResult && typeof embeddedPresentableResult.kind === 'string') {
+        return embeddedPresentableResult;
+    }
+    if (resultPayload && typeof resultPayload.kind === 'string') {
+        return resultPayload;
+    }
+    return {
+        kind: 'job_result',
+        title: record.title,
+        summary: record.summary,
+        status: record.status,
+        progress_percent: record.progress_percent,
+        stage: record.stage,
+        job_type: record.job_type,
+        job_id: record.job_id,
+        capability_key: record.capability_key,
+        capability_scope: record.capability_scope,
+        provider_id: record.provider_id,
+        provider_type: record.provider_type,
+        route: record.route,
+        metadata: record.metadata,
+        result_payload: resultPayload ?? {},
+    };
+}
+
+function buildCapabilityJobRecordFromPresentableResult(
+    presentableResult: Record<string, unknown>,
+    payload: Record<string, unknown> | null,
+    ownerAgentId: string,
+): Omit<ManagementCapabilityJobRecord, 'updated_at'> | null {
+    if ((pickJobText(presentableResult.kind) || '').trim().toLowerCase() !== 'job_result') {
+        return null;
+    }
+    const jobId = pickJobText(
+        presentableResult.jobId,
+        presentableResult.job_id,
+        presentableResult.id,
+        payload?.job_id,
+        payload?.jobId,
+        payload?.id,
+    );
+    const capabilityKey = pickJobText(
+        presentableResult.capabilityKey,
+        presentableResult.capability_key,
+        payload?.capability_key,
+        payload?.capabilityKey,
+    );
+    if (!jobId || !capabilityKey || !ownerAgentId.trim()) {
+        return null;
+    }
+    const resultPayload = asUnknownRecord(payload?.result)
+        ?? asUnknownRecord(payload?.result_payload)
+        ?? asUnknownRecord(payload?.resultPayload)
+        ?? buildCapabilityJobResultPayload(payload, presentableResult);
+    return {
+        job_id: jobId,
+        owner_agent_id: ownerAgentId.trim(),
+        capability_key: capabilityKey,
+        capability_scope: pickJobText(
+            presentableResult.capabilityScope,
+            presentableResult.capability_scope,
+            payload?.capability_scope,
+            payload?.capabilityScope,
+        ) || 'generic',
+        provider_id: pickJobText(
+            presentableResult.providerId,
+            presentableResult.provider_id,
+            payload?.provider_id,
+            payload?.providerId,
+        ),
+        provider_type: pickJobText(
+            presentableResult.providerType,
+            presentableResult.provider_type,
+            payload?.provider_type,
+            payload?.providerType,
+        ),
+        route: pickJobText(presentableResult.route, payload?.route),
+        title: pickJobText(presentableResult.title, payload?.title),
+        summary: pickJobText(presentableResult.summary, payload?.summary),
+        status: pickJobText(presentableResult.status, presentableResult.state, payload?.status, payload?.state) || 'queued',
+        progress_percent: pickJobNumber(
+            presentableResult.progressPercent,
+            presentableResult.progress_percent,
+            presentableResult.progress,
+            presentableResult.percent,
+            payload?.progress_percent,
+            payload?.progressPercent,
+        ),
+        stage: pickJobText(
+            presentableResult.stage,
+            presentableResult.currentStage,
+            presentableResult.current_stage,
+            payload?.stage,
+        ),
+        job_type: pickJobText(
+            presentableResult.jobType,
+            presentableResult.job_type,
+            presentableResult.mediaType,
+            presentableResult.media_type,
+            payload?.job_type,
+            payload?.jobType,
+        ),
+        input_payload: asUnknownRecord(payload?.input_payload)
+            ?? asUnknownRecord(payload?.inputPayload)
+            ?? asUnknownRecord(payload?.input)
+            ?? {},
+        result_payload: resultPayload,
+        error_message: pickJobText(
+            presentableResult.errorMessage,
+            presentableResult.error_message,
+            payload?.error_message,
+            payload?.errorMessage,
+        ),
+        metadata: asUnknownRecord(presentableResult.metadata)
+            ?? asUnknownRecord(payload?.metadata)
+            ?? {},
+        created_at: pickJobText(payload?.created_at, payload?.createdAt),
+        started_at: pickJobText(payload?.started_at, payload?.startedAt),
+        finished_at: pickJobText(payload?.finished_at, payload?.finishedAt),
+        last_heartbeat_at: pickJobText(
+            payload?.last_heartbeat_at,
+            payload?.lastHeartbeatAt,
+        ),
+    };
+}
+
+function buildCapabilityJobRecordFromMessageSpec(
+    spec: unknown,
+    ownerAgentId: string,
+): Omit<ManagementCapabilityJobRecord, 'updated_at'> | null {
+    const specRecord = asUnknownRecord(spec);
+    const props = asUnknownRecord(specRecord?.props);
+    if (!specRecord || !props) {
+        return null;
+    }
+    const specType = pickJobText(specRecord.type, specRecord.component);
+    if ((specType || '').trim().toLowerCase() !== 'jobprogresscard') {
+        return null;
+    }
+    const jobId = pickJobText(props.jobId, props.job_id, props.id);
+    const capabilityKey = pickJobText(props.capabilityKey, props.capability_key);
+    if (!jobId || !capabilityKey || !ownerAgentId.trim()) {
+        return null;
+    }
+    const previewUrl = pickJobText(props.previewUrl, props.preview_url);
+    const currentResultPayload = asUnknownRecord(props.resultPayload)
+        ?? asUnknownRecord(props.result_payload)
+        ?? {};
+    const currentMetadata = asUnknownRecord(props.metadata) ?? {};
+    return {
+        job_id: jobId,
+        owner_agent_id: ownerAgentId.trim(),
+        capability_key: capabilityKey,
+        capability_scope: pickJobText(props.capabilityScope, props.capability_scope) || 'generic',
+        provider_id: pickJobText(props.providerId, props.provider_id),
+        provider_type: pickJobText(props.providerType, props.provider_type),
+        route: pickJobText(props.route),
+        title: pickJobText(props.title),
+        summary: pickJobText(props.summary, props.description),
+        status: pickJobText(props.status, props.state) || 'queued',
+        progress_percent: pickJobNumber(
+            props.progressPercent,
+            props.progress_percent,
+            props.progress,
+            props.percent,
+            props.value,
+        ),
+        stage: pickJobText(props.stage, props.currentStage, props.current_stage),
+        job_type: pickJobText(props.jobType, props.job_type, props.kind),
+        input_payload: {},
+        result_payload: previewUrl
+            ? {
+                ...currentResultPayload,
+                ...(asUnknownRecord(currentResultPayload.presentable_result)
+                    || asUnknownRecord(currentResultPayload.presentableResult)
+                    ? {}
+                    : { previewUrl }),
+              }
+            : currentResultPayload,
+        error_message: pickJobText(props.errorMessage, props.error_message),
+        metadata: previewUrl
+            ? {
+                ...currentMetadata,
+                ...(pickJobText(currentMetadata.previewUrl, currentMetadata.preview_url) ? {} : { previewUrl }),
+              }
+            : currentMetadata,
+        created_at: undefined,
+        started_at: undefined,
+        finished_at: undefined,
+        last_heartbeat_at: undefined,
+    };
+}
+
+function extractCapabilityJobRefFromMessageSpec(spec: unknown): { jobId: string; status?: string } | null {
+    const specRecord = asUnknownRecord(spec);
+    const props = asUnknownRecord(specRecord?.props);
+    if (!specRecord || !props) {
+        return null;
+    }
+    const specType = pickJobText(specRecord.type, specRecord.component);
+    if ((specType || '').trim().toLowerCase() !== 'jobprogresscard') {
+        return null;
+    }
+    const jobId = pickJobText(props.jobId, props.job_id, props.id);
+    if (!jobId) {
+        return null;
+    }
+    return {
+        jobId,
+        status: pickJobText(props.status, props.state),
+    };
+}
+
 function normalizeLabelComponent(raw: string, maxLen: number): string {
     const trimmed = raw.trim();
     if (!trimmed) return '';
@@ -297,7 +655,129 @@ function parseBackendMessageRole(value: unknown): Message['role'] {
 const CHAT_ATTACHMENT_PROMPT_BEGIN = '[WEBOT_CHAT_ATTACHMENTS_BEGIN]';
 const CHAT_ATTACHMENT_PROMPT_END = '[WEBOT_CHAT_ATTACHMENTS_END]';
 const TOOL_TRACE_ONLY_FALLBACK_TEXT = '本次请求只返回了工具/记忆日志，未生成正文回复，请重试。';
+
+function stripTransientMessageMeta(meta?: string): string {
+    if (!meta) {
+        return '';
+    }
+    return meta
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && line !== WATCHDOG_WARNING_TEXT)
+        .join('\n');
+}
 const CHAT_ATTACHMENT_LEGACY_HEADER = '以下文件已上传到当前智能体工作区的 data/chat-uploads 目录，请按需读取：';
+
+function normalizeLocalVisionText(text?: string): string {
+    return typeof text === 'string'
+        ? text.replace(/\s+/g, ' ').trim()
+        : '';
+}
+
+function buildOutgoingChatAttachmentPrompt(text: string, attachments: ChatAttachment[]): string {
+    const userText = text.trim();
+    const lines = attachments.map((attachment, index) => {
+        const localVisionText = normalizeLocalVisionText(attachment.localVisionSummary);
+        const parts = [
+            `${index + 1}. ${attachment.kind === 'image' ? '图片' : '附件'}：${attachment.name}`,
+            `- 相对路径：${attachment.relativePath}`,
+        ];
+        if (attachment.savedPath?.trim()) {
+            parts.push(`- 绝对路径：${attachment.savedPath.trim()}`);
+        }
+        if (attachment.mimeType?.trim()) {
+            parts.push(`- MIME：${attachment.mimeType.trim()}`);
+        }
+        if (attachment.upstreamFileId?.trim()) {
+            parts.push(`- OpenFang 文件ID：${attachment.upstreamFileId.trim()}`);
+        }
+        if (localVisionText) {
+            parts.push('- 已完成发送前本地视觉聚焦：是');
+            parts.push(`- 本地视觉文本：${localVisionText}`);
+            const localVisionSource = [
+                attachment.localVisionProvider?.trim(),
+                attachment.localVisionModel?.trim(),
+            ].filter(Boolean).join(' / ');
+            if (localVisionSource) {
+                parts.push(`- 本地视觉模型：${localVisionSource}`);
+            }
+        }
+        return parts.join('\n');
+    });
+
+    const attachmentBlock = attachments.length > 0
+        ? [
+            CHAT_ATTACHMENT_PROMPT_BEGIN,
+            '以下文件已上传到当前智能体工作区的 data/chat-uploads 目录，请按需读取：',
+            ...lines,
+            '处理要求：',
+            '- 若附件已携带本地视觉文本，请直接把这段文本当作该图片在本轮问题下的可用事实，不要忽略它，也不要脱离它自行猜测。',
+            '- 已完成发送前本地视觉聚焦的图片，本轮不会再作为原始视觉附件发送；若需要继续编辑或读取，请直接使用上面的相对路径或绝对路径。',
+            '- 只有没有本地视觉文本的图片，才需要继续查看图片附件或读取文件。',
+            '- 回复时优先引用文件名和关键结论，无需重复整段路径。',
+            CHAT_ATTACHMENT_PROMPT_END,
+        ].join('\n')
+        : '';
+
+    return [userText || '请先读取我刚上传的附件并继续处理。', attachmentBlock]
+        .filter((item) => item.trim().length > 0)
+        .join('\n\n');
+}
+
+async function waitForNextPaint(): Promise<void> {
+    await new Promise<void>((resolve) => {
+        if (typeof window === 'undefined') {
+            resolve();
+            return;
+        }
+        if (typeof window.requestAnimationFrame === 'function') {
+            window.requestAnimationFrame(() => resolve());
+            return;
+        }
+        window.setTimeout(resolve, 0);
+    });
+}
+
+async function enrichChatAttachmentsWithLocalVision(
+    attachments: ChatAttachment[],
+    userText: string,
+): Promise<ChatAttachment[]> {
+    return Promise.all(attachments.map(async (attachment) => {
+        if (
+            attachment.kind !== 'image'
+            || attachment.localVisionSummary?.trim()
+            || !attachment.sha256
+            || !attachment.savedPath
+            || !attachment.mimeType
+        ) {
+            return attachment;
+        }
+
+        try {
+            const localVision = await analyzeAndCacheChatImageWithLocalVision({
+                sha256: attachment.sha256,
+                imageUrl: attachment.assetUrl || '',
+                mimeType: attachment.mimeType,
+                relativePath: attachment.relativePath,
+                savedPath: attachment.savedPath,
+                upstreamFileId: attachment.upstreamFileId,
+                fileName: attachment.name,
+            }, userText);
+            if (!localVision) {
+                return attachment;
+            }
+            return {
+                ...attachment,
+                localVisionSummary: localVision.text,
+                localVisionProvider: localVision.provider,
+                localVisionModel: localVision.model,
+            };
+        } catch (error) {
+            console.warn('[local-vision] 发送后补充视觉聚焦失败', error);
+            return attachment;
+        }
+    }));
+}
 
 function buildRecoveredChatAssetUrl(agentId: string | undefined, relativePath: string): string | undefined {
     const normalizedAgentId = agentId?.trim();
@@ -402,312 +882,6 @@ function parseEmbeddedChatAttachments(text: string, ownerAgentId?: string): {
     };
 }
 
-const IMAGE_EDIT_ROUTING_TAG = '[system:image-edit-routing]';
-const IMAGE_EDIT_META_DISCUSSION_PATTERN = /(?:图片服务|图片生成|图片编辑|图像服务|图像生成|图像编辑|配置|设置|工作流|workflow|工具链|能力|逻辑|功能|provider|模型服务|comfyui|modelscope)/i;
-const CURRENT_APPEARANCE_QUERY_PATTERN = /(?:现在|当前|此刻|这会儿)?(?:穿什么|穿的什么|什么衣服|什么装扮|什么穿搭|什么造型|什么服饰)|(?:现在|当前|此刻|这会儿).{0,8}(?:衣服|装扮|穿搭|服饰|造型|外观|形象)|(?:看看|显示|发一下|给我看).{0,8}(?:当前|现在)?(?:立绘|外观|穿搭|服饰|造型)|(?:立绘|外观|形象).{0,8}(?:衣服|装扮|穿搭|服饰|造型)/i;
-
-interface EditableImageCandidate {
-    key: string;
-    sourceType: 'path' | 'url';
-    value: string;
-    origin: string;
-}
-
-function toTrimmedText(value: unknown): string {
-    return typeof value === 'string' ? value.trim() : '';
-}
-
-function pickStringList(value: unknown): string[] {
-    return Array.isArray(value)
-        ? value
-            .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-            .map((item) => item.trim())
-        : [];
-}
-
-function looksLikeImageAssetName(value: string): boolean {
-    return /\.(?:png|jpe?g|webp|gif|bmp|svg)(?:$|[?#])/i.test(value);
-}
-
-function isImageLikeAttachment(attachment: ChatAttachment | null | undefined): attachment is ChatAttachment {
-    if (!attachment) return false;
-    if (attachment.kind === 'image') return true;
-    if ((attachment.mimeType || '').trim().toLowerCase().startsWith('image/')) return true;
-    return looksLikeImageAssetName(attachment.name || '');
-}
-
-function resolveEditableAttachmentSource(attachment: ChatAttachment): {
-    sourceType: EditableImageCandidate['sourceType'];
-    value: string;
-} | null {
-    const relativePath = toTrimmedText(attachment.relativePath);
-    if (relativePath) {
-        return { sourceType: 'path', value: relativePath };
-    }
-    const savedPath = toTrimmedText(attachment.savedPath);
-    if (savedPath) {
-        return { sourceType: 'path', value: savedPath };
-    }
-    const assetUrl = toTrimmedText(attachment.assetUrl);
-    if (assetUrl) {
-        return { sourceType: 'url', value: assetUrl };
-    }
-    return null;
-}
-
-function looksLikeEditableImageSource(value: string, key: string): boolean {
-    const normalized = value.trim();
-    if (!normalized) return false;
-    if (normalized.startsWith('data:image/')) return true;
-    if (normalized.startsWith('/api/uploads/')) return true;
-    if (normalized.includes('/chat-assets/file?path=')) return true;
-    if (normalized.startsWith('/api/management/agents/')) return true;
-    if (/^https?:\/\//i.test(normalized)) {
-        return looksLikeImageAssetName(normalized) || /\/images?\//i.test(normalized);
-    }
-    if (key === 'path') {
-        return looksLikeImageAssetName(normalized) || normalized.includes('\\') || normalized.includes('/');
-    }
-    if ((key === 'src' || key === 'url') && normalized.startsWith('/')) {
-        return true;
-    }
-    return false;
-}
-
-function collectEditableImageSourcesFromSpec(spec: unknown, limit = 4): string[] {
-    const results: string[] = [];
-    const seen = new Set<string>();
-
-    const visit = (node: unknown, depth: number) => {
-        if (depth > 6 || results.length >= limit || node == null) {
-            return;
-        }
-        if (Array.isArray(node)) {
-            for (const item of node) {
-                visit(item, depth + 1);
-                if (results.length >= limit) return;
-            }
-            return;
-        }
-        if (!isRecordValue(node)) {
-            return;
-        }
-
-        const record = node as Record<string, unknown>;
-        for (const key of ['src', 'url', 'path'] as const) {
-            const candidate = toTrimmedText(record[key]);
-            if (!candidate || !looksLikeEditableImageSource(candidate, key) || seen.has(candidate)) {
-                continue;
-            }
-            seen.add(candidate);
-            results.push(candidate);
-            if (results.length >= limit) return;
-        }
-
-        for (const value of Object.values(record)) {
-            if (Array.isArray(value) || isRecordValue(value)) {
-                visit(value, depth + 1);
-                if (results.length >= limit) return;
-            }
-        }
-    };
-
-    visit(spec, 0);
-    return results;
-}
-
-function collectEditableImageCandidatesFromToolTrace(
-    traces: MessageTrace[] | undefined,
-    origin: string,
-): EditableImageCandidate[] {
-    if (!traces || traces.length === 0) {
-        return [];
-    }
-
-    const candidates: EditableImageCandidate[] = [];
-    const seen = new Set<string>();
-
-    for (let index = traces.length - 1; index >= 0; index -= 1) {
-        const detail = toTrimmedText(traces[index]?.detail);
-        if (!detail) continue;
-        const payload = parseJsonSafely<Record<string, unknown>>(detail);
-        if (!payload) continue;
-        const toolName = toTrimmedText(payload.tool || payload.name || payload.tool_name).toLowerCase();
-        if (toolName !== 'image_generate' && toolName !== 'image_edit') {
-            continue;
-        }
-        if (payload.is_error === true) {
-            continue;
-        }
-
-        const nestedResult =
-            (typeof payload.result === 'string'
-                ? parseJsonSafely<Record<string, unknown>>(payload.result)
-                : (isRecordValue(payload.result) ? payload.result : null))
-            || payload;
-
-        const savedPaths = pickStringList(nestedResult.saved_to ?? nestedResult.savedTo);
-        const imageUrls = pickStringList(nestedResult.image_urls ?? nestedResult.imageUrls);
-        for (const savedPath of savedPaths) {
-            const key = `path:${savedPath}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            candidates.push({
-                key,
-                sourceType: 'path',
-                value: savedPath,
-                origin,
-            });
-        }
-        for (const imageUrl of imageUrls) {
-            const key = `url:${imageUrl}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            candidates.push({
-                key,
-                sourceType: 'url',
-                value: imageUrl,
-                origin,
-            });
-        }
-        if (candidates.length > 0) {
-            return candidates;
-        }
-    }
-
-    return candidates;
-}
-
-function collectRecentEditableImageCandidates(messages: Message[], limit = 4): EditableImageCandidate[] {
-    const out: EditableImageCandidate[] = [];
-    const seen = new Set<string>();
-    const recentMessages = messages.slice(-16);
-
-    const pushCandidate = (candidate: EditableImageCandidate | null | undefined) => {
-        if (!candidate || !candidate.value.trim() || seen.has(candidate.key)) {
-            return;
-        }
-        seen.add(candidate.key);
-        out.push(candidate);
-    };
-
-    for (let index = recentMessages.length - 1; index >= 0; index -= 1) {
-        if (out.length >= limit) break;
-        const message = recentMessages[index];
-        if (!message) continue;
-
-        if (message.role === 'user' && message.attachments?.length) {
-            for (const attachment of message.attachments) {
-                if (!isImageLikeAttachment(attachment)) continue;
-                const source = resolveEditableAttachmentSource(attachment);
-                if (!source) continue;
-                pushCandidate({
-                    key: `${source.sourceType}:${source.value}`,
-                    sourceType: source.sourceType,
-                    value: source.value,
-                    origin: `当前或最近用户图片：${attachment.name || '未命名图片'}`,
-                });
-                if (out.length >= limit) break;
-            }
-        }
-
-        if (out.length >= limit || message.role !== 'agent') {
-            continue;
-        }
-
-        const toolTraceCandidates = collectEditableImageCandidatesFromToolTrace(
-            message.toolTrace,
-            '最近聊天生成/修改结果',
-        );
-        for (const candidate of toolTraceCandidates) {
-            pushCandidate(candidate);
-            if (out.length >= limit) break;
-        }
-        if (out.length >= limit) break;
-
-        if (message.attachments?.length) {
-            for (const attachment of message.attachments) {
-                if (!isImageLikeAttachment(attachment)) continue;
-                const source = resolveEditableAttachmentSource(attachment);
-                if (!source) continue;
-                pushCandidate({
-                    key: `${source.sourceType}:${source.value}`,
-                    sourceType: source.sourceType,
-                    value: source.value,
-                    origin: `最近聊天附件图：${attachment.name || '未命名图片'}`,
-                });
-                if (out.length >= limit) break;
-            }
-        }
-        if (out.length >= limit) break;
-
-        const specSources = collectEditableImageSourcesFromSpec(message.spec, limit - out.length);
-        for (const specSource of specSources) {
-            pushCandidate({
-                key: `url:${specSource}`,
-                sourceType: 'url',
-                value: specSource,
-                origin: '最近聊天预览图',
-            });
-            if (out.length >= limit) break;
-        }
-    }
-
-    return out;
-}
-
-function buildImageEditRoutingPreamble(message: string, sessionMessages: Message[]): string {
-    const normalizedMessage = message.trim();
-    if (!normalizedMessage || IMAGE_EDIT_META_DISCUSSION_PATTERN.test(normalizedMessage)) {
-        return '';
-    }
-
-    const candidates = collectRecentEditableImageCandidates(sessionMessages, 4);
-    if (candidates.length === 0) {
-        return '';
-    }
-
-    const lines = [
-        IMAGE_EDIT_ROUTING_TAG,
-        '当前会话里有最近可复用的图片源。如果本轮涉及图片处理，请先按照图片工具协议判断 `image_edit` 还是 `image_generate`，不要默认重新生成。',
-        '图片工具决策大纲：',
-        '1. 需要保持同一个人物/主体/场景仍然可识别，或者只是局部微调/中等修改，用 `image_edit`。',
-        '2. 配饰、耳环、项链、首饰、衣服、发型、妆容、姿势、表情、背景、光线、道具、细节优化，这类通常属于 `image_edit`。',
-        '3. 只有当用户明确要全新图片、全新人物、全新构图、完全重做，或者不再要求延续上一张图时，才用 `image_generate`。',
-        '4. `image_generate` 不能保证还是同一个人物；如果人物身份一致性重要，就必须复用原图做 `image_edit`。',
-        '选择输入图时，优先顺序是：当前工作区/上传图片 > 最近聊天里已经生成或展示过的图片 > 没有源图时再说明缺少输入图。',
-    ];
-
-    lines.push('当前可直接复用的图片输入候选：');
-    candidates.forEach((candidate, index) => {
-        lines.push(`${index + 1}. ${candidate.origin}`);
-        lines.push(`- 推荐参数：${candidate.sourceType === 'path' ? 'image_path' : 'image_url'}="${candidate.value}"`);
-    });
-    lines.push('如果用户说“改下图 / 原图 / 这张图 / 刚才那张图”，默认优先使用上面最新且最匹配的候选源图。');
-    return lines.join('\n');
-}
-
-function buildCurrentAppearancePreamble(message: string, currentAgent: Agent, targetAgentId: string): string {
-    if (targetAgentId.trim() !== currentAgent.id.trim()) {
-        return '';
-    }
-    const normalizedMessage = message.trim();
-    const portraitUrl = currentAgent.portraitUrl?.trim() || '';
-    if (!normalizedMessage || !portraitUrl || !CURRENT_APPEARANCE_QUERY_PATTERN.test(normalizedMessage)) {
-        return '';
-    }
-
-    const avatarUrl = currentAgent.avatarUrl?.trim() || '';
-    return [
-        '[system:current-appearance]',
-        '当前智能体已经有正式立绘可直接复用。用户询问你现在穿什么、当前装扮、服饰、穿搭、造型或外观时，必须以当前立绘为准，不要虚构，也不要改用临时 /api/uploads/... 会话图。',
-        `当前立绘 URL：${portraitUrl}`,
-        avatarUrl ? `当前头像 URL：${avatarUrl}` : '',
-        '如果需要展示图片，请优先输出 `<UI_JSON>{"type":"ImageCover","props":{"src":"当前立绘 URL","title":"当前装扮"}}...</UI_JSON>`，并把上面的当前立绘 URL 原样写入 `src`。',
-        '如果需要先确认服饰细节，可先基于当前立绘做图片分析，再回答；最终仍优先返回当前立绘图片组件。',
-    ].filter(Boolean).join('\n');
-}
-
 function normalizeBackendMessage(role: Message['role'], raw: string, ownerAgentId?: string): {
     text: string;
     attachments?: ChatAttachment[];
@@ -767,6 +941,237 @@ function parseBackendToolCalls(raw: unknown): MessageToolCall[] | undefined {
         });
     }
     return tools.length > 0 ? tools : undefined;
+}
+
+function stringifyBackendStructuredPayload(raw: unknown): string | undefined {
+    if (typeof raw === 'string') {
+        const trimmed = raw.trim();
+        return trimmed || undefined;
+    }
+    if (raw == null) {
+        return undefined;
+    }
+    try {
+        const serialized = JSON.stringify(raw, null, 2);
+        return serialized.trim() || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+interface ParsedBackendStructuredContent {
+    onlyToolResult: boolean;
+    readableText?: string;
+    renderableSpec?: unknown;
+    text: string;
+    tools?: MessageToolCall[];
+}
+
+function parseBackendStructuredContent(raw: unknown): ParsedBackendStructuredContent {
+    if (!Array.isArray(raw)) {
+        return {
+            onlyToolResult: false,
+            text: '',
+        };
+    }
+
+    const textParts: string[] = [];
+    const tools: MessageToolCall[] = [];
+    let sawToolResult = false;
+    let sawNonToolResultPayload = false;
+    let renderableSpec: unknown | undefined;
+    let readableText: string | undefined;
+
+    raw.forEach((entry, index) => {
+        if (!entry || typeof entry !== 'object') {
+            return;
+        }
+        const item = entry as Record<string, unknown>;
+        const type = typeof item.type === 'string' ? item.type.trim().toLowerCase() : '';
+
+        if (type === 'text') {
+            const text = typeof item.text === 'string' ? item.text.trim() : '';
+            if (text) {
+                textParts.push(text);
+                sawNonToolResultPayload = true;
+            }
+            return;
+        }
+
+        if (type === 'thinking') {
+            const thinking = typeof item.thinking === 'string' ? item.thinking.trim() : '';
+            if (thinking) {
+                sawNonToolResultPayload = true;
+            }
+            return;
+        }
+
+        if (type === 'tool_use') {
+            const name = typeof item.name === 'string' ? item.name.trim() : '';
+            if (!name) {
+                return;
+            }
+            sawNonToolResultPayload = true;
+            tools.push({
+                id: typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `remote_tool_use_${Date.now()}_${index}`,
+                name,
+                running: false,
+                expanded: false,
+                input: stringifyBackendStructuredPayload(item.input),
+            });
+            return;
+        }
+
+        if (type === 'tool_result') {
+            sawToolResult = true;
+            const name = typeof item.tool_name === 'string'
+                ? item.tool_name.trim()
+                : (typeof item.name === 'string' ? item.name.trim() : '');
+            const result = stringifyBackendStructuredPayload(item.content);
+            if (name) {
+                tools.push({
+                    id: typeof item.tool_use_id === 'string' && item.tool_use_id.trim()
+                        ? item.tool_use_id.trim()
+                        : `remote_tool_result_${Date.now()}_${index}`,
+                    name,
+                    running: false,
+                    expanded: false,
+                    result,
+                    is_error: typeof item.is_error === 'boolean' ? item.is_error : undefined,
+                });
+            }
+            if (result) {
+                renderableSpec = renderableSpec ?? buildRenderableSpecFromToolLog(result);
+                readableText = readableText ?? extractReadableTextFromLog(result);
+            }
+            return;
+        }
+
+        const fallbackText = typeof item.text === 'string' ? item.text.trim() : '';
+        if (fallbackText) {
+            textParts.push(fallbackText);
+            sawNonToolResultPayload = true;
+        }
+    });
+
+    return {
+        onlyToolResult: sawToolResult && !sawNonToolResultPayload && textParts.length === 0,
+        readableText,
+        renderableSpec,
+        text: textParts.join('\n\n').trim(),
+        tools: tools.length > 0 ? tools : undefined,
+    };
+}
+
+function buildRenderableSpecFromAssistantText(text: string): unknown | undefined {
+    const normalizedText = text.trim();
+    if (!normalizedText) {
+        return undefined;
+    }
+    return normalizeIncomingSpec(
+        tryParseInlineSpecFromText(normalizedText)
+        ?? buildRenderableSpecFromMarkdownMedia(normalizedText),
+    );
+}
+
+function buildRecoveredMessageSpec(
+    row: Record<string, unknown>,
+    role: Message['role'],
+    text: string,
+    tools?: MessageToolCall[],
+): unknown | undefined {
+    const inlineSpec = normalizeIncomingSpec(row.spec);
+    if (inlineSpec != null) {
+        return inlineSpec;
+    }
+    const directPresentableResult = row.presentable_result;
+    if (directPresentableResult && typeof directPresentableResult === 'object') {
+        const fromPresentable = buildRenderableSpecFromPresentableResult(directPresentableResult as Record<string, unknown>);
+        if (fromPresentable != null) {
+            return normalizeIncomingSpec(fromPresentable);
+        }
+    }
+    if (tools && tools.length > 0) {
+        for (let index = tools.length - 1; index >= 0; index -= 1) {
+            const candidate = (tools[index]?.result || '').trim();
+            if (!candidate) {
+                continue;
+            }
+            const renderableSpec = buildRenderableSpecFromToolLog(candidate);
+            if (renderableSpec != null) {
+                return normalizeIncomingSpec(renderableSpec);
+            }
+        }
+    }
+    if (role !== 'agent' || !text.trim()) {
+        return undefined;
+    }
+    return buildRenderableSpecFromAssistantText(text);
+}
+
+function getRecoveredSpecType(spec: unknown): string {
+    if (!spec || typeof spec !== 'object') {
+        return '';
+    }
+    const type = (spec as Record<string, unknown>).type;
+    return typeof type === 'string' ? type.trim().toLowerCase() : '';
+}
+
+function getRecoveredSpecRank(spec: unknown): number {
+    const type = getRecoveredSpecType(spec);
+    if (!type) return 0;
+    if (type === 'jobprogresscard') return 1;
+    if (
+        type === 'videocover'
+        || type === 'videogallery'
+        || type === 'videocarousel'
+        || type === 'imagecover'
+        || type === 'imagecarousel'
+        || type === 'imagealbum'
+        || type === 'audioplayer'
+        || type === 'audioplaylist'
+        || type === 'officepreviewcard'
+        || type === 'markdownpreviewcard'
+    ) {
+        return 3;
+    }
+    return 2;
+}
+
+function pickRicherRecoveredSpec(left: unknown, right: unknown): unknown | undefined {
+    if (left == null) return right === undefined ? undefined : right;
+    if (right == null) return left === undefined ? undefined : left;
+    if (JSON.stringify(left) === JSON.stringify(right)) {
+        return right;
+    }
+    return getRecoveredSpecRank(right) >= getRecoveredSpecRank(left) ? right : left;
+}
+
+function mergeRecoveredToolCalls(
+    left?: MessageToolCall[],
+    right?: MessageToolCall[],
+): MessageToolCall[] | undefined {
+    const merged = [...(left ?? []), ...(right ?? [])];
+    if (merged.length === 0) {
+        return undefined;
+    }
+    const seen = new Set<string>();
+    const out: MessageToolCall[] = [];
+    for (const tool of merged) {
+        const key = [
+            tool.id || '',
+            tool.name || '',
+            tool.input || '',
+            tool.result || '',
+            tool.is_error ? '1' : '0',
+        ].join('::');
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        out.push(tool);
+    }
+    return out;
 }
 
 function parseBackendTimestampMs(value: unknown): number {
@@ -1056,16 +1461,24 @@ function areMessagesContentCompatible(left: Message, right: Message): boolean {
     if (JSON.stringify(left.tools ?? null) !== JSON.stringify(right.tools ?? null)) {
         return false;
     }
+    if (
+        left.taskCard
+        || right.taskCard
+        || (left.a2aCards?.length ?? 0) > 0
+        || (right.a2aCards?.length ?? 0) > 0
+        || (left.attachments?.length ?? 0) > 0
+        || (right.attachments?.length ?? 0) > 0
+        || (left.tools?.length ?? 0) > 0
+        || (right.tools?.length ?? 0) > 0
+    ) {
+        return (left.text || '').trim() === (right.text || '').trim()
+            && JSON.stringify(left.taskCard ?? null) === JSON.stringify(right.taskCard ?? null)
+            && JSON.stringify(left.a2aCards ?? null) === JSON.stringify(right.a2aCards ?? null);
+    }
     const leftText = (left.text || '').trim();
     const rightText = (right.text || '').trim();
-    if (leftText && rightText) {
-        if (leftText === rightText) {
-            return true;
-        }
-        if (leftText.includes(rightText) || rightText.includes(leftText)) {
-            return true;
-        }
-        return false;
+    if (leftText || rightText) {
+        return leftText === rightText;
     }
     return true;
 }
@@ -1151,12 +1564,73 @@ function hydrateRecoveredMessage(base: Message | undefined, recovered: Message):
         agentColor: recovered.agentColor ?? base.agentColor,
         agentPortraitUrl: recovered.agentPortraitUrl ?? base.agentPortraitUrl,
         attachments: (recovered.attachments?.length ?? 0) > 0 ? recovered.attachments : base.attachments,
-        tools: (recovered.tools?.length ?? 0) > 0 ? recovered.tools : base.tools,
+        tools: mergeRecoveredToolCalls(base.tools, recovered.tools),
+        spec: pickRicherRecoveredSpec(base.spec, recovered.spec),
+        uiRawText: pickRicherText(base.uiRawText || '', recovered.uiRawText || '') || undefined,
+        uiStreamState: recovered.spec != null || recovered.uiRawText?.trim()
+            ? (recovered.uiStreamState ?? 'ready')
+            : (base.uiStreamState ?? recovered.uiStreamState),
         thinkingTrace: (recovered.thinkingTrace?.length ?? 0) > 0 ? recovered.thinkingTrace : base.thinkingTrace,
         toolTrace: (recovered.toolTrace?.length ?? 0) > 0 ? recovered.toolTrace : base.toolTrace,
         taskCard: recovered.taskCard ?? base.taskCard,
         a2aCards: (recovered.a2aCards?.length ?? 0) > 0 ? recovered.a2aCards : base.a2aCards,
     };
+}
+
+function getRecoveredMessageRichnessScore(message: Message): number {
+    let score = (message.text || '').trim().length;
+    if ((message.attachments?.length ?? 0) > 0) score += 200;
+    if ((message.tools?.length ?? 0) > 0) score += 160;
+    if ((message.a2aCards?.length ?? 0) > 0) score += 140;
+    if (message.taskCard) score += 140;
+    if (message.spec != null) score += 120;
+    if ((message.toolTrace?.length ?? 0) > 0) score += 80;
+    if ((message.thinkingTrace?.length ?? 0) > 0) score += 40;
+    return score;
+}
+
+function dedupeRecoveredAdjacentMessages(messages: Message[]): Message[] {
+    if (messages.length <= 1) {
+        return messages;
+    }
+
+    const deduped: Message[] = [];
+    for (const message of messages) {
+        const previous = deduped[deduped.length - 1];
+        if (!previous) {
+            deduped.push(message);
+            continue;
+        }
+        if (previous.role !== message.role) {
+            deduped.push(message);
+            continue;
+        }
+        if (!areMessagesContentCompatible(previous, message)) {
+            const previousText = (previous.text || '').trim();
+            const currentText = (message.text || '').trim();
+            const sameSpeaker = (previous.agentId || '').trim() === (message.agentId || '').trim();
+            const highlySimilarAgentDuplicate = previous.role === 'agent'
+                && sameSpeaker
+                && previousText
+                && currentText
+                && computeDuplicateSimilarityJaccard(
+                    buildDuplicateSimilarityTrigramSet(previousText),
+                    buildDuplicateSimilarityTrigramSet(currentText),
+                ) >= 0.98;
+            if (!highlySimilarAgentDuplicate) {
+                deduped.push(message);
+                continue;
+            }
+        }
+
+        const merged = hydrateRecoveredMessage(previous, message);
+        const keepMerged = getRecoveredMessageRichnessScore(merged)
+            >= Math.max(getRecoveredMessageRichnessScore(previous), getRecoveredMessageRichnessScore(message));
+        deduped[deduped.length - 1] = keepMerged
+            ? merged
+            : (getRecoveredMessageRichnessScore(message) > getRecoveredMessageRichnessScore(previous) ? message : previous);
+    }
+    return deduped;
 }
 
 function mergeRecoveredMessages(local: Message[], remote: Message[]): Message[] {
@@ -1216,7 +1690,7 @@ function mergeRecoveredMessages(local: Message[], remote: Message[]): Message[] 
         remoteIndex += 1;
     }
 
-    return merged;
+    return dedupeRecoveredAdjacentMessages(merged);
 }
 
 function buildSessionFromBackendPayload(
@@ -1236,29 +1710,81 @@ function buildSessionFromBackendPayload(
         : [];
 
     const startAt = Date.now() - rows.length * 1000;
-    const messages: Message[] = rows
-        .map((row, index) => {
-            const rawText = typeof row.content === 'string'
-                ? row.content
-                : (typeof row.message === 'string' ? row.message : '');
-            const role = parseBackendMessageRole(row.role);
-            const normalized = normalizeBackendMessage(role, rawText, ownerAgentId);
-            const text = normalized.text;
-            const tools = parseBackendToolCalls(row.tools);
-            if (!text.trim() && (!normalized.attachments || normalized.attachments.length === 0) && (!tools || tools.length === 0)) {
-                return null;
-            }
-            return {
-                id: buildStableRemoteMessageId(rawSessionId, row, index, role, rawText),
-                role,
-                agentId: role === 'agent' ? ownerAgentId?.trim() || undefined : undefined,
-                text,
-                attachments: normalized.attachments,
+    const messages: Message[] = [];
+    let pendingRecoveredAgentPayload: {
+        readableText?: string;
+        spec?: unknown;
+        tools?: MessageToolCall[];
+    } | null = null;
+
+    rows.forEach((row, index) => {
+        const role = parseBackendMessageRole(row.role);
+        const rawStructuredContent = Array.isArray(row.content)
+            ? row.content
+            : (Array.isArray(row.message) ? row.message : row.content);
+        const structured = parseBackendStructuredContent(rawStructuredContent);
+        const rawText = typeof row.content === 'string'
+            ? row.content
+            : (typeof row.message === 'string' ? row.message : structured.text);
+        const normalized = normalizeBackendMessage(role, rawText, ownerAgentId);
+        let text = normalized.text || structured.text;
+        let tools = mergeRecoveredToolCalls(parseBackendToolCalls(row.tools), structured.tools);
+        let spec = buildRecoveredMessageSpec(row, role, text, tools) ?? structured.renderableSpec;
+
+        if (
+            role === 'user'
+            && structured.onlyToolResult
+            && (spec != null || structured.readableText || (tools?.length ?? 0) > 0)
+        ) {
+            pendingRecoveredAgentPayload = {
+                readableText: structured.readableText,
+                spec,
                 tools,
-                timestamp: new Date(startAt + index * 1000).toISOString(),
-            } as Message;
-        })
-        .filter((item): item is Message => item != null);
+            };
+            return;
+        }
+
+        if (role === 'agent' && pendingRecoveredAgentPayload) {
+            spec = pickRicherRecoveredSpec(pendingRecoveredAgentPayload.spec, spec);
+            tools = mergeRecoveredToolCalls(pendingRecoveredAgentPayload.tools, tools);
+            if (!text.trim() && pendingRecoveredAgentPayload.readableText?.trim()) {
+                text = pendingRecoveredAgentPayload.readableText.trim();
+            }
+            pendingRecoveredAgentPayload = null;
+        }
+
+        if (!text.trim() && (!normalized.attachments || normalized.attachments.length === 0) && (!tools || tools.length === 0) && spec == null) {
+            return;
+        }
+
+        messages.push({
+            id: buildStableRemoteMessageId(rawSessionId, row, index, role, rawText),
+            role,
+            agentId: role === 'agent' ? ownerAgentId?.trim() || undefined : undefined,
+            text: role === 'agent' ? cleanupAssistantText(text, spec) : text,
+            attachments: normalized.attachments,
+            tools,
+            spec,
+            uiStreamState: spec != null ? 'ready' : 'idle',
+            debugSpecSource: spec != null ? 'recovered' : 'none',
+            timestamp: new Date(startAt + index * 1000).toISOString(),
+        } as Message);
+    });
+
+    if (pendingRecoveredAgentPayload && (pendingRecoveredAgentPayload.spec != null || pendingRecoveredAgentPayload.readableText?.trim() || (pendingRecoveredAgentPayload.tools?.length ?? 0) > 0)) {
+        const text = pendingRecoveredAgentPayload.readableText?.trim() || '';
+        messages.push({
+            id: buildStableRemoteMessageId(rawSessionId, { kind: 'pending_tool_result' }, rows.length, 'agent', text),
+            role: 'agent',
+            agentId: ownerAgentId?.trim() || undefined,
+            text: cleanupAssistantText(text, pendingRecoveredAgentPayload.spec),
+            tools: pendingRecoveredAgentPayload.tools,
+            spec: pendingRecoveredAgentPayload.spec,
+            uiStreamState: pendingRecoveredAgentPayload.spec != null ? 'ready' : 'idle',
+            debugSpecSource: pendingRecoveredAgentPayload.spec != null ? 'recovered' : 'none',
+            timestamp: new Date(startAt + rows.length * 1000).toISOString(),
+        } as Message);
+    }
     const rawSessionLabel = typeof source.label === 'string'
         ? source.label.trim()
         : (typeof source.session_label === 'string'
@@ -1306,20 +1832,7 @@ function mergeRemoteSessions(current: StoredChatSession[], incoming: StoredChatS
             continue;
         }
 
-        let matchedIndex = next.findIndex((session) => getRemoteSessionId(session) === remoteSessionId);
-        if (matchedIndex < 0) {
-            const remoteLabel = (remote.sessionLabel || '').trim();
-            if (remoteLabel) {
-                matchedIndex = next.findIndex((session) => {
-                    const localRemoteId = getRemoteSessionId(session);
-                    if (localRemoteId) {
-                        return false;
-                    }
-                    const localLabel = (session.sessionLabel || '').trim();
-                    return localLabel === remoteLabel;
-                });
-            }
-        }
+        const matchedIndex = next.findIndex((session) => getRemoteSessionId(session) === remoteSessionId);
         if (matchedIndex >= 0) {
             const matched = next[matchedIndex];
             const keepTitle = Boolean(matched.title && matched.title.trim());
@@ -1707,16 +2220,6 @@ async function mapAsyncWithConcurrency<TInput, TResult>(
     return results;
 }
 
-function scheduleUnitToMs(value: number, unit: string): number {
-    const normalized = unit.trim().toLowerCase();
-    if (normalized === '秒' || normalized === '秒钟') return value * 1000;
-    if (normalized === '分钟' || normalized === '分') return value * 60_000;
-    if (normalized === '小时') return value * 3_600_000;
-    if (normalized === '天' || normalized === '日') return value * 86_400_000;
-    if (normalized === '周') return value * 7 * 86_400_000;
-    return value * 60_000;
-}
-
 function formatLocalDateKey(value: Date = new Date()): string {
     const yyyy = value.getFullYear();
     const mm = String(value.getMonth() + 1).padStart(2, '0');
@@ -1825,212 +2328,6 @@ function buildAutoConversationPrompt(params: {
 
 function isDocumentHidden(): boolean {
     return typeof document !== 'undefined' && document.visibilityState === 'hidden';
-}
-
-function formatEveryMsInCard(everyMs: number): string {
-    const safe = Math.max(1000, Math.floor(everyMs));
-    if (safe % 86_400_000 === 0) return `每 ${safe / 86_400_000} 天`;
-    if (safe % 3_600_000 === 0) return `每 ${safe / 3_600_000} 小时`;
-    if (safe % 60_000 === 0) return `每 ${safe / 60_000} 分钟`;
-    if (safe % 1000 === 0) return `每 ${safe / 1000} 秒`;
-    return `每 ${safe} 毫秒`;
-}
-
-function parseChineseNumeral(raw: string): number | null {
-    const text = raw.trim();
-    if (!text) return null;
-    if (!/^[零〇一二两三四五六七八九十百千]+$/.test(text)) return null;
-
-    const digitMap: Record<string, number> = {
-        零: 0,
-        〇: 0,
-        一: 1,
-        二: 2,
-        两: 2,
-        三: 3,
-        四: 4,
-        五: 5,
-        六: 6,
-        七: 7,
-        八: 8,
-        九: 9,
-    };
-
-    const unitMap: Record<string, number> = {
-        十: 10,
-        百: 100,
-        千: 1000,
-    };
-
-    let total = 0;
-    let current = 0;
-    for (const ch of text) {
-        if (ch in digitMap) {
-            current = digitMap[ch];
-            continue;
-        }
-        const unit = unitMap[ch];
-        if (!unit) return null;
-        total += (current || 1) * unit;
-        current = 0;
-    }
-    total += current;
-    if (!Number.isFinite(total) || total <= 0) return null;
-    return total;
-}
-
-function parseLoosePositiveInt(raw: string | undefined): number | null {
-    const text = (raw || '').trim();
-    if (!text) return null;
-    if (/^\d+$/.test(text)) {
-        const value = Number(text);
-        if (Number.isFinite(value) && value > 0) return Math.floor(value);
-        return null;
-    }
-    return parseChineseNumeral(text);
-}
-
-function buildTaskExecutionPrompt(objective: string, maxRuns: number): string {
-    return [
-        '你是任务执行助手。请直接执行以下任务并给出简洁结果：',
-        objective,
-        maxRuns > 0 ? `任务总执行次数上限：${maxRuns} 次。达到上限后停止。` : '任务总执行次数上限：无限次。',
-        '要求：',
-        '1) 必须返回可读的结论。',
-        '2) 若失败，返回失败原因。',
-        '3) 不要输出额外格式包装。',
-        '4) 禁止输出“是否创建任务/请确认/确认后执行”等二次确认语句。',
-        '5) 禁止复述调度信息（如每几分钟执行一次），仅输出本次查询结果。',
-        '6) 监控/阈值类任务必须明确输出：`告警状态：触发` 或 `告警状态：未触发`，并说明关键数值与阈值比较。',
-    ].join('\n');
-}
-
-function normalizeAssistantTaskDraftText(raw: string): string {
-    const text = raw.replace(/\r\n/g, '\n').trim();
-    if (!text) return '';
-    const normalized = text
-        .replace(/\*\*([^*]+)\*\*/g, '$1')
-        .replace(/`([^`]+)`/g, '$1');
-    const lines = normalized
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .filter((line) => !/^\|?(?:\s*:?-{3,}:?\s*\|)+\s*$/.test(line))
-        .map((line) => {
-            if (!line.includes('|')) {
-                return line.replace(/^\s*[-*]\s+/, '');
-            }
-            const cells = line
-                .split('|')
-                .map((cell) => cell.trim())
-                .filter(Boolean);
-            if (cells.length >= 2) {
-                return `${cells[0]}: ${cells.slice(1).join(' ')}`.trim();
-            }
-            return line.replace(/\|/g, ' ').replace(/\s+/g, ' ').trim();
-        })
-        .filter(Boolean);
-    return lines.join('\n').trim();
-}
-
-function createProposalTaskCardFromAssistantText(raw: string): ChatTaskCardData | null {
-    const text = normalizeAssistantTaskDraftText(raw);
-    if (!text) return null;
-    const normalizedText = text.trim();
-
-    const asksForConfirmation = /(请确认|确认无误|确认后|回复.?确认|是否创建)/i.test(normalizedText);
-    const scheduleHint = /(定时任务|执行间隔|总执行次数|总次数|每隔|每\s*\d*\s*(秒钟?|分钟|分|小时|天|日|周))/i.test(normalizedText);
-    if (!asksForConfirmation && !scheduleHint) return null;
-
-    const nameMatch = normalizedText.match(/任务名称\s*(?:[:：]\s*)?([^\n]+)/i);
-    const objectiveMatch = normalizedText.match(/任务内容\s*(?:[:：]\s*)?([^\n]+)/i);
-    const intervalMatch = normalizedText.match(
-        /(?:执行间隔[:：]\s*)?(?:每隔|每)\s*([0-9]+|[零〇一二两三四五六七八九十百千]+)?\s*(秒钟?|秒|分钟|分|小时|天|日|周)/i,
-    );
-    const runsMatch = normalizedText.match(/总执行次数\s*(?:[:：]\s*)?([0-9]+|[零〇一二两三四五六七八九十百千]+)\s*次/i)
-        || normalizedText.match(/总次数\s*(?:[:：]\s*)?([0-9]+|[零〇一二两三四五六七八九十百千]+)\s*次/i)
-        || normalizedText.match(/任务执行\s*([0-9]+|[零〇一二两三四五六七八九十百千]+)\s*次/i)
-        || normalizedText.match(/(?:总共|一共|共|连续|持续|运行|执行)\s*([0-9]+|[零〇一二两三四五六七八九十百千]+)\s*次/i);
-
-    if (!intervalMatch || !runsMatch) {
-        return null;
-    }
-
-    const intervalValue = parseLoosePositiveInt(intervalMatch[1]) ?? 1;
-    const intervalUnit = String(intervalMatch[2] || '');
-    const maxRunsRaw = parseLoosePositiveInt(runsMatch[1]);
-    if (!Number.isFinite(intervalValue) || intervalValue <= 0) return null;
-    if (!maxRunsRaw || maxRunsRaw <= 0) return null;
-
-    const everyMs = Math.max(1000, scheduleUnitToMs(intervalValue, intervalUnit));
-    const maxRuns = Math.max(1, Math.min(1000, Math.floor(maxRunsRaw)));
-    const taskName = (nameMatch?.[1] || objectiveMatch?.[1] || '定时任务').trim();
-    const objective = (objectiveMatch?.[1] || nameMatch?.[1] || taskName).trim();
-    const now = new Date().toISOString();
-    const draftEntry = buildTaskTimelineEntry({
-        kind: 'created',
-        title: '已识别任务草案',
-        detail: `${formatEveryMsInCard(everyMs)}，计划执行 ${maxRuns} 次`,
-        at: now,
-        level: 'info',
-    });
-    return {
-        taskName,
-        objective,
-        scheduleText: `${formatEveryMsInCard(everyMs)}，共 ${maxRuns} 次`,
-        everyMs,
-        maxRuns,
-        runCount: 0,
-        executionPrompt: buildTaskExecutionPrompt(objective, maxRuns),
-        sourceMessageText: objective,
-        stage: 'proposal',
-        createdAt: now,
-        updatedAt: now,
-        canCreate: true,
-        canCancel: true,
-        canDelete: false,
-        notifyOnComplete: true,
-        completedNotified: false,
-        taskKind: 'chat_schedule',
-        reportStatus: 'pending',
-        progressPercent: 0,
-        timeline: [draftEntry],
-    };
-}
-
-function createProposalTaskCard(raw: string): ChatTaskCardData | null {
-    const parsed = createProposalTaskCardFromAssistantText(raw);
-    if (!parsed) return null;
-    const now = new Date().toISOString();
-    const draftEntry = buildTaskTimelineEntry({
-        kind: 'created',
-        title: '已识别任务草案',
-        detail: parsed.scheduleText,
-        at: now,
-        level: 'info',
-    });
-    return {
-        taskName: parsed.taskName,
-        objective: parsed.objective,
-        scheduleText: parsed.scheduleText,
-        everyMs: parsed.everyMs,
-        maxRuns: parsed.maxRuns,
-        runCount: 0,
-        executionPrompt: parsed.executionPrompt,
-        sourceMessageText: parsed.sourceMessageText,
-        stage: 'proposal',
-        createdAt: now,
-        updatedAt: now,
-        canCreate: true,
-        canCancel: true,
-        canDelete: false,
-        notifyOnComplete: true,
-        completedNotified: false,
-        taskKind: 'chat_schedule',
-        reportStatus: 'pending',
-        progressPercent: 0,
-        timeline: parsed.timeline ?? [draftEntry],
-    };
 }
 
 type ParsedAgentManagementSummaryItem = {
@@ -2205,18 +2502,33 @@ function summarizeAgentManagementPayload(payload: Record<string, unknown>): {
 }
 
 function resolveCardStage(task: Task, card: ChatTaskCardData, runCount: number): ChatTaskCardData['stage'] {
-    if (task.runInfo.lastStatus === 'running') {
+    if (task.runtimeState === 'running' || task.runInfo.lastStatus === 'running') {
         return 'running';
+    }
+    if (task.runtimeState === 'completed') {
+        return 'completed';
+    }
+    if (task.runtimeState === 'failed' || task.runtimeState === 'disabled') {
+        return 'failed';
+    }
+    if (task.runtimeState === 'paused') {
+        return runCount > 0 || Boolean(task.runInfo.lastRun) ? 'cancelled' : 'scheduled';
+    }
+    if (task.runtimeState === 'draft') {
+        return 'proposal';
     }
     if (card.maxRuns > 0 && runCount >= card.maxRuns) {
         return 'completed';
     }
     const hasStarted = runCount > 0 || Boolean(task.runInfo.lastRun);
-    if (task.enabled && !hasStarted) {
+    if (task.enabled && hasStarted) {
         return 'running';
     }
+    if (task.enabled && !hasStarted) {
+        return 'scheduled';
+    }
     if (task.runInfo.lastStatus === 'error' && hasStarted) {
-        return task.enabled ? 'scheduled' : 'failed';
+        return task.enabled ? 'running' : 'failed';
     }
     if (!task.enabled && hasStarted) {
         return 'cancelled';
@@ -2230,6 +2542,139 @@ function calculateTaskProgressPercent(runCount: number, maxRuns: number): number
     }
     const safeRunCount = Math.max(0, Math.floor(runCount));
     return Math.max(0, Math.min(100, Math.round((safeRunCount / maxRuns) * 100)));
+}
+
+function mapManagedTaskTimelineKind(sourceKind?: string, status?: string): ChatTaskLifecycleItem['kind'] {
+    const normalizedStatus = (status || '').trim().toLowerCase();
+    if (normalizedStatus.includes('failed') || normalizedStatus.includes('error')) return 'failed';
+    if (normalizedStatus.includes('completed') || normalizedStatus.includes('succeeded') || normalizedStatus.includes('sent')) return 'final';
+    if (normalizedStatus.includes('anomaly')) return 'anomaly';
+    if (normalizedStatus.includes('started') || normalizedStatus.includes('running')) return 'started';
+    if ((sourceKind || '').trim().toLowerCase() === 'delivery_attempt') return 'progress';
+    return 'created';
+}
+
+function mapManagedTaskTimelineToChat(timeline?: Task['timeline']): ChatTaskLifecycleItem[] {
+    return (timeline || [])
+        .map((item) => ({
+            id: item.id,
+            kind: mapManagedTaskTimelineKind(item.sourceKind, item.status),
+            title: item.summary,
+            detail: item.summary,
+            at: item.createdAt,
+            level: item.status?.includes('failed') || item.status?.includes('error')
+                ? 'error'
+                : item.status?.includes('completed') || item.status?.includes('succeeded') || item.status?.includes('sent')
+                    ? 'success'
+                    : 'info',
+        } satisfies ChatTaskLifecycleItem))
+        .sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
+}
+
+function mapTaskRunsToTimeline(runs: readonly TaskRunRecord[]): ChatTaskLifecycleItem[] {
+    return runs
+        .slice(-6)
+        .map((run) => buildTaskTimelineEntry({
+            idSeed: `run:${run.id}`,
+            kind: run.status === 'error' ? 'failed' : 'progress',
+            title: run.status === 'error' ? '执行失败' : '执行日志',
+            detail: run.output?.trim() || (run.status === 'error' ? '任务执行失败' : '任务已执行'),
+            at: run.endTime || run.startTime,
+            level: run.status === 'error' ? 'error' : 'info',
+        }));
+}
+
+function mergeTaskTimelineItems(...groups: Array<readonly ChatTaskLifecycleItem[] | undefined>): ChatTaskLifecycleItem[] {
+    const merged = new Map<string, ChatTaskLifecycleItem>();
+    for (const group of groups) {
+        for (const item of group || []) {
+            if (!item?.id) continue;
+            merged.set(item.id, item);
+        }
+    }
+    return [...merged.values()]
+        .sort((left, right) => Date.parse(left.at) - Date.parse(right.at))
+        .slice(-18);
+}
+
+function readTaskDeliveryProgressPercent(payload?: Record<string, unknown>): number | undefined {
+    if (!payload) return undefined;
+    const candidates = [
+        payload.progressPercent,
+        payload.progress_percent,
+        payload.progress,
+        payload.percent,
+    ];
+    for (const candidate of candidates) {
+        if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+            return Math.max(0, Math.min(100, Math.floor(candidate)));
+        }
+    }
+    return undefined;
+}
+
+function readTaskDeliverySummary(delivery: TaskReportDelivery): string {
+    const direct = (delivery.summaryText || delivery.errorText || '').trim();
+    if (direct) {
+        return direct;
+    }
+    const payload = delivery.payload;
+    if (!payload) {
+        return '';
+    }
+    const candidates = [
+        payload.summaryText,
+        payload.summary_text,
+        payload.summary,
+        payload.title,
+        payload.message,
+        payload.error,
+        payload.errorText,
+        payload.error_text,
+    ];
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+            return candidate.trim();
+        }
+    }
+    return '';
+}
+
+function resolveTaskDetailsJobType(kind?: ChatTaskCardData['taskKind']): string {
+    if (kind === 'chat_async') return '聊天长任务';
+    if (kind === 'manual_schedule') return '任务中心定时任务';
+    if (kind === 'a2a_delegate') return '协作委派任务';
+    return '聊天定时任务';
+}
+
+function cloneTaskCardForDetails(card: ChatTaskCardData): ChatTaskCardData {
+    return {
+        ...card,
+        timeline: card.timeline?.map((item) => ({ ...item })),
+    };
+}
+
+function buildFallbackTaskDetailsTask(
+    sourceCard: ChatTaskCardData,
+    sourceMessageId: string,
+    agentView: Pick<Agent, 'id' | 'name' | 'avatarUrl' | 'color'>,
+): TaskDetailsTask {
+    return {
+        id: sourceCard.taskId || sourceMessageId,
+        name: sourceCard.taskName || '聊天异步任务',
+        jobType: resolveTaskDetailsJobType(sourceCard.taskKind),
+        enabled: sourceCard.stage !== 'cancelled',
+        agentId: agentView.id,
+        agentName: agentView.name,
+        agentAvatarUrl: agentView.avatarUrl,
+        agentColor: agentView.color,
+        createdAt: sourceCard.createdAt,
+        maxRuns: sourceCard.maxRuns,
+        runInfo: {
+            lastStatus: sourceCard.lastStatus,
+            runCount: sourceCard.runCount,
+        },
+    };
 }
 
 function buildTaskTimelineEntry(input: {
@@ -2280,54 +2725,6 @@ function appendTaskTimeline(
     };
 }
 
-function buildTaskDeliveryTimelineEntry(delivery: TaskReportDelivery): ChatTaskLifecycleItem {
-    const payload = isTaskDeliveryPayloadRecord(delivery.payload) ? delivery.payload : undefined;
-    const payloadStatus = typeof payload?.status === 'string' ? payload.status.trim().toLowerCase() : '';
-    const runCount = typeof delivery.runCount === 'number' ? Math.max(0, delivery.runCount) : undefined;
-    if (delivery.deliveryKind === 'anomaly' || payloadStatus === 'alert' || payloadStatus === 'anomaly') {
-        return buildTaskTimelineEntry({
-            idSeed: `task_delivery_timeline_${delivery.id}`,
-            kind: 'anomaly',
-            title: '触发异常汇报',
-            detail: (delivery.errorText || delivery.summaryText || '任务命中异常条件。').trim(),
-            at: delivery.createdAt,
-            runCount,
-            level: 'error',
-        });
-    }
-    if (delivery.deliveryKind === 'progress') {
-        return buildTaskTimelineEntry({
-            idSeed: `task_delivery_timeline_${delivery.id}`,
-            kind: 'progress',
-            title: runCount ? `第 ${runCount} 轮进度回传` : '任务进度回传',
-            detail: (delivery.summaryText || delivery.errorText || '任务已产生新的执行进度。').trim(),
-            at: delivery.createdAt,
-            runCount,
-            level: 'info',
-        });
-    }
-    if (payloadStatus === 'failed' || delivery.errorText) {
-        return buildTaskTimelineEntry({
-            idSeed: `task_delivery_timeline_${delivery.id}`,
-            kind: 'failed',
-            title: '任务执行失败',
-            detail: (delivery.errorText || delivery.summaryText || '任务执行失败。').trim(),
-            at: delivery.createdAt,
-            runCount,
-            level: 'error',
-        });
-    }
-    return buildTaskTimelineEntry({
-        idSeed: `task_delivery_timeline_${delivery.id}`,
-        kind: 'final',
-        title: '最终总结已回传',
-        detail: (delivery.summaryText || '任务已完成。').trim(),
-        at: delivery.createdAt,
-        runCount,
-        level: 'success',
-    });
-}
-
 function resolveTaskConversationScope(
     runtimeKey: string,
     sessionOwnerAgentId: string,
@@ -2352,9 +2749,12 @@ function isTaskDeliveryPayloadRecord(value: unknown): value is Record<string, un
 }
 
 function hasAsyncWorkHandoff(message: Message): boolean {
-    const taskStage = message.taskCard?.stage;
-    const hasAsyncTask = taskStage === 'scheduled' || taskStage === 'running';
-    return hasAsyncTask;
+    if (message.taskCard?.taskKind === 'chat_async'
+        && message.taskCard.stage === 'running') {
+        return true;
+    }
+    const jobRef = extractCapabilityJobRefFromMessageSpec(message.spec);
+    return Boolean(jobRef?.jobId) && !isCapabilityJobTerminalStatus(jobRef?.status);
 }
 
 interface AgentChatReadinessMeta {
@@ -2363,6 +2763,16 @@ interface AgentChatReadinessMeta {
     modelProvider?: string;
     modelName?: string;
     apiKeyEnv?: string;
+}
+
+function collectAgentLookupKeys(...values: Array<string | undefined | null>): string[] {
+    const seen = new Set<string>();
+    for (const value of values) {
+        const trimmed = typeof value === 'string' ? value.trim() : '';
+        if (!trimmed) continue;
+        seen.add(trimmed);
+    }
+    return [...seen];
 }
 
 function isAgentChatUnavailable(meta?: AgentChatReadinessMeta): boolean {
@@ -2829,6 +3239,8 @@ interface ChatPageProps {
     runtimeKey?: string;
     sessionOwnerAgentId?: string;
     sessionLabel?: string;
+    sessionLabelResolver?: (sessionId: string) => string;
+    sessionLabelMatcher?: (label: string) => boolean;
     systemPreamble?: string;
     groupUpgradeEnabled?: boolean;
     fixedSessionTitle?: string;
@@ -2876,6 +3288,8 @@ export function ChatPage({
     runtimeKey: runtimeKeyProp,
     sessionOwnerAgentId: sessionOwnerAgentIdProp,
     sessionLabel: sessionLabelProp,
+    sessionLabelResolver: sessionLabelResolverProp,
+    sessionLabelMatcher: sessionLabelMatcherProp,
     systemPreamble: systemPreambleProp,
     groupUpgradeEnabled: groupUpgradeEnabledProp,
     fixedSessionTitle: fixedSessionTitleProp,
@@ -2917,7 +3331,6 @@ export function ChatPage({
     const [sessionKeyword, setSessionKeyword] = useState('');
     const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null);
     const [sessionDeleteBusy, setSessionDeleteBusy] = useState(false);
-    const [pendingCreateTaskMessageId, setPendingCreateTaskMessageId] = useState<string | null>(null);
     const [taskActionBusy, setTaskActionBusy] = useState(false);
     const [taskDetailsOpen, setTaskDetailsOpen] = useState(false);
     const [taskDetailsItem, setTaskDetailsItem] = useState<TaskDetailsTask | null>(null);
@@ -2936,6 +3349,19 @@ export function ChatPage({
     const [streamState, setStreamState] = useState<StreamState>('idle');
     const [pendingSilentCount, setPendingSilentCount] = useState(0);
     const [silentDispatching, setSilentDispatching] = useState(false);
+    const clearTaskDetailsState = useCallback(() => {
+        setTaskDetailsItem(null);
+        setTaskDetailRuns([]);
+        setTaskDetailFinalSummary(null);
+        setTaskDetailsChatCard(null);
+        setTaskDetailsMessageId(null);
+    }, []);
+    const openTaskDetailsFallback = useCallback((fallbackTask: TaskDetailsTask | null) => {
+        setTaskDetailsItem(fallbackTask);
+        setTaskDetailRuns([]);
+        setTaskDetailFinalSummary(null);
+        setTaskDetailsOpen(true);
+    }, []);
     const [multiReplyDispatching, setMultiReplyDispatching] = useState(false);
     const [remoteLoadingMore, setRemoteLoadingMore] = useState(false);
     const [remotePendingCount, setRemotePendingCount] = useState(0);
@@ -2945,6 +3371,8 @@ export function ChatPage({
     const [activeSessionContextUpdatedAt, setActiveSessionContextUpdatedAt] = useState<number | null>(null);
 
     const messagesRef = useRef<Message[]>([]);
+    const pendingChatTaskDraftsRef = useRef<Map<string, PendingChatTaskDraftState>>(new Map());
+    const handledTaskDeliveryIdsRef = useRef<Set<string>>(new Set());
     const isSendingRef = useRef(isSending);
     const silentDispatchingRef = useRef(silentDispatching);
     const multiReplyDispatchingRef = useRef(multiReplyDispatching);
@@ -2978,6 +3406,7 @@ export function ChatPage({
     const remoteSessionSummaryMapRef = useRef<Map<string, BackendSessionSummary>>(new Map());
     const remoteBatchLoadingRef = useRef(false);
     const remoteSyncTokenRef = useRef(0);
+    const capabilityJobPersistStateRef = useRef<Map<string, string>>(new Map());
     const activeSessionContextRequestRef = useRef(0);
     const agentManagementBusyRef = useRef(false);
     const selfAppearanceQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -3002,11 +3431,37 @@ export function ChatPage({
     const baseSessionLabel = (sessionLabelProp ?? '').trim();
     const baseSessionLabelRef = useRef(baseSessionLabel);
     baseSessionLabelRef.current = baseSessionLabel;
+    const sessionLabelResolverRef = useRef(sessionLabelResolverProp);
+    sessionLabelResolverRef.current = sessionLabelResolverProp;
+    const sessionLabelMatcherRef = useRef(sessionLabelMatcherProp);
+    sessionLabelMatcherRef.current = sessionLabelMatcherProp;
     const resolveSessionLabel = useCallback((sessionId: string) => {
         const base = baseSessionLabelRef.current;
         if (base) return base;
+        const resolver = sessionLabelResolverRef.current;
+        if (resolver) {
+            try {
+                return resolver(sessionId);
+            } catch {
+                return buildLocalSessionLabel(sessionId);
+            }
+        }
         return buildLocalSessionLabel(sessionId);
     }, []);
+    const matchesRemoteSessionScope = useCallback((label: string) => {
+        const normalized = label.trim();
+        const matcher = sessionLabelMatcherRef.current;
+        if (matcher) {
+            try {
+                return matcher(normalized);
+            } catch {
+                return false;
+            }
+        }
+        return groupRuntimeEnabled
+            ? isGroupScopedSessionLabel(normalized)
+            : !isGroupScopedSessionLabel(normalized);
+    }, [groupRuntimeEnabled]);
     const transformUserMessageRef = useRef(transformUserMessageProp);
     transformUserMessageRef.current = transformUserMessageProp;
     const resolveSystemPreambleRef = useRef(resolveSystemPreambleProp);
@@ -3092,12 +3547,7 @@ export function ChatPage({
             mode,
         })?.trim() || '';
         const basePreamble = resolved || systemPreambleRef.current || '';
-        const imageEditPreamble = buildImageEditRoutingPreamble(
-            message,
-            getSessionMessagesSnapshot(activeSessionIdRef.current),
-        );
-        const currentAppearancePreamble = buildCurrentAppearancePreamble(message, agent, agentId);
-        const combined = [basePreamble, imageEditPreamble, currentAppearancePreamble].filter(Boolean).join('\n\n').trim();
+        const combined = [basePreamble].filter(Boolean).join('\n\n').trim();
         return combined || undefined;
     };
     const messages = useMemo(() => activeSession?.messages ?? [], [activeSession]);
@@ -3137,9 +3587,17 @@ export function ChatPage({
                 .map((card) => card.taskId as string),
         )]
     ), [messages]);
-    const pendingCreateTaskMessage = pendingCreateTaskMessageId
-        ? messages.find((message) => message.id === pendingCreateTaskMessageId) ?? null
-        : null;
+    const sessionTaskSummaries = useMemo(() => {
+        const latestByKey = new Map<string, { messageId: string; card: ChatTaskCardData }>();
+        for (const message of messages) {
+            const card = message.taskCard;
+            if (!card) continue;
+            const key = card.taskId?.trim() || `draft:${message.id}`;
+            latestByKey.set(key, { messageId: message.id, card });
+        }
+        return [...latestByKey.values()]
+            .sort((left, right) => Date.parse(right.card.updatedAt || right.card.createdAt) - Date.parse(left.card.updatedAt || left.card.createdAt));
+    }, [messages]);
     const sessionKeywordNormalized = useMemo(() => sessionKeyword.trim().toLocaleLowerCase(), [sessionKeyword]);
     const visibleSessions = useMemo(
         () => {
@@ -3312,15 +3770,20 @@ export function ChatPage({
                 ? (updater as (items: ChatSession[]) => ChatSession[])(prev)
                 : updater;
             const fixedLabel = baseSessionLabelRef.current;
-            const normalized = fixedLabel
+            let normalized = fixedLabel
                 ? sanitizeSessionsForFixedLabel(next, fixedLabel)
                 : next;
+            if (!groupRuntimeEnabled) {
+                normalized = normalized.filter((session) => !isGroupScopedSessionLabel((session.sessionLabel || '').trim()));
+            }
             return normalizeSessionCollection(normalized, activeSessionIdRef.current);
         });
     };
 
     const setActiveSessionId = (nextId: string) => {
-        chatRuntimeStore.setActiveSessionId(runtimeAgentIdRef.current, nextId);
+        const normalizedId = nextId.trim();
+        activeSessionIdRef.current = normalizedId;
+        chatRuntimeStore.setActiveSessionId(runtimeAgentIdRef.current, normalizedId);
     };
 
     const patchSessionState = (sessionId: string, updater: (session: ChatSession) => ChatSession): void => {
@@ -3497,7 +3960,8 @@ export function ChatPage({
         const size = Math.max(1, Math.floor(batchSize));
         const batch = remoteSessionQueueRef.current.splice(0, size);
         syncRemoteQueueMeta(remoteSessionQueueRef.current.length);
-        if (batch.length === 0) {
+        const visibleBatch = batch.filter((summary) => matchesRemoteSessionScope(summary.sessionLabel));
+        if (visibleBatch.length === 0) {
             return;
         }
 
@@ -3510,10 +3974,10 @@ export function ChatPage({
             if (syncToken !== remoteSyncTokenRef.current) {
                 return;
             }
-            setSessions((prev) => mergeRemoteSessions(prev, batch.map((summary) => buildRemoteSessionStub(summary, chatAgentId))));
+            setSessions((prev) => mergeRemoteSessions(prev, visibleBatch.map((summary) => buildRemoteSessionStub(summary, chatAgentId))));
 
             const restoredSessions = await mapAsyncWithConcurrency(
-                batch,
+                visibleBatch,
                 REMOTE_SESSION_DETAIL_CONCURRENCY,
                 async (summary) => {
                     try {
@@ -3531,8 +3995,9 @@ export function ChatPage({
             if (syncToken !== remoteSyncTokenRef.current) {
                 return;
             }
-            if (restoredSessions.length > 0) {
-                setSessions((prev) => mergeRemoteSessions(prev, restoredSessions));
+            const safeRestoredSessions = restoredSessions.filter((session) => matchesRemoteSessionScope((session.sessionLabel || '').trim()));
+            if (safeRestoredSessions.length > 0) {
+                setSessions((prev) => mergeRemoteSessions(prev, safeRestoredSessions));
             }
         } finally {
             if (syncToken === remoteSyncTokenRef.current) {
@@ -3744,6 +4209,70 @@ export function ChatPage({
             return next;
         });
     };
+
+    const persistCapabilityJobRecord = useCallback((record: Omit<ManagementCapabilityJobRecord, 'updated_at'> | null) => {
+        if (!record?.job_id) {
+            return;
+        }
+        const signature = JSON.stringify({
+            status: record.status,
+            progress: record.progress_percent ?? null,
+            stage: record.stage ?? null,
+            summary: record.summary ?? null,
+            finished_at: record.finished_at ?? null,
+            heartbeat: record.last_heartbeat_at ?? null,
+        });
+        const previous = capabilityJobPersistStateRef.current.get(record.job_id);
+        if (previous === signature) {
+            return;
+        }
+        capabilityJobPersistStateRef.current.set(record.job_id, signature);
+        void upsertManagementCapabilityJob(record).catch(() => {
+            if (capabilityJobPersistStateRef.current.get(record.job_id) === signature) {
+                capabilityJobPersistStateRef.current.delete(record.job_id);
+            }
+        });
+    }, []);
+
+    const buildRenderableSpecFromCapabilityJobRecord = useCallback((record: ManagementCapabilityJobRecord): unknown | undefined => {
+        const presentableResult = buildCapabilityJobPresentableResult(record);
+        return buildRenderableSpecFromPresentableResult(presentableResult);
+    }, []);
+
+    const resolvePresentableResultFromRawOutput = useCallback((
+        raw: string,
+        ownerAgentId: string,
+    ): {
+        presentableResult?: Record<string, unknown>;
+        renderableSpec?: unknown;
+        readableText?: string;
+    } => {
+        const trimmed = raw.trim();
+        if (!trimmed) {
+            return {};
+        }
+        const presentableResult = buildPresentableResultFromToolLog(trimmed);
+        if (presentableResult) {
+            persistCapabilityJobRecord(
+                buildCapabilityJobRecordFromPresentableResult(
+                    presentableResult,
+                    parseJsonSafely<Record<string, unknown>>(trimmed),
+                    ownerAgentId,
+                ),
+            );
+        }
+        return {
+            presentableResult: presentableResult ?? undefined,
+            renderableSpec: presentableResult
+                ? (
+                    shouldRenderPresentableResultAsMessageSpec(presentableResult)
+                        ? buildRenderableSpecFromPresentableResult(presentableResult)
+                        : undefined
+                )
+                : tryParseInlineSpecFromText(trimmed) ?? undefined,
+            readableText: extractReadableTextFromLog(trimmed),
+        };
+    }, [persistCapabilityJobRecord]);
 
     const flushPendingStreamDraft = () => {
         clearStreamPatchTimer();
@@ -4077,6 +4606,80 @@ export function ChatPage({
         }]);
     };
 
+    const getPendingChatTaskDraftKey = (): string => {
+        const sessionId = activeSessionIdRef.current.trim();
+        return sessionId || '__default__';
+    };
+
+    const getPendingChatTaskDraft = (): PendingChatTaskDraftState | null => {
+        return pendingChatTaskDraftsRef.current.get(getPendingChatTaskDraftKey()) ?? null;
+    };
+
+    const setPendingChatTaskDraft = (draft: PendingChatTaskDraftState | null): void => {
+        const key = getPendingChatTaskDraftKey();
+        if (!draft) {
+            pendingChatTaskDraftsRef.current.delete(key);
+            return;
+        }
+        pendingChatTaskDraftsRef.current.set(key, draft);
+    };
+
+    const normalizePendingChatTaskDraft = (
+        draft: Partial<PendingChatTaskDraftState> | null | undefined,
+        fallbackText: string,
+        previous?: PendingChatTaskDraftState | null,
+    ): PendingChatTaskDraftState | null => {
+        if (!draft) {
+            return null;
+        }
+        const sourceMessageText = (draft.sourceMessageText || previous?.sourceMessageText || fallbackText).trim();
+        if (!sourceMessageText) {
+            return null;
+        }
+        return {
+            objective: draft.objective?.trim() || previous?.objective,
+            reportCondition: draft.reportCondition?.trim() || previous?.reportCondition,
+            everyMs: typeof draft.everyMs === 'number' && draft.everyMs > 0 ? draft.everyMs : previous?.everyMs,
+            maxRuns: typeof draft.maxRuns === 'number' && draft.maxRuns >= 0 ? draft.maxRuns : previous?.maxRuns,
+            durationMs: typeof draft.durationMs === 'number' && draft.durationMs > 0 ? draft.durationMs : previous?.durationMs,
+            scheduleText: draft.scheduleText?.trim() || previous?.scheduleText,
+            taskName: draft.taskName?.trim() || previous?.taskName,
+            executionPrompt: draft.executionPrompt?.trim() || previous?.executionPrompt,
+            sourceMessageText,
+            createdAt: draft.createdAt?.trim() || previous?.createdAt || new Date().toISOString(),
+        };
+    };
+
+    const applyPendingChatTaskDraftState = useCallback((
+        messageText: string,
+        payload: {
+            matched?: boolean;
+            cancelled?: boolean;
+            readyToConfirm?: boolean;
+            draft?: unknown;
+        },
+    ) => {
+        if (payload.matched !== true) {
+            return;
+        }
+        if (payload.cancelled) {
+            setPendingChatTaskDraft(null);
+            return;
+        }
+        const currentDraft = getPendingChatTaskDraft();
+        const normalizedDraft = normalizeChatTaskDraftState(payload.draft);
+        const nextDraft = normalizePendingChatTaskDraft(
+            normalizedDraft ?? currentDraft,
+            messageText,
+            currentDraft,
+        );
+        if (payload.readyToConfirm) {
+            setPendingChatTaskDraft(null);
+            return;
+        }
+        setPendingChatTaskDraft(nextDraft);
+    }, []);
+
     const buildSessionContextDigest = (session: ChatSession | null | undefined): ChatSession['contextDigest'] => {
         if (!session) return undefined;
         const offset = typeof session.remoteContextOffset === 'number' && Number.isFinite(session.remoteContextOffset)
@@ -4111,7 +4714,10 @@ export function ChatPage({
     const buildRecoveredSessionLabelForLocalSession = (sessionId: string): string => {
         const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
         const session = runtimeState.sessions.find((item) => item.id === sessionId);
-        const baseLabel = (session?.sessionLabel || resolveSessionLabel(sessionId) || sessionId).trim();
+        let baseLabel = (session?.sessionLabel || resolveSessionLabel(sessionId) || sessionId).trim();
+        if (!groupRuntimeEnabled && isGroupScopedSessionLabel(baseLabel)) {
+            baseLabel = buildLocalSessionLabel(sessionId);
+        }
         const normalizedBase = normalizeLabelComponent(baseLabel || chatAgentId || 'chat', 72) || 'chat';
         return `${normalizedBase}_recover_${Date.now().toString(36)}`;
     };
@@ -4123,7 +4729,10 @@ export function ChatPage({
         noticeText?: string,
     ) => {
         const sid = sessionId.trim();
-        const nextLabel = recoveredSessionLabel.trim();
+        const rawLabel = recoveredSessionLabel.trim();
+        const nextLabel = (!groupRuntimeEnabled && isGroupScopedSessionLabel(rawLabel))
+            ? buildRecoveredSessionLabelForLocalSession(sid)
+            : rawLabel;
         if (!sid || !nextLabel) {
             return;
         }
@@ -4134,8 +4743,12 @@ export function ChatPage({
             const nextSession: ChatSession = {
                 ...current,
                 sessionLabel: nextLabel,
-                remoteSessionId: recoveredRemoteSessionId?.trim() || undefined,
-                remoteSessionOwnerAgentId: recoveredRemoteSessionId?.trim() ? sessionOwnerAgentId : undefined,
+                remoteSessionId: (!groupRuntimeEnabled && isGroupScopedSessionLabel(rawLabel))
+                    ? undefined
+                    : (recoveredRemoteSessionId?.trim() || undefined),
+                remoteSessionOwnerAgentId: (!groupRuntimeEnabled && isGroupScopedSessionLabel(rawLabel))
+                    ? undefined
+                    : (recoveredRemoteSessionId?.trim() ? sessionOwnerAgentId : undefined),
                 remoteContextOffset: current.messages.length,
                 updatedAt: Date.now(),
             };
@@ -4149,6 +4762,48 @@ export function ChatPage({
         if (noticeText?.trim()) {
             appendSessionSystemMessage(sid, noticeText);
         }
+    };
+
+    const bindSessionRemoteTarget = (
+        sessionId: string,
+        binding?: { sessionId?: string; sessionLabel?: string; ownerAgentId?: string },
+    ): void => {
+        const sid = sessionId.trim();
+        const remoteSessionId = binding?.sessionId?.trim() || '';
+        const sessionLabel = binding?.sessionLabel?.trim() || '';
+        const ownerAgentId = binding?.ownerAgentId?.trim() || sessionOwnerAgentId;
+        if (!groupRuntimeEnabled && sessionLabel && isGroupScopedSessionLabel(sessionLabel)) {
+            return;
+        }
+        if (!sid || (!remoteSessionId && !sessionLabel)) {
+            return;
+        }
+        setSessions((prev) => {
+            const idx = prev.findIndex((session) => session.id === sid);
+            if (idx < 0) return prev;
+            const current = prev[idx];
+            const nextRemoteSessionId = remoteSessionId || getRemoteSessionId(current);
+            const nextSessionLabel = sessionLabel || (current.sessionLabel || '').trim();
+            const nextOwnerAgentId = nextRemoteSessionId
+                ? (ownerAgentId || getRemoteSessionOwnerAgentId(current) || sessionOwnerAgentId)
+                : (getRemoteSessionOwnerAgentId(current) || undefined);
+            if (
+                nextRemoteSessionId === getRemoteSessionId(current)
+                && nextSessionLabel === (current.sessionLabel || '').trim()
+                && (nextOwnerAgentId || '') === (getRemoteSessionOwnerAgentId(current) || '')
+            ) {
+                return prev;
+            }
+            const nextSession: ChatSession = {
+                ...current,
+                remoteSessionId: nextRemoteSessionId || undefined,
+                remoteSessionOwnerAgentId: nextOwnerAgentId,
+                sessionLabel: nextSessionLabel || undefined,
+            };
+            const next = [...prev];
+            next[idx] = nextSession;
+            return next;
+        });
     };
 
     const getSessionContextPressure = (session: ChatSession | null | undefined): { messageCount: number; charCount: number } => {
@@ -4335,6 +4990,9 @@ export function ChatPage({
         const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
         const pendingId = pendingMessageIdRef.current;
         const hasWorkingA2a = (draft.a2aCards ?? []).some((card) => card.status === 'working');
+        const hasCapabilityJobHandoff = Boolean(
+            extractCapabilityJobRefFromMessageSpec(draft.spec)?.jobId,
+        );
         const fallbackText = hasWorkingA2a
             ? '已转入异步协作执行，后续进展会继续回传到当前会话。你可以继续输入新的问题。'
             : '任务已转入异步执行，后续结果会继续回传到当前会话。你可以继续输入新的问题。';
@@ -4344,7 +5002,9 @@ export function ChatPage({
             streaming: false,
             thinking: false,
             generationElapsedMs: Math.max(0, Date.now() - (draft.generationStartedAt || Date.now())),
-            text: (draft.text || '').trim() || fallbackText,
+            text: hasCapabilityJobHandoff
+                ? (draft.text || '').trim()
+                : ((draft.text || '').trim() || fallbackText),
             tools: (draft.tools ?? []).map((tool) => ({ ...tool, running: false })),
         };
 
@@ -4389,254 +5049,140 @@ export function ChatPage({
         setStreamState('idle');
     };
 
-    function resolveTaskReportSpeaker(delivery: TaskReportDelivery): Agent {
-        // 聊天内任务回执：发言人与头像以“执行人”为准，避免显示成当前会话智能体或错误的汇报者。
-        const reportActorId = (delivery.executorAgentId || delivery.reportActorAgentId || chatAgentId).trim() || chatAgentId;
-        if (reportActorId === agent.id || reportActorId === chatAgentId) {
-            const directoryHit = agentDirectoryRef.current.get(reportActorId);
-            return {
-                ...agent,
-                id: reportActorId,
-                name: delivery.executorAgentName?.trim()
-                    || delivery.reportActorAgentName?.trim()
-                    || agent.name,
-                title: delivery.executorAgentName?.trim()
-                    || delivery.reportActorAgentName?.trim()
-                    || agent.title,
-                avatarUrl: agent.avatarUrl || directoryHit?.avatarUrl,
-                color: agent.color || directoryHit?.color || '#111827',
-            };
-        }
-        const directoryHit = agentDirectoryRef.current.get(reportActorId);
-        if (directoryHit) {
-            const fallback = buildFallbackAgent(reportActorId);
-            return {
-                ...fallback,
-                id: directoryHit.id,
-                name: delivery.executorAgentName?.trim()
-                    || delivery.reportActorAgentName?.trim()
-                    || directoryHit.name
-                    || fallback.name,
-                title: delivery.executorAgentName?.trim()
-                    || delivery.reportActorAgentName?.trim()
-                    || directoryHit.name
-                    || fallback.title,
-                avatarUrl: directoryHit.avatarUrl || fallback.avatarUrl,
-                color: directoryHit.color || fallback.color,
-            };
-        }
-        const fallback = buildFallbackAgent(reportActorId);
-        return {
-            ...fallback,
-            id: reportActorId,
-            name: delivery.executorAgentName?.trim()
-                || delivery.reportActorAgentName?.trim()
-                || fallback.name,
-            title: delivery.executorAgentName?.trim()
-                || delivery.reportActorAgentName?.trim()
-                || fallback.title,
-        };
-    }
-
-    function buildTaskReportMessageText(delivery: TaskReportDelivery): string {
-        const payload = isTaskDeliveryPayloadRecord(delivery.payload) ? delivery.payload : undefined;
-        const payloadStatus = typeof payload?.status === 'string' ? payload.status.trim().toLowerCase() : '';
-        const taskName = delivery.taskName?.trim() || '未命名任务';
-        const executorName = delivery.executorAgentName?.trim()
-            || delivery.reportActorAgentName?.trim()
-            || delivery.executorAgentId?.trim()
-            || delivery.reportActorAgentId?.trim()
-            || '当前智能体';
-        const reportActorName = delivery.reportActorAgentName?.trim()
-            || delivery.executorAgentName?.trim()
-            || delivery.reportActorAgentId?.trim()
-            || delivery.executorAgentId?.trim()
-            || executorName;
-        const taskRunText = typeof delivery.runCount === 'number' ? `${Math.max(0, delivery.runCount)} 次` : '未知';
-        const summaryText = (delivery.summaryText || '').trim();
-        const errorText = (delivery.errorText || '').trim();
-        const isProgress = delivery.deliveryKind === 'progress' || payloadStatus === 'running' || payloadStatus === 'progress';
-        const isAnomaly = delivery.deliveryKind === 'anomaly' || payloadStatus === 'alert' || payloadStatus === 'anomaly';
-        const failed = payloadStatus === 'failed' || Boolean(errorText);
-        const body = failed
-            ? (errorText || summaryText || '任务执行失败，但暂未返回更多错误摘要。')
-            : (summaryText || '任务已执行完成，暂未返回总结内容。');
-        const lines = isProgress
-            ? [
-                `任务进度：${taskName}`,
-                `执行人：${executorName}`,
-                `汇报人：${reportActorName}`,
-                `当前轮次：${taskRunText}`,
-                `进度摘要：${summaryText || '任务已产生新的执行结果。'}`,
-            ]
-            : isAnomaly
-            ? [
-                `任务告警：${taskName}`,
-                `执行人：${executorName}`,
-                `汇报人：${reportActorName}`,
-                `触发轮次：${taskRunText}`,
-                `告警摘要：${body}`,
-                '如果需要，我可以继续帮你停止监控、调整阈值，或分析这次命中原因。',
-            ]
-            : failed
-            ? [
-                `任务失败报告：${taskName}`,
-                `执行人：${executorName}`,
-                `汇报人：${reportActorName}`,
-                `已执行：${taskRunText}`,
-                `失败摘要：${body}`,
-                '要我重试、调整方案后重试，还是继续当前问题？',
-            ]
-            : [
-                `任务报告：${taskName}`,
-                `执行人：${executorName}`,
-                `汇报人：${reportActorName}`,
-                `已执行：${taskRunText}`,
-                `结论：${body}`,
-            ];
-        return lines.join('\n');
-    }
-
-    async function consumePendingTaskReportDeliveries(sessionId?: string): Promise<number> {
-        const targetSessionId = (sessionId || activeSessionIdRef.current || '').trim();
-        if (!targetSessionId) {
-            return 0;
-        }
-        const scope = resolveTaskConversationScope(
-            runtimeAgentIdRef.current,
-            sessionOwnerAgentId,
-            chatAgentId,
-        );
-        const deliveriesMap = new Map<string, TaskReportDelivery>();
-        const queryCandidates: Array<{
-            runtimeKey?: string;
-            chatSessionId?: string;
-            conversationType?: TaskConversationType;
-            conversationId?: string;
-        }> = [
-            {
-                runtimeKey: runtimeAgentIdRef.current,
-                chatSessionId: targetSessionId,
-                conversationType: scope.conversationType,
-                conversationId: scope.conversationId,
-            },
-            {
-                runtimeKey: runtimeAgentIdRef.current,
-                chatSessionId: targetSessionId,
-            },
-            {
-                chatSessionId: targetSessionId,
-            },
-        ];
-        for (const candidate of queryCandidates) {
-            try {
-                const rows = await listPendingTaskReportDeliveries(candidate);
-                for (const row of rows) {
-                    deliveriesMap.set(row.id, row);
-                }
-            } catch {
-                // 某个查询条件失败时退回到更宽松的过滤条件。
-            }
-        }
-        const deliveries = [...deliveriesMap.values()];
-        if (!deliveries.length) {
-            return 0;
-        }
-
-        const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
-        const session = runtimeState.sessions.find((item) => item.id === targetSessionId);
-        const knownMessageIds = new Set((session?.messages ?? []).map((item) => item.id));
-        let inserted = 0;
-
-        const orderedDeliveries = [...deliveries].sort(
-            (left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt),
-        );
-
-        for (const delivery of orderedDeliveries) {
-            const messageId = `task_delivery_${delivery.id}`;
-            const payload = isTaskDeliveryPayloadRecord(delivery.payload) ? delivery.payload : undefined;
-            const payloadStatus = typeof payload?.status === 'string' ? payload.status.trim().toLowerCase() : '';
-            const nextRunCount = typeof delivery.runCount === 'number' ? Math.max(0, delivery.runCount) : undefined;
-            const reportActorName = delivery.reportActorAgentName?.trim()
-                || delivery.executorAgentName?.trim()
-                || undefined;
-            const executorAgentName = delivery.executorAgentName?.trim()
-                || delivery.reportActorAgentName?.trim()
-                || undefined;
-            const errorSummary = (delivery.errorText || delivery.summaryText || '').trim() || undefined;
-            const timelineEntry = buildTaskDeliveryTimelineEntry(delivery);
-            const isProgress = delivery.deliveryKind === 'progress' || payloadStatus === 'running' || payloadStatus === 'progress';
-            const isFinal = delivery.deliveryKind === 'final';
-            const isFailed = payloadStatus === 'failed' || Boolean(delivery.errorText);
-            const isAnomaly = delivery.deliveryKind === 'anomaly' || payloadStatus === 'alert' || payloadStatus === 'anomaly';
-            const shouldEmitChatMessage = isFinal || isFailed || isAnomaly;
-            const hasMessage = knownMessageIds.has(messageId);
-            const ackStatus = hasMessage || !shouldEmitChatMessage ? 'acknowledged' : 'reported';
-
-            // 进度回执仅更新卡片，不落聊天消息，避免用户边聊天边被刷屏。
-            if (shouldEmitChatMessage && !hasMessage) {
-                const speaker = resolveTaskReportSpeaker(delivery);
-                const reportMessage: Message = {
-                    id: messageId,
-                    role: 'agent',
-                    agentId: speaker.id,
-                    agentName: speaker.name,
-                    agentAvatarUrl: speaker.avatarUrl,
-                    agentColor: speaker.color,
-                    agentPortraitUrl: speaker.portraitUrl,
-                    text: buildTaskReportMessageText(delivery),
-                    meta: `task_report:${delivery.id}`,
-                    timestamp: new Date().toISOString(),
-                };
-                commitMessages((prev) => [...prev, reportMessage], { sessionId: targetSessionId });
-                knownMessageIds.add(messageId);
-                inserted += 1;
-            }
-
-            updateTaskCardByTaskId(delivery.taskId, (card) => {
-                let nextCard = appendTaskTimeline(card, timelineEntry);
-                const resolvedRunCount = nextRunCount ?? nextCard.runCount;
-                nextCard = {
-                    ...nextCard,
-                    bindingSessionId: nextCard.bindingSessionId || targetSessionId,
-                    runCount: resolvedRunCount,
-                    progressPercent: calculateTaskProgressPercent(resolvedRunCount, nextCard.maxRuns) ?? nextCard.progressPercent,
-                    executorAgentName: executorAgentName || nextCard.executorAgentName,
-                    reportActorName: reportActorName || nextCard.reportActorName,
-                    reportStatus: ackStatus,
-                    errorSummary: isFailed || isAnomaly ? errorSummary : nextCard.errorSummary,
-                    finalSummaryReady: isFinal ? Boolean(delivery.summaryText || delivery.errorText) : nextCard.finalSummaryReady,
-                    finalSummaryText: isFinal ? (delivery.summaryText || delivery.errorText || nextCard.finalSummaryText) : nextCard.finalSummaryText,
-                    stage: isFinal
-                        ? 'completed'
-                        : isFailed
-                            ? 'failed'
-                            : isProgress || isAnomaly
-                                ? 'running'
-                                : nextCard.stage,
-                    updatedAt: new Date().toISOString(),
-                };
-                return nextCard;
-            });
-
-            try {
-                await updateTaskReportDeliveryStatus(delivery.id, 'acknowledged');
-                updateTaskCardByTaskId(delivery.taskId, (card) => ({
-                    ...card,
-                    reportStatus: 'acknowledged',
-                    updatedAt: new Date().toISOString(),
-                }));
-            } catch {
-                // ack 失败时保留已汇报状态，下一轮继续重试。
-            }
-        }
-
-        return inserted;
-    }
-
     useEffect(() => {
         messagesRef.current = messages;
     }, [messages]);
+
+    useEffect(() => {
+        let cancelled = false;
+        let timer: number | null = null;
+
+        const pollCapabilityJobs = async () => {
+            const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
+            if (runtimeState.sessions.length === 0) {
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void pollCapabilityJobs();
+                    }, 4_000);
+                }
+                return;
+            }
+            if (
+                isDocumentHidden()
+                || streamStateRef.current === 'streaming'
+                || isSendingRef.current
+                || silentDispatchingRef.current
+                || multiReplyDispatchingRef.current
+            ) {
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void pollCapabilityJobs();
+                    }, 4_000);
+                }
+                return;
+            }
+
+            const targets = runtimeState.sessions
+                .flatMap((session) => session.messages.map((message) => ({
+                    sessionId: session.id,
+                    messageId: message.id,
+                    jobRef: extractCapabilityJobRefFromMessageSpec(message.spec),
+                })))
+                .filter((item): item is {
+                    sessionId: string;
+                    messageId: string;
+                    jobRef: { jobId: string; status?: string };
+                } => Boolean(item.jobRef))
+                .filter((item) => !isCapabilityJobTerminalStatus(item.jobRef.status));
+
+            if (targets.length === 0) {
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void pollCapabilityJobs();
+                    }, 4_000);
+                }
+                return;
+            }
+
+            try {
+                const settled = await Promise.allSettled(
+                    targets.map(async (target) => ({
+                        sessionId: target.sessionId,
+                        messageId: target.messageId,
+                        record: await getManagementCapabilityJob(target.jobRef.jobId),
+                    })),
+                );
+                if (cancelled) {
+                    return;
+                }
+                const updates = new Map<string, ManagementCapabilityJobRecord>();
+                for (const item of settled) {
+                    if (item.status !== 'fulfilled' || !item.value.record) {
+                        continue;
+                    }
+                    updates.set(`${item.value.sessionId}::${item.value.messageId}`, item.value.record);
+                }
+                if (updates.size > 0) {
+                    setSessions((prev) => prev.map((session) => {
+                        let changed = false;
+                        const nextMessages = session.messages.map((message) => {
+                            const record = updates.get(`${session.id}::${message.id}`);
+                            if (!record) {
+                                return message;
+                            }
+                            const nextSpec = buildRenderableSpecFromCapabilityJobRecord(record);
+                            if (!nextSpec) {
+                                return message;
+                            }
+                            const nextText = message.text?.trim()
+                                ? message.text
+                                : record.summary?.trim() || record.title?.trim() || '任务处理中';
+                            const previousStatus = buildCapabilityJobRecordFromMessageSpec(message.spec, runtimeAgentId)?.status;
+                            const nextStatus = record.status;
+                            if (
+                                JSON.stringify(message.spec ?? null) === JSON.stringify(nextSpec)
+                                && nextText === message.text
+                                && previousStatus === nextStatus
+                            ) {
+                                return message;
+                            }
+                            changed = true;
+                            return {
+                                ...message,
+                                spec: nextSpec,
+                                text: nextText,
+                            };
+                        });
+                        if (!changed) {
+                            return session;
+                        }
+                        return {
+                            ...session,
+                            messages: nextMessages,
+                            updatedAt: Date.now(),
+                        };
+                    }));
+                }
+            } catch {
+                // capability job 轮询失败时等待下一轮重试。
+            } finally {
+                if (!cancelled) {
+                    timer = window.setTimeout(() => {
+                        void pollCapabilityJobs();
+                    }, 4_000);
+                }
+            }
+        };
+
+        void pollCapabilityJobs();
+
+        return () => {
+            cancelled = true;
+            if (timer != null) {
+                window.clearTimeout(timer);
+            }
+        };
+    }, [buildRenderableSpecFromCapabilityJobRecord, persistCapabilityJobRecord, runtimeAgentId]);
 
     useEffect(() => {
         isSendingRef.current = isSending;
@@ -4720,31 +5266,36 @@ export function ChatPage({
                             },
                         ]),
                     );
-                    agentReadinessRef.current = new Map(
-                        rows.map((row) => [
-                            row.id,
-                            {
-                                authStatus: row.authStatus,
-                                ready: row.ready,
-                                modelProvider: row.model.provider,
-                                modelName: row.model.model,
-                                apiKeyEnv: row.model.apiKeyEnv,
-                            } satisfies AgentChatReadinessMeta,
-                        ]),
-                    );
+                    const readinessEntries: Array<[string, AgentChatReadinessMeta]> = [];
+                    for (const row of rows) {
+                        const readinessMeta = {
+                            authStatus: row.authStatus,
+                            ready: row.ready,
+                            modelProvider: row.model.provider,
+                            modelName: row.model.model,
+                            apiKeyEnv: row.model.apiKeyEnv,
+                        } satisfies AgentChatReadinessMeta;
+                        for (const key of collectAgentLookupKeys(row.id, row.nickname, row.name, row.english_name)) {
+                            readinessEntries.push([key, readinessMeta]);
+                        }
+                    }
+                    agentReadinessRef.current = new Map(readinessEntries);
                 }
 
                 if (id) {
                     setAgent((prev) => (prev.id === id ? prev : buildFallbackAgent(id)));
                     const detail = await getManagementAgentDetail(id);
                     if (!cancelled) {
-                        agentReadinessRef.current.set(id, {
+                        const readinessMeta = {
                             authStatus: detail.authStatus,
                             ready: detail.ready,
                             modelProvider: detail.model.provider,
                             modelName: detail.model.model,
                             apiKeyEnv: detail.model.apiKeyEnv,
-                        });
+                        } satisfies AgentChatReadinessMeta;
+                        for (const key of collectAgentLookupKeys(id, detail.id, detail.nickname, detail.name, detail.english_name)) {
+                            agentReadinessRef.current.set(key, readinessMeta);
+                        }
                         setAgent(mapManagementAgentToUi(detail));
                     }
                     return;
@@ -4768,7 +5319,7 @@ export function ChatPage({
         clearWaitingFinalizeTimer();
         setTaskCenterAgentId(chatAgentId);
 
-        const loadedFromLocal = isWebRuntime() ? null : chatRuntimeStore.loadAgentFromStorage(runtimeAgentId);
+        const loadedFromLocal = chatRuntimeStore.loadAgentFromStorage(runtimeAgentId);
         chatRuntimeStore.ensureAgentState(runtimeAgentId, () => {
             const loadedSessions = loadedFromLocal?.sessions?.length
                 ? loadedFromLocal.sessions
@@ -4806,13 +5357,8 @@ export function ChatPage({
 
         setSessionKeyword('');
         setPendingDeleteSessionId(null);
-        setPendingCreateTaskMessageId(null);
         setTaskDetailsOpen(false);
-        setTaskDetailsItem(null);
-        setTaskDetailRuns([]);
-        setTaskDetailFinalSummary(null);
-        setTaskDetailsChatCard(null);
-        setTaskDetailsMessageId(null);
+        clearTaskDetailsState();
         setA2aDetailsOpen(false);
         setA2aDetailsCard(null);
         setStreamingMessage(null);
@@ -4871,7 +5417,7 @@ export function ChatPage({
                 } else {
                     const sessionsPayload = await requestJson<unknown>(`/api/chat/${encodeURIComponent(sessionOwnerAgentId)}/sessions`);
                     const summaries = parseBackendSessionSummaries(sessionsPayload)
-                        .filter((summary) => !isGroupScopedSessionLabel(summary.sessionLabel));
+                        .filter((summary) => matchesRemoteSessionScope(summary.sessionLabel));
                     const summaryMap = new Map<string, BackendSessionSummary>();
                     for (const item of summaries) {
                         summaryMap.set(item.sessionId, item);
@@ -4910,7 +5456,7 @@ export function ChatPage({
         return () => {
             cancelled = true;
         };
-    }, [runtimeAgentId, chatAgentId, sessionOwnerAgentId, baseSessionLabel]);
+    }, [runtimeAgentId, chatAgentId, sessionOwnerAgentId, baseSessionLabel, clearTaskDetailsState, matchesRemoteSessionScope]);
 
     useEffect(() => {
         if (!sessions.length) {
@@ -4942,6 +5488,7 @@ export function ChatPage({
             }
             clearWaitingFinalizeTimer();
             clearStreamPatchTimer();
+            chatRuntimeStore.flushAgentState(runtimeAgentIdRef.current);
         };
     }, []);
 
@@ -4967,6 +5514,7 @@ export function ChatPage({
 
                 const next: Message = {
                     ...base,
+                    meta: stripTransientMessageMeta(base.meta),
                     thinkingTrace: [...(base.thinkingTrace ?? [])],
                     toolTrace: [...(base.toolTrace ?? [])],
                     generationStartedAt: base.generationStartedAt ?? Date.now(),
@@ -4977,7 +5525,7 @@ export function ChatPage({
                     debugChunkCount: (base.debugChunkCount || 0) + 1,
                     debugReceivedDone: base.debugReceivedDone || false,
                     debugReceivedError: base.debugReceivedError || false,
-                    debugWatchdogTriggered: base.debugWatchdogTriggered || false,
+                    debugWatchdogTriggered: false,
                     debugLastChunkKind: chunk.kind,
                     debugLastEvent: chunk.event || '',
                     debugNativeFrames: base.debugNativeFrames || '',
@@ -5030,13 +5578,28 @@ export function ChatPage({
                     next.thinking = false;
                 }
                 next.streaming = true;
-                next.text = sanitizeAssistantText(stripThinkingBlocks(textPart));
+                const inferredStreamSpec = next.spec ?? buildRenderableSpecFromAssistantText(textPart);
+                if (inferredStreamSpec != null) {
+                    next.spec = inferredStreamSpec;
+                    if (next.debugSpecSource === 'none' || !next.debugSpecSource) {
+                        next.debugSpecSource = 'inline';
+                    }
+                }
+                next.text = inferredStreamSpec != null
+                    ? cleanupAssistantText(textPart, inferredStreamSpec)
+                    : sanitizeAssistantText(stripThinkingBlocks(textPart));
                 next.debugRawStream = rawAssistantStreamRef.current;
                 next.uiRawText = extractUiRawText(rawAssistantStreamRef.current);
                 next.debugHasUiJson = boundary >= 0;
-                next.uiStreamState = boundary >= 0 ? 'streaming' : 'idle';
+                next.uiStreamState = boundary >= 0
+                    ? 'streaming'
+                    : inferredStreamSpec != null
+                        ? 'ready'
+                        : 'idle';
                 if (boundary >= 0) {
                     next.cardPending = true;
+                } else if (inferredStreamSpec != null) {
+                    next.cardPending = false;
                 }
                 const streamText = (next.text || '').trim();
                 if (streamText && next.a2aCards && next.a2aCards.length > 0) {
@@ -5165,16 +5728,39 @@ export function ChatPage({
                         }
                     }
                     next.tools = toolList;
-                    if (next.spec == null) {
-                        const renderableSpec = buildRenderableSpecFromToolLog(raw);
-                        if (renderableSpec != null) {
-                            next.spec = renderableSpec;
-                            next.debugSpecSource = 'tool_result';
-                            next.uiStreamState = 'ready';
-                            next.cardPending = false;
-                            if (!(next.text || '').trim()) {
-                                next.text = readable || '已生成卡片结果。';
-                            }
+                    const presentableResult = buildPresentableResultFromToolLog(raw);
+                    if (presentableResult) {
+                        persistCapabilityJobRecord(
+                            buildCapabilityJobRecordFromPresentableResult(
+                                presentableResult,
+                                parsedTool,
+                                runtimeAgentIdRef.current,
+                            ),
+                        );
+                    }
+                    const renderableSpec = presentableResult
+                        ? (
+                            shouldRenderPresentableResultAsMessageSpec(presentableResult)
+                                ? buildRenderableSpecFromPresentableResult(presentableResult)
+                                : undefined
+                        )
+                        : buildRenderableSpecFromToolLog(raw);
+                    const presentableKind = (pickJobText(presentableResult?.kind) || '').trim().toLowerCase();
+                    if (
+                        renderableSpec != null
+                        && (
+                            next.spec == null
+                            || (presentableResult && shouldPromotePresentableResultToMessageSpec(next.spec, presentableResult))
+                        )
+                    ) {
+                        next.spec = renderableSpec;
+                        next.debugSpecSource = 'tool_result';
+                        next.uiStreamState = 'ready';
+                        next.cardPending = false;
+                        if (presentableKind === 'job_result' && presentableResult && shouldRenderPresentableResultAsMessageSpec(presentableResult)) {
+                            next.text = '';
+                        } else if (!(next.text || '').trim()) {
+                            next.text = readable || '已生成卡片结果。';
                         }
                     }
                     if (next.spec == null) {
@@ -5283,13 +5869,13 @@ export function ChatPage({
                 next.uiRawText = extractUiRawText(rawAssistantStreamRef.current || next.text || '');
                 next.debugHasUiJson = Boolean(next.uiRawText);
                 if (next.spec == null && next.text) {
-                    next.spec = tryParseInlineSpecFromText(next.text);
+                    next.spec = buildRenderableSpecFromAssistantText(next.text);
                     if (next.spec != null) {
                         next.debugSpecSource = 'inline';
                     }
                 }
                 if (next.spec == null && rawAssistantStreamRef.current) {
-                    next.spec = tryParseInlineSpecFromText(rawAssistantStreamRef.current);
+                    next.spec = buildRenderableSpecFromAssistantText(rawAssistantStreamRef.current);
                     if (next.spec != null) {
                         next.debugSpecSource = 'inline';
                     }
@@ -5303,6 +5889,20 @@ export function ChatPage({
                 const appearanceUpdated = normalizeAgentSelfAppearanceActionPayload(
                     chunk.meta?.appearanceUpdated,
                 );
+                const taskCard = normalizeChatTaskDraftTaskCard(chunk.meta?.taskCard);
+                applyPendingChatTaskDraftState(rawAssistantStreamRef.current || next.text || '', {
+                    matched: chunk.meta?.taskDraftMatched === true,
+                    cancelled: chunk.meta?.taskDraftCancelled === true,
+                    readyToConfirm: chunk.meta?.taskDraftReadyToConfirm === true,
+                    draft: chunk.meta?.taskDraftState,
+                });
+                if (taskCard) {
+                    next.taskCard = taskCard;
+                    next.spec = undefined;
+                    next.uiRawText = '';
+                    next.uiStreamState = 'ready';
+                    next.debugSpecSource = 'task_card';
+                }
                 const autoAppearanceAction = extractAgentSelfAppearanceActionFromSpec(next.spec);
                 if (autoAppearanceAction) {
                     next.spec = autoAppearanceAction.strippedSpec;
@@ -5359,7 +5959,7 @@ export function ChatPage({
                         agentId: next.agentId || chatAgentId,
                     });
                 }
-                next.cardPending = autoComponentInvokeAction ? true : false;
+                next.cardPending = false;
 
             } else if (chunk.kind === 'error') {
                 next.debugReceivedError = true;
@@ -5482,32 +6082,30 @@ export function ChatPage({
             appendUser?: boolean;
             agentIdOverride?: string;
             agentOverride?: Agent;
+            userPromptText?: string;
             userDisplayText?: string;
             userAttachments?: Message['attachments'];
             groupQueueItemId?: string;
             requestOrigin?: 'group_auto';
         },
-    ) => {
+    ): Promise<boolean> => {
         const text = rawText.trim();
         if (!text || isSendingRef.current) {
             setSilentDispatching(false);
-            return;
+            return false;
         }
         const appendUser = options?.appendUser ?? true;
+        const userPromptText = options?.userPromptText?.trim() ?? text;
         const dispatchAgentId = (options?.agentIdOverride ?? chatAgentId).trim() || chatAgentId;
         const dispatchAgent = options?.agentOverride ?? (dispatchAgentId === agent.id ? agent : buildFallbackAgent(dispatchAgentId));
         const groupQueueItemId = (options?.groupQueueItemId || '').trim();
         const requestOrigin = groupRuntimeEnabled ? options?.requestOrigin : undefined;
-        const queueSessionId = activeSessionIdRef.current.trim();
-        try {
-            await consumePendingTaskReportDeliveries(activeSessionIdRef.current);
-        } catch {
-            // 回执拉取失败不阻断当前对话发送。
-        }
+        const requestSessionId = activeSessionIdRef.current.trim();
+        const queueSessionId = requestSessionId;
 
         const requestId = generateId();
         const startedAt = Date.now();
-        const userMsg: Message | null = appendUser
+        const originalUserMsg: Message | null = appendUser
             ? {
                 id: generateId(),
                 role: 'user',
@@ -5516,6 +6114,11 @@ export function ChatPage({
                 timestamp: new Date().toISOString(),
             }
             : null;
+        const shouldForwardCurrentTaskDraft = appendUser
+            && !options?.requestOrigin
+            && !groupRuntimeEnabled;
+        const currentTaskDraft = shouldForwardCurrentTaskDraft ? getPendingChatTaskDraft() : null;
+        const userMsg = originalUserMsg;
         const readiness = agentReadinessRef.current.get(dispatchAgentId);
         if (isAgentChatUnavailable(readiness)) {
             const reasonText = buildAgentChatUnavailableMessage(readiness);
@@ -5538,33 +6141,16 @@ export function ChatPage({
                     },
                 ],
             };
-            commitMessages((prev) => (userMsg ? [...prev, userMsg, failed] : [...prev, failed]));
+            commitMessages((prev) => (userMsg ? [...prev, userMsg, failed] : [...prev, failed]), {
+                sessionId: requestSessionId,
+            });
             updateGroupQueueItem(queueSessionId, groupQueueItemId, 'skipped', {
                 speakerId: dispatchAgentId,
                 note: compactGroupRuntimeNote(reasonText),
             });
             setSilentDispatching(false);
-            return;
+            return true;
         }
-        const history = buildHistory(getSessionMessagesSnapshot(activeSessionIdRef.current));
-        const outgoingAttachments = (options?.userAttachments ?? [])
-            .filter((item): item is NonNullable<Message['attachments']>[number] => Boolean(item))
-            .map((item) => ({
-                id: item.id,
-                kind: item.kind,
-                filename: item.name,
-                fileId: item.upstreamFileId,
-                contentType: item.mimeType,
-                relativePath: item.relativePath,
-                savedPath: item.savedPath,
-                assetUrl: item.assetUrl,
-                size: item.size,
-                sha256: item.sha256,
-                localVisionSummary: item.localVisionSummary,
-                localVisionProvider: item.localVisionProvider,
-                localVisionModel: item.localVisionModel,
-            }))
-            .filter((item) => Boolean(item.fileId));
         const draft: Message = {
             id: generateId(),
             role: 'agent',
@@ -5595,7 +6181,7 @@ export function ChatPage({
         };
 
         activeRequestIdRef.current = requestId;
-        activeRequestSessionIdRef.current = activeSessionIdRef.current;
+        activeRequestSessionIdRef.current = requestSessionId;
         const requestSessionIdForRequest = activeRequestSessionIdRef.current;
         if (requestSessionIdForRequest && groupQueueItemId) {
             requestGroupQueueMapRef.current.set(requestId, {
@@ -5624,8 +6210,95 @@ export function ChatPage({
         }
         pendingMessageIdRef.current = draft.id;
         bindRuntimeRequest(requestId, activeRequestSessionIdRef.current, draft.id);
-                commitMessages((prev) => (userMsg ? [...prev, userMsg, draft] : [...prev, draft]));
+        commitMessages((prev) => (userMsg ? [...prev, userMsg, draft] : [...prev, draft]), {
+            sessionId: requestSessionIdForRequest,
+        });
         setStreamingMessage(draft);
+        await waitForNextPaint();
+
+        const patchPendingDraft = (updater: (current: Message) => Message) => {
+            if (activeRequestIdRef.current !== requestId) {
+                return;
+            }
+            const current = streamingDraftRef.current;
+            if (!current || current.id !== draft.id) {
+                return;
+            }
+            const next = updater(current);
+            streamingDraftRef.current = next;
+            if (requestSessionIdForRequest) {
+                patchSessionMessageById(requestSessionIdForRequest, draft.id, next);
+            }
+            setStreamingMessage(next);
+        };
+
+        let outgoingChatAttachments: ChatAttachment[] = (options?.userAttachments ?? [])
+            .filter((item): item is NonNullable<Message['attachments']>[number] => Boolean(item))
+            .map((item) => ({
+                id: item.id,
+                kind: item.kind,
+                name: item.name,
+                upstreamFileId: item.upstreamFileId,
+                relativePath: item.relativePath,
+                savedPath: item.savedPath,
+                assetUrl: item.assetUrl,
+                mimeType: item.mimeType,
+                size: item.size,
+                sha256: item.sha256,
+                localVisionSummary: item.localVisionSummary,
+                localVisionProvider: item.localVisionProvider,
+                localVisionModel: item.localVisionModel,
+            }));
+        const localVisionTargetCount = outgoingChatAttachments.filter((attachment) => (
+            attachment.kind === 'image'
+            && !attachment.localVisionSummary?.trim()
+            && Boolean(attachment.sha256)
+            && Boolean(attachment.savedPath)
+            && Boolean(attachment.mimeType)
+        )).length;
+        if (localVisionTargetCount > 0) {
+            patchPendingDraft((current) => ({
+                ...current,
+                toolTrace: pushTrace(current.toolTrace, {
+                    id: generateId(),
+                    title: '本地视觉分析',
+                    detail: `正在整理 ${localVisionTargetCount} 张图片，本步骤已改为发送后异步执行，不再阻塞用户气泡。`,
+                    at: new Date().toISOString(),
+                }),
+            }));
+            outgoingChatAttachments = await enrichChatAttachmentsWithLocalVision(outgoingChatAttachments, userPromptText);
+            const resolvedCount = outgoingChatAttachments.filter((attachment) => attachment.localVisionSummary?.trim()).length;
+            patchPendingDraft((current) => ({
+                ...current,
+                toolTrace: pushTrace(current.toolTrace, {
+                    id: generateId(),
+                    title: '本地视觉完成',
+                    detail: resolvedCount > 0
+                        ? `已补充 ${resolvedCount} 份本地视觉文本，继续发送到模型。`
+                        : '本地视觉未产出额外文本，已直接继续发送到模型。',
+                    at: new Date().toISOString(),
+                }),
+            }));
+        }
+        const outgoingMessage = buildOutgoingChatAttachmentPrompt(userPromptText, outgoingChatAttachments);
+        const outgoingAttachments = outgoingChatAttachments
+            .map((item) => ({
+                id: item.id,
+                kind: item.kind,
+                filename: item.name,
+                fileId: item.upstreamFileId,
+                contentType: item.mimeType,
+                relativePath: item.relativePath,
+                savedPath: item.savedPath,
+                assetUrl: item.assetUrl,
+                size: item.size,
+                sha256: item.sha256,
+                localVisionSummary: item.localVisionSummary,
+                localVisionProvider: item.localVisionProvider,
+                localVisionModel: item.localVisionModel,
+            }))
+            .filter((item) => Boolean(item.fileId));
+        const history = buildHistory(getSessionMessagesSnapshot(requestSessionIdForRequest));
         const watchdogRequestId = requestId;
         const watchdogMessageId = draft.id;
         watchdogRef.current = window.setTimeout(() => {
@@ -5651,7 +6324,6 @@ export function ChatPage({
             if (hasAnyOutput) {
                 return;
             }
-            const warningText = '上游暂未返回输出流，仍在等待回流（如长时间无响应可点击“终止输出”）。';
             const next: Message = {
                 ...current,
                 debugWatchdogTriggered: true,
@@ -5659,7 +6331,6 @@ export function ChatPage({
                 debugLastChunkKind: 'none',
                 debugLastEvent: 'watchdog_timeout',
                 generationElapsedMs: Math.max(0, Date.now() - (current.generationStartedAt || Date.now())),
-                meta: current.meta ? `${current.meta}\n${warningText}` : warningText,
                 toolTrace: pushTrace(current.toolTrace, {
                     id: generateId(),
                     title: '无输出 watchdog',
@@ -5673,7 +6344,7 @@ export function ChatPage({
                 setSessionStreamState(activeRequestSessionIdRef.current, 'waiting');
             }
             setStreamState('waiting');
-        }, 10000);
+        }, 3000);
 
         let keepWaiting = false;
         try {
@@ -5687,7 +6358,7 @@ export function ChatPage({
                 const requestSessionTarget = resolveRequestSessionTarget(requestSessionIdForRequest);
                 return sendAgentChat(withChatRenderContext({
                     agentId: dispatchAgentId,
-                    message: text,
+                    message: outgoingMessage,
                     history,
                     attachments: outgoingAttachments,
                     stream: true,
@@ -5695,6 +6366,7 @@ export function ChatPage({
                     sessionId: requestSessionTarget.sessionId,
                     sessionLabel: requestSessionTarget.sessionLabel,
                     requestOrigin,
+                    currentTaskDraft,
                     systemPreamble: getSystemPreambleForRequest(dispatchAgentId, text, 'primary'),
                 }, {
                     channel: CHAT_CHANNELS.app,
@@ -5721,21 +6393,26 @@ export function ChatPage({
 
             if (detachedRequestIdsRef.current.has(requestId)) {
                 keepWaiting = false;
-                return;
+                return true;
             }
 
             if (finalizedRequestIdRef.current === requestId) {
                 keepWaiting = false;
-                return;
+                return true;
             }
 
             if (result.recoveredSessionLabel && requestSessionIdForRequest) {
                 recoverSessionBinding(
                     requestSessionIdForRequest,
                     result.recoveredSessionLabel,
-                    result.recoveredRemoteSessionId,
+                    result.sessionId || result.recoveredRemoteSessionId,
                     getRecoveryNoticeText(result.recoveryReason),
                 );
+            } else if (requestSessionIdForRequest) {
+                bindSessionRemoteTarget(requestSessionIdForRequest, {
+                    sessionId: result.sessionId,
+                    sessionLabel: result.sessionLabel,
+                });
             }
 
             let finalDraft = streamingDraftRef.current
@@ -5766,6 +6443,17 @@ export function ChatPage({
             if (!finalDraft.uiRawText) {
                 finalDraft.uiRawText = result.uiRawText || extractUiRawText(result.text || result.content || '');
             }
+            const rawOutputResolution = resolvePresentableResultFromRawOutput(
+                result.text || result.content || '',
+                runtimeAgentIdRef.current,
+            );
+            const taskCardFromResult = normalizeChatTaskDraftTaskCard(result.taskCard);
+            applyPendingChatTaskDraftState(result.text || result.content || '', {
+                matched: result.taskDraftMatched,
+                cancelled: result.taskDraftCancelled,
+                readyToConfirm: result.taskDraftReadyToConfirm,
+                draft: result.taskDraftState,
+            });
             finalDraft.debugNormalizedUiRawText = finalDraft.uiRawText || '';
             finalDraft.debugRepairedUiRawText = finalDraft.uiRawText ? repairUiJsonString(finalDraft.uiRawText) : '';
             finalDraft.debugUiContractWarnings = (() => {
@@ -5784,20 +6472,31 @@ export function ChatPage({
                 }
                 return warnings.join('；');
             })();
-            if (finalDraft.spec == null && result.spec != null) {
+            if (!finalDraft.taskCard && finalDraft.spec == null && result.spec != null) {
                 finalDraft.spec = normalizeIncomingSpec(result.spec);
             }
-            if (finalDraft.spec == null && finalDraft.text) {
-                finalDraft.spec = tryParseInlineSpecFromText(finalDraft.text);
+            if (taskCardFromResult) {
+                finalDraft.taskCard = taskCardFromResult;
+                finalDraft.spec = undefined;
+                finalDraft.uiRawText = '';
+                finalDraft.uiStreamState = 'ready';
+                finalDraft.debugSpecSource = 'task_card';
             }
-            if (finalDraft.spec == null && rawAssistantStreamRef.current) {
-                finalDraft.spec = tryParseInlineSpecFromText(rawAssistantStreamRef.current);
+            if (!finalDraft.taskCard && finalDraft.spec == null && rawOutputResolution.renderableSpec != null) {
+                finalDraft.spec = rawOutputResolution.renderableSpec;
+                finalDraft.debugSpecSource = 'tool_result';
             }
-            if (finalDraft.spec == null && finalDraft.uiRawText) {
+            if (!finalDraft.taskCard && finalDraft.spec == null && finalDraft.text) {
+                finalDraft.spec = buildRenderableSpecFromAssistantText(finalDraft.text);
+            }
+            if (!finalDraft.taskCard && finalDraft.spec == null && rawAssistantStreamRef.current) {
+                finalDraft.spec = buildRenderableSpecFromAssistantText(rawAssistantStreamRef.current);
+            }
+            if (!finalDraft.taskCard && finalDraft.spec == null && finalDraft.uiRawText) {
                 finalDraft.spec = tryParseInlineSpecFromText(finalDraft.uiRawText);
             }
             const taskCardCandidateText = finalDraft.text || result.text || result.content || rawAssistantStreamRef.current || '';
-            if (finalDraft.spec == null && isNuwaManagementAgent) {
+            if (!finalDraft.taskCard && finalDraft.spec == null && isNuwaManagementAgent) {
                 const recoveredAgentManagementSpec = createAgentManagementConfirmSpecFromAssistantText(
                     taskCardCandidateText || finalDraft.text || rawAssistantStreamRef.current || '',
                 );
@@ -5820,11 +6519,16 @@ export function ChatPage({
             const profileSchemaReady = Boolean(getManifestSchemaFromCache('ProfileIntroCard'));
             finalDraft.debugLegacySanitizer = finalDraft.debugProfileIntroDetected && !profileSchemaReady ? 'ProfileIntroCard' : '';
             finalDraft.debugSchemaSanitizer = profileSchemaReady ? 'manifest-cache-ready+fallback-patch' : 'manifest-prompt-only';
+            finalDraft.meta = stripTransientMessageMeta(finalDraft.meta);
             finalDraft.text = cleanupAssistantText(finalDraft.text || '', finalDraft.spec);
+            if (!(finalDraft.text || '').trim() && rawOutputResolution.readableText && !looksLikeProtocolOnlyText(rawOutputResolution.readableText)) {
+                finalDraft.text = rawOutputResolution.readableText;
+            }
             // 即使没有收到前端订阅到的 done/error chunk，这里也已经进入请求收尾阶段，
             // 必须显式清掉流式标记，避免旧失败消息继续被当成 activeStreaming 复用。
             finalDraft.thinking = false;
             finalDraft.streaming = false;
+            finalDraft.debugWatchdogTriggered = false;
             finalDraft.tools = (finalDraft.tools ?? []).map((tool) => ({ ...tool, running: false }));
             finalDraft.uiStreamState = finalDraft.spec != null || (finalDraft.uiRawText || '').trim()
                 ? 'ready'
@@ -5858,12 +6562,6 @@ export function ChatPage({
                     detail: `已切换到恢复会话：${result.recoveredSessionLabel}`,
                     at: new Date().toISOString(),
                 });
-            }
-            if (!finalDraft.taskCard) {
-                const proposalFromLlm = createProposalTaskCard(taskCardCandidateText || finalDraft.text || '');
-                if (proposalFromLlm) {
-                    finalDraft.taskCard = proposalFromLlm;
-                }
             }
             const appearanceUpdated = result.success
                 ? normalizeAgentSelfAppearanceActionPayload(result.appearanceUpdated)
@@ -5903,7 +6601,7 @@ export function ChatPage({
             }
             // sendAgentChat(stream=true) 只有在流结束后才 resolve；这里不应再进入 waiting 收尾。
             keepWaiting = false;
-            finalDraft.cardPending = autoComponentInvokeAction ? true : false;
+            finalDraft.cardPending = false;
 
             const draftId = pendingMessageIdRef.current;
             const requestSessionId = activeRequestSessionIdRef.current || activeSessionIdRef.current;
@@ -5931,7 +6629,7 @@ export function ChatPage({
                     }
                 }
             } else if (!suppressDuplicate) {
-                commitMessages((prev) => [...prev, finalDraft]);
+                commitMessages((prev) => [...prev, finalDraft], { sessionId: requestSessionId });
                 if (autoComponentInvokeAction) {
                     scheduleComponentInvokeForMessage(autoComponentInvokeAction.payload, {
                         sessionId: requestSessionId,
@@ -6029,9 +6727,10 @@ export function ChatPage({
                 }
                 setStreamState('idle');
             }
+            return true;
         } catch (error) {
             if (detachedRequestIdsRef.current.has(requestId)) {
-                return;
+                return true;
             }
             const message = error instanceof Error ? error.message : '发送失败';
             const failed: Message = {
@@ -6055,7 +6754,9 @@ export function ChatPage({
                     },
                 ],
             };
-            commitMessages((prev) => [...prev, failed]);
+            commitMessages((prev) => [...prev, failed], {
+                sessionId: requestSessionIdForRequest,
+            });
             const queueBinding = requestGroupQueueMapRef.current.get(requestId);
             if (queueBinding) {
                 updateGroupQueueItem(queueBinding.sessionId, queueBinding.itemId, 'skipped', {
@@ -6067,12 +6768,13 @@ export function ChatPage({
                 setSessionStreamState(requestSessionIdForRequest, 'idle');
             }
             setStreamState('idle');
+            return true;
         } finally {
             requestGroupQueueMapRef.current.delete(requestId);
             const detached = detachedRequestIdsRef.current.delete(requestId);
             patchBufferRef.current.delete(requestId);
             if (detached) {
-                return;
+                return true;
             }
             if (!keepWaiting) {
                 clearWaitingFinalizeTimer();
@@ -6111,28 +6813,6 @@ export function ChatPage({
         }));
     };
 
-    const setTaskCardMessage = (messageId: string, taskCard: ChatTaskCardData) => {
-        commitMessages((prev) => prev.map((message) => {
-            if (message.id !== messageId) return message;
-            return {
-                ...message,
-                taskCard,
-            };
-        }));
-    };
-
-    const ensureTaskCardFromMessage = (messageId: string): ChatTaskCardData | null => {
-        const target = messagesRef.current.find((message) => message.id === messageId);
-        if (!target) return null;
-        if (target.taskCard) return target.taskCard;
-        const candidateText = `${target.text || ''}\n${target.uiRawText || ''}`.trim();
-        if (!candidateText) return null;
-        const recovered = createProposalTaskCardFromAssistantText(candidateText);
-        if (!recovered) return null;
-        setTaskCardMessage(messageId, recovered);
-        return recovered;
-    };
-
     const updateTaskCardByTaskId = (taskId: string, updater: (card: ChatTaskCardData) => ChatTaskCardData) => {
         commitMessages((prev) => prev.map((message) => {
             if (!message.taskCard || message.taskCard.taskId !== taskId) return message;
@@ -6142,6 +6822,108 @@ export function ChatPage({
             };
         }));
     };
+
+    const consumePendingTaskReportDeliveries = useCallback(async (sessionId: string) => {
+        const deliveries = await listPendingTaskReportDeliveries({ chatSessionId: sessionId });
+        if (deliveries.length === 0) {
+            return;
+        }
+        const ordered = deliveries
+            .slice()
+            .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+        for (const delivery of ordered) {
+            const deliveryId = delivery.id.trim();
+            const taskId = delivery.taskId.trim();
+            if (!deliveryId || !taskId) {
+                continue;
+            }
+            if (handledTaskDeliveryIdsRef.current.has(deliveryId)) {
+                continue;
+            }
+            const reportAt = delivery.reportedAt || delivery.updatedAt || delivery.createdAt;
+            const summary = readTaskDeliverySummary(delivery);
+            const progressPercent = readTaskDeliveryProgressPercent(delivery.payload);
+            if (!summary && delivery.deliveryKind !== 'progress') {
+                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
+                handledTaskDeliveryIdsRef.current.add(deliveryId);
+                continue;
+            }
+
+            if (delivery.deliveryKind === 'progress') {
+                updateTaskCardByTaskId(taskId, (card) => appendTaskTimeline({
+                    ...card,
+                    stage: card.stage === 'completed' || card.stage === 'cancelled' ? card.stage : 'running',
+                    reportStatus: 'acknowledged',
+                    latestReportAt: reportAt,
+                    latestReportKind: 'progress',
+                    updatedAt: reportAt,
+                    progressPercent: typeof progressPercent === 'number'
+                        ? Math.max(card.progressPercent ?? 0, progressPercent)
+                        : card.progressPercent,
+                }, buildTaskTimelineEntry({
+                    idSeed: deliveryId,
+                    kind: 'progress',
+                    title: summary || '收到进度汇报',
+                    detail: summary || undefined,
+                    at: reportAt,
+                    runCount: delivery.runCount,
+                    level: 'info',
+                })));
+                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
+                handledTaskDeliveryIdsRef.current.add(deliveryId);
+                continue;
+            }
+
+            if (delivery.deliveryKind === 'anomaly') {
+                updateTaskCardByTaskId(taskId, (card) => appendTaskTimeline({
+                    ...card,
+                    reportStatus: 'acknowledged',
+                    errorSummary: summary,
+                    errorCount: Math.max(1, card.errorCount ?? 0),
+                    latestReportAt: reportAt,
+                    latestReportKind: 'anomaly',
+                    updatedAt: reportAt,
+                }, buildTaskTimelineEntry({
+                    idSeed: deliveryId,
+                    kind: 'anomaly',
+                    title: '收到异常汇报',
+                    detail: summary,
+                    at: reportAt,
+                    runCount: delivery.runCount,
+                    level: 'error',
+                })));
+                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
+                handledTaskDeliveryIdsRef.current.add(deliveryId);
+                continue;
+            }
+
+            if (delivery.deliveryKind === 'final') {
+                const runCount = Math.max(0, Math.floor(delivery.runCount ?? 0));
+                storeTaskFinalSummary(taskId, runCount, summary);
+                markTaskFinalSummaryDelivered(taskId, runCount || 1);
+                updateTaskCardByTaskId(taskId, (card) => appendTaskTimeline({
+                    ...card,
+                    stage: 'completed',
+                    finalSummaryReady: true,
+                    finalSummaryText: summary,
+                    reportStatus: 'acknowledged',
+                    latestReportAt: reportAt,
+                    latestReportKind: 'final',
+                    updatedAt: reportAt,
+                }, buildTaskTimelineEntry({
+                    idSeed: deliveryId,
+                    kind: 'final',
+                    title: '收到最终总结',
+                    detail: summary,
+                    at: reportAt,
+                    runCount: delivery.runCount,
+                    level: 'success',
+                })));
+                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
+                handledTaskDeliveryIdsRef.current.add(deliveryId);
+            }
+        }
+    }, [agent.name]);
 
     type AutoDispatchMeta = {
         chainId: string;
@@ -6510,14 +7292,24 @@ export function ChatPage({
                                 recoverSessionBinding(
                                     currentSessionId,
                                     result.recoveredSessionLabel,
-                                    result.recoveredRemoteSessionId,
+                                    result.sessionId || result.recoveredRemoteSessionId,
                                     getRecoveryNoticeText(result.recoveryReason),
                                 );
+                            }
+                        } else {
+                            const currentSessionId = activeSessionIdRef.current.trim();
+                            if (currentSessionId) {
+                                bindSessionRemoteTarget(currentSessionId, {
+                                    sessionId: result.sessionId,
+                                    sessionLabel: result.sessionLabel,
+                                    ownerAgentId: targetId,
+                                });
                             }
                         }
 
                         const raw = (result.text || result.content || '').trim();
-                        const spec = raw ? tryParseInlineSpecFromText(raw) : null;
+                        const rawOutputResolution = resolvePresentableResultFromRawOutput(raw, runtimeAgentIdRef.current);
+                        const spec = rawOutputResolution.renderableSpec ?? (raw ? tryParseInlineSpecFromText(raw) : null);
                         const appearanceUpdated = normalizeAgentSelfAppearanceActionPayload(
                             result.appearanceUpdated,
                         );
@@ -6545,6 +7337,9 @@ export function ChatPage({
                         let finalText = raw
                             ? cleanupAssistantText(raw, renderSpec)
                             : (result.success ? '' : fallbackText);
+                        if (!finalText && rawOutputResolution.readableText && !looksLikeProtocolOnlyText(rawOutputResolution.readableText)) {
+                            finalText = rawOutputResolution.readableText;
+                        }
                         let resolvedMessage: Message = {
                             ...draft,
                             thinking: false,
@@ -6614,14 +7409,19 @@ export function ChatPage({
         })();
     }, [chatAgentId, mentionDispatchMaxDepth, mentionDispatchMaxTargets, messages]);
 
-    const handleSendMessage = async (payload: ChatSendPayload) => {
-        if (inputLocked) return;
-        const submitText = payload.submitText.trim();
+    const handleSendMessage = async (payload: ChatSendPayload): Promise<boolean> => {
+        if (inputLocked || isSendingRef.current || silentDispatchingRef.current || multiReplyDispatchingRef.current) return false;
+        const rawText = payload.rawText.trim();
         const displayText = payload.displayText.trim();
-        const text = submitText || displayText;
-        if (!text) return;
+        const routingText = rawText || displayText;
+        if (!routingText) return false;
         markUserActivity('send');
-        const transformed = transformUserMessageRef.current ? transformUserMessageRef.current(text) : text;
+        const transformUserMessage = transformUserMessageRef.current;
+        const transformedPromptText = rawText
+            ? (transformUserMessage ? transformUserMessage(rawText) : rawText)
+            : '';
+        const transformed = transformedPromptText
+            || (transformUserMessage ? transformUserMessage(routingText) : routingText);
         const primaryReplyAgent = (() => {
             const resolver = resolvePrimaryReplyAgentRef.current;
             if (!resolver) return null;
@@ -6651,19 +7451,26 @@ export function ChatPage({
             setGroupQueuePlan(queueSessionId, [primaryQueueItem, ...extraQueueItems]);
         }
         resetTurnBudget(primaryReplyAgentId);
-        await sendMessageInternal(transformed, {
+        const accepted = await sendMessageInternal(transformed, {
             appendUser: true,
             agentIdOverride: primaryReplyAgentId,
             agentOverride: primaryReplyAgent ?? undefined,
+            userPromptText: transformedPromptText,
             userDisplayText: displayText || transformed,
             userAttachments: payload.attachments,
             groupQueueItemId: primaryQueueItem.id,
         });
+        if (!accepted) {
+            if (queueSessionId) {
+                setGroupQueuePlan(queueSessionId, []);
+            }
+            return false;
+        }
         if (extras.length === 0) {
-            return;
+            return true;
         }
         if (isSendingRef.current || silentDispatchingRef.current || multiReplyDispatchingRef.current) {
-            return;
+            return true;
         }
 
         const getActiveSessionMessagesSnapshot = (): Message[] => {
@@ -6795,14 +7602,24 @@ export function ChatPage({
                         recoverSessionBinding(
                             currentSessionId,
                             result.recoveredSessionLabel,
-                            result.recoveredRemoteSessionId,
+                            result.sessionId || result.recoveredRemoteSessionId,
                             getRecoveryNoticeText(result.recoveryReason),
                         );
+                    }
+                } else {
+                    const currentSessionId = activeSessionIdRef.current.trim();
+                    if (currentSessionId) {
+                        bindSessionRemoteTarget(currentSessionId, {
+                            sessionId: result.sessionId,
+                            sessionLabel: result.sessionLabel,
+                            ownerAgentId: extraId,
+                        });
                     }
                 }
 
                 const raw = (result.text || result.content || '').trim();
-                const spec = raw ? tryParseInlineSpecFromText(raw) : null;
+                const rawOutputResolution = resolvePresentableResultFromRawOutput(raw, runtimeAgentIdRef.current);
+                const spec = rawOutputResolution.renderableSpec ?? (raw ? tryParseInlineSpecFromText(raw) : null);
                 const appearanceUpdated = normalizeAgentSelfAppearanceActionPayload(
                     result.appearanceUpdated,
                 );
@@ -6830,6 +7647,9 @@ export function ChatPage({
                 let finalText = raw
                     ? cleanupAssistantText(raw, renderSpec)
                     : (result.success ? '' : fallbackText);
+                if (!finalText && rawOutputResolution.readableText && !looksLikeProtocolOnlyText(rawOutputResolution.readableText)) {
+                    finalText = rawOutputResolution.readableText;
+                }
                 let resolvedMessage: Message = {
                     ...draft,
                     thinking: false,
@@ -6901,6 +7721,7 @@ export function ChatPage({
         } finally {
             setMultiReplyDispatching(false);
         }
+        return true;
     };
 
     useEffect(() => {
@@ -7027,7 +7848,7 @@ export function ChatPage({
         if (!target?.taskCard || !['proposal', 'failed'].includes(target.taskCard.stage)) {
             return;
         }
-        setPendingCreateTaskMessageId(messageId);
+        void createAndStartTaskFromMessageId(messageId);
     };
 
     const encodeChatTaskSourceRef = (sessionId: string, messageId: string): string => {
@@ -7041,32 +7862,110 @@ export function ChatPage({
     const createAndStartTaskFromMessageId = async (sourceMessageId: string) => {
         if (!sourceMessageId || taskActionBusy) return;
         const sourceMessage = messagesRef.current.find((message) => message.id === sourceMessageId);
-        const sourceCard = sourceMessage?.taskCard || ensureTaskCardFromMessage(sourceMessageId);
+        const sourceCard = sourceMessage?.taskCard;
         if (!sourceCard || !['proposal', 'failed'].includes(sourceCard.stage)) {
             return;
+        }
+        const nowIso = new Date().toISOString();
+        const isRetryingDraftCreation = sourceCard.stage === 'failed' && !sourceCard.taskId;
+        const originMessageId = (sourceCard.bindingSourceMessageId || sourceMessageId).trim() || sourceMessageId;
+        const placeholderMessageId = isRetryingDraftCreation ? sourceMessageId : generateId();
+        const placeholderCard: ChatTaskCardData = appendTaskTimeline({
+            ...sourceCard,
+            stage: 'running',
+            runCount: 0,
+            canCreate: false,
+            canCancel: false,
+            canDelete: false,
+            reportStatus: 'pending',
+            progressPercent: 5,
+            bindingSessionId: activeSessionIdRef.current.trim() || sourceCard.bindingSessionId,
+            bindingSourceMessageId: originMessageId,
+            updatedAt: nowIso,
+        }, buildTaskTimelineEntry({
+            kind: 'started',
+            title: isRetryingDraftCreation ? '正在重试创建任务' : '已确认任务卡片，正在创建任务',
+            detail: sourceCard.scheduleText,
+            at: nowIso,
+            level: 'info',
+        }));
+        if (isRetryingDraftCreation) {
+            updateTaskCardMessage(placeholderMessageId, () => placeholderCard);
+            commitMessages((prev) => prev.map((message) => (
+                message.id === placeholderMessageId
+                    ? {
+                        ...message,
+                        text: `任务已重新受理：${sourceCard.taskName}`,
+                        timestamp: nowIso,
+                    }
+                    : message
+            )));
+        } else {
+            commitMessages((prev) => prev.flatMap((message) => {
+                if (message.id !== sourceMessageId) {
+                    return [message];
+                }
+                return [
+                    {
+                        ...message,
+                        taskCard: undefined,
+                        spec: undefined,
+                        text: `${(message.text || '').trim()}\n已确认创建任务，运行占位符已生成。`.trim(),
+                        uiRawText: '',
+                        uiStreamState: 'idle',
+                        tools: [],
+                        toolTrace: [],
+                        thinkingTrace: [],
+                        debugRawStream: '',
+                        debugNativeFrames: '',
+                        debugDonePayload: '',
+                        cardPending: false,
+                        streaming: false,
+                        thinking: false,
+                    },
+                    {
+                        id: placeholderMessageId,
+                        role: 'agent',
+                        agentId: chatAgentId,
+                        agentName: agent.name,
+                        agentAvatarUrl: agent.avatarUrl,
+                        agentColor: agent.color,
+                        agentPortraitUrl: agent.portraitUrl,
+                        text: `任务已受理：${sourceCard.taskName}`,
+                        taskCard: placeholderCard,
+                        timestamp: nowIso,
+                    },
+                ];
+            }));
         }
         const scope = resolveTaskConversationScope(
             runtimeAgentIdRef.current,
             sessionOwnerAgentId,
             chatAgentId,
         );
-        const creatorParticipantId = sourceMessage?.agentId?.trim()
-            || (sourceMessage?.role === 'user' ? 'user' : '');
-        const creatorParticipantName = sourceMessage?.agentName?.trim()
-            || (sourceMessage?.role === 'user' ? '用户' : '');
+        const creatorParticipantId = sourceMessage?.role === 'user'
+            ? (sourceMessage.agentId?.trim() || 'user')
+            : 'user';
+        const creatorParticipantName = sourceMessage?.role === 'user'
+            ? (sourceMessage.agentName?.trim() || '用户')
+            : (sourceCard.creatorParticipantName?.trim() || '用户');
         const bindingSessionId = activeSessionIdRef.current.trim();
+        const remoteChatSessionId = getRemoteSessionId(activeSession);
+        const remoteChatSessionOwnerAgentId = getRemoteSessionOwnerAgentId(activeSession) || sessionOwnerAgentId;
 
         setTaskActionBusy(true);
         try {
             const created = await createTask({
                 teamId: chatAgentId,
-                runtimeKey: runtimeAgentIdRef.current,
+                remoteChatSessionId: remoteChatSessionId || undefined,
+                remoteChatSessionOwnerAgentId: remoteChatSessionOwnerAgentId || undefined,
                 sourceType: 'chat',
-                sourceRef: encodeChatTaskSourceRef(activeSessionIdRef.current, sourceMessageId),
+                sourceRef: encodeChatTaskSourceRef(activeSessionIdRef.current, originMessageId),
+                reportCondition: sourceCard.reportCondition,
                 originConversationType: scope.conversationType,
                 originConversationId: scope.conversationId,
                 originChatSessionId: activeSessionIdRef.current,
-                originMessageId: sourceMessageId,
+                originMessageId,
                 creatorParticipantId: creatorParticipantId || undefined,
                 creatorParticipantName: creatorParticipantName || undefined,
                 executorAgentId: chatAgentId,
@@ -7090,13 +7989,13 @@ export function ChatPage({
                     message: created.message || '未知错误',
                     level: 'error',
                 });
-                updateTaskCardMessage(sourceMessageId, (card) => appendTaskTimeline({
+                updateTaskCardMessage(placeholderMessageId, (card) => appendTaskTimeline({
                     ...card,
                     stage: 'failed',
                     canCreate: true,
-                    canCancel: true,
+                    canCancel: false,
                     bindingSessionId: card.bindingSessionId || bindingSessionId || undefined,
-                    bindingSourceMessageId: card.bindingSourceMessageId || sourceMessageId,
+                    bindingSourceMessageId: card.bindingSourceMessageId || originMessageId,
                     updatedAt: new Date().toISOString(),
                 }, buildTaskTimelineEntry({
                     kind: 'failed',
@@ -7108,21 +8007,32 @@ export function ChatPage({
             }
 
             const task = created.data;
-            const runResult = await runTaskNow(task.id);
-            const activeTaskId = runResult.activeTaskId || task.id;
+            const publishResult = await publishTask(task.id);
+            const firstRunResult = publishResult.success
+                ? await runTaskOnce(task.id)
+                : { success: false, message: publishResult.message || '任务发布失败。' };
+            const activeTaskId = task.id;
             const latest = await getTaskDetail(activeTaskId);
             const latestRunCount = latest?.runInfo.runCount ?? task.runInfo.runCount;
             const latestStage = latest
                 ? resolveCardStage(latest, sourceCard, latestRunCount)
-                : (runResult.success ? 'running' : 'scheduled');
+                : (firstRunResult.success ? 'running' : (publishResult.success ? 'scheduled' : 'failed'));
             const startedEntry = buildTaskTimelineEntry({
-                kind: 'started',
-                title: runResult.success ? '任务已创建并开始执行' : '任务已创建，等待首次执行',
-                detail: runResult.success
-                    ? `${sourceCard.scheduleText}，已绑定当前会话`
-                    : (runResult.message || `${sourceCard.scheduleText}，等待首次调度`),
+                kind: publishResult.success ? 'started' : 'failed',
+                title: publishResult.success
+                    ? (firstRunResult.success ? '任务已发布并开始首次执行' : '任务已发布，等待首次执行')
+                    : '任务已创建，但发布失败',
+                detail: publishResult.success
+                    ? (
+                        firstRunResult.success
+                            ? `${sourceCard.scheduleText}，已绑定当前会话并触发首次执行`
+                            : (firstRunResult.message || `${sourceCard.scheduleText}，等待首次调度`)
+                    )
+                    : (publishResult.message || '任务已创建，但还未进入调度。'),
                 runCount: latestRunCount,
-                level: runResult.success ? 'success' : 'info',
+                level: publishResult.success
+                    ? (firstRunResult.success ? 'success' : 'info')
+                    : 'error',
             });
             const nextCard: ChatTaskCardData = appendTaskTimeline({
                 ...sourceCard,
@@ -7144,25 +8054,25 @@ export function ChatPage({
                 progressPercent: calculateTaskProgressPercent(latestRunCount, sourceCard.maxRuns) ?? sourceCard.progressPercent,
                 errorSummary: undefined,
                 bindingSessionId: bindingSessionId || sourceCard.bindingSessionId,
-                bindingSourceMessageId: sourceMessageId,
+                bindingSourceMessageId: originMessageId,
                 updatedAt: new Date().toISOString(),
             }, startedEntry);
 
-            updateTaskCardMessage(sourceMessageId, () => nextCard);
+            updateTaskCardMessage(placeholderMessageId, () => nextCard);
             pushInAppNotice({
-                title: runResult.success ? '任务已启动' : '任务已创建',
-                message: runResult.success
-                    ? `${nextCard.taskName} 已进入异步执行`
-                    : `${nextCard.taskName} 创建成功，但启动失败：${runResult.message || '-'}`,
-                level: runResult.success ? 'success' : 'error',
+                title: publishResult.success ? '任务已发布' : '任务发布失败',
+                message: publishResult.success
+                    ? (
+                        firstRunResult.success
+                            ? `${nextCard.taskName} 已发布并触发首次执行`
+                            : `${nextCard.taskName} 已发布，首次执行将按计划触发：${firstRunResult.message || '-'}`
+                    )
+                    : `${nextCard.taskName} 已创建，但发布失败：${publishResult.message || '-'}`,
+                level: publishResult.success ? (firstRunResult.success ? 'success' : 'info') : 'error',
             });
         } finally {
             setTaskActionBusy(false);
         }
-    };
-
-    const handleConfirmCreateTaskCard = async (messageId: string) => {
-        await createAndStartTaskFromMessageId(messageId);
     };
 
     const handleConfirmGroupUpgrade = useCallback(async (payload: GroupUpgradeActionPayload) => {
@@ -7393,15 +8303,59 @@ export function ChatPage({
         );
     }, [agentManagementPermissionScope, appendLocalAgentMessage]);
 
-    const handleConfirmCreateTask = async () => {
-        const sourceMessageId = pendingCreateTaskMessage?.id;
-        if (!sourceMessageId) return;
-        try {
-            await createAndStartTaskFromMessageId(sourceMessageId);
-        } finally {
-            setPendingCreateTaskMessageId(null);
+    const handleSendSilentMessage = useCallback((rawText: string) => {
+        const text = rawText.trim();
+        if (!text) return;
+        enqueueSilentMessage(text);
+        if (isSendingRef.current || silentDispatchingRef.current) {
+            return;
         }
-    };
+        const next = shiftSilentMessage();
+        if (!next) return;
+        setSilentDispatching(true);
+        void sendMessageInternal(next, { appendUser: false });
+    }, [enqueueSilentMessage, shiftSilentMessage, sendMessageInternal]);
+
+    const handleConfirmSelfUpgrade = useCallback((
+        payload: Record<string, unknown>,
+        _ctx?: { messageId?: string },
+    ) => {
+        const reviewId = typeof payload.reviewId === 'string'
+            ? payload.reviewId.trim()
+            : typeof payload.review_id === 'string'
+                ? payload.review_id.trim()
+                : '';
+        const nextPayload: Record<string, unknown> = {
+            confirmed_by_user: true,
+        };
+        if (reviewId) {
+            nextPayload.review_id = reviewId;
+        }
+        if (payload.review && typeof payload.review === 'object') {
+            nextPayload.review = payload.review;
+        }
+        handleSendSilentMessage([
+            '用户已通过桌面确认卡确认本次自我升级。',
+            '请立即调用 my_upgrade_apply 执行升级，不要再重复审查。',
+            `工具参数：${JSON.stringify(nextPayload)}`,
+        ].join('\n'));
+    }, [handleSendSilentMessage]);
+
+    const handleCancelSelfUpgrade = useCallback((
+        payload: Record<string, unknown>,
+        _ctx?: { messageId?: string },
+    ) => {
+        const reviewId = typeof payload.reviewId === 'string'
+            ? payload.reviewId.trim()
+            : typeof payload.review_id === 'string'
+                ? payload.review_id.trim()
+                : '';
+        appendLocalAgentMessage(
+            reviewId
+                ? `已取消本次自我升级确认（review_id=${reviewId}）。`
+                : '已取消本次自我升级确认。',
+        );
+    }, [appendLocalAgentMessage]);
 
     const handleCancelTaskCard = async (messageId: string) => {
         const target = messagesRef.current.find((message) => message.id === messageId);
@@ -7535,7 +8489,7 @@ export function ChatPage({
         }
     };
 
-    const handleOpenTaskCardDetails = async ({
+    const handleOpenTaskCardDetails = useCallback(async ({
         taskId,
         messageId,
     }: {
@@ -7554,44 +8508,24 @@ export function ChatPage({
         }
 
         setTaskDetailsMessageId(messageId);
-        setTaskDetailsChatCard(sourceCard ? { ...sourceCard, timeline: sourceCard.timeline?.map((item) => ({ ...item })) } : null);
+        setTaskDetailsChatCard(sourceCard ? cloneTaskCardForDetails(sourceCard) : null);
 
-        const fallbackTask: TaskDetailsTask | null = sourceCard ? {
-            id: sourceCard.taskId || messageId,
-            name: sourceCard.taskName || '聊天异步任务',
-            jobType: sourceCard.taskKind === 'chat_async'
-                ? '聊天长任务'
-                : sourceCard.taskKind === 'manual_schedule'
-                    ? '任务中心定时任务'
-                    : sourceCard.taskKind === 'a2a_delegate'
-                        ? '协作委派任务'
-                        : '聊天定时任务',
-            enabled: sourceCard.stage !== 'cancelled',
-            agentId: agent.id,
-            agentName: agent.name,
-            agentAvatarUrl: agent.avatarUrl,
-            agentColor: agent.color,
-            createdAt: sourceCard.createdAt,
-            maxRuns: sourceCard.maxRuns,
-            runInfo: {
-                lastStatus: sourceCard.lastStatus,
-                runCount: sourceCard.runCount,
-            },
-        } : null;
+        const fallbackTask: TaskDetailsTask | null = sourceCard
+            ? buildFallbackTaskDetailsTask(sourceCard, messageId, {
+                id: agent.id,
+                name: agent.name,
+                avatarUrl: agent.avatarUrl,
+                color: agent.color,
+            })
+            : null;
 
         if (!taskId) {
-            setTaskDetailsItem(fallbackTask);
-            setTaskDetailRuns([]);
-            setTaskDetailFinalSummary(null);
-            setTaskDetailsOpen(true);
+            openTaskDetailsFallback(fallbackTask);
             return;
         }
 
         const detail = await getTaskDetail(taskId);
         if (!detail) {
-            setTaskDetailsItem(fallbackTask);
-            setTaskDetailRuns([]);
-            setTaskDetailFinalSummary(null);
             if (!fallbackTask) {
                 pushInAppNotice({
                     title: '读取任务详情失败',
@@ -7605,7 +8539,7 @@ export function ChatPage({
                 message: '后端任务明细暂不可用，已展示当前会话中的闭环详情。',
                 level: 'info',
             });
-            setTaskDetailsOpen(true);
+            openTaskDetailsFallback(fallbackTask);
             return;
         }
         const runs = await listTaskRuns(taskId);
@@ -7617,9 +8551,9 @@ export function ChatPage({
             agentColor: agent.color,
         });
         setTaskDetailRuns(runs);
-        setTaskDetailFinalSummary(getTaskFinalSummary(taskId));
+        setTaskDetailFinalSummary(detail.finalSummary ?? getTaskFinalSummary(taskId));
         setTaskDetailsOpen(true);
-    };
+    }, [agent.avatarUrl, agent.color, agent.id, agent.name, openTaskDetailsFallback]);
 
     const handleOpenA2aCardDetails = (messageId: string, cardId: string) => {
         const message = messagesRef.current.find((item) => item.id === messageId);
@@ -7654,18 +8588,11 @@ export function ChatPage({
         let cancelled = false;
         let timer: number | null = null;
 
-        const pollPendingTaskDeliveries = async () => {
+        const poll = async () => {
             const sessionId = activeSessionIdRef.current.trim();
-            if (!sessionId) {
-                if (!cancelled) {
-                    timer = window.setTimeout(() => {
-                        void pollPendingTaskDeliveries();
-                    }, 3_000);
-                }
-                return;
-            }
             if (
-                isDocumentHidden()
+                !sessionId
+                || isDocumentHidden()
                 || streamStateRef.current !== 'idle'
                 || isSendingRef.current
                 || silentDispatchingRef.current
@@ -7673,7 +8600,7 @@ export function ChatPage({
             ) {
                 if (!cancelled) {
                     timer = window.setTimeout(() => {
-                        void pollPendingTaskDeliveries();
+                        void poll();
                     }, 3_000);
                 }
                 return;
@@ -7681,25 +8608,24 @@ export function ChatPage({
             try {
                 await consumePendingTaskReportDeliveries(sessionId);
             } catch {
-                // 当前轮询失败时等待下一轮重试。
+                // 下一轮轮询继续处理。
             } finally {
                 if (!cancelled) {
                     timer = window.setTimeout(() => {
-                        void pollPendingTaskDeliveries();
+                        void poll();
                     }, 3_000);
                 }
             }
         };
 
-        void pollPendingTaskDeliveries();
-
+        void poll();
         return () => {
             cancelled = true;
             if (timer != null) {
                 window.clearTimeout(timer);
             }
         };
-    }, [activeSessionId, runtimeAgentId, chatAgentId, sessionOwnerAgentId, agent.id, agent.name, agent.avatarUrl, agent.color, agent.portraitUrl]);
+    }, [activeSessionId, consumePendingTaskReportDeliveries]);
 
     useEffect(() => {
         if (activeTaskSyncIds.length === 0) {
@@ -7727,15 +8653,19 @@ export function ChatPage({
 
                     const runCount = Math.max(detail.runInfo.runCount, runs.length);
                     const stage = resolveCardStage(detail, seedCard, runCount);
-
-                    if (stage === 'completed' && detail.enabled) {
-                        await pauseTask(taskId);
+                    if (detail.finalSummary?.content?.trim()) {
+                        storeTaskFinalSummary(taskId, detail.finalSummary.runCount, detail.finalSummary.content);
                     }
 
                     updateTaskCardByTaskId(taskId, (card) => {
-                        const finalSummary = getTaskFinalSummary(taskId);
+                        const finalSummary = detail.finalSummary ?? getTaskFinalSummary(taskId);
                         const errorCount = runs.filter((run) => run.status === 'error').length;
-                        const next: ChatTaskCardData = {
+                        const mergedTimeline = mergeTaskTimelineItems(
+                            card.timeline,
+                            mapManagedTaskTimelineToChat(detail.timeline),
+                            mapTaskRunsToTimeline(runs),
+                        );
+                        let next: ChatTaskCardData = {
                             ...card,
                             stage,
                             runCount,
@@ -7746,23 +8676,45 @@ export function ChatPage({
                             nextRun: detail.runInfo.nextRun,
                             lastRun: detail.runInfo.lastRun,
                             lastStatus: detail.runInfo.lastStatus,
-                            canDelete: runCount === 0 && !detail.runInfo.lastRun,
-                            canCancel: stage === 'scheduled' || stage === 'running',
+                            canDelete: Boolean(detail.capabilities?.delete),
+                            canCancel: Boolean(detail.capabilities?.pause),
                             taskKind: card.taskKind || 'chat_schedule',
                             executorAgentName: card.executorAgentName || agent.name,
                             reportActorName: card.reportActorName || agent.name,
                             progressPercent: calculateTaskProgressPercent(runCount, card.maxRuns) ?? card.progressPercent,
                             errorSummary: errorCount > 0 ? (runs.find((run) => run.status === 'error')?.output || card.errorSummary) : card.errorSummary,
+                            timeline: mergedTimeline,
                             updatedAt: new Date().toISOString(),
                         };
+                        if (finalSummary?.content?.trim() && !next.timeline?.some((item) => item.kind === 'final')) {
+                            next = appendTaskTimeline(next, buildTaskTimelineEntry({
+                                idSeed: finalSummary.createdAt,
+                                kind: 'final',
+                                title: '任务完成并生成最终总结',
+                                detail: finalSummary.content,
+                                at: finalSummary.createdAt,
+                                runCount: finalSummary.runCount,
+                                level: 'success',
+                            }));
+                        }
+                        if (stage === 'failed' && next.errorSummary && !next.timeline?.some((item) => item.kind === 'failed')) {
+                            next = appendTaskTimeline(next, buildTaskTimelineEntry({
+                                idSeed: `${taskId}-failed-${detail.runInfo.lastRun || detail.updatedAt}`,
+                                kind: 'failed',
+                                title: '任务执行失败',
+                                detail: next.errorSummary,
+                                at: detail.runInfo.lastRun || detail.updatedAt,
+                                runCount,
+                                level: 'error',
+                            }));
+                        }
                         if (stage === 'completed' && !card.completedNotified && card.notifyOnComplete !== false) {
                             next.completedNotified = true;
-                            const finalDelivered = hasTaskFinalSummaryDelivered(taskId, runCount);
                             pushInAppNotice({
                                 title: '任务执行完成',
-                                message: finalDelivered
+                                message: finalSummary?.content?.trim()
                                     ? `${card.taskName} 已完成并回传最终总结`
-                                    : `${card.taskName} 已达到完成条件，正在生成最终总结`,
+                                    : `${card.taskName} 已达到完成条件`,
                                 level: 'success',
                             });
                         }
@@ -7788,19 +8740,6 @@ export function ChatPage({
             }
         };
     }, [activeTaskSyncIds]);
-
-    const handleSendSilentMessage = (rawText: string) => {
-        const text = rawText.trim();
-        if (!text) return;
-        enqueueSilentMessage(text);
-        if (isSendingRef.current || silentDispatchingRef.current) {
-            return;
-        }
-        const next = shiftSilentMessage();
-        if (!next) return;
-        setSilentDispatching(true);
-        void sendMessageInternal(next, { appendUser: false });
-    };
 
     useEffect(() => {
         if (isSending || silentDispatching) return;
@@ -8052,7 +8991,6 @@ export function ChatPage({
             onRegenerateMessage={handleRegenerateMessage}
             onStopStreaming={handleStopStreaming}
             onCreateTaskCard={handleCreateTaskCard}
-            onConfirmCreateTaskCard={handleConfirmCreateTaskCard}
             onCancelTaskCard={handleCancelTaskCard}
             onDeleteTaskCard={handleDeleteTaskCard}
             onToggleAutoConversation={onAutoConversationEnabledChangeProp ? () => {
@@ -8070,6 +9008,8 @@ export function ChatPage({
             onCancelGroupUpgrade={handleCancelGroupUpgrade}
             onConfirmAgentManagement={handleConfirmAgentManagement}
             onCancelAgentManagement={handleCancelAgentManagement}
+            onConfirmSelfUpgrade={handleConfirmSelfUpgrade}
+            onCancelSelfUpgrade={handleCancelSelfUpgrade}
             sidebarCollapsed={sidebarCollapsed}
             setSidebarCollapsed={setSidebarCollapsed}
             infoSidebarCollapsed={infoSidebarCollapsed}
@@ -8100,65 +9040,12 @@ export function ChatPage({
                     </DialogFooter>
                 </DialogContent>
             </Dialog>
-            <Dialog open={Boolean(pendingCreateTaskMessage)} onOpenChange={(open) => {
-                if (!open && !taskActionBusy) {
-                    if (pendingCreateTaskMessageId) {
-                        updateTaskCardMessage(pendingCreateTaskMessageId, (card) => ({
-                            ...card,
-                            stage: 'cancelled',
-                            canCreate: false,
-                            canCancel: false,
-                            updatedAt: new Date().toISOString(),
-                        }));
-                    }
-                    setPendingCreateTaskMessageId(null);
-                }
-            }}>
-                <DialogContent className="max-w-md">
-                    <DialogHeader>
-                        <DialogTitle>确认创建定时任务</DialogTitle>
-                        <DialogDescription>
-                            {pendingCreateTaskMessage?.taskCard
-                                ? `任务：${pendingCreateTaskMessage.taskCard.taskName}；调度：${pendingCreateTaskMessage.taskCard.scheduleText}。`
-                                : '确认后将创建定时任务。'}
-                        </DialogDescription>
-                    </DialogHeader>
-                    <DialogFooter>
-                        <Button
-                            type="button"
-                            variant="outline"
-                            disabled={taskActionBusy}
-                            onClick={() => {
-                                if (pendingCreateTaskMessageId) {
-                                    updateTaskCardMessage(pendingCreateTaskMessageId, (card) => ({
-                                        ...card,
-                                        stage: 'cancelled',
-                                        canCreate: false,
-                                        canCancel: false,
-                                        updatedAt: new Date().toISOString(),
-                                    }));
-                                }
-                                setPendingCreateTaskMessageId(null);
-                            }}
-                        >
-                            取消
-                        </Button>
-                        <Button type="button" disabled={taskActionBusy} onClick={handleConfirmCreateTask}>
-                            {taskActionBusy ? '创建中...' : '创建任务'}
-                        </Button>
-                    </DialogFooter>
-                </DialogContent>
-            </Dialog>
             <TaskDetailsDialog
                 open={taskDetailsOpen}
                 onOpenChange={(open) => {
                     setTaskDetailsOpen(open);
                     if (!open) {
-                        setTaskDetailsItem(null);
-                        setTaskDetailRuns([]);
-                        setTaskDetailFinalSummary(null);
-                        setTaskDetailsChatCard(null);
-                        setTaskDetailsMessageId(null);
+                        clearTaskDetailsState();
                     }
                 }}
                 task={taskDetailsItem}
@@ -8441,6 +9328,7 @@ export function ChatPage({
                                 </Badge>
                             ))}
                         </div>
+
                     </div>
                 </div>
             </div>
@@ -8449,3 +9337,4 @@ export function ChatPage({
         </div>
     );
 }
+

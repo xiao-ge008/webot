@@ -42,6 +42,27 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
 
+fn filter_blocked_tool_definitions(
+    tools: Vec<ToolDefinition>,
+    blocked_tools: &[String],
+) -> Vec<ToolDefinition> {
+    if blocked_tools.is_empty() {
+        return tools;
+    }
+    let blocked = blocked_tools
+        .iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect::<HashSet<_>>();
+    if blocked.is_empty() {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|tool| !blocked.contains(&tool.name.trim().to_ascii_lowercase()))
+        .collect()
+}
+
 /// The main OpenFang kernel  ?coordinates all subsystems.
 /// Stub LLM driver used when no providers are configured.
 /// Returns a helpful error so the dashboard still boots and users can configure providers.
@@ -552,6 +573,57 @@ fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
         Some(openfang_types::truncate_str(&content, MAX_IDENTITY_FILE_BYTES).to_string())
     } else {
         Some(content)
+    }
+}
+
+fn read_embodiment_value(workspace: &Path) -> Option<serde_json::Value> {
+    let raw = read_identity_file(workspace, "EMBODIMENT.json")?;
+    serde_json::from_str::<serde_json::Value>(&raw).ok()
+}
+
+fn summarize_embodiment_config(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(default_portrait) = object
+        .get("assets")
+        .and_then(|value| value.get("defaultPortrait"))
+        .and_then(|value| value.get("label").or_else(|| value.get("url")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("- Default portrait: {default_portrait}"));
+    } else if let Some(default_avatar) = object
+        .get("assets")
+        .and_then(|value| value.get("defaultAvatar"))
+        .and_then(|value| value.get("label").or_else(|| value.get("url")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("- Default avatar: {default_avatar}"));
+    }
+    if let Some(default_voice) = object
+        .get("voice")
+        .and_then(|value| value.get("defaultVoice"))
+        .and_then(|value| {
+            value
+                .get("label")
+                .or_else(|| value.get("speakerProfileId"))
+                .or_else(|| value.get("voice"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("- Default voice: {default_voice}"));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
     }
 }
 
@@ -1436,6 +1508,7 @@ impl OpenFangKernel {
             handle,
             None,
             SchedulerQuotaScope::Ignore,
+            &[],
         )
         .await
     }
@@ -1461,6 +1534,7 @@ impl OpenFangKernel {
             handle,
             memory_turn_context,
             SchedulerQuotaScope::Ignore,
+            &[],
         )
         .await
     }
@@ -1488,12 +1562,31 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         quota_scope: SchedulerQuotaScope,
     ) -> KernelResult<AgentLoopResult> {
+        self.send_message_with_handle_and_quota_scope_and_blocked_tools(
+            agent_id,
+            message,
+            kernel_handle,
+            quota_scope,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn send_message_with_handle_and_quota_scope_and_blocked_tools(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        quota_scope: SchedulerQuotaScope,
+        blocked_tools: Vec<String>,
+    ) -> KernelResult<AgentLoopResult> {
         self.send_message_with_handle_and_memory_context(
             agent_id,
             message,
             kernel_handle,
             None,
             quota_scope,
+            &blocked_tools,
         )
         .await
     }
@@ -1505,6 +1598,7 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         memory_turn_context: Option<MemoryTurnContext>,
         quota_scope: SchedulerQuotaScope,
+        blocked_tools: &[String],
     ) -> KernelResult<AgentLoopResult> {
         // Enforce quota before running the agent loop
         self.scheduler
@@ -1529,6 +1623,7 @@ impl OpenFangKernel {
                 message,
                 kernel_handle,
                 memory_turn_context,
+                blocked_tools,
             )
             .await
         };
@@ -1603,6 +1698,26 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         quota_scope: SchedulerQuotaScope,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
+        self.send_message_streaming_with_quota_scope_and_blocked_tools(
+            agent_id,
+            message,
+            kernel_handle,
+            quota_scope,
+            Vec::new(),
+        )
+    }
+
+    pub fn send_message_streaming_with_quota_scope_and_blocked_tools(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        quota_scope: SchedulerQuotaScope,
+        blocked_tools: Vec<String>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -1714,6 +1829,7 @@ impl OpenFangKernel {
 
         let tools = self.available_tools(agent_id);
         let tools = entry.mode.filter_tools(tools);
+        let tools = filter_blocked_tool_definitions(tools, &blocked_tools);
         let driver = self.resolve_driver(&entry.manifest)?;
 
         // Look up model's actual context window from the catalog
@@ -1818,6 +1934,11 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                embodiment_summary: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_embodiment_value(w))
+                    .and_then(|value| summarize_embodiment_config(&value)),
                 heartbeat_md: if manifest.autonomous.is_some() {
                     manifest
                         .workspace
@@ -2170,6 +2291,7 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         memory_turn_context: Option<MemoryTurnContext>,
+        blocked_tools: &[String],
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -2194,6 +2316,7 @@ impl OpenFangKernel {
 
         let tools = self.available_tools(agent_id);
         let tools = entry.mode.filter_tools(tools);
+        let tools = filter_blocked_tool_definitions(tools, blocked_tools);
 
         info!(
             agent = %entry.name,
@@ -2309,6 +2432,11 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                embodiment_summary: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_embodiment_value(w))
+                    .and_then(|value| summarize_embodiment_config(&value)),
                 heartbeat_md: if manifest.autonomous.is_some() {
                     manifest
                         .workspace
@@ -3740,7 +3868,34 @@ impl OpenFangKernel {
                         let agent_id = job.agent_id;
                         let job_name = job.name.clone();
 
-                        match &job.action {
+                        let managed_task = kernel
+                            .memory
+                            .task_find_by_cron_job_id(&job_id.to_string())
+                            .ok()
+                            .flatten();
+                        if let Some(task) = managed_task {
+                            let kernel = Arc::clone(&kernel);
+                            tokio::spawn(async move {
+                                if let Err(error) = kernel
+                                    .execute_managed_task(
+                                        task.spec.id.as_str(),
+                                        Some(job_id),
+                                        false,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        task_id = %task.spec.id,
+                                        job = %job_name,
+                                        error = %error,
+                                        "Managed cron task execution failed"
+                                    );
+                                }
+                            });
+                            continue;
+                        }
+
+                        match job.action.clone() {
                             openfang_types::scheduler::CronAction::SystemEvent { text } => {
                                 tracing::debug!(job = %job_name, "Cron: firing system event");
                                 let payload_bytes = serde_json::to_vec(&serde_json::json!({
@@ -3755,7 +3910,7 @@ impl OpenFangKernel {
                                     EventPayload::Custom(payload_bytes),
                                 );
                                 kernel.publish_event(event).await;
-                                kernel.cron_scheduler.record_success(job_id, Some(text));
+                                kernel.cron_scheduler.record_success(job_id, Some(&text));
                             }
                             openfang_types::scheduler::CronAction::AgentTurn {
                                 message,
@@ -3763,45 +3918,51 @@ impl OpenFangKernel {
                                 ..
                             } => {
                                 tracing::debug!(job = %job_name, agent = %agent_id, "Cron: firing agent turn");
-                                let timeout_s = timeout_secs.unwrap_or(120);
-                                let timeout = std::time::Duration::from_secs(timeout_s);
+                                let kernel = Arc::clone(&kernel);
                                 let delivery = job.delivery.clone();
-                                let kh: std::sync::Arc<
-                                    dyn openfang_runtime::kernel_handle::KernelHandle,
-                                > = kernel.clone();
-                                match tokio::time::timeout(
-                                    timeout,
-                                    kernel.send_message_with_handle(agent_id, message, Some(kh)),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(result)) => {
-                                        tracing::info!(job = %job_name, "Cron job completed successfully");
-                                        kernel
-                                            .cron_scheduler
-                                            .record_success(job_id, Some(&result.response));
-                                        // Deliver response to configured channel
-                                        cron_deliver_response(
-                                            &kernel,
+                                tokio::spawn(async move {
+                                    let timeout_s = timeout_secs.unwrap_or(120);
+                                    let timeout = std::time::Duration::from_secs(timeout_s);
+                                    let kh: std::sync::Arc<
+                                        dyn openfang_runtime::kernel_handle::KernelHandle,
+                                    > = kernel.clone();
+                                    match tokio::time::timeout(
+                                        timeout,
+                                        kernel.send_message_with_handle(
                                             agent_id,
-                                            &result.response,
-                                            &delivery,
-                                        )
-                                        .await;
+                                            &message,
+                                            Some(kh),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(result)) => {
+                                            tracing::info!(job = %job_name, "Cron job completed successfully");
+                                            kernel
+                                                .cron_scheduler
+                                                .record_success(job_id, Some(&result.response));
+                                            cron_deliver_response(
+                                                &kernel,
+                                                agent_id,
+                                                &result.response,
+                                                &delivery,
+                                            )
+                                            .await;
+                                        }
+                                        Ok(Err(e)) => {
+                                            let err_msg = format!("{e}");
+                                            tracing::warn!(job = %job_name, error = %err_msg, "Cron job failed");
+                                            kernel.cron_scheduler.record_failure(job_id, &err_msg);
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!(job = %job_name, timeout_s, "Cron job timed out");
+                                            kernel.cron_scheduler.record_failure(
+                                                job_id,
+                                                &format!("timed out after {timeout_s}s"),
+                                            );
+                                        }
                                     }
-                                    Ok(Err(e)) => {
-                                        let err_msg = format!("{e}");
-                                        tracing::warn!(job = %job_name, error = %err_msg, "Cron job failed");
-                                        kernel.cron_scheduler.record_failure(job_id, &err_msg);
-                                    }
-                                    Err(_) => {
-                                        tracing::warn!(job = %job_name, timeout_s, "Cron job timed out");
-                                        kernel.cron_scheduler.record_failure(
-                                            job_id,
-                                            &format!("timed out after {timeout_s}s"),
-                                        );
-                                    }
-                                }
+                                });
                             }
                         }
                     }
@@ -4230,6 +4391,14 @@ impl OpenFangKernel {
             .unwrap_or_default();
 
         for server_config in &servers {
+            if server_config.name.starts_with("agent-workspace-") {
+                info!(
+                    server = %server_config.name,
+                    "Skipping workspace MCP eager connect during daemon boot"
+                );
+                continue;
+            }
+
             let transport = match &server_config.transport {
                 McpTransportEntry::Stdio { command, args, cwd } => McpTransport::Stdio {
                     command: command.clone(),
@@ -4639,6 +4808,13 @@ impl OpenFangKernel {
         if exec_blocks_shell {
             all_tools.retain(|t| t.name != "shell_exec");
         }
+
+        // Component skills may intentionally bind themselves to existing base tool
+        // names such as `image_generate`. Keep the first definition so the built-in
+        // canonical schema wins, while runtime dispatch can still route through the
+        // selector/provider chain internally.
+        let mut seen_tool_names = HashSet::new();
+        all_tools.retain(|tool| seen_tool_names.insert(tool.name.clone()));
 
         let caps = self.capabilities.list(agent_id);
         let has_any_tool_cap = caps
@@ -6184,6 +6360,1365 @@ async fn cron_deliver_response(
     }
 }
 
+impl OpenFangKernel {
+    fn managed_task_now() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn build_managed_task_runtime(
+        enabled: bool,
+        next_run: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> openfang_types::tasks::ManagedTaskRuntime {
+        openfang_types::tasks::ManagedTaskRuntime {
+            state: if enabled {
+                openfang_types::tasks::ManagedTaskState::Scheduled
+            } else {
+                openfang_types::tasks::ManagedTaskState::Draft
+            },
+            next_run: next_run.map(|value| value.to_rfc3339()),
+            last_run: None,
+            last_status: openfang_types::tasks::ManagedTaskStatus::Idle,
+            last_output: None,
+            run_count: 0,
+            consecutive_errors: 0,
+            latest_summary: None,
+            last_error: None,
+            completed_at: None,
+            disabled_reason: None,
+        }
+    }
+
+    fn build_managed_task_event(
+        task_id: &str,
+        run_id: Option<&str>,
+        event_type: openfang_types::tasks::ManagedTaskEventType,
+        summary: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> openfang_types::tasks::ManagedTaskEvent {
+        openfang_types::tasks::ManagedTaskEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            run_id: run_id.map(|value| value.to_string()),
+            event_type,
+            summary: summary.into(),
+            payload,
+            created_at: Self::managed_task_now(),
+        }
+    }
+
+    fn build_managed_task_delivery(
+        task: &openfang_types::tasks::ManagedTaskDetail,
+        run_id: Option<&str>,
+        event_id: Option<&str>,
+        target_kind: openfang_types::tasks::ManagedTaskDeliveryTargetKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> openfang_types::tasks::ManagedTaskDelivery {
+        openfang_types::tasks::ManagedTaskDelivery {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.spec.id.clone(),
+            run_id: run_id.map(|value| value.to_string()),
+            event_id: event_id.map(|value| value.to_string()),
+            target_kind,
+            status: openfang_types::tasks::ManagedTaskDeliveryStatus::Pending,
+            origin_chat_session_id: task.spec.binding.origin_chat_session_id.clone(),
+            origin_message_id: task.spec.binding.origin_message_id.clone(),
+            title: title.into(),
+            body: body.into(),
+            payload,
+            created_at: Self::managed_task_now(),
+            updated_at: Self::managed_task_now(),
+            delivered_at: None,
+        }
+    }
+
+    fn derive_next_run_from_cron_job(&self, cron_job_id: Option<&str>) -> Option<String> {
+        let cron_job_id = cron_job_id?.trim();
+        if cron_job_id.is_empty() {
+            return None;
+        }
+        let parsed = uuid::Uuid::parse_str(cron_job_id).ok()?;
+        let id = openfang_types::scheduler::CronJobId(parsed);
+        self.cron_scheduler
+            .get_meta(id)
+            .and_then(|meta| meta.job.next_run.map(|value| value.to_rfc3339()))
+    }
+
+    fn build_managed_task_agent_prompt(prompt: &str) -> String {
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            return [
+                "请执行任务并返回简洁结论。",
+                "最后必须单独追加一行机器结果，格式严格如下：",
+                "<task-result>{\"status\":\"ok\",\"alert\":false,\"summary\":\"一句话总结\",\"details\":\"补充说明，可为空\"}</task-result>",
+            ]
+            .join("\n");
+        }
+        if trimmed.contains("<task-result>") {
+            return trimmed.to_string();
+        }
+        [
+            trimmed,
+            "",
+            "最后必须单独追加一行机器结果，格式严格如下：",
+            "<task-result>{\"status\":\"ok\",\"alert\":false,\"summary\":\"一句话总结\",\"details\":\"补充说明，可为空\"}</task-result>",
+            "如果任务执行失败，把 status 改为 error；如果命中异常或阈值，把 alert 改为 true。",
+        ]
+        .join("\n")
+    }
+
+    fn extract_task_result(output: &str) -> (String, Option<serde_json::Value>) {
+        let start_tag = "<task-result>";
+        let end_tag = "</task-result>";
+        let Some(start) = output.rfind(start_tag) else {
+            return (output.trim().to_string(), None);
+        };
+        let content_start = start + start_tag.len();
+        let Some(relative_end) = output[content_start..].find(end_tag) else {
+            return (output.trim().to_string(), None);
+        };
+        let end = content_start + relative_end;
+        let json_text = output[content_start..end].trim();
+        let parsed = serde_json::from_str::<serde_json::Value>(json_text).ok();
+        let mut cleaned = String::with_capacity(output.len());
+        cleaned.push_str(output[..start].trim_end());
+        let suffix = output[end + end_tag.len()..].trim();
+        if !suffix.is_empty() {
+            if !cleaned.trim().is_empty() {
+                cleaned.push('\n');
+            }
+            cleaned.push_str(suffix);
+        }
+        (cleaned.trim().to_string(), parsed)
+    }
+
+    fn task_result_status(task_result: Option<&serde_json::Value>) -> Option<String> {
+        task_result
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn task_result_summary(task_result: Option<&serde_json::Value>) -> Option<String> {
+        task_result
+            .and_then(|value| value.get("summary"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn task_result_details(task_result: Option<&serde_json::Value>) -> Option<String> {
+        task_result
+            .and_then(|value| value.get("details"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn extract_report_condition_threshold(report_condition: &str) -> Vec<String> {
+        let trimmed = report_condition.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let mut values = vec![trimmed.to_string()];
+        let mut numeric = String::new();
+        let mut started = false;
+        for ch in trimmed.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                numeric.push(ch);
+                started = true;
+                continue;
+            }
+            if started {
+                break;
+            }
+        }
+        if !numeric.is_empty() {
+            values.push(numeric);
+        }
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    fn output_matches_report_condition(output: &str, report_condition: Option<&str>) -> bool {
+        let Some(report_condition) = report_condition else {
+            return false;
+        };
+        let normalized = output
+            .trim()
+            .replace(char::is_whitespace, "")
+            .replace('：', ":");
+        if normalized.is_empty() {
+            return false;
+        }
+        let thresholds = Self::extract_report_condition_threshold(report_condition);
+        if thresholds.is_empty() {
+            return false;
+        }
+        const POSITIVE_PATTERNS: &[&str] = &[
+            "高于", "超过", "达到", "涨到", "低于", "跌到", "小于", "等于",
+        ];
+        for threshold in thresholds {
+            let target = threshold.replace(char::is_whitespace, "");
+            if target.is_empty() {
+                continue;
+            }
+            if normalized.contains(&format!("命中{}", target))
+                || normalized.contains(&format!("触发{}", target))
+                || normalized.contains(&format!("{}阈值", target))
+                    && (normalized.contains("高于")
+                        || normalized.contains("超过")
+                        || normalized.contains("达到")
+                        || normalized.contains("涨到")
+                        || normalized.contains("低于")
+                        || normalized.contains("跌到")
+                        || normalized.contains("小于")
+                        || normalized.contains("等于"))
+            {
+                return true;
+            }
+            if POSITIVE_PATTERNS
+                .iter()
+                .any(|prefix| normalized.contains(&format!("{}{}", prefix, target)))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn should_emit_anomaly(
+        output: &str,
+        task_result: Option<&serde_json::Value>,
+        report_condition: Option<&str>,
+    ) -> bool {
+        if task_result
+            .and_then(|value| value.get("alert"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let normalized = output.trim();
+        normalized.contains("告警状态：触发")
+            || normalized.contains("告警状态:触发")
+            || Self::output_matches_report_condition(normalized, report_condition)
+    }
+
+    fn summarize_task_output(
+        output: &str,
+        fallback: &str,
+        task_result: Option<&serde_json::Value>,
+    ) -> String {
+        if let Some(summary) = Self::task_result_summary(task_result) {
+            return openfang_types::truncate_str(summary.trim(), 600).to_string();
+        }
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return fallback.to_string();
+        }
+        openfang_types::truncate_str(trimmed, 600).to_string()
+    }
+
+    fn build_managed_task_capabilities(
+        detail: &openfang_types::tasks::ManagedTaskDetail,
+    ) -> openfang_types::tasks::ManagedTaskCapabilities {
+        use openfang_types::tasks::ManagedTaskState;
+
+        let state = &detail.runtime.state;
+        let has_run = detail.runtime.run_count > 0;
+        openfang_types::tasks::ManagedTaskCapabilities {
+            publish: matches!(
+                state,
+                ManagedTaskState::Draft | ManagedTaskState::Paused | ManagedTaskState::Disabled
+            ),
+            pause: matches!(
+                state,
+                ManagedTaskState::Scheduled | ManagedTaskState::Running
+            ),
+            run_once: matches!(
+                state,
+                ManagedTaskState::Draft | ManagedTaskState::Paused | ManagedTaskState::Scheduled
+            ),
+            delete: !has_run && !matches!(state, ManagedTaskState::Running),
+        }
+    }
+
+    fn build_managed_task_delivery_stats(
+        deliveries: &[openfang_types::tasks::ManagedTaskDelivery],
+        attempts: &[openfang_types::tasks::ManagedTaskDeliveryAttempt],
+    ) -> openfang_types::tasks::ManagedTaskDeliveryStats {
+        let mut stats = openfang_types::tasks::ManagedTaskDeliveryStats::default();
+        stats.total = deliveries.len() as u64;
+        for delivery in deliveries {
+            match &delivery.status {
+                openfang_types::tasks::ManagedTaskDeliveryStatus::Pending => stats.pending += 1,
+                openfang_types::tasks::ManagedTaskDeliveryStatus::Reported => stats.reported += 1,
+                openfang_types::tasks::ManagedTaskDeliveryStatus::Acknowledged => {
+                    stats.acknowledged += 1
+                }
+                openfang_types::tasks::ManagedTaskDeliveryStatus::Failed => stats.failed += 1,
+            }
+        }
+        stats.attempts = attempts.len() as u64;
+        stats.attempt_failures = attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.status == openfang_types::tasks::ManagedTaskDeliveryAttemptStatus::Failed
+            })
+            .count() as u64;
+        stats
+    }
+
+    fn build_managed_task_final_summary(
+        detail: &openfang_types::tasks::ManagedTaskDetail,
+        runs: &[openfang_types::tasks::ManagedTaskRun],
+        events: &[openfang_types::tasks::ManagedTaskEvent],
+    ) -> Option<openfang_types::tasks::ManagedTaskFinalSummary> {
+        let terminal = matches!(
+            detail.runtime.state,
+            openfang_types::tasks::ManagedTaskState::Completed
+                | openfang_types::tasks::ManagedTaskState::Failed
+                | openfang_types::tasks::ManagedTaskState::Disabled
+        );
+        if !terminal && detail.runtime.completed_at.is_none() {
+            return None;
+        }
+
+        let event = events.iter().find(|item| {
+            matches!(
+                &item.event_type,
+                openfang_types::tasks::ManagedTaskEventType::Completed
+                    | openfang_types::tasks::ManagedTaskEventType::Failed
+                    | openfang_types::tasks::ManagedTaskEventType::Succeeded
+            )
+        });
+        let run = runs.first();
+        let content = event
+            .map(|item| item.summary.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                run.and_then(|item| item.summary.clone())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                detail
+                    .runtime
+                    .latest_summary
+                    .clone()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })?;
+
+        Some(openfang_types::tasks::ManagedTaskFinalSummary {
+            run_count: detail.runtime.run_count,
+            status: Some(format!("{:?}", detail.runtime.state).to_ascii_lowercase()),
+            content,
+            created_at: event
+                .map(|item| item.created_at.clone())
+                .or_else(|| run.and_then(|item| item.end_time.clone()))
+                .or_else(|| detail.runtime.completed_at.clone())
+                .unwrap_or_else(Self::managed_task_now),
+            run_id: event
+                .and_then(|item| item.run_id.clone())
+                .or_else(|| run.map(|item| item.id.clone())),
+            event_id: event.map(|item| item.id.clone()),
+        })
+    }
+
+    fn build_managed_task_timeline(
+        task_id: &str,
+        events: &[openfang_types::tasks::ManagedTaskEvent],
+        deliveries: &[openfang_types::tasks::ManagedTaskDelivery],
+        attempts: &[openfang_types::tasks::ManagedTaskDeliveryAttempt],
+    ) -> Vec<openfang_types::tasks::ManagedTaskTimelineEntry> {
+        let mut timeline = Vec::with_capacity(events.len() + deliveries.len() + attempts.len());
+        for event in events {
+            timeline.push(openfang_types::tasks::ManagedTaskTimelineEntry {
+                id: format!("event:{}", event.id),
+                source_kind: "event".to_string(),
+                source_id: event.id.clone(),
+                task_id: task_id.to_string(),
+                run_id: event.run_id.clone(),
+                event_id: Some(event.id.clone()),
+                target_kind: None,
+                status: Some(format!("{:?}", event.event_type).to_ascii_lowercase()),
+                summary: event.summary.clone(),
+                metadata: event.payload.clone(),
+                created_at: event.created_at.clone(),
+            });
+        }
+        for delivery in deliveries {
+            timeline.push(openfang_types::tasks::ManagedTaskTimelineEntry {
+                id: format!("delivery:{}", delivery.id),
+                source_kind: "delivery".to_string(),
+                source_id: delivery.id.clone(),
+                task_id: task_id.to_string(),
+                run_id: delivery.run_id.clone(),
+                event_id: delivery.event_id.clone(),
+                target_kind: Some(delivery.target_kind.clone()),
+                status: Some(format!("{:?}", delivery.status).to_ascii_lowercase()),
+                summary: format!("{}: {}", delivery.title, delivery.body),
+                metadata: delivery.payload.clone(),
+                created_at: delivery.created_at.clone(),
+            });
+        }
+        for attempt in attempts {
+            timeline.push(openfang_types::tasks::ManagedTaskTimelineEntry {
+                id: format!("attempt:{}", attempt.id),
+                source_kind: "delivery_attempt".to_string(),
+                source_id: attempt.id.clone(),
+                task_id: task_id.to_string(),
+                run_id: attempt.run_id.clone(),
+                event_id: attempt.event_id.clone(),
+                target_kind: Some(attempt.target_kind.clone()),
+                status: Some(format!("{:?}", attempt.status).to_ascii_lowercase()),
+                summary: attempt
+                    .error
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "投递尝试已完成".to_string()),
+                metadata: attempt.metadata_json.clone(),
+                created_at: attempt.started_at.clone(),
+            });
+        }
+        timeline.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        timeline
+    }
+
+    fn hydrate_managed_task_detail(
+        &self,
+        mut detail: openfang_types::tasks::ManagedTaskDetail,
+    ) -> Result<openfang_types::tasks::ManagedTaskDetail, String> {
+        let task_id = detail.spec.id.clone();
+        let runs = self
+            .memory
+            .task_list_runs_managed(&task_id)
+            .map_err(|e| format!("Managed task runs failed: {e}"))?;
+        let events = self
+            .memory
+            .task_list_events_managed(&task_id)
+            .map_err(|e| format!("Managed task events failed: {e}"))?;
+        let deliveries = self
+            .memory
+            .task_list_deliveries_managed(&task_id)
+            .map_err(|e| format!("Managed task deliveries failed: {e}"))?;
+        let attempts = self
+            .memory
+            .task_list_delivery_attempts_managed(&task_id)
+            .map_err(|e| format!("Managed task delivery attempts failed: {e}"))?;
+        detail.final_summary = Self::build_managed_task_final_summary(&detail, &runs, &events);
+        detail.delivery_stats = Self::build_managed_task_delivery_stats(&deliveries, &attempts);
+        detail.capabilities = Self::build_managed_task_capabilities(&detail);
+        detail.timeline =
+            Self::build_managed_task_timeline(&task_id, &events, &deliveries, &attempts);
+        Ok(detail)
+    }
+
+    fn append_managed_task_delivery(
+        &self,
+        task: &openfang_types::tasks::ManagedTaskDetail,
+        run_id: Option<&str>,
+        event_id: Option<&str>,
+        target_kind: openfang_types::tasks::ManagedTaskDeliveryTargetKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<openfang_types::tasks::ManagedTaskDelivery, String> {
+        let title = title.into();
+        let body = body.into();
+        let delivery = Self::build_managed_task_delivery(
+            task,
+            run_id,
+            event_id,
+            target_kind.clone(),
+            title.clone(),
+            body.clone(),
+            payload.clone(),
+        );
+        self.memory
+            .task_append_delivery(&delivery)
+            .map_err(|e| format!("Managed task delivery append failed: {e}"))?;
+        let pending_event = Self::build_managed_task_event(
+            &task.spec.id,
+            run_id,
+            openfang_types::tasks::ManagedTaskEventType::DeliveryPending,
+            format!("投递待处理：{title}"),
+            serde_json::json!({
+                "delivery_id": delivery.id.clone(),
+                "target_kind": target_kind.clone(),
+                "status": delivery.status.clone(),
+                "body": body,
+                "payload": payload,
+            }),
+        );
+        let _ = self.memory.task_append_event(&pending_event);
+        Ok(delivery)
+    }
+
+    pub fn list_managed_task_delivery_attempts(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<openfang_types::tasks::ManagedTaskDeliveryAttempt>, String> {
+        self.memory
+            .task_list_delivery_attempts_managed(task_id)
+            .map_err(|e| format!("Managed task delivery attempts failed: {e}"))
+    }
+
+    pub fn list_managed_task_timeline(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<openfang_types::tasks::ManagedTaskTimelineEntry>, String> {
+        let events = self.list_managed_task_events(task_id)?;
+        let deliveries = self.list_managed_task_deliveries(task_id)?;
+        let attempts = self.list_managed_task_delivery_attempts(task_id)?;
+        Ok(Self::build_managed_task_timeline(
+            task_id,
+            &events,
+            &deliveries,
+            &attempts,
+        ))
+    }
+
+    pub fn record_managed_task_delivery_attempt(
+        &self,
+        attempt: openfang_types::tasks::ManagedTaskDeliveryAttempt,
+    ) -> Result<openfang_types::tasks::ManagedTaskDeliveryAttempt, String> {
+        self.memory
+            .task_append_delivery_attempt(&attempt)
+            .map_err(|e| format!("Managed task delivery attempt append failed: {e}"))?;
+        let event_type = if attempt.status
+            == openfang_types::tasks::ManagedTaskDeliveryAttemptStatus::Succeeded
+        {
+            openfang_types::tasks::ManagedTaskEventType::DeliverySent
+        } else {
+            openfang_types::tasks::ManagedTaskEventType::DeliveryFailed
+        };
+        let summary = if event_type == openfang_types::tasks::ManagedTaskEventType::DeliverySent {
+            "投递成功".to_string()
+        } else {
+            attempt
+                .error
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "投递失败".to_string())
+        };
+        let event = Self::build_managed_task_event(
+            &attempt.task_id,
+            attempt.run_id.as_deref(),
+            event_type,
+            summary,
+            serde_json::json!({
+                "delivery_id": attempt.delivery_id.clone(),
+                "attempt_id": attempt.id.clone(),
+                "target_kind": attempt.target_kind.clone(),
+                "consumer_kind": attempt.consumer_kind.clone(),
+                "status": attempt.status.clone(),
+                "error": attempt.error.clone(),
+                "metadata": attempt.metadata_json.clone(),
+            }),
+        );
+        let _ = self.memory.task_append_event(&event);
+        Ok(attempt)
+    }
+
+    pub async fn create_managed_task(
+        &self,
+        request: openfang_types::tasks::ManagedTaskCreateRequest,
+    ) -> Result<openfang_types::tasks::ManagedTaskDetail, String> {
+        use openfang_types::scheduler::{
+            CronAction, CronDelivery, CronJob, CronJobId, CronSchedule,
+        };
+
+        let agent_uuid = uuid::Uuid::parse_str(request.agent_id.trim())
+            .map_err(|e| format!("Invalid agent ID: {e}"))?;
+        let agent_id = openfang_types::agent::AgentId(agent_uuid);
+        let enabled = request.enabled.unwrap_or(false);
+        let schedule = match request.schedule.kind.trim() {
+            "at" => CronSchedule::At {
+                at: request
+                    .schedule
+                    .at
+                    .as_deref()
+                    .ok_or("Missing task schedule.at")?
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .map_err(|e| format!("Invalid at schedule: {e}"))?,
+            },
+            "every" => CronSchedule::Every {
+                every_secs: request.schedule.every_secs.unwrap_or(60),
+            },
+            _ => CronSchedule::Cron {
+                expr: request
+                    .schedule
+                    .expr
+                    .clone()
+                    .unwrap_or_else(|| "* * * * *".to_string()),
+                tz: request.schedule.tz.clone(),
+            },
+        };
+        let action = if request.action.job_type.trim().eq_ignore_ascii_case("shell") {
+            CronAction::SystemEvent {
+                text: request
+                    .action
+                    .command
+                    .clone()
+                    .or(request.action.prompt.clone())
+                    .unwrap_or_else(|| request.name.clone()),
+            }
+        } else {
+            CronAction::AgentTurn {
+                message: request
+                    .action
+                    .prompt
+                    .clone()
+                    .or(request.action.command.clone())
+                    .unwrap_or_else(|| request.name.clone()),
+                model_override: None,
+                timeout_secs: Some(180),
+            }
+        };
+        let job = CronJob {
+            id: CronJobId::new(),
+            agent_id,
+            name: request.name.clone(),
+            enabled,
+            schedule,
+            action,
+            delivery: CronDelivery::None,
+            created_at: chrono::Utc::now(),
+            next_run: None,
+            last_run: None,
+        };
+        let one_shot = request.schedule.kind.trim().eq_ignore_ascii_case("at");
+        let job_id = self
+            .cron_scheduler
+            .add_job(job, one_shot)
+            .map_err(|e| format!("{e}"))?;
+        let _ = self.cron_scheduler.persist();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let now = Self::managed_task_now();
+        let spec = openfang_types::tasks::ManagedTaskSpec {
+            id: task_id.clone(),
+            agent_id: request.agent_id.clone(),
+            name: request.name,
+            source_type: request.source_type,
+            source_ref: request.source_ref,
+            report_condition: request.report_condition,
+            summary_style: request.summary_style,
+            enabled,
+            schedule: request.schedule,
+            action: request.action,
+            delivery: request.delivery.unwrap_or_default(),
+            max_runs: request.max_runs,
+            binding: request.binding.unwrap_or_default(),
+            cron_job_id: Some(job_id.to_string()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let runtime = Self::build_managed_task_runtime(
+            enabled,
+            self.cron_scheduler
+                .get_meta(job_id)
+                .and_then(|meta| meta.job.next_run),
+        );
+        self.memory
+            .task_create(&spec, &runtime)
+            .map_err(|e| format!("Managed task create failed: {e}"))?;
+        let event = Self::build_managed_task_event(
+            &task_id,
+            None,
+            openfang_types::tasks::ManagedTaskEventType::Created,
+            "任务已创建",
+            serde_json::json!({
+                "task_id": task_id,
+                "enabled": enabled,
+            }),
+        );
+        let _ = self.memory.task_append_event(&event);
+        self.hydrate_managed_task_detail(openfang_types::tasks::ManagedTaskDetail {
+            spec,
+            runtime,
+            final_summary: None,
+            delivery_stats: Default::default(),
+            capabilities: Default::default(),
+            timeline: Vec::new(),
+        })
+    }
+
+    pub fn list_managed_tasks(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<openfang_types::tasks::ManagedTaskDetail>, String> {
+        self.memory
+            .task_list_managed(agent_id)
+            .map_err(|e| format!("Managed task list failed: {e}"))?
+            .into_iter()
+            .map(|detail| self.hydrate_managed_task_detail(detail))
+            .collect()
+    }
+
+    pub fn get_managed_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<openfang_types::tasks::ManagedTaskDetail>, String> {
+        match self
+            .memory
+            .task_get(task_id)
+            .map_err(|e| format!("Managed task get failed: {e}"))
+        {
+            Ok(Some(detail)) => self.hydrate_managed_task_detail(detail).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn list_managed_task_runs(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<openfang_types::tasks::ManagedTaskRun>, String> {
+        self.memory
+            .task_list_runs_managed(task_id)
+            .map_err(|e| format!("Managed task runs failed: {e}"))
+    }
+
+    pub fn list_managed_task_events(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<openfang_types::tasks::ManagedTaskEvent>, String> {
+        self.memory
+            .task_list_events_managed(task_id)
+            .map_err(|e| format!("Managed task events failed: {e}"))
+    }
+
+    pub fn list_managed_task_deliveries(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<openfang_types::tasks::ManagedTaskDelivery>, String> {
+        self.memory
+            .task_list_deliveries_managed(task_id)
+            .map_err(|e| format!("Managed task deliveries failed: {e}"))
+    }
+
+    pub fn list_pending_managed_task_deliveries(
+        &self,
+        target_kind: Option<&str>,
+        origin_chat_session_id: Option<&str>,
+    ) -> Result<Vec<openfang_types::tasks::ManagedTaskDelivery>, String> {
+        self.memory
+            .task_list_pending_deliveries_managed(target_kind, origin_chat_session_id)
+            .map_err(|e| format!("Managed task pending deliveries failed: {e}"))
+    }
+
+    pub fn update_managed_task_delivery_status(
+        &self,
+        delivery_id: &str,
+        status: openfang_types::tasks::ManagedTaskDeliveryStatus,
+    ) -> Result<Option<openfang_types::tasks::ManagedTaskDelivery>, String> {
+        self.memory
+            .task_mark_delivery_status(delivery_id, status)
+            .map_err(|e| format!("Managed task delivery update failed: {e}"))
+    }
+
+    pub fn pause_managed_task(
+        &self,
+        task_id: &str,
+    ) -> Result<openfang_types::tasks::ManagedTaskDetail, String> {
+        let mut detail = self
+            .memory
+            .task_get(task_id)
+            .map_err(|e| format!("Managed task load failed: {e}"))?
+            .ok_or_else(|| format!("Task not found: {task_id}"))?;
+        if !Self::build_managed_task_capabilities(&detail).pause {
+            return Err("当前任务状态不允许暂停".to_string());
+        }
+        if let Some(cron_job_id) = detail.spec.cron_job_id.clone() {
+            let parsed = uuid::Uuid::parse_str(&cron_job_id)
+                .map_err(|e| format!("Invalid cron job ID: {e}"))?;
+            self.cron_scheduler
+                .set_enabled(openfang_types::scheduler::CronJobId(parsed), false)
+                .map_err(|e| format!("{e}"))?;
+            let _ = self.cron_scheduler.persist();
+        }
+        detail.spec.enabled = false;
+        detail.spec.updated_at = Self::managed_task_now();
+        detail.runtime.state = openfang_types::tasks::ManagedTaskState::Paused;
+        detail.runtime.next_run = None;
+        self.memory
+            .task_update(&detail.spec, &detail.runtime)
+            .map_err(|e| format!("Managed task update failed: {e}"))?;
+        let event = Self::build_managed_task_event(
+            task_id,
+            None,
+            openfang_types::tasks::ManagedTaskEventType::Paused,
+            "任务已暂停",
+            serde_json::json!({ "task_id": task_id }),
+        );
+        let _ = self.memory.task_append_event(&event);
+        self.hydrate_managed_task_detail(detail)
+    }
+
+    pub fn publish_managed_task(
+        &self,
+        task_id: &str,
+    ) -> Result<openfang_types::tasks::ManagedTaskDetail, String> {
+        let mut detail = self
+            .memory
+            .task_get(task_id)
+            .map_err(|e| format!("Managed task load failed: {e}"))?
+            .ok_or_else(|| format!("Task not found: {task_id}"))?;
+        if !Self::build_managed_task_capabilities(&detail).publish {
+            return Err("当前任务状态不允许发布".to_string());
+        }
+        let cron_job_id = detail
+            .spec
+            .cron_job_id
+            .clone()
+            .ok_or_else(|| "Missing cron job mapping".to_string())?;
+        let parsed =
+            uuid::Uuid::parse_str(&cron_job_id).map_err(|e| format!("Invalid cron job ID: {e}"))?;
+        let job_id = openfang_types::scheduler::CronJobId(parsed);
+        self.cron_scheduler
+            .set_enabled(job_id, true)
+            .map_err(|e| format!("{e}"))?;
+        let _ = self.cron_scheduler.persist();
+        detail.spec.enabled = true;
+        detail.spec.updated_at = Self::managed_task_now();
+        detail.runtime.state = openfang_types::tasks::ManagedTaskState::Scheduled;
+        detail.runtime.next_run = self.derive_next_run_from_cron_job(Some(&cron_job_id));
+        self.memory
+            .task_update(&detail.spec, &detail.runtime)
+            .map_err(|e| format!("Managed task update failed: {e}"))?;
+        let event = Self::build_managed_task_event(
+            task_id,
+            None,
+            openfang_types::tasks::ManagedTaskEventType::Published,
+            "任务已发布",
+            serde_json::json!({ "task_id": task_id }),
+        );
+        let _ = self.memory.task_append_event(&event);
+        self.hydrate_managed_task_detail(detail)
+    }
+
+    pub fn delete_managed_task(&self, task_id: &str) -> Result<(), String> {
+        let detail = self
+            .memory
+            .task_get(task_id)
+            .map_err(|e| format!("Managed task load failed: {e}"))?;
+        if let Some(detail) = detail {
+            if !Self::build_managed_task_capabilities(&detail).delete {
+                return Err("任务已开始执行，当前不允许删除".to_string());
+            }
+            if let Some(cron_job_id) = detail.spec.cron_job_id {
+                if let Ok(parsed) = uuid::Uuid::parse_str(&cron_job_id) {
+                    let _ = self
+                        .cron_scheduler
+                        .remove_job(openfang_types::scheduler::CronJobId(parsed));
+                    let _ = self.cron_scheduler.persist();
+                }
+            }
+        }
+        self.memory
+            .task_delete_managed(task_id)
+            .map_err(|e| format!("Managed task delete failed: {e}"))
+    }
+
+    pub async fn run_managed_task_once(
+        &self,
+        task_id: &str,
+    ) -> Result<openfang_types::tasks::ManagedTaskDetail, String> {
+        let detail = self
+            .memory
+            .task_get(task_id)
+            .map_err(|e| format!("Managed task load failed: {e}"))?
+            .ok_or_else(|| format!("Task not found: {task_id}"))?;
+        if !Self::build_managed_task_capabilities(&detail).run_once {
+            return Err("当前任务状态不允许立即执行一次".to_string());
+        }
+        self.execute_managed_task(task_id, None, true).await
+    }
+
+    pub async fn execute_managed_task(
+        &self,
+        task_id: &str,
+        cron_job_id: Option<openfang_types::scheduler::CronJobId>,
+        manual: bool,
+    ) -> Result<openfang_types::tasks::ManagedTaskDetail, String> {
+        let mut detail = self
+            .memory
+            .task_get(task_id)
+            .map_err(|e| format!("Managed task load failed: {e}"))?
+            .ok_or_else(|| format!("Task not found: {task_id}"))?;
+        if detail.runtime.state == openfang_types::tasks::ManagedTaskState::Running {
+            return self.hydrate_managed_task_detail(detail);
+        }
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let start_time = Self::managed_task_now();
+        detail.runtime.state = openfang_types::tasks::ManagedTaskState::Running;
+        detail.runtime.last_status = openfang_types::tasks::ManagedTaskStatus::Running;
+        detail.spec.updated_at = start_time.clone();
+        self.memory
+            .task_update(&detail.spec, &detail.runtime)
+            .map_err(|e| format!("Managed task start update failed: {e}"))?;
+        let started_event = Self::build_managed_task_event(
+            task_id,
+            Some(&run_id),
+            openfang_types::tasks::ManagedTaskEventType::Started,
+            "任务开始执行",
+            serde_json::json!({
+                "task_id": task_id,
+                "manual": manual,
+            }),
+        );
+        let _ = self.memory.task_append_event(&started_event);
+
+        let execution = if detail
+            .spec
+            .action
+            .job_type
+            .trim()
+            .eq_ignore_ascii_case("shell")
+        {
+            Ok(detail
+                .spec
+                .action
+                .command
+                .clone()
+                .or(detail.spec.action.prompt.clone())
+                .unwrap_or_else(|| detail.spec.name.clone()))
+        } else {
+            let kernel_handle: Option<Arc<dyn KernelHandle>> = self
+                .self_handle
+                .get()
+                .and_then(|weak| weak.upgrade())
+                .map(|arc| arc as Arc<dyn KernelHandle>);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(180),
+                self.send_message_with_handle(
+                    openfang_types::agent::AgentId(
+                        uuid::Uuid::parse_str(&detail.spec.agent_id)
+                            .map_err(|e| format!("Invalid agent ID: {e}"))?,
+                    ),
+                    &Self::build_managed_task_agent_prompt(
+                        detail
+                            .spec
+                            .action
+                            .prompt
+                            .as_deref()
+                            .or(detail.spec.action.command.as_deref())
+                            .unwrap_or(&detail.spec.name),
+                    ),
+                    kernel_handle,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(result)) => Ok(result.response),
+                Ok(Err(error)) => Err(format!("{error}")),
+                Err(_) => Err("timed out after 180s".to_string()),
+            }
+        };
+
+        let end_time = Self::managed_task_now();
+        let next_run = self.derive_next_run_from_cron_job(detail.spec.cron_job_id.as_deref());
+        let current_run_no = detail.runtime.run_count + 1;
+        match execution {
+            Ok(output) => {
+                let (clean_output, structured_result) = Self::extract_task_result(&output);
+                let task_result = structured_result.as_ref();
+                if matches!(
+                    Self::task_result_status(task_result).as_deref(),
+                    Some("error" | "failed")
+                ) {
+                    let logical_error = Self::task_result_summary(task_result)
+                        .or_else(|| Self::task_result_details(task_result))
+                        .or_else(|| {
+                            let trimmed = clean_output.trim();
+                            (!trimmed.is_empty()).then(|| trimmed.to_string())
+                        })
+                        .unwrap_or_else(|| "任务执行失败".to_string());
+                    if let Some(job_id) = cron_job_id {
+                        self.cron_scheduler.record_failure(job_id, &logical_error);
+                        detail.runtime.consecutive_errors = self
+                            .cron_scheduler
+                            .get_meta(job_id)
+                            .map(|meta| meta.consecutive_errors)
+                            .unwrap_or(detail.runtime.consecutive_errors.saturating_add(1));
+                    } else {
+                        detail.runtime.consecutive_errors =
+                            detail.runtime.consecutive_errors.saturating_add(1);
+                    }
+                    detail.runtime.run_count = current_run_no;
+                    detail.runtime.last_run = Some(end_time.clone());
+                    detail.runtime.last_status = openfang_types::tasks::ManagedTaskStatus::Error;
+                    detail.runtime.last_error = Some(logical_error.clone());
+                    detail.runtime.latest_summary = Some(logical_error.clone());
+                    let disabled = detail.runtime.consecutive_errors >= 5;
+                    detail.runtime.state = if disabled {
+                        openfang_types::tasks::ManagedTaskState::Disabled
+                    } else if detail.spec.enabled {
+                        openfang_types::tasks::ManagedTaskState::Scheduled
+                    } else {
+                        openfang_types::tasks::ManagedTaskState::Paused
+                    };
+                    detail.runtime.next_run = if disabled { None } else { next_run };
+                    if disabled {
+                        detail.spec.enabled = false;
+                        detail.runtime.disabled_reason = Some("repeated_failures".to_string());
+                    }
+                    detail.spec.updated_at = end_time.clone();
+                    let run = openfang_types::tasks::ManagedTaskRun {
+                        id: run_id.clone(),
+                        task_id: task_id.to_string(),
+                        run_no: current_run_no,
+                        trigger_type: if manual {
+                            openfang_types::tasks::ManagedTaskRunTriggerType::Manual
+                        } else {
+                            openfang_types::tasks::ManagedTaskRunTriggerType::Schedule
+                        },
+                        status: openfang_types::tasks::ManagedTaskStatus::Error,
+                        output: if clean_output.trim().is_empty() {
+                            None
+                        } else {
+                            Some(clean_output.clone())
+                        },
+                        error: Some(logical_error.clone()),
+                        summary: Some(logical_error.clone()),
+                        start_time,
+                        end_time: Some(end_time.clone()),
+                    };
+                    let _ = self.memory.task_append_run(&run);
+                    let failed_event = Self::build_managed_task_event(
+                        task_id,
+                        Some(&run_id),
+                        openfang_types::tasks::ManagedTaskEventType::Failed,
+                        logical_error.clone(),
+                        serde_json::json!({
+                            "run_no": current_run_no,
+                            "disabled": disabled,
+                            "structured_result": structured_result,
+                        }),
+                    );
+                    let _ = self.memory.task_append_event(&failed_event);
+                    if detail.spec.binding.origin_chat_session_id.is_some() {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&failed_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::ChatMessage,
+                            format!("任务异常：{}", detail.spec.name),
+                            logical_error.clone(),
+                            serde_json::json!({
+                                "delivery_kind": "anomaly",
+                                "status": "failed",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                            }),
+                        );
+                    }
+                    let _ = self.append_managed_task_delivery(
+                        &detail,
+                        Some(&run_id),
+                        Some(&failed_event.id),
+                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                        format!("任务异常：{}", detail.spec.name),
+                        logical_error,
+                        serde_json::json!({
+                            "delivery_kind": "anomaly",
+                            "status": "failed",
+                            "task_name": detail.spec.name,
+                            "run_count": current_run_no,
+                        }),
+                    );
+                    self.memory
+                        .task_update(&detail.spec, &detail.runtime)
+                        .map_err(|e| format!("Managed task final update failed: {e}"))?;
+                    return self.hydrate_managed_task_detail(detail);
+                }
+                if let Some(job_id) = cron_job_id {
+                    self.cron_scheduler
+                        .record_success(job_id, Some(&clean_output));
+                }
+                let summary =
+                    Self::summarize_task_output(&clean_output, "任务执行成功", task_result);
+                detail.runtime.run_count = current_run_no;
+                detail.runtime.consecutive_errors = 0;
+                detail.runtime.last_run = Some(end_time.clone());
+                detail.runtime.last_status = openfang_types::tasks::ManagedTaskStatus::Ok;
+                detail.runtime.last_output = Some(summary.clone());
+                detail.runtime.latest_summary = Some(summary.clone());
+                let reached_max = detail
+                    .spec
+                    .max_runs
+                    .map(|max_runs| current_run_no >= max_runs)
+                    .unwrap_or(false);
+                let one_shot = detail.spec.schedule.kind.eq_ignore_ascii_case("at");
+                let completed = reached_max || one_shot;
+                detail.runtime.state = if completed {
+                    openfang_types::tasks::ManagedTaskState::Completed
+                } else if detail.spec.enabled {
+                    openfang_types::tasks::ManagedTaskState::Scheduled
+                } else {
+                    openfang_types::tasks::ManagedTaskState::Paused
+                };
+                detail.runtime.next_run = if completed { None } else { next_run };
+                if completed {
+                    detail.runtime.completed_at = Some(end_time.clone());
+                    detail.spec.enabled = false;
+                    if let Some(cron_job_id) = detail.spec.cron_job_id.clone() {
+                        if let Ok(parsed) = uuid::Uuid::parse_str(&cron_job_id) {
+                            let _ = self
+                                .cron_scheduler
+                                .set_enabled(openfang_types::scheduler::CronJobId(parsed), false);
+                        }
+                    }
+                }
+                detail.spec.updated_at = end_time.clone();
+                let run = openfang_types::tasks::ManagedTaskRun {
+                    id: run_id.clone(),
+                    task_id: task_id.to_string(),
+                    run_no: current_run_no,
+                    trigger_type: if manual {
+                        openfang_types::tasks::ManagedTaskRunTriggerType::Manual
+                    } else {
+                        openfang_types::tasks::ManagedTaskRunTriggerType::Schedule
+                    },
+                    status: openfang_types::tasks::ManagedTaskStatus::Ok,
+                    output: Some(clean_output.clone()),
+                    error: None,
+                    summary: Some(summary.clone()),
+                    start_time,
+                    end_time: Some(end_time.clone()),
+                };
+                let _ = self.memory.task_append_run(&run);
+                let succeeded_event = Self::build_managed_task_event(
+                    task_id,
+                    Some(&run_id),
+                    openfang_types::tasks::ManagedTaskEventType::Succeeded,
+                    summary.clone(),
+                    serde_json::json!({
+                        "run_no": current_run_no,
+                        "completed": completed,
+                        "structured_result": structured_result.clone(),
+                    }),
+                );
+                let _ = self.memory.task_append_event(&succeeded_event);
+                let emit_anomaly_notice = Self::should_emit_anomaly(
+                    &clean_output,
+                    task_result,
+                    detail.spec.report_condition.as_deref(),
+                );
+                if emit_anomaly_notice {
+                    let anomaly_event = Self::build_managed_task_event(
+                        task_id,
+                        Some(&run_id),
+                        openfang_types::tasks::ManagedTaskEventType::Anomaly,
+                        summary.clone(),
+                        serde_json::json!({
+                            "run_no": current_run_no,
+                            "output": clean_output,
+                            "structured_result": structured_result.clone(),
+                        }),
+                    );
+                    let _ = self.memory.task_append_event(&anomaly_event);
+                    if detail.spec.binding.origin_chat_session_id.is_some() {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&anomaly_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::ChatMessage,
+                            format!("任务异常：{}", detail.spec.name),
+                            summary.clone(),
+                            serde_json::json!({
+                                "delivery_kind": "anomaly",
+                                "status": "anomaly",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                            }),
+                        );
+                    }
+                    let _ = self.append_managed_task_delivery(
+                        &detail,
+                        Some(&run_id),
+                        Some(&anomaly_event.id),
+                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                        format!("任务异常：{}", detail.spec.name),
+                        summary.clone(),
+                        serde_json::json!({
+                            "delivery_kind": "anomaly",
+                            "status": "anomaly",
+                            "task_name": detail.spec.name,
+                            "run_count": current_run_no,
+                        }),
+                    );
+                }
+                if !completed
+                    && !emit_anomaly_notice
+                    && detail.spec.binding.origin_chat_session_id.is_none()
+                {
+                    let _ = self.append_managed_task_delivery(
+                        &detail,
+                        Some(&run_id),
+                        Some(&succeeded_event.id),
+                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                        format!("任务汇报：{}", detail.spec.name),
+                        summary.clone(),
+                        serde_json::json!({
+                            "delivery_kind": "progress",
+                            "status": "reported",
+                            "task_name": detail.spec.name,
+                            "run_count": current_run_no,
+                        }),
+                    );
+                }
+                if completed {
+                    let final_summary = summary.clone();
+                    let completed_event = Self::build_managed_task_event(
+                        task_id,
+                        Some(&run_id),
+                        openfang_types::tasks::ManagedTaskEventType::Completed,
+                        final_summary.clone(),
+                        serde_json::json!({
+                            "run_no": current_run_no,
+                            "task_name": detail.spec.name,
+                        }),
+                    );
+                    let _ = self.memory.task_append_event(&completed_event);
+                    if detail.spec.binding.origin_chat_session_id.is_some() {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&completed_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::ChatMessage,
+                            format!("任务完成：{}", detail.spec.name),
+                            final_summary.clone(),
+                            serde_json::json!({
+                                "delivery_kind": "final",
+                                "status": "completed",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                            }),
+                        );
+                    }
+                    let _ = self.append_managed_task_delivery(
+                        &detail,
+                        Some(&run_id),
+                        Some(&completed_event.id),
+                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                        format!("任务完成：{}", detail.spec.name),
+                        final_summary,
+                        serde_json::json!({
+                            "delivery_kind": "final",
+                            "status": "completed",
+                            "task_name": detail.spec.name,
+                            "run_count": current_run_no,
+                        }),
+                    );
+                }
+            }
+            Err(error) => {
+                if let Some(job_id) = cron_job_id {
+                    self.cron_scheduler.record_failure(job_id, &error);
+                    detail.runtime.consecutive_errors = self
+                        .cron_scheduler
+                        .get_meta(job_id)
+                        .map(|meta| meta.consecutive_errors)
+                        .unwrap_or(detail.runtime.consecutive_errors.saturating_add(1));
+                } else {
+                    detail.runtime.consecutive_errors =
+                        detail.runtime.consecutive_errors.saturating_add(1);
+                }
+                detail.runtime.run_count = current_run_no;
+                detail.runtime.last_run = Some(end_time.clone());
+                detail.runtime.last_status = openfang_types::tasks::ManagedTaskStatus::Error;
+                detail.runtime.last_error = Some(error.clone());
+                detail.runtime.latest_summary = Some(error.clone());
+                let disabled = detail.runtime.consecutive_errors >= 5;
+                detail.runtime.state = if disabled {
+                    openfang_types::tasks::ManagedTaskState::Disabled
+                } else if detail.spec.enabled {
+                    openfang_types::tasks::ManagedTaskState::Scheduled
+                } else {
+                    openfang_types::tasks::ManagedTaskState::Paused
+                };
+                detail.runtime.next_run = if disabled { None } else { next_run };
+                if disabled {
+                    detail.spec.enabled = false;
+                    detail.runtime.disabled_reason = Some("repeated_failures".to_string());
+                }
+                detail.spec.updated_at = end_time.clone();
+                let run = openfang_types::tasks::ManagedTaskRun {
+                    id: run_id.clone(),
+                    task_id: task_id.to_string(),
+                    run_no: current_run_no,
+                    trigger_type: if manual {
+                        openfang_types::tasks::ManagedTaskRunTriggerType::Manual
+                    } else {
+                        openfang_types::tasks::ManagedTaskRunTriggerType::Schedule
+                    },
+                    status: openfang_types::tasks::ManagedTaskStatus::Error,
+                    output: None,
+                    error: Some(error.clone()),
+                    summary: Some(error.clone()),
+                    start_time,
+                    end_time: Some(end_time.clone()),
+                };
+                let _ = self.memory.task_append_run(&run);
+                let failed_event = Self::build_managed_task_event(
+                    task_id,
+                    Some(&run_id),
+                    openfang_types::tasks::ManagedTaskEventType::Failed,
+                    error.clone(),
+                    serde_json::json!({
+                        "run_no": current_run_no,
+                        "disabled": disabled,
+                    }),
+                );
+                let _ = self.memory.task_append_event(&failed_event);
+                if detail.spec.binding.origin_chat_session_id.is_some() {
+                    let _ = self.append_managed_task_delivery(
+                        &detail,
+                        Some(&run_id),
+                        Some(&failed_event.id),
+                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::ChatMessage,
+                        format!("任务异常：{}", detail.spec.name),
+                        error.clone(),
+                        serde_json::json!({
+                            "delivery_kind": "anomaly",
+                            "task_name": detail.spec.name,
+                            "run_count": current_run_no,
+                        }),
+                    );
+                }
+                let _ = self.append_managed_task_delivery(
+                    &detail,
+                    Some(&run_id),
+                    Some(&failed_event.id),
+                    openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                    format!("任务异常：{}", detail.spec.name),
+                    error,
+                    serde_json::json!({
+                        "delivery_kind": "anomaly",
+                        "task_name": detail.spec.name,
+                        "run_count": current_run_no,
+                    }),
+                );
+            }
+        }
+
+        self.memory
+            .task_update(&detail.spec, &detail.runtime)
+            .map_err(|e| format!("Managed task final update failed: {e}"))?;
+        self.hydrate_managed_task_detail(detail)
+    }
+}
+
 #[async_trait]
 impl KernelHandle for OpenFangKernel {
     async fn spawn_agent(
@@ -6440,13 +7975,63 @@ impl KernelHandle for OpenFangKernel {
 
     fn get_agent_self_context(&self, agent_id: &str) -> Result<serde_json::Value, String> {
         let agent = resolve_agent_entry_for_collaboration(&self.registry, agent_id)?;
+        let embodiment = agent
+            .manifest
+            .workspace
+            .as_ref()
+            .and_then(|path| read_embodiment_value(path))
+            .unwrap_or_else(|| serde_json::json!({}));
+        let portrait_url = embodiment
+            .get("assets")
+            .and_then(|value| value.get("defaultPortrait"))
+            .and_then(|value| value.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| agent.identity.portrait_url.clone());
+        let tts_config = embodiment
+            .get("voice")
+            .and_then(|value| value.get("defaultVoice"))
+            .and_then(|value| value.get("speakerProfileId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|speaker_profile_id| {
+                serde_json::json!({
+                    "speakerProfileId": speaker_profile_id
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({}));
+        let speaker_profiles = embodiment
+            .get("voice")
+            .and_then(|value| value.get("defaultVoice"))
+            .and_then(|value| {
+                let speaker_profile_id = value
+                    .get("speakerProfileId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())?;
+                Some(serde_json::json!([{
+                    "id": speaker_profile_id,
+                    "name": value
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(speaker_profile_id)
+                }]))
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
         Ok(serde_json::json!({
             "agent_id": agent.id.to_string(),
             "name": agent.name,
             "workspace": agent.manifest.workspace.as_ref().map(|path| path.to_string_lossy().to_string()),
             "system_prompt": agent.manifest.model.system_prompt,
             "avatar_url": agent.identity.avatar_url,
+            "portrait_url": portrait_url,
             "color": agent.identity.color,
+            "embodiment": embodiment,
+            "tts_config": tts_config,
+            "speaker_profiles": speaker_profiles,
         }))
     }
 
@@ -6474,7 +8059,10 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| e.to_string())?;
         }
 
-        if patch_obj.contains_key("avatar_url") || patch_obj.contains_key("color") {
+        if patch_obj.contains_key("avatar_url")
+            || patch_obj.contains_key("portrait_url")
+            || patch_obj.contains_key("color")
+        {
             let mut identity = agent.identity.clone();
             if let Some(avatar_url) = patch_obj.get("avatar_url") {
                 identity.avatar_url = match avatar_url {
@@ -6488,6 +8076,20 @@ impl KernelHandle for OpenFangKernel {
                         }
                     }
                     _ => return Err("avatar_url must be a string or null".to_string()),
+                };
+            }
+            if let Some(portrait_url) = patch_obj.get("portrait_url") {
+                identity.portrait_url = match portrait_url {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(value) => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    _ => return Err("portrait_url must be a string or null".to_string()),
                 };
             }
             if let Some(color) = patch_obj.get("color") {
@@ -7471,6 +9073,46 @@ impl KernelHandle for OpenFangKernel {
             &api_key,
         )
         .await
+    }
+
+    async fn generate_video_with_agent_model(
+        &self,
+        agent_id: &str,
+        _request: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let agent_id: AgentId = agent_id
+            .parse()
+            .map_err(|_| format!("Invalid agent id: {agent_id}"))?;
+        let entry = self
+            .registry
+            .get(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+        let provider = entry.manifest.model.provider.trim();
+        let model_name = entry.manifest.model.model.trim();
+        Err(format!(
+            "当前模型 '{}' (provider: {}) 尚未接入原生视频生成能力",
+            model_name, provider
+        ))
+    }
+
+    async fn edit_video_with_agent_model(
+        &self,
+        agent_id: &str,
+        _request: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let agent_id: AgentId = agent_id
+            .parse()
+            .map_err(|_| format!("Invalid agent id: {agent_id}"))?;
+        let entry = self
+            .registry
+            .get(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+        let provider = entry.manifest.model.provider.trim();
+        let model_name = entry.manifest.model.model.trim();
+        Err(format!(
+            "当前模型 '{}' (provider: {}) 尚未接入原生视频编辑能力",
+            model_name, provider
+        ))
     }
 
     async fn spawn_agent_checked(

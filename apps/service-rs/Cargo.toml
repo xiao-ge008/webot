@@ -8,13 +8,16 @@ description = "Rust management gateway aligned with OpenFang official API"
 axum = { version = "0.8", features = ["macros", "json", "multipart"] }
 base64 = "0.22"
 bytes = "1"
+chrono = { version = "0.4", features = ["clock"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
@@ -22,3 +25,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "2.2.0", default-features = false, features = ["deflate"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(not(all(target_os = "windows", target_env = "gnu")))'.dependencies]
+paddle-ocr-rs = "0.6.1"

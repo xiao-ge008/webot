@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use rusqlite::{params, types::Value as SqlValue, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -172,31 +172,6 @@ pub struct ChatGroupRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct TaskRuntimeBindingRecord {
-    pub task_id: String,
-    pub owner_agent_id: String,
-    pub runtime_key: Option<String>,
-    pub source_type: String,
-    pub display_name: Option<String>,
-    pub origin_conversation_type: Option<String>,
-    pub origin_conversation_id: Option<String>,
-    pub origin_chat_session_id: Option<String>,
-    pub origin_message_id: Option<String>,
-    pub creator_participant_id: Option<String>,
-    pub creator_participant_name: Option<String>,
-    pub executor_agent_id: Option<String>,
-    pub executor_agent_name: Option<String>,
-    pub report_actor_agent_id: Option<String>,
-    pub report_actor_agent_name: Option<String>,
-    pub max_runs: Option<i64>,
-    pub final_summary_prompt: Option<String>,
-    pub notify_on_final: bool,
-    pub metadata: Value,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct TaskDeliveryRecord {
     pub id: String,
     pub task_id: String,
@@ -224,6 +199,110 @@ pub struct TaskDeliveryRecord {
     pub updated_at: String,
     pub reported_at: Option<String>,
     pub acknowledged_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityDescriptorRecord {
+    pub key: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityProviderRecord {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub display_name: Option<String>,
+    pub capabilities: Vec<CapabilityDescriptorRecord>,
+    pub supported_scopes: Vec<String>,
+    pub priority: i64,
+    pub requirements: Value,
+    pub supports_job: bool,
+    pub enabled: bool,
+    pub health_state: String,
+    pub input_contract: Value,
+    pub output_contract: Value,
+    pub metadata: Value,
+    pub is_removed: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityProviderBindingRecord {
+    pub capability_key: String,
+    pub capability_scope: String,
+    pub provider_id: String,
+    pub enabled: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCapabilityBindingRecord {
+    pub agent_id: String,
+    pub capability_key: String,
+    pub capability_scope: String,
+    pub provider_id: Option<String>,
+    pub binding_type: String,
+    pub enabled: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RendererBindingRecord {
+    pub channel: String,
+    pub result_kind: String,
+    pub media_type: Option<String>,
+    pub document_type: Option<String>,
+    pub renderer_key: String,
+    pub enabled: bool,
+    pub fallback_channel: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHealthStateRecord {
+    pub provider_id: String,
+    pub health_state: String,
+    pub message: Option<String>,
+    pub checked_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityAuditLogRecord {
+    pub id: String,
+    pub event_type: String,
+    pub provider_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub capability_key: Option<String>,
+    pub capability_scope: Option<String>,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityJobRecord {
+    pub job_id: String,
+    pub owner_agent_id: String,
+    pub capability_key: String,
+    pub capability_scope: String,
+    pub provider_id: Option<String>,
+    pub provider_type: Option<String>,
+    pub route: Option<String>,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub status: String,
+    pub progress_percent: Option<f64>,
+    pub stage: Option<String>,
+    pub job_type: Option<String>,
+    pub input_payload: Value,
+    pub result_payload: Value,
+    pub error_message: Option<String>,
+    pub metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub last_heartbeat_at: Option<String>,
 }
 
 pub fn normalize_provider_id(value: &str) -> String {
@@ -500,6 +579,115 @@ pub fn ensure_db() -> Result<PathBuf, String> {
         CREATE INDEX IF NOT EXISTS idx_media_assets_sha256
             ON media_assets(sha256);
 
+        CREATE TABLE IF NOT EXISTS capability_providers (
+            provider_id TEXT PRIMARY KEY,
+            provider_type TEXT NOT NULL,
+            display_name TEXT NULL,
+            capabilities_json TEXT NOT NULL DEFAULT '[]',
+            supported_scopes_json TEXT NOT NULL DEFAULT '[]',
+            priority INTEGER NOT NULL DEFAULT 100,
+            requirements_json TEXT NOT NULL DEFAULT '{}',
+            supports_job INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            health_state TEXT NOT NULL DEFAULT 'unknown',
+            input_contract_json TEXT NOT NULL DEFAULT '{}',
+            output_contract_json TEXT NOT NULL DEFAULT '{}',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            is_removed INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS capability_provider_bindings (
+            capability_key TEXT NOT NULL,
+            capability_scope TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (capability_key, capability_scope, provider_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_capability_provider_bindings_provider
+            ON capability_provider_bindings(provider_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS agent_capability_bindings (
+            agent_id TEXT NOT NULL,
+            capability_key TEXT NOT NULL,
+            capability_scope TEXT NOT NULL,
+            provider_id TEXT NOT NULL DEFAULT '',
+            binding_type TEXT NOT NULL DEFAULT 'capability',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (agent_id, capability_key, capability_scope, provider_id, binding_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_capability_bindings_agent
+            ON agent_capability_bindings(agent_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS renderer_bindings (
+            channel TEXT NOT NULL,
+            result_kind TEXT NOT NULL,
+            media_type TEXT NOT NULL DEFAULT '',
+            document_type TEXT NOT NULL DEFAULT '',
+            renderer_key TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            fallback_channel TEXT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (channel, result_kind, media_type, document_type)
+        );
+
+        CREATE TABLE IF NOT EXISTS provider_health_state (
+            provider_id TEXT PRIMARY KEY,
+            health_state TEXT NOT NULL DEFAULT 'unknown',
+            message TEXT NULL,
+            checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS capability_audit_logs (
+            id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            provider_id TEXT NULL,
+            agent_id TEXT NULL,
+            capability_key TEXT NULL,
+            capability_scope TEXT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_capability_audit_logs_created
+            ON capability_audit_logs(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS capability_jobs (
+            job_id TEXT PRIMARY KEY,
+            owner_agent_id TEXT NOT NULL,
+            capability_key TEXT NOT NULL,
+            capability_scope TEXT NOT NULL DEFAULT 'generic',
+            provider_id TEXT NULL,
+            provider_type TEXT NULL,
+            route TEXT NULL,
+            title TEXT NULL,
+            summary TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            progress_percent REAL NULL,
+            stage TEXT NULL,
+            job_type TEXT NULL,
+            input_payload_json TEXT NOT NULL DEFAULT '{}',
+            result_payload_json TEXT NOT NULL DEFAULT '{}',
+            error_message TEXT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT NULL,
+            finished_at TEXT NULL,
+            last_heartbeat_at TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_capability_jobs_owner_updated
+            ON capability_jobs(owner_agent_id, updated_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_capability_jobs_status_updated
+            ON capability_jobs(status, updated_at DESC);
+
         CREATE TABLE IF NOT EXISTS hidden_agents (
             agent_id TEXT PRIMARY KEY,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -538,36 +726,6 @@ pub fn ensure_db() -> Result<PathBuf, String> {
         CREATE INDEX IF NOT EXISTS idx_chat_group_admins_group_id
             ON chat_group_admins(group_id);
 
-        CREATE TABLE IF NOT EXISTS task_runtime_bindings (
-            task_id TEXT PRIMARY KEY,
-            owner_agent_id TEXT NOT NULL,
-            runtime_key TEXT NULL,
-            source_type TEXT NOT NULL DEFAULT 'custom',
-            display_name TEXT NULL,
-            origin_conversation_type TEXT NULL,
-            origin_conversation_id TEXT NULL,
-            origin_chat_session_id TEXT NULL,
-            origin_message_id TEXT NULL,
-            creator_participant_id TEXT NULL,
-            creator_participant_name TEXT NULL,
-            executor_agent_id TEXT NULL,
-            executor_agent_name TEXT NULL,
-            report_actor_agent_id TEXT NULL,
-            report_actor_agent_name TEXT NULL,
-            max_runs INTEGER NULL,
-            final_summary_prompt TEXT NULL,
-            notify_on_final INTEGER NOT NULL DEFAULT 1,
-            metadata_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_task_runtime_bindings_runtime_key
-            ON task_runtime_bindings(runtime_key);
-
-        CREATE INDEX IF NOT EXISTS idx_task_runtime_bindings_owner_agent
-            ON task_runtime_bindings(owner_agent_id);
-
         CREATE TABLE IF NOT EXISTS task_deliveries (
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
@@ -605,6 +763,8 @@ pub fn ensure_db() -> Result<PathBuf, String> {
 
         CREATE INDEX IF NOT EXISTS idx_task_deliveries_session_status
             ON task_deliveries(origin_chat_session_id, status, created_at DESC);
+
+        DROP TABLE IF EXISTS task_runtime_bindings;
         "#,
     )
     .map_err(|e| format!("初始化数据库结构失败: {e}"))?;
@@ -854,7 +1014,12 @@ pub fn bootstrap_storage() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{make_model_id, normalize_model_id, normalize_provider_id};
+    use super::{
+        capability_job_is_placeholder, capability_job_status_rank, make_model_id,
+        merge_capability_job_records, normalize_model_id, normalize_provider_id,
+        CapabilityJobRecord,
+    };
+    use serde_json::json;
 
     #[test]
     fn normalize_provider_id_only_trims() {
@@ -871,6 +1036,222 @@ mod tests {
         assert_eq!(
             make_model_id("nvidia-nim", "xianyu/glm-4.7"),
             "nvidia-nim::xianyu/glm-4.7"
+        );
+    }
+
+    #[test]
+    fn capability_job_placeholder_detection_matches_frontend_clobber_shape() {
+        let record = CapabilityJobRecord {
+            job_id: "job-1".to_string(),
+            owner_agent_id: "agent-1".to_string(),
+            capability_key: "generate.video".to_string(),
+            capability_scope: "generic".to_string(),
+            provider_id: Some("component_skill:image2video".to_string()),
+            provider_type: Some("component_skill".to_string()),
+            route: Some("component_skill".to_string()),
+            title: Some("LTX2.3图片生成视频".to_string()),
+            summary: Some("LTX2.3图片生成视频 已提交，正在生成视频".to_string()),
+            status: "queued".to_string(),
+            progress_percent: None,
+            stage: Some("dispatching".to_string()),
+            job_type: Some("video".to_string()),
+            input_payload: json!({}),
+            result_payload: json!({}),
+            error_message: None,
+            metadata: json!({
+                "componentEnglishName": "image2video",
+                "dispatchPending": true
+            }),
+            created_at: String::new(),
+            updated_at: String::new(),
+            started_at: None,
+            finished_at: None,
+            last_heartbeat_at: None,
+        };
+
+        assert!(capability_job_is_placeholder(&record));
+        assert_eq!(capability_job_status_rank(&record.status), 0);
+    }
+
+    #[test]
+    fn merge_capability_job_records_keeps_richer_submitted_component_state() {
+        let existing = CapabilityJobRecord {
+            job_id: "job-2".to_string(),
+            owner_agent_id: "agent-1".to_string(),
+            capability_key: "generate.video".to_string(),
+            capability_scope: "generic".to_string(),
+            provider_id: Some("component_skill:image2video".to_string()),
+            provider_type: Some("component_skill".to_string()),
+            route: Some("component_skill".to_string()),
+            title: Some("LTX2.3图片生成视频".to_string()),
+            summary: Some("LTX2.3图片生成视频 已提交到 ComfyUI，正在生成视频".to_string()),
+            status: "running".to_string(),
+            progress_percent: None,
+            stage: Some("submitted".to_string()),
+            job_type: Some("video".to_string()),
+            input_payload: json!({}),
+            result_payload: json!({
+                "presentable_result": {
+                    "kind": "job_result",
+                    "job_id": "job-2",
+                    "status": "running"
+                },
+                "raw": {
+                    "prompt_id": "remote-1"
+                }
+            }),
+            error_message: None,
+            metadata: json!({
+                "componentEnglishName": "image2video",
+                "dispatchPending": false,
+                "providerRequestId": "remote-1"
+            }),
+            created_at: String::new(),
+            updated_at: String::new(),
+            started_at: Some("2026-03-27 08:00:00".to_string()),
+            finished_at: None,
+            last_heartbeat_at: Some("2026-03-27 08:00:02".to_string()),
+        };
+        let incoming = CapabilityJobRecord {
+            job_id: "job-2".to_string(),
+            owner_agent_id: "agent-1".to_string(),
+            capability_key: "generate.video".to_string(),
+            capability_scope: "generic".to_string(),
+            provider_id: Some("component_skill:image2video".to_string()),
+            provider_type: Some("component_skill".to_string()),
+            route: Some("component_skill".to_string()),
+            title: Some("LTX2.3图片生成视频".to_string()),
+            summary: Some("LTX2.3图片生成视频 已提交，正在生成视频".to_string()),
+            status: "queued".to_string(),
+            progress_percent: None,
+            stage: Some("dispatching".to_string()),
+            job_type: Some("video".to_string()),
+            input_payload: json!({}),
+            result_payload: json!({}),
+            error_message: None,
+            metadata: json!({
+                "componentEnglishName": "image2video",
+                "dispatchPending": true
+            }),
+            created_at: String::new(),
+            updated_at: String::new(),
+            started_at: None,
+            finished_at: None,
+            last_heartbeat_at: None,
+        };
+
+        let merged = merge_capability_job_records(&existing, incoming);
+        assert_eq!(merged.status, "running");
+        assert_eq!(merged.stage.as_deref(), Some("submitted"));
+        assert_eq!(
+            merged
+                .metadata
+                .get("providerRequestId")
+                .and_then(|value| value.as_str()),
+            Some("remote-1")
+        );
+        assert_eq!(
+            merged
+                .result_payload
+                .get("presentable_result")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("job_result")
+        );
+        assert_eq!(
+            merged
+                .metadata
+                .get("dispatchPending")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn merge_capability_job_records_keeps_dispatch_pending_false_sticky() {
+        let existing = CapabilityJobRecord {
+            job_id: "job-3".to_string(),
+            owner_agent_id: "agent-1".to_string(),
+            capability_key: "generate.video".to_string(),
+            capability_scope: "generic".to_string(),
+            provider_id: Some("component_skill:image2video".to_string()),
+            provider_type: Some("component_skill".to_string()),
+            route: Some("component_skill".to_string()),
+            title: Some("LTX2.3图片生成视频".to_string()),
+            summary: Some("已提交到 ComfyUI".to_string()),
+            status: "running".to_string(),
+            progress_percent: None,
+            stage: Some("submitted".to_string()),
+            job_type: Some("video".to_string()),
+            input_payload: json!({}),
+            result_payload: json!({
+                "presentable_result": {
+                    "kind": "job_result",
+                    "job_id": "job-3",
+                    "status": "running"
+                }
+            }),
+            error_message: None,
+            metadata: json!({
+                "dispatchPending": false,
+                "providerRequestId": "remote-3",
+                "source": "component_center"
+            }),
+            created_at: String::new(),
+            updated_at: String::new(),
+            started_at: Some("2026-03-27 08:00:00".to_string()),
+            finished_at: None,
+            last_heartbeat_at: Some("2026-03-27 08:00:02".to_string()),
+        };
+        let incoming = CapabilityJobRecord {
+            job_id: "job-3".to_string(),
+            owner_agent_id: "agent-1".to_string(),
+            capability_key: "generate.video".to_string(),
+            capability_scope: "generic".to_string(),
+            provider_id: Some("component_skill:image2video".to_string()),
+            provider_type: Some("component_skill".to_string()),
+            route: Some("component_skill".to_string()),
+            title: Some("LTX2.3图片生成视频".to_string()),
+            summary: Some("已提交，正在生成视频".to_string()),
+            status: "running".to_string(),
+            progress_percent: None,
+            stage: Some("submitted".to_string()),
+            job_type: Some("video".to_string()),
+            input_payload: json!({}),
+            result_payload: json!({
+                "presentable_result": {
+                    "kind": "job_result",
+                    "job_id": "job-3",
+                    "status": "running"
+                }
+            }),
+            error_message: None,
+            metadata: json!({
+                "dispatchPending": true,
+                "providerRequestId": "remote-3",
+                "source": "openfang_runtime"
+            }),
+            created_at: String::new(),
+            updated_at: String::new(),
+            started_at: Some("2026-03-27 08:00:00".to_string()),
+            finished_at: None,
+            last_heartbeat_at: Some("2026-03-27 08:00:03".to_string()),
+        };
+
+        let merged = merge_capability_job_records(&existing, incoming);
+        assert_eq!(
+            merged
+                .metadata
+                .get("dispatchPending")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            merged
+                .metadata
+                .get("providerRequestId")
+                .and_then(|value| value.as_str()),
+            Some("remote-3")
         );
     }
 }
@@ -2042,8 +2423,7 @@ pub fn upsert_agent_profile_override(
     };
     let speaker_profiles_json = match merged_speaker_profiles {
         Some(value) => Some(
-            serde_json::to_string(&value)
-                .map_err(|e| format!("序列化音色样本 JSON 失败: {e}"))?,
+            serde_json::to_string(&value).map_err(|e| format!("序列化音色样本 JSON 失败: {e}"))?,
         ),
         None => None,
     };
@@ -2698,138 +3078,6 @@ pub fn upsert_agent_context_file(
     Ok(())
 }
 
-pub fn upsert_task_runtime_binding(record: &TaskRuntimeBindingRecord) -> Result<(), String> {
-    let task_id = record.task_id.trim();
-    if task_id.is_empty() {
-        return Err("task_id 不能为空".to_string());
-    }
-    let owner_agent_id = record.owner_agent_id.trim();
-    if owner_agent_id.is_empty() {
-        return Err("owner_agent_id 不能为空".to_string());
-    }
-    let metadata_json = serde_json::to_string(&record.metadata)
-        .map_err(|e| format!("序列化任务元数据失败: {e}"))?;
-    let conn = open_conn()?;
-    conn.execute(
-        r#"
-        INSERT INTO task_runtime_bindings(
-            task_id,
-            owner_agent_id,
-            runtime_key,
-            source_type,
-            display_name,
-            origin_conversation_type,
-            origin_conversation_id,
-            origin_chat_session_id,
-            origin_message_id,
-            creator_participant_id,
-            creator_participant_name,
-            executor_agent_id,
-            executor_agent_name,
-            report_actor_agent_id,
-            report_actor_agent_name,
-            max_runs,
-            final_summary_prompt,
-            notify_on_final,
-            metadata_json,
-            created_at,
-            updated_at
-        )
-        VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-        )
-        ON CONFLICT(task_id) DO UPDATE SET
-            owner_agent_id = excluded.owner_agent_id,
-            runtime_key = excluded.runtime_key,
-            source_type = excluded.source_type,
-            display_name = excluded.display_name,
-            origin_conversation_type = excluded.origin_conversation_type,
-            origin_conversation_id = excluded.origin_conversation_id,
-            origin_chat_session_id = excluded.origin_chat_session_id,
-            origin_message_id = excluded.origin_message_id,
-            creator_participant_id = excluded.creator_participant_id,
-            creator_participant_name = excluded.creator_participant_name,
-            executor_agent_id = excluded.executor_agent_id,
-            executor_agent_name = excluded.executor_agent_name,
-            report_actor_agent_id = excluded.report_actor_agent_id,
-            report_actor_agent_name = excluded.report_actor_agent_name,
-            max_runs = excluded.max_runs,
-            final_summary_prompt = excluded.final_summary_prompt,
-            notify_on_final = excluded.notify_on_final,
-            metadata_json = excluded.metadata_json,
-            updated_at = CURRENT_TIMESTAMP
-        "#,
-        params![
-            task_id,
-            owner_agent_id,
-            record.runtime_key.as_deref(),
-            record.source_type.trim(),
-            record.display_name.as_deref(),
-            record.origin_conversation_type.as_deref(),
-            record.origin_conversation_id.as_deref(),
-            record.origin_chat_session_id.as_deref(),
-            record.origin_message_id.as_deref(),
-            record.creator_participant_id.as_deref(),
-            record.creator_participant_name.as_deref(),
-            record.executor_agent_id.as_deref(),
-            record.executor_agent_name.as_deref(),
-            record.report_actor_agent_id.as_deref(),
-            record.report_actor_agent_name.as_deref(),
-            record.max_runs,
-            record.final_summary_prompt.as_deref(),
-            if record.notify_on_final { 1 } else { 0 },
-            metadata_json,
-        ],
-    )
-    .map_err(|e| format!("写入任务元数据失败: {e}"))?;
-    Ok(())
-}
-
-pub fn get_task_runtime_binding(task_id: &str) -> Result<Option<TaskRuntimeBindingRecord>, String> {
-    let conn = open_conn()?;
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT
-                task_id,
-                owner_agent_id,
-                runtime_key,
-                source_type,
-                display_name,
-                origin_conversation_type,
-                origin_conversation_id,
-                origin_chat_session_id,
-                origin_message_id,
-                creator_participant_id,
-                creator_participant_name,
-                executor_agent_id,
-                executor_agent_name,
-                report_actor_agent_id,
-                report_actor_agent_name,
-                max_runs,
-                final_summary_prompt,
-                notify_on_final,
-                metadata_json,
-                created_at,
-                updated_at
-            FROM task_runtime_bindings
-            WHERE task_id = ?1
-            "#,
-        )
-        .map_err(|e| format!("准备查询任务元数据失败: {e}"))?;
-    let mut rows = stmt
-        .query(params![task_id.trim()])
-        .map_err(|e| format!("执行任务元数据查询失败: {e}"))?;
-    let Some(row) = rows
-        .next()
-        .map_err(|e| format!("读取任务元数据失败: {e}"))?
-    else {
-        return Ok(None);
-    };
-    map_task_runtime_binding_row(row).map(Some)
-}
-
 pub fn create_or_update_task_delivery(record: &TaskDeliveryRecord) -> Result<(), String> {
     let delivery_id = record.id.trim();
     if delivery_id.is_empty() {
@@ -3082,78 +3330,6 @@ pub fn mark_task_delivery_status(delivery_id: &str, status: &str) -> Result<(), 
     )
     .map_err(|e| format!("更新任务投递状态失败: {e}"))?;
     Ok(())
-}
-
-fn map_task_runtime_binding_row(
-    row: &rusqlite::Row<'_>,
-) -> Result<TaskRuntimeBindingRecord, String> {
-    let metadata_json: String = row
-        .get(18)
-        .map_err(|e| format!("读取任务元数据 JSON 失败: {e}"))?;
-    let metadata =
-        serde_json::from_str(&metadata_json).unwrap_or(Value::Object(Default::default()));
-    Ok(TaskRuntimeBindingRecord {
-        task_id: row.get(0).map_err(|e| format!("读取 task_id 失败: {e}"))?,
-        owner_agent_id: row
-            .get(1)
-            .map_err(|e| format!("读取 owner_agent_id 失败: {e}"))?,
-        runtime_key: row
-            .get(2)
-            .map_err(|e| format!("读取 runtime_key 失败: {e}"))?,
-        source_type: row
-            .get(3)
-            .map_err(|e| format!("读取 source_type 失败: {e}"))?,
-        display_name: row
-            .get(4)
-            .map_err(|e| format!("读取 display_name 失败: {e}"))?,
-        origin_conversation_type: row
-            .get(5)
-            .map_err(|e| format!("读取 origin_conversation_type 失败: {e}"))?,
-        origin_conversation_id: row
-            .get(6)
-            .map_err(|e| format!("读取 origin_conversation_id 失败: {e}"))?,
-        origin_chat_session_id: row
-            .get(7)
-            .map_err(|e| format!("读取 origin_chat_session_id 失败: {e}"))?,
-        origin_message_id: row
-            .get(8)
-            .map_err(|e| format!("读取 origin_message_id 失败: {e}"))?,
-        creator_participant_id: row
-            .get(9)
-            .map_err(|e| format!("读取 creator_participant_id 失败: {e}"))?,
-        creator_participant_name: row
-            .get(10)
-            .map_err(|e| format!("读取 creator_participant_name 失败: {e}"))?,
-        executor_agent_id: row
-            .get(11)
-            .map_err(|e| format!("读取 executor_agent_id 失败: {e}"))?,
-        executor_agent_name: row
-            .get(12)
-            .map_err(|e| format!("读取 executor_agent_name 失败: {e}"))?,
-        report_actor_agent_id: row
-            .get(13)
-            .map_err(|e| format!("读取 report_actor_agent_id 失败: {e}"))?,
-        report_actor_agent_name: row
-            .get(14)
-            .map_err(|e| format!("读取 report_actor_agent_name 失败: {e}"))?,
-        max_runs: row
-            .get(15)
-            .map_err(|e| format!("读取 max_runs 失败: {e}"))?,
-        final_summary_prompt: row
-            .get(16)
-            .map_err(|e| format!("读取 final_summary_prompt 失败: {e}"))?,
-        notify_on_final: row
-            .get::<_, i64>(17)
-            .map_err(|e| format!("读取 notify_on_final 失败: {e}"))?
-            != 0,
-        metadata,
-        created_at: row
-            .get(19)
-            .map_err(|e| format!("读取 created_at 失败: {e}"))?,
-        updated_at: row
-            .get(20)
-            .map_err(|e| format!("读取 updated_at 失败: {e}"))?,
-    })
 }
 
 fn map_task_delivery_row(row: &rusqlite::Row<'_>) -> Result<TaskDeliveryRecord, rusqlite::Error> {
@@ -3511,6 +3687,1292 @@ pub fn list_media_assets(filter: MediaAssetListQuery) -> Result<Vec<MediaAssetRe
         output.push(row.map_err(|e| format!("解析媒体资产列表失败: {e}"))?);
     }
     Ok(output)
+}
+
+pub fn upsert_capability_provider(
+    record: CapabilityProviderRecord,
+) -> Result<CapabilityProviderRecord, String> {
+    let conn = open_conn()?;
+    let normalized = normalize_capability_provider_record(record)?;
+    conn.execute(
+        r#"
+        INSERT INTO capability_providers(
+            provider_id,
+            provider_type,
+            display_name,
+            capabilities_json,
+            supported_scopes_json,
+            priority,
+            requirements_json,
+            supports_job,
+            enabled,
+            health_state,
+            input_contract_json,
+            output_contract_json,
+            metadata_json,
+            is_removed,
+            updated_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(provider_id) DO UPDATE SET
+            provider_type = excluded.provider_type,
+            display_name = excluded.display_name,
+            capabilities_json = excluded.capabilities_json,
+            supported_scopes_json = excluded.supported_scopes_json,
+            priority = excluded.priority,
+            requirements_json = excluded.requirements_json,
+            supports_job = excluded.supports_job,
+            enabled = excluded.enabled,
+            health_state = excluded.health_state,
+            input_contract_json = excluded.input_contract_json,
+            output_contract_json = excluded.output_contract_json,
+            metadata_json = excluded.metadata_json,
+            is_removed = excluded.is_removed,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            normalized.provider_id,
+            normalized.provider_type,
+            normalized.display_name,
+            serde_json::to_string(&normalized.capabilities)
+                .map_err(|e| format!("序列化 capability provider capabilities 失败: {e}"))?,
+            serde_json::to_string(&normalized.supported_scopes)
+                .map_err(|e| format!("序列化 capability provider scopes 失败: {e}"))?,
+            normalized.priority,
+            normalized.requirements.to_string(),
+            if normalized.supports_job { 1 } else { 0 },
+            if normalized.enabled { 1 } else { 0 },
+            normalized.health_state,
+            normalized.input_contract.to_string(),
+            normalized.output_contract.to_string(),
+            normalized.metadata.to_string(),
+            if normalized.is_removed { 1 } else { 0 },
+        ],
+    )
+    .map_err(|e| format!("写入 capability provider 失败: {e}"))?;
+    get_capability_provider(&normalized.provider_id)?
+        .ok_or_else(|| "capability provider 写入后读取失败".to_string())
+}
+
+pub fn get_capability_provider(
+    provider_id: &str,
+) -> Result<Option<CapabilityProviderRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                provider_id,
+                provider_type,
+                display_name,
+                capabilities_json,
+                supported_scopes_json,
+                priority,
+                requirements_json,
+                supports_job,
+                enabled,
+                health_state,
+                input_contract_json,
+                output_contract_json,
+                metadata_json,
+                is_removed,
+                updated_at
+            FROM capability_providers
+            WHERE provider_id = ?1
+            LIMIT 1
+            "#,
+        )
+        .map_err(|e| format!("准备查询 capability provider 失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![provider_id.trim()])
+        .map_err(|e| format!("读取 capability provider 失败: {e}"))?;
+    rows.next()
+        .map_err(|e| format!("读取 capability provider 结果失败: {e}"))?
+        .map(parse_capability_provider_row)
+        .transpose()
+        .map_err(|e| format!("解析 capability provider 失败: {e}"))
+}
+
+pub fn list_capability_providers(
+    include_removed: bool,
+) -> Result<Vec<CapabilityProviderRecord>, String> {
+    let conn = open_conn()?;
+    let mut sql = String::from(
+        r#"
+        SELECT
+            provider_id,
+            provider_type,
+            display_name,
+            capabilities_json,
+            supported_scopes_json,
+            priority,
+            requirements_json,
+            supports_job,
+            enabled,
+            health_state,
+            input_contract_json,
+            output_contract_json,
+            metadata_json,
+            is_removed,
+            updated_at
+        FROM capability_providers
+        "#,
+    );
+    if !include_removed {
+        sql.push_str(" WHERE is_removed = 0");
+    }
+    sql.push_str(" ORDER BY priority ASC, provider_id ASC");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备 capability provider 列表失败: {e}"))?;
+    let rows = stmt
+        .query_map([], parse_capability_provider_row)
+        .map_err(|e| format!("查询 capability provider 列表失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析 capability provider 列表失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn upsert_capability_provider_binding(
+    record: CapabilityProviderBindingRecord,
+) -> Result<CapabilityProviderBindingRecord, String> {
+    let conn = open_conn()?;
+    let normalized = normalize_capability_provider_binding_record(record)?;
+    conn.execute(
+        r#"
+        INSERT INTO capability_provider_bindings(
+            capability_key,
+            capability_scope,
+            provider_id,
+            enabled,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+        ON CONFLICT(capability_key, capability_scope, provider_id) DO UPDATE SET
+            enabled = excluded.enabled,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            normalized.capability_key,
+            normalized.capability_scope,
+            normalized.provider_id,
+            if normalized.enabled { 1 } else { 0 },
+        ],
+    )
+    .map_err(|e| format!("写入 capability provider binding 失败: {e}"))?;
+    Ok(normalized)
+}
+
+pub fn delete_capability_provider_binding(
+    capability_key: &str,
+    capability_scope: &str,
+    provider_id: &str,
+) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        DELETE FROM capability_provider_bindings
+        WHERE capability_key = ?1 AND capability_scope = ?2 AND provider_id = ?3
+        "#,
+        params![
+            normalize_capability_key(capability_key),
+            normalize_capability_scope(capability_scope),
+            normalize_required_text(provider_id, "provider_id")?,
+        ],
+    )
+    .map_err(|e| format!("删除 capability provider binding 失败: {e}"))?;
+    Ok(())
+}
+
+pub fn list_capability_provider_bindings() -> Result<Vec<CapabilityProviderBindingRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT capability_key, capability_scope, provider_id, enabled, updated_at
+            FROM capability_provider_bindings
+            ORDER BY capability_key ASC, capability_scope ASC, provider_id ASC
+            "#,
+        )
+        .map_err(|e| format!("准备 capability provider binding 列表失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CapabilityProviderBindingRecord {
+                capability_key: row.get(0)?,
+                capability_scope: row.get(1)?,
+                provider_id: row.get(2)?,
+                enabled: row.get::<_, i64>(3)? != 0,
+                updated_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("查询 capability provider binding 列表失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析 capability provider binding 失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn upsert_agent_capability_binding(
+    record: AgentCapabilityBindingRecord,
+) -> Result<AgentCapabilityBindingRecord, String> {
+    let conn = open_conn()?;
+    let normalized = normalize_agent_capability_binding_record(record)?;
+    let provider_id = normalized.provider_id.clone().unwrap_or_default();
+    conn.execute(
+        r#"
+        INSERT INTO agent_capability_bindings(
+            agent_id,
+            capability_key,
+            capability_scope,
+            provider_id,
+            binding_type,
+            enabled,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+        ON CONFLICT(agent_id, capability_key, capability_scope, provider_id, binding_type) DO UPDATE SET
+            enabled = excluded.enabled,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            normalized.agent_id,
+            normalized.capability_key,
+            normalized.capability_scope,
+            provider_id,
+            normalized.binding_type,
+            if normalized.enabled { 1 } else { 0 },
+        ],
+    )
+    .map_err(|e| format!("写入 agent capability binding 失败: {e}"))?;
+    Ok(normalized)
+}
+
+pub fn delete_agent_capability_binding(
+    agent_id: &str,
+    capability_key: &str,
+    capability_scope: &str,
+    provider_id: Option<&str>,
+    binding_type: &str,
+) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        DELETE FROM agent_capability_bindings
+        WHERE agent_id = ?1
+          AND capability_key = ?2
+          AND capability_scope = ?3
+          AND provider_id = ?4
+          AND binding_type = ?5
+        "#,
+        params![
+            normalize_required_text(agent_id, "agent_id")?,
+            normalize_capability_key(capability_key),
+            normalize_capability_scope(capability_scope),
+            provider_id
+                .map(|value| normalize_optional_text(value))
+                .unwrap_or_default(),
+            normalize_binding_type(binding_type),
+        ],
+    )
+    .map_err(|e| format!("删除 agent capability binding 失败: {e}"))?;
+    Ok(())
+}
+
+pub fn list_agent_capability_bindings(
+    agent_id: Option<&str>,
+) -> Result<Vec<AgentCapabilityBindingRecord>, String> {
+    let conn = open_conn()?;
+    let normalized_agent_id = agent_id.map(normalize_optional_text);
+    let mut sql = String::from(
+        r#"
+        SELECT
+            agent_id,
+            capability_key,
+            capability_scope,
+            provider_id,
+            binding_type,
+            enabled,
+            updated_at
+        FROM agent_capability_bindings
+        "#,
+    );
+    let mut params_vec: Vec<SqlValue> = Vec::new();
+    if let Some(value) = normalized_agent_id {
+        sql.push_str(" WHERE agent_id = ?");
+        params_vec.push(SqlValue::Text(value));
+    }
+    sql.push_str(" ORDER BY agent_id ASC, updated_at DESC");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备 agent capability binding 列表失败: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params_vec), |row| {
+            let provider_id: String = row.get(3)?;
+            Ok(AgentCapabilityBindingRecord {
+                agent_id: row.get(0)?,
+                capability_key: row.get(1)?,
+                capability_scope: row.get(2)?,
+                provider_id: if provider_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(provider_id)
+                },
+                binding_type: row.get(4)?,
+                enabled: row.get::<_, i64>(5)? != 0,
+                updated_at: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("查询 agent capability binding 列表失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析 agent capability binding 失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn upsert_renderer_binding(
+    record: RendererBindingRecord,
+) -> Result<RendererBindingRecord, String> {
+    let conn = open_conn()?;
+    let normalized = normalize_renderer_binding_record(record)?;
+    conn.execute(
+        r#"
+        INSERT INTO renderer_bindings(
+            channel,
+            result_kind,
+            media_type,
+            document_type,
+            renderer_key,
+            enabled,
+            fallback_channel,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)
+        ON CONFLICT(channel, result_kind, media_type, document_type) DO UPDATE SET
+            renderer_key = excluded.renderer_key,
+            enabled = excluded.enabled,
+            fallback_channel = excluded.fallback_channel,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            normalized.channel,
+            normalized.result_kind,
+            normalized.media_type.clone().unwrap_or_default(),
+            normalized.document_type.clone().unwrap_or_default(),
+            normalized.renderer_key,
+            if normalized.enabled { 1 } else { 0 },
+            normalized.fallback_channel,
+        ],
+    )
+    .map_err(|e| format!("写入 renderer binding 失败: {e}"))?;
+    Ok(normalized)
+}
+
+pub fn delete_renderer_binding(
+    channel: &str,
+    result_kind: &str,
+    media_type: Option<&str>,
+    document_type: Option<&str>,
+) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        DELETE FROM renderer_bindings
+        WHERE channel = ?1
+          AND result_kind = ?2
+          AND media_type = ?3
+          AND document_type = ?4
+        "#,
+        params![
+            normalize_required_text(channel, "channel")?,
+            normalize_required_text(result_kind, "result_kind")?,
+            media_type.map(normalize_optional_text).unwrap_or_default(),
+            document_type
+                .map(normalize_optional_text)
+                .unwrap_or_default(),
+        ],
+    )
+    .map_err(|e| format!("删除 renderer binding 失败: {e}"))?;
+    Ok(())
+}
+
+pub fn list_renderer_bindings() -> Result<Vec<RendererBindingRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                channel,
+                result_kind,
+                media_type,
+                document_type,
+                renderer_key,
+                enabled,
+                fallback_channel,
+                updated_at
+            FROM renderer_bindings
+            ORDER BY channel ASC, result_kind ASC, media_type ASC, document_type ASC
+            "#,
+        )
+        .map_err(|e| format!("准备 renderer binding 列表失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let media_type: String = row.get(2)?;
+            let document_type: String = row.get(3)?;
+            Ok(RendererBindingRecord {
+                channel: row.get(0)?,
+                result_kind: row.get(1)?,
+                media_type: if media_type.trim().is_empty() {
+                    None
+                } else {
+                    Some(media_type)
+                },
+                document_type: if document_type.trim().is_empty() {
+                    None
+                } else {
+                    Some(document_type)
+                },
+                renderer_key: row.get(4)?,
+                enabled: row.get::<_, i64>(5)? != 0,
+                fallback_channel: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })
+        .map_err(|e| format!("查询 renderer binding 列表失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析 renderer binding 失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn upsert_provider_health_state(
+    record: ProviderHealthStateRecord,
+) -> Result<ProviderHealthStateRecord, String> {
+    let conn = open_conn()?;
+    let normalized = normalize_provider_health_state_record(record)?;
+    conn.execute(
+        r#"
+        INSERT INTO provider_health_state(
+            provider_id,
+            health_state,
+            message,
+            checked_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+        ON CONFLICT(provider_id) DO UPDATE SET
+            health_state = excluded.health_state,
+            message = excluded.message,
+            checked_at = excluded.checked_at,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            normalized.provider_id,
+            normalized.health_state,
+            normalized.message,
+            normalized.checked_at,
+        ],
+    )
+    .map_err(|e| format!("写入 provider health state 失败: {e}"))?;
+    Ok(normalized)
+}
+
+pub fn list_provider_health_states() -> Result<Vec<ProviderHealthStateRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT provider_id, health_state, message, checked_at, updated_at
+            FROM provider_health_state
+            ORDER BY updated_at DESC, provider_id ASC
+            "#,
+        )
+        .map_err(|e| format!("准备 provider health state 列表失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ProviderHealthStateRecord {
+                provider_id: row.get(0)?,
+                health_state: row.get(1)?,
+                message: row.get(2)?,
+                checked_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("查询 provider health state 列表失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析 provider health state 失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn append_capability_audit_log(
+    event_type: &str,
+    provider_id: Option<&str>,
+    agent_id: Option<&str>,
+    capability_key: Option<&str>,
+    capability_scope: Option<&str>,
+    payload: &Value,
+) -> Result<CapabilityAuditLogRecord, String> {
+    let conn = open_conn()?;
+    let id = Uuid::new_v4().to_string();
+    let normalized_event_type = normalize_required_text(event_type, "event_type")?;
+    let normalized_provider_id = provider_id.map(normalize_optional_text);
+    let normalized_agent_id = agent_id.map(normalize_optional_text);
+    let normalized_capability_key = capability_key.map(normalize_capability_key);
+    let normalized_capability_scope = capability_scope.map(normalize_capability_scope);
+    conn.execute(
+        r#"
+        INSERT INTO capability_audit_logs(
+            id,
+            event_type,
+            provider_id,
+            agent_id,
+            capability_key,
+            capability_scope,
+            payload_json,
+            created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)
+        "#,
+        params![
+            id,
+            normalized_event_type,
+            normalized_provider_id,
+            normalized_agent_id,
+            normalized_capability_key,
+            normalized_capability_scope,
+            payload.to_string(),
+        ],
+    )
+    .map_err(|e| format!("写入 capability audit log 失败: {e}"))?;
+    let mut logs = list_capability_audit_logs(Some(1))?;
+    logs.pop()
+        .ok_or_else(|| "capability audit log 写入后读取失败".to_string())
+}
+
+pub fn upsert_capability_job(record: CapabilityJobRecord) -> Result<CapabilityJobRecord, String> {
+    let existing = get_capability_job(&record.job_id)?;
+    let conn = open_conn()?;
+    let mut normalized = normalize_capability_job_record(record)?;
+    if let Some(existing) = existing.as_ref() {
+        normalized = merge_capability_job_records(existing, normalized);
+    }
+    conn.execute(
+        r#"
+        INSERT INTO capability_jobs(
+            job_id,
+            owner_agent_id,
+            capability_key,
+            capability_scope,
+            provider_id,
+            provider_type,
+            route,
+            title,
+            summary,
+            status,
+            progress_percent,
+            stage,
+            job_type,
+            input_payload_json,
+            result_payload_json,
+            error_message,
+            metadata_json,
+            created_at,
+            updated_at,
+            started_at,
+            finished_at,
+            last_heartbeat_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+            COALESCE(NULLIF(?18, ''), CURRENT_TIMESTAMP),
+            CURRENT_TIMESTAMP,
+            ?19, ?20, ?21
+        )
+        ON CONFLICT(job_id) DO UPDATE SET
+            owner_agent_id = excluded.owner_agent_id,
+            capability_key = excluded.capability_key,
+            capability_scope = excluded.capability_scope,
+            provider_id = excluded.provider_id,
+            provider_type = excluded.provider_type,
+            route = excluded.route,
+            title = excluded.title,
+            summary = excluded.summary,
+            status = excluded.status,
+            progress_percent = excluded.progress_percent,
+            stage = excluded.stage,
+            job_type = excluded.job_type,
+            input_payload_json = excluded.input_payload_json,
+            result_payload_json = excluded.result_payload_json,
+            error_message = excluded.error_message,
+            metadata_json = excluded.metadata_json,
+            updated_at = CURRENT_TIMESTAMP,
+            started_at = excluded.started_at,
+            finished_at = excluded.finished_at,
+            last_heartbeat_at = excluded.last_heartbeat_at
+        "#,
+        params![
+            normalized.job_id,
+            normalized.owner_agent_id,
+            normalized.capability_key,
+            normalized.capability_scope,
+            normalized.provider_id,
+            normalized.provider_type,
+            normalized.route,
+            normalized.title,
+            normalized.summary,
+            normalized.status,
+            normalized.progress_percent,
+            normalized.stage,
+            normalized.job_type,
+            normalized.input_payload.to_string(),
+            normalized.result_payload.to_string(),
+            normalized.error_message,
+            normalized.metadata.to_string(),
+            normalized.created_at,
+            normalized.started_at,
+            normalized.finished_at,
+            normalized.last_heartbeat_at,
+        ],
+    )
+    .map_err(|e| format!("写入 capability job 失败: {e}"))?;
+    get_capability_job(&normalized.job_id)?
+        .ok_or_else(|| "capability job 写入后读取失败".to_string())
+}
+
+fn merge_capability_job_records(
+    existing: &CapabilityJobRecord,
+    mut incoming: CapabilityJobRecord,
+) -> CapabilityJobRecord {
+    if existing.job_id != incoming.job_id {
+        return incoming;
+    }
+
+    let existing_rank = capability_job_status_rank(&existing.status);
+    let incoming_rank = capability_job_status_rank(&incoming.status);
+    let existing_terminal = is_capability_job_terminal_status_local(&existing.status);
+    let incoming_terminal = is_capability_job_terminal_status_local(&incoming.status);
+    let existing_is_richer = capability_job_is_richer(existing);
+    let incoming_is_placeholder = capability_job_is_placeholder(&incoming);
+
+    if existing_terminal && !incoming_terminal {
+        return existing.clone();
+    }
+
+    if existing_rank > incoming_rank || (existing_is_richer && incoming_is_placeholder) {
+        incoming.provider_id = incoming
+            .provider_id
+            .or_else(|| existing.provider_id.clone());
+        incoming.provider_type = incoming
+            .provider_type
+            .or_else(|| existing.provider_type.clone());
+        incoming.route = incoming.route.or_else(|| existing.route.clone());
+        incoming.title = incoming.title.or_else(|| existing.title.clone());
+        incoming.summary = if incoming.summary.is_some() && !incoming_is_placeholder {
+            incoming.summary
+        } else {
+            incoming.summary.or_else(|| existing.summary.clone())
+        };
+        incoming.status = existing.status.clone();
+        incoming.progress_percent = incoming.progress_percent.or(existing.progress_percent);
+        incoming.stage = existing.stage.clone().or(incoming.stage);
+        incoming.job_type = incoming.job_type.or_else(|| existing.job_type.clone());
+        incoming.input_payload =
+            merge_json_objects(&existing.input_payload, &incoming.input_payload);
+        incoming.result_payload =
+            merge_capability_job_json_payload(&existing.result_payload, &incoming.result_payload);
+        incoming.error_message = incoming
+            .error_message
+            .or_else(|| existing.error_message.clone());
+        incoming.metadata = merge_capability_job_metadata(&existing.metadata, &incoming.metadata);
+        incoming.created_at = pick_preferred_timestamp(&incoming.created_at, &existing.created_at);
+        incoming.started_at = incoming.started_at.or_else(|| existing.started_at.clone());
+        incoming.finished_at = incoming
+            .finished_at
+            .or_else(|| existing.finished_at.clone());
+        incoming.last_heartbeat_at = incoming
+            .last_heartbeat_at
+            .or_else(|| existing.last_heartbeat_at.clone());
+        return incoming;
+    }
+
+    incoming.provider_id = incoming
+        .provider_id
+        .or_else(|| existing.provider_id.clone());
+    incoming.provider_type = incoming
+        .provider_type
+        .or_else(|| existing.provider_type.clone());
+    incoming.route = incoming.route.or_else(|| existing.route.clone());
+    incoming.title = incoming.title.or_else(|| existing.title.clone());
+    incoming.summary = incoming.summary.or_else(|| existing.summary.clone());
+    incoming.progress_percent = incoming.progress_percent.or(existing.progress_percent);
+    incoming.stage = incoming.stage.or_else(|| existing.stage.clone());
+    incoming.job_type = incoming.job_type.or_else(|| existing.job_type.clone());
+    incoming.input_payload = merge_json_objects(&existing.input_payload, &incoming.input_payload);
+    incoming.result_payload =
+        merge_capability_job_json_payload(&existing.result_payload, &incoming.result_payload);
+    incoming.error_message = incoming
+        .error_message
+        .or_else(|| existing.error_message.clone());
+    incoming.metadata = merge_capability_job_metadata(&existing.metadata, &incoming.metadata);
+    incoming.created_at = pick_preferred_timestamp(&incoming.created_at, &existing.created_at);
+    incoming.started_at = incoming.started_at.or_else(|| existing.started_at.clone());
+    if incoming_terminal {
+        incoming.finished_at = incoming
+            .finished_at
+            .or_else(|| existing.finished_at.clone());
+    } else if existing_terminal {
+        incoming.finished_at = existing.finished_at.clone();
+    }
+    incoming.last_heartbeat_at = incoming
+        .last_heartbeat_at
+        .or_else(|| existing.last_heartbeat_at.clone());
+    incoming
+}
+
+fn merge_capability_job_json_payload(existing: &Value, incoming: &Value) -> Value {
+    if json_value_is_meaningfully_empty(incoming) {
+        return existing.clone();
+    }
+    merge_json_objects(existing, incoming)
+}
+
+fn merge_capability_job_metadata(existing: &Value, incoming: &Value) -> Value {
+    let mut merged = merge_json_objects(existing, incoming);
+    let Some(merged_object) = merged.as_object_mut() else {
+        return merged;
+    };
+
+    let existing_dispatch_pending = metadata_dispatch_pending(existing);
+    let incoming_dispatch_pending = metadata_dispatch_pending(incoming);
+    if matches!(existing_dispatch_pending, Some(false))
+        || matches!(incoming_dispatch_pending, Some(false))
+    {
+        merged_object.insert("dispatchPending".to_string(), Value::Bool(false));
+    }
+
+    if metadata_provider_request_id(&Value::Object(merged_object.clone())).is_none() {
+        if let Some(provider_request_id) = metadata_provider_request_id(incoming)
+            .or_else(|| metadata_provider_request_id(existing))
+        {
+            merged_object.insert(
+                "providerRequestId".to_string(),
+                Value::String(provider_request_id.to_string()),
+            );
+        }
+    }
+
+    Value::Object(merged_object.clone())
+}
+
+fn merge_json_objects(existing: &Value, incoming: &Value) -> Value {
+    if let (Some(existing_map), Some(incoming_map)) = (existing.as_object(), incoming.as_object()) {
+        let mut merged = existing_map.clone();
+        for (key, value) in incoming_map {
+            if let Some(previous) = merged.get(key) {
+                merged.insert(key.clone(), merge_json_objects(previous, value));
+            } else {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        return Value::Object(merged);
+    }
+
+    if !json_value_is_meaningfully_empty(incoming) {
+        return incoming.clone();
+    }
+
+    existing.clone()
+}
+
+fn json_value_is_meaningfully_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+fn pick_preferred_timestamp(primary: &str, fallback: &str) -> String {
+    let trimmed = primary.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    fallback.trim().to_string()
+}
+
+fn metadata_dispatch_pending(value: &Value) -> Option<bool> {
+    value.as_object().and_then(|object| {
+        object
+            .get("dispatchPending")
+            .or_else(|| object.get("dispatch_pending"))
+            .and_then(Value::as_bool)
+    })
+}
+
+fn metadata_provider_request_id(value: &Value) -> Option<&str> {
+    value.as_object().and_then(|object| {
+        object
+            .get("providerRequestId")
+            .or_else(|| object.get("provider_request_id"))
+            .or_else(|| object.get("taskId"))
+            .or_else(|| object.get("task_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+    })
+}
+
+fn capability_job_is_placeholder(record: &CapabilityJobRecord) -> bool {
+    let status = record.status.trim().to_ascii_lowercase();
+    let stage = record
+        .stage
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(status.as_str(), "queued" | "running")
+        && matches!(stage.as_str(), "" | "dispatching" | "queued")
+        && metadata_dispatch_pending(&record.metadata).unwrap_or(false)
+        && metadata_provider_request_id(&record.metadata).is_none()
+        && json_value_is_meaningfully_empty(&record.result_payload)
+}
+
+fn capability_job_is_richer(record: &CapabilityJobRecord) -> bool {
+    metadata_provider_request_id(&record.metadata).is_some()
+        || metadata_dispatch_pending(&record.metadata) == Some(false)
+        || !json_value_is_meaningfully_empty(&record.result_payload)
+        || capability_job_status_rank(&record.status) > 0
+}
+
+fn capability_job_status_rank(status: &str) -> u8 {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "queued" | "pending" => 0,
+        "running" | "processing" | "progress" | "submitted" => 1,
+        "completed" | "done" | "success" | "failed" | "error" | "cancelled" | "canceled" => 2,
+        _ => 0,
+    }
+}
+
+fn is_capability_job_terminal_status_local(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "done" | "success" | "failed" | "error" | "cancelled" | "canceled"
+    )
+}
+
+pub fn get_capability_job(job_id: &str) -> Result<Option<CapabilityJobRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                job_id,
+                owner_agent_id,
+                capability_key,
+                capability_scope,
+                provider_id,
+                provider_type,
+                route,
+                title,
+                summary,
+                status,
+                progress_percent,
+                stage,
+                job_type,
+                input_payload_json,
+                result_payload_json,
+                error_message,
+                metadata_json,
+                created_at,
+                updated_at,
+                started_at,
+                finished_at,
+                last_heartbeat_at
+            FROM capability_jobs
+            WHERE job_id = ?1
+            LIMIT 1
+            "#,
+        )
+        .map_err(|e| format!("准备查询 capability job 失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![normalize_required_text(job_id, "job_id")?])
+        .map_err(|e| format!("读取 capability job 失败: {e}"))?;
+    rows.next()
+        .map_err(|e| format!("读取 capability job 结果失败: {e}"))?
+        .map(parse_capability_job_row)
+        .transpose()
+        .map_err(|e| format!("解析 capability job 失败: {e}"))
+}
+
+pub fn list_capability_jobs(
+    owner_agent_id: Option<&str>,
+    status: Option<&str>,
+    limit: Option<u32>,
+) -> Result<Vec<CapabilityJobRecord>, String> {
+    let conn = open_conn()?;
+    let normalized_owner_agent_id = owner_agent_id
+        .map(|value| value.trim().to_string())
+        .and_then(normalize_nullable_text);
+    let normalized_status = status
+        .map(|value| value.trim().to_string())
+        .and_then(normalize_nullable_text)
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| value != "all");
+    let mut sql = String::from(
+        r#"
+        SELECT
+            job_id,
+            owner_agent_id,
+            capability_key,
+            capability_scope,
+            provider_id,
+            provider_type,
+            route,
+            title,
+            summary,
+            status,
+            progress_percent,
+            stage,
+            job_type,
+            input_payload_json,
+            result_payload_json,
+            error_message,
+            metadata_json,
+            created_at,
+            updated_at,
+            started_at,
+            finished_at,
+            last_heartbeat_at
+        FROM capability_jobs
+        WHERE 1 = 1
+        "#,
+    );
+    let mut params_vec: Vec<SqlValue> = Vec::new();
+    if let Some(agent_id) = normalized_owner_agent_id {
+        sql.push_str(" AND owner_agent_id = ?");
+        params_vec.push(SqlValue::Text(agent_id));
+    }
+    if let Some(status) = normalized_status {
+        sql.push_str(" AND status = ?");
+        params_vec.push(SqlValue::Text(status));
+    }
+    sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
+    params_vec.push(SqlValue::Integer(i64::from(
+        limit.unwrap_or(200).clamp(1, 500),
+    )));
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备 capability job 列表失败: {e}"))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params_vec),
+            parse_capability_job_row,
+        )
+        .map_err(|e| format!("查询 capability job 列表失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析 capability job 列表失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn list_capability_audit_logs(
+    limit: Option<u32>,
+) -> Result<Vec<CapabilityAuditLogRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, event_type, provider_id, agent_id, capability_key, capability_scope, payload_json, created_at
+            FROM capability_audit_logs
+            ORDER BY created_at DESC
+            LIMIT ?1
+            "#,
+        )
+        .map_err(|e| format!("准备 capability audit log 列表失败: {e}"))?;
+    let rows = stmt
+        .query_map(
+            params![i64::from(limit.unwrap_or(200).clamp(1, 500))],
+            |row| {
+                let payload_json: String = row.get(6)?;
+                Ok(CapabilityAuditLogRecord {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    provider_id: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    capability_key: row.get(4)?,
+                    capability_scope: row.get(5)?,
+                    payload: parse_json_value_or_default(
+                        &payload_json,
+                        Value::Object(Default::default()),
+                    ),
+                    created_at: row.get(7)?,
+                })
+            },
+        )
+        .map_err(|e| format!("查询 capability audit log 列表失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析 capability audit log 失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+fn normalize_capability_provider_record(
+    record: CapabilityProviderRecord,
+) -> Result<CapabilityProviderRecord, String> {
+    let provider_id = normalize_required_text(&record.provider_id, "provider_id")?;
+    let provider_type = normalize_required_text(&record.provider_type, "provider_type")?;
+    let display_name = record.display_name.and_then(normalize_nullable_text);
+    let capabilities = record
+        .capabilities
+        .into_iter()
+        .map(normalize_capability_descriptor_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let supported_scopes = record
+        .supported_scopes
+        .into_iter()
+        .map(|value| normalize_capability_scope(&value))
+        .collect::<Vec<_>>();
+    Ok(CapabilityProviderRecord {
+        provider_id,
+        provider_type,
+        display_name,
+        capabilities,
+        supported_scopes,
+        priority: record.priority,
+        requirements: normalize_json_object_like(record.requirements),
+        supports_job: record.supports_job,
+        enabled: record.enabled,
+        health_state: normalize_optional_text(&record.health_state),
+        input_contract: normalize_json_object_like(record.input_contract),
+        output_contract: normalize_json_object_like(record.output_contract),
+        metadata: normalize_json_object_like(record.metadata),
+        is_removed: record.is_removed,
+        updated_at: record.updated_at,
+    })
+}
+
+fn normalize_capability_descriptor_record(
+    record: CapabilityDescriptorRecord,
+) -> Result<CapabilityDescriptorRecord, String> {
+    Ok(CapabilityDescriptorRecord {
+        key: normalize_capability_key(&record.key),
+        scope: normalize_capability_scope(&record.scope),
+    })
+}
+
+fn normalize_capability_provider_binding_record(
+    record: CapabilityProviderBindingRecord,
+) -> Result<CapabilityProviderBindingRecord, String> {
+    Ok(CapabilityProviderBindingRecord {
+        capability_key: normalize_capability_key(&record.capability_key),
+        capability_scope: normalize_capability_scope(&record.capability_scope),
+        provider_id: normalize_required_text(&record.provider_id, "provider_id")?,
+        enabled: record.enabled,
+        updated_at: record.updated_at,
+    })
+}
+
+fn normalize_agent_capability_binding_record(
+    record: AgentCapabilityBindingRecord,
+) -> Result<AgentCapabilityBindingRecord, String> {
+    Ok(AgentCapabilityBindingRecord {
+        agent_id: normalize_required_text(&record.agent_id, "agent_id")?,
+        capability_key: normalize_capability_key(&record.capability_key),
+        capability_scope: normalize_capability_scope(&record.capability_scope),
+        provider_id: record.provider_id.and_then(normalize_nullable_text),
+        binding_type: normalize_binding_type(&record.binding_type),
+        enabled: record.enabled,
+        updated_at: record.updated_at,
+    })
+}
+
+fn normalize_renderer_binding_record(
+    record: RendererBindingRecord,
+) -> Result<RendererBindingRecord, String> {
+    Ok(RendererBindingRecord {
+        channel: normalize_required_text(&record.channel, "channel")?,
+        result_kind: normalize_required_text(&record.result_kind, "result_kind")?,
+        media_type: record.media_type.and_then(normalize_nullable_text),
+        document_type: record.document_type.and_then(normalize_nullable_text),
+        renderer_key: normalize_required_text(&record.renderer_key, "renderer_key")?,
+        enabled: record.enabled,
+        fallback_channel: record.fallback_channel.and_then(normalize_nullable_text),
+        updated_at: record.updated_at,
+    })
+}
+
+fn normalize_provider_health_state_record(
+    record: ProviderHealthStateRecord,
+) -> Result<ProviderHealthStateRecord, String> {
+    Ok(ProviderHealthStateRecord {
+        provider_id: normalize_required_text(&record.provider_id, "provider_id")?,
+        health_state: normalize_optional_text(&record.health_state),
+        message: record.message.and_then(normalize_nullable_text),
+        checked_at: normalize_required_text(&record.checked_at, "checked_at")?,
+        updated_at: record.updated_at,
+    })
+}
+
+fn normalize_capability_job_record(
+    record: CapabilityJobRecord,
+) -> Result<CapabilityJobRecord, String> {
+    Ok(CapabilityJobRecord {
+        job_id: normalize_required_text(&record.job_id, "job_id")?,
+        owner_agent_id: normalize_required_text(&record.owner_agent_id, "owner_agent_id")?,
+        capability_key: normalize_capability_key(&record.capability_key),
+        capability_scope: normalize_capability_scope(&record.capability_scope),
+        provider_id: record.provider_id.and_then(normalize_nullable_text),
+        provider_type: record.provider_type.and_then(normalize_nullable_text),
+        route: record.route.and_then(normalize_nullable_text),
+        title: record.title.and_then(normalize_nullable_text),
+        summary: record.summary.and_then(normalize_nullable_text),
+        status: normalize_required_text(&record.status, "status")?.to_ascii_lowercase(),
+        progress_percent: record.progress_percent.map(|value| value.clamp(0.0, 100.0)),
+        stage: record.stage.and_then(normalize_nullable_text),
+        job_type: record.job_type.and_then(normalize_nullable_text),
+        input_payload: normalize_json_object_like(record.input_payload),
+        result_payload: normalize_json_object_like(record.result_payload),
+        error_message: record.error_message.and_then(normalize_nullable_text),
+        metadata: normalize_json_object_like(record.metadata),
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        started_at: record.started_at.and_then(normalize_nullable_text),
+        finished_at: record.finished_at.and_then(normalize_nullable_text),
+        last_heartbeat_at: record.last_heartbeat_at.and_then(normalize_nullable_text),
+    })
+}
+
+fn normalize_json_object_like(value: Value) -> Value {
+    if value.is_null() {
+        Value::Object(Default::default())
+    } else {
+        value
+    }
+}
+
+fn normalize_optional_text(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn normalize_required_text(value: &str, field_name: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field_name} 不能为空"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_capability_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn normalize_capability_scope(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "self" => "self".to_string(),
+        _ => "generic".to_string(),
+    }
+}
+
+fn normalize_binding_type(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "provider" => "provider".to_string(),
+        _ => "capability".to_string(),
+    }
+}
+
+fn parse_capability_provider_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CapabilityProviderRecord, rusqlite::Error> {
+    let capabilities_json: String = row.get(3)?;
+    let supported_scopes_json: String = row.get(4)?;
+    let requirements_json: String = row.get(6)?;
+    let input_contract_json: String = row.get(10)?;
+    let output_contract_json: String = row.get(11)?;
+    let metadata_json: String = row.get(12)?;
+    let capabilities = serde_json::from_str::<Vec<CapabilityDescriptorRecord>>(&capabilities_json)
+        .unwrap_or_default();
+    let supported_scopes = serde_json::from_str::<Vec<String>>(&supported_scopes_json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| normalize_capability_scope(&value))
+        .collect::<Vec<_>>();
+    Ok(CapabilityProviderRecord {
+        provider_id: row.get(0)?,
+        provider_type: row.get(1)?,
+        display_name: row.get(2)?,
+        capabilities,
+        supported_scopes,
+        priority: row.get(5)?,
+        requirements: parse_json_value_or_default(
+            &requirements_json,
+            Value::Object(Default::default()),
+        ),
+        supports_job: row.get::<_, i64>(7)? != 0,
+        enabled: row.get::<_, i64>(8)? != 0,
+        health_state: row.get(9)?,
+        input_contract: parse_json_value_or_default(
+            &input_contract_json,
+            Value::Object(Default::default()),
+        ),
+        output_contract: parse_json_value_or_default(
+            &output_contract_json,
+            Value::Object(Default::default()),
+        ),
+        metadata: parse_json_value_or_default(&metadata_json, Value::Object(Default::default())),
+        is_removed: row.get::<_, i64>(13)? != 0,
+        updated_at: row.get(14)?,
+    })
+}
+
+fn parse_capability_job_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CapabilityJobRecord, rusqlite::Error> {
+    let input_payload_json: String = row.get(13)?;
+    let result_payload_json: String = row.get(14)?;
+    let metadata_json: String = row.get(16)?;
+    Ok(CapabilityJobRecord {
+        job_id: row.get(0)?,
+        owner_agent_id: row.get(1)?,
+        capability_key: row.get(2)?,
+        capability_scope: row.get(3)?,
+        provider_id: row.get(4)?,
+        provider_type: row.get(5)?,
+        route: row.get(6)?,
+        title: row.get(7)?,
+        summary: row.get(8)?,
+        status: row.get(9)?,
+        progress_percent: row.get(10)?,
+        stage: row.get(11)?,
+        job_type: row.get(12)?,
+        input_payload: parse_json_value_or_default(
+            &input_payload_json,
+            Value::Object(Default::default()),
+        ),
+        result_payload: parse_json_value_or_default(
+            &result_payload_json,
+            Value::Object(Default::default()),
+        ),
+        error_message: row.get(15)?,
+        metadata: parse_json_value_or_default(&metadata_json, Value::Object(Default::default())),
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+        started_at: row.get(19)?,
+        finished_at: row.get(20)?,
+        last_heartbeat_at: row.get(21)?,
+    })
 }
 
 fn open_conn() -> Result<Connection, String> {

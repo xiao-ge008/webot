@@ -29,6 +29,7 @@ export interface ChatTaskLifecycleItem {
 export interface ChatTaskCardData {
   taskName: string;
   objective: string;
+  reportCondition?: string;
   scheduleText: string;
   everyMs: number;
   maxRuns: number;
@@ -55,7 +56,7 @@ export interface ChatTaskCardData {
   creatorParticipantName?: string;
   executorAgentName?: string;
   reportActorName?: string;
-  reportStatus?: 'pending' | 'reported' | 'acknowledged';
+  reportStatus?: 'pending' | 'acknowledged';
   progressPercent?: number;
   errorSummary?: string;
   finalSummaryText?: string;

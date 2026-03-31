@@ -4,7 +4,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::header;
 use axum::http::{HeaderMap as AxumHeaderMap, StatusCode};
+use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -20,11 +21,13 @@ use bytes::Bytes;
 use futures_util::{future::join_all, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
 use crate::assignment_store;
+use crate::capability_registry;
+use crate::chat_task_draft;
 use crate::component_center;
 use crate::error::ApiError;
 use crate::image_generation;
@@ -35,6 +38,7 @@ use crate::vision_analysis;
 use crate::AppState;
 
 const DEFAULT_UI_SKILL_NAME: &str = "ui-skill";
+const MANAGED_TASK_DELIVERY_UPSTREAM_TIMEOUT_SECS: u64 = 4;
 
 #[derive(Debug, Clone)]
 struct RuntimeSkillListEntry {
@@ -59,14 +63,17 @@ struct ImportedSkillListEntry {
 }
 
 async fn probe_openfang_health(state: &Arc<AppState>) -> Result<Value, ApiError> {
+    tracing::info!("probe_openfang_health started");
     match state.openfang.get_json("/api/health").await {
         Ok(upstream) => {
             state.set_power_state(true, None).await;
+            tracing::info!("probe_openfang_health succeeded");
             Ok(upstream)
         }
         Err(error) => {
             let message = error.message;
             state.set_power_state(false, Some(message.clone())).await;
+            tracing::warn!(error = %message, "probe_openfang_health failed");
             Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message))
         }
     }
@@ -74,10 +81,17 @@ async fn probe_openfang_health(state: &Arc<AppState>) -> Result<Value, ApiError>
 
 async fn ensure_online(state: &Arc<AppState>) -> Result<(), ApiError> {
     probe_openfang_health(state).await?;
-    if let Err(err) = maybe_ensure_default_agents(state).await {
-        tracing::warn!(error = %err.message, "auto-create default agents failed");
-    }
+    spawn_default_agent_ensure(state.clone());
     Ok(())
+}
+
+fn spawn_default_agent_ensure(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        if let Err(err) = maybe_ensure_default_agents(&state).await {
+            tracing::warn!(error = %err.message, "auto-create default agents failed");
+        }
+        chat_task_draft::warm_task_draft_parser_agent(&state).await;
+    });
 }
 
 async fn maybe_ensure_default_agents(state: &Arc<AppState>) -> Result<(), ApiError> {
@@ -487,10 +501,7 @@ pub fn management_router() -> Router<Arc<AppState>> {
             "/agents/{id}/chat-assets/upload-inline",
             post(upload_agent_chat_asset_inline),
         )
-        .route(
-            "/agents/{id}/tts/synthesize",
-            post(synthesize_agent_tts),
-        )
+        .route("/agents/{id}/tts/synthesize", post(synthesize_agent_tts))
         .route("/agents/{id}/portrait/{filename}", get(get_agent_portrait))
         .route("/agents/{id}/portrait/upload", post(upload_agent_portrait))
         .route(
@@ -548,6 +559,43 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/cron/jobs/{id}", delete(delete_cron_job))
         .route("/cron/jobs/{id}/enable", put(toggle_cron_job))
         .route("/cron/jobs/{id}/status", get(get_cron_job_status))
+        .route(
+            "/tasks",
+            get(list_managed_tasks_route).post(create_managed_task_route),
+        )
+        .route(
+            "/tasks/deliveries/pending",
+            get(list_managed_task_pending_deliveries_route),
+        )
+        .route(
+            "/tasks/deliveries/{id}/status",
+            post(update_managed_task_delivery_status_route),
+        )
+        .route(
+            "/tasks/deliveries/{id}/chat-writeback",
+            post(writeback_managed_task_delivery_to_chat_route),
+        )
+        .route(
+            "/tasks/{id}",
+            get(get_managed_task_route).delete(delete_managed_task_route),
+        )
+        .route("/tasks/{id}/publish", post(publish_managed_task_route))
+        .route("/tasks/{id}/pause", post(pause_managed_task_route))
+        .route("/tasks/{id}/run-once", post(run_managed_task_once_route))
+        .route("/tasks/{id}/runs", get(list_managed_task_runs_route))
+        .route("/tasks/{id}/events", get(list_managed_task_events_route))
+        .route(
+            "/tasks/{id}/deliveries",
+            get(list_managed_task_deliveries_route),
+        )
+        .route(
+            "/tasks/{id}/delivery-attempts",
+            get(list_managed_task_delivery_attempts_route),
+        )
+        .route(
+            "/tasks/{id}/timeline",
+            get(list_managed_task_timeline_route),
+        )
         .route("/skills", get(list_skills))
         .route(
             "/components/config",
@@ -601,8 +649,19 @@ pub fn management_router() -> Router<Arc<AppState>> {
             get(tts_management::get_tts_config).put(tts_management::set_tts_config),
         )
         .route("/tts/status", get(tts_management::get_tts_status))
+        .route(
+            "/tts/speaker-profiles/upload",
+            post(tts_management::upload_speaker_profile),
+        )
+        .route(
+            "/tts/speaker-profiles/{profile_id}",
+            delete(tts_management::delete_speaker_profile),
+        )
         .route("/tts/download", post(tts_management::start_tts_download))
-        .route("/tts/install-runtime", post(tts_management::install_tts_runtime))
+        .route(
+            "/tts/install-runtime",
+            post(tts_management::install_tts_runtime),
+        )
         .route("/tts/load", post(tts_management::load_tts_engine))
         .route("/tts/unload", post(tts_management::unload_tts_engine))
         .route(
@@ -619,6 +678,10 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route(
             "/components/{english_name}/invoke",
             post(component_center::invoke_component_definition),
+        )
+        .route(
+            "/components/{english_name}/capability-invoke",
+            post(component_center::invoke_component_capability_definition),
         )
         .route("/mcp/servers", get(list_mcp_servers))
         .route("/global/skills", get(list_global_skills))
@@ -674,6 +737,7 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/a2a/tasks/send", post(send_a2a_task))
         .route("/a2a/tasks/{id}", get(get_a2a_task))
         .route("/a2a/tasks/{id}/cancel", post(cancel_a2a_task))
+        .merge(capability_registry::management_router())
 }
 
 #[derive(Deserialize)]
@@ -1093,8 +1157,180 @@ pub fn chat_router() -> Router<Arc<AppState>> {
         )
         .route("/{id}/session/content", put(update_chat_session_content))
         .route("/{id}/session/compact", post(chat_session_compact))
+        .route("/{id}/task-draft", post(analyze_chat_task_draft_route))
         .route("/{id}/message", post(chat_message))
         .route("/{id}/message/stream", post(chat_message_stream))
+}
+
+pub async fn analyze_chat_task_draft_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<chat_task_draft::AnalyzeChatTaskDraftRequest>,
+) -> Result<Json<Value>, ApiError> {
+    validate_agent_path_segment(&id)?;
+    let response = chat_task_draft::analyze_chat_task_draft(&state, &id, payload).await;
+    Ok(Json(serde_json::to_value(response).unwrap_or_else(|_| {
+        json!({
+            "matched": false,
+            "cancelled": false,
+            "ready_to_confirm": false
+        })
+    })))
+}
+
+fn should_try_inline_chat_task_draft(payload: &ChatMessageRequest) -> bool {
+    if payload
+        .request_origin
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("group_auto"))
+    {
+        return false;
+    }
+    if !payload.attachments.is_empty() {
+        return false;
+    }
+    looks_like_inline_chat_task_draft_intent(
+        &payload.message,
+        payload.current_task_draft.is_some(),
+    )
+}
+
+fn looks_like_inline_chat_task_draft_intent(message: &str, has_current_draft: bool) -> bool {
+    if has_current_draft {
+        return true;
+    }
+
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let keyword_hits = [
+        "提醒",
+        "定时",
+        "定期",
+        "监控",
+        "监测",
+        "告警",
+        "通知",
+        "汇报",
+        "跟踪",
+        "追踪",
+        "轮询",
+        "自动执行",
+        "自动检查",
+        "自动提醒",
+        "自动监控",
+        "帮我盯",
+        "帮我看",
+        "到点",
+        "记得",
+        "取消提醒",
+        "停止提醒",
+        "关闭提醒",
+        "取消监控",
+        "停止监控",
+        "关闭监控",
+        "every ",
+        "hourly",
+        "daily",
+        "weekly",
+        "monthly",
+        "remind",
+        "reminder",
+        "monitor",
+        "alert",
+        "notify",
+        "notification",
+        "schedule",
+        "scheduled",
+        "recurring",
+        "periodic",
+    ]
+    .iter()
+    .any(|keyword| trimmed.contains(keyword) || normalized.contains(keyword));
+
+    if keyword_hits {
+        return true;
+    }
+
+    let has_cn_schedule = trimmed.contains('每')
+        && ["秒", "分钟", "小时", "天", "周", "月", "次"]
+            .iter()
+            .any(|unit| trimmed.contains(unit));
+    if has_cn_schedule {
+        return true;
+    }
+
+    let has_cn_trigger = ["达到", "超过", "低于", "跌破", "涨到", "触发"]
+        .iter()
+        .any(|keyword| trimmed.contains(keyword));
+    if has_cn_trigger
+        && ["提醒", "通知", "汇报", "告诉我", "告警", "监控"]
+            .iter()
+            .any(|keyword| trimmed.contains(keyword))
+    {
+        return true;
+    }
+
+    let has_en_schedule = normalized.contains("every ")
+        && [" second", " minute", " hour", " day", " week", " month"]
+            .iter()
+            .any(|unit| normalized.contains(unit));
+    if has_en_schedule {
+        return true;
+    }
+
+    ["when ", "if price", "if it", "above ", "below "]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+}
+
+async fn maybe_resolve_inline_chat_task_draft(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    payload: &ChatMessageRequest,
+) -> Option<chat_task_draft::AnalyzeChatTaskDraftResponse> {
+    if !should_try_inline_chat_task_draft(payload) {
+        return None;
+    }
+    let response = chat_task_draft::analyze_chat_task_draft(
+        state,
+        agent_id,
+        chat_task_draft::AnalyzeChatTaskDraftRequest {
+            message: payload.message.clone(),
+            current_draft: payload.current_task_draft.clone(),
+        },
+    )
+    .await;
+    response.matched.then_some(response)
+}
+
+fn build_inline_chat_task_draft_json(
+    response: &chat_task_draft::AnalyzeChatTaskDraftResponse,
+    session_id: Option<&str>,
+    session_label: Option<&str>,
+) -> Value {
+    let content = response
+        .prompt_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    json!({
+        "response": content,
+        "content": content,
+        "task_draft_matched": response.matched,
+        "task_draft_cancelled": response.cancelled,
+        "task_draft_ready_to_confirm": response.ready_to_confirm,
+        "task_draft": response.draft.clone(),
+        "task_card": response.task_card.clone(),
+        "session_id": session_id,
+        "session_label": session_label,
+    })
 }
 
 pub fn groups_router() -> Router<Arc<AppState>> {
@@ -1108,74 +1344,15 @@ pub fn groups_router() -> Router<Arc<AppState>> {
         )
 }
 
-pub fn tasks_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/meta", post(upsert_task_runtime_meta))
-        .route("/meta/{id}", get(get_task_runtime_meta))
-        .route("/deliveries", post(create_task_delivery))
-        .route(
-            "/deliveries/pending",
-            get(list_pending_task_deliveries_route),
-        )
-        .route("/deliveries/{id}", get(get_task_delivery_route))
-        .route("/deliveries/{id}/status", post(update_task_delivery_status))
+#[derive(Deserialize)]
+pub struct ManagedTaskListQuery {
+    pub agent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct UpsertTaskRuntimeMetaRequest {
-    pub task_id: String,
-    pub owner_agent_id: String,
-    pub runtime_key: Option<String>,
-    pub source_type: Option<String>,
-    pub display_name: Option<String>,
-    pub origin_conversation_type: Option<String>,
-    pub origin_conversation_id: Option<String>,
+pub struct ManagedTaskPendingDeliveriesQuery {
+    pub target_kind: Option<String>,
     pub origin_chat_session_id: Option<String>,
-    pub origin_message_id: Option<String>,
-    pub creator_participant_id: Option<String>,
-    pub creator_participant_name: Option<String>,
-    pub executor_agent_id: Option<String>,
-    pub executor_agent_name: Option<String>,
-    pub report_actor_agent_id: Option<String>,
-    pub report_actor_agent_name: Option<String>,
-    pub max_runs: Option<i64>,
-    pub final_summary_prompt: Option<String>,
-    pub notify_on_final: Option<bool>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Deserialize)]
-pub struct CreateTaskDeliveryRequest {
-    pub id: Option<String>,
-    pub task_id: String,
-    pub owner_agent_id: String,
-    pub runtime_key: Option<String>,
-    pub delivery_kind: Option<String>,
-    pub dedupe_key: String,
-    pub status: Option<String>,
-    pub origin_conversation_type: Option<String>,
-    pub origin_conversation_id: Option<String>,
-    pub origin_chat_session_id: Option<String>,
-    pub origin_message_id: Option<String>,
-    pub creator_participant_id: Option<String>,
-    pub creator_participant_name: Option<String>,
-    pub executor_agent_id: Option<String>,
-    pub executor_agent_name: Option<String>,
-    pub report_actor_agent_id: Option<String>,
-    pub report_actor_agent_name: Option<String>,
-    pub task_name: Option<String>,
-    pub run_count: Option<i64>,
-    pub summary_text: Option<String>,
-    pub error_text: Option<String>,
-    pub payload: Option<Value>,
-}
-
-#[derive(Deserialize)]
-pub struct PendingTaskDeliveriesQuery {
-    pub runtime_key: Option<String>,
-    pub chat_session_id: Option<String>,
-    pub conversation_type: Option<String>,
-    pub conversation_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1183,212 +1360,15 @@ pub struct UpdateTaskDeliveryStatusRequest {
     pub status: String,
 }
 
-fn normalize_optional_string(input: Option<String>) -> Option<String> {
-    input
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+#[derive(Deserialize)]
+pub struct ManagedTaskChatWritebackRequest {
+    pub task_id: String,
+    pub message_text: String,
 }
 
-fn build_task_delivery_id(task_id: &str, dedupe_key: &str) -> String {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    task_id.hash(&mut hasher);
-    dedupe_key.hash(&mut hasher);
-    format!("td_{now_ms:x}_{:x}", hasher.finish())
-}
-
-pub async fn upsert_task_runtime_meta(
-    State(_state): State<Arc<AppState>>,
-    Json(payload): Json<UpsertTaskRuntimeMetaRequest>,
-) -> Result<Json<Value>, ApiError> {
-    assignment_store::ensure_db().map_err(storage_error)?;
-    let task_id = payload.task_id.trim();
-    if task_id.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "task_id 不能为空"));
-    }
-    let owner_agent_id = payload.owner_agent_id.trim();
-    if owner_agent_id.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "owner_agent_id 不能为空",
-        ));
-    }
-    let record = assignment_store::TaskRuntimeBindingRecord {
-        task_id: task_id.to_string(),
-        owner_agent_id: owner_agent_id.to_string(),
-        runtime_key: normalize_optional_string(payload.runtime_key),
-        source_type: payload
-            .source_type
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "custom".to_string()),
-        display_name: normalize_optional_string(payload.display_name),
-        origin_conversation_type: normalize_optional_string(payload.origin_conversation_type),
-        origin_conversation_id: normalize_optional_string(payload.origin_conversation_id),
-        origin_chat_session_id: normalize_optional_string(payload.origin_chat_session_id),
-        origin_message_id: normalize_optional_string(payload.origin_message_id),
-        creator_participant_id: normalize_optional_string(payload.creator_participant_id),
-        creator_participant_name: normalize_optional_string(payload.creator_participant_name),
-        executor_agent_id: normalize_optional_string(payload.executor_agent_id),
-        executor_agent_name: normalize_optional_string(payload.executor_agent_name),
-        report_actor_agent_id: normalize_optional_string(payload.report_actor_agent_id),
-        report_actor_agent_name: normalize_optional_string(payload.report_actor_agent_name),
-        max_runs: payload.max_runs,
-        final_summary_prompt: normalize_optional_string(payload.final_summary_prompt),
-        notify_on_final: payload.notify_on_final.unwrap_or(true),
-        metadata: payload
-            .metadata
-            .unwrap_or_else(|| Value::Object(Default::default())),
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
-    assignment_store::upsert_task_runtime_binding(&record).map_err(storage_error)?;
-    let stored = assignment_store::get_task_runtime_binding(task_id)
-        .map_err(storage_error)?
-        .ok_or_else(|| storage_error("写入任务元数据后读取失败"))?;
-    Ok(Json(json!({ "meta": stored })))
-}
-
-pub async fn get_task_runtime_meta(
-    State(_state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    assignment_store::ensure_db().map_err(storage_error)?;
-    let meta = assignment_store::get_task_runtime_binding(&id).map_err(storage_error)?;
-    match meta {
-        Some(meta) => Ok(Json(json!({ "meta": meta }))),
-        None => Err(ApiError::new(StatusCode::NOT_FOUND, "任务元数据不存在")),
-    }
-}
-
-pub async fn create_task_delivery(
-    State(_state): State<Arc<AppState>>,
-    Json(payload): Json<CreateTaskDeliveryRequest>,
-) -> Result<Json<Value>, ApiError> {
-    assignment_store::ensure_db().map_err(storage_error)?;
-    let task_id = payload.task_id.trim();
-    if task_id.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "task_id 不能为空"));
-    }
-    let owner_agent_id = payload.owner_agent_id.trim();
-    if owner_agent_id.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "owner_agent_id 不能为空",
-        ));
-    }
-    let dedupe_key = payload.dedupe_key.trim();
-    if dedupe_key.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "dedupe_key 不能为空",
-        ));
-    }
-    let delivery_id = payload
-        .id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| build_task_delivery_id(task_id, dedupe_key));
-    let record = assignment_store::TaskDeliveryRecord {
-        id: delivery_id.clone(),
-        task_id: task_id.to_string(),
-        owner_agent_id: owner_agent_id.to_string(),
-        runtime_key: normalize_optional_string(payload.runtime_key),
-        delivery_kind: payload
-            .delivery_kind
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "final".to_string()),
-        dedupe_key: dedupe_key.to_string(),
-        status: payload
-            .status
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "pending".to_string()),
-        origin_conversation_type: normalize_optional_string(payload.origin_conversation_type),
-        origin_conversation_id: normalize_optional_string(payload.origin_conversation_id),
-        origin_chat_session_id: normalize_optional_string(payload.origin_chat_session_id),
-        origin_message_id: normalize_optional_string(payload.origin_message_id),
-        creator_participant_id: normalize_optional_string(payload.creator_participant_id),
-        creator_participant_name: normalize_optional_string(payload.creator_participant_name),
-        executor_agent_id: normalize_optional_string(payload.executor_agent_id),
-        executor_agent_name: normalize_optional_string(payload.executor_agent_name),
-        report_actor_agent_id: normalize_optional_string(payload.report_actor_agent_id),
-        report_actor_agent_name: normalize_optional_string(payload.report_actor_agent_name),
-        task_name: normalize_optional_string(payload.task_name),
-        run_count: payload.run_count,
-        summary_text: normalize_optional_string(payload.summary_text),
-        error_text: normalize_optional_string(payload.error_text),
-        payload: payload
-            .payload
-            .unwrap_or_else(|| Value::Object(Default::default())),
-        created_at: String::new(),
-        updated_at: String::new(),
-        reported_at: None,
-        acknowledged_at: None,
-    };
-    assignment_store::create_or_update_task_delivery(&record).map_err(storage_error)?;
-    let stored = assignment_store::list_pending_task_deliveries(
-        record.runtime_key.as_deref(),
-        record.origin_chat_session_id.as_deref(),
-        record.origin_conversation_type.as_deref(),
-        record.origin_conversation_id.as_deref(),
-    )
-    .map_err(storage_error)?
-    .into_iter()
-    .find(|item| item.dedupe_key == record.dedupe_key)
-    .unwrap_or(record);
-    Ok(Json(json!({ "delivery": stored })))
-}
-
-pub async fn list_pending_task_deliveries_route(
-    State(_state): State<Arc<AppState>>,
-    Query(query): Query<PendingTaskDeliveriesQuery>,
-) -> Result<Json<Value>, ApiError> {
-    assignment_store::ensure_db().map_err(storage_error)?;
-    let rows = assignment_store::list_pending_task_deliveries(
-        query.runtime_key.as_deref(),
-        query.chat_session_id.as_deref(),
-        query.conversation_type.as_deref(),
-        query.conversation_id.as_deref(),
-    )
-    .map_err(storage_error)?;
-    Ok(Json(json!({ "deliveries": rows })))
-}
-
-pub async fn get_task_delivery_route(
-    State(_state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    assignment_store::ensure_db().map_err(storage_error)?;
-    let delivery = assignment_store::get_task_delivery(&id).map_err(storage_error)?;
-    match delivery {
-        Some(delivery) => Ok(Json(json!({ "delivery": delivery }))),
-        None => Err(ApiError::new(StatusCode::NOT_FOUND, "任务投递不存在")),
-    }
-}
-
-pub async fn update_task_delivery_status(
-    State(_state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<UpdateTaskDeliveryStatusRequest>,
-) -> Result<Json<Value>, ApiError> {
-    assignment_store::ensure_db().map_err(storage_error)?;
-    let status = payload.status.trim();
-    if !matches!(status, "pending" | "reported" | "acknowledged") {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "status 仅支持 pending/reported/acknowledged",
-        ));
-    }
-    assignment_store::mark_task_delivery_status(&id, status).map_err(storage_error)?;
-    let delivery = assignment_store::get_task_delivery(&id)
-        .map_err(storage_error)?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "任务投递不存在"))?;
-    Ok(Json(json!({ "delivery": delivery })))
+#[derive(Deserialize)]
+pub struct InternalTaskDeliverySendRequest {
+    pub delivery: Value,
 }
 
 #[derive(Deserialize)]
@@ -1656,27 +1636,16 @@ pub async fn update_chat_session_content(
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let was_online = state.power_state.read().await.online;
-    match probe_openfang_health(&state).await {
-        Ok(upstream) => Json(json!({
-            "status": "ok",
-            "service": "webot-service-rs",
-            "openfang": {
-                "reachable": true,
-                "baseUrl": state.config.openfang_base_url,
-                "health": upstream
-            }
-        })),
-        Err(error) => Json(json!({
-            "status": if was_online { "degraded" } else { "offline" },
-            "service": "webot-service-rs",
-            "openfang": {
-                "reachable": false,
-                "baseUrl": state.config.openfang_base_url,
-                "error": error.message
-            }
-        })),
-    }
+    let power = state.power_state.read().await;
+    Json(json!({
+        "status": "ok",
+        "service": "webot-service-rs",
+        "openfang": {
+            "reachable": power.online,
+            "baseUrl": state.config.openfang_base_url,
+            "error": power.last_error
+        }
+    }))
 }
 
 #[derive(Deserialize)]
@@ -2245,22 +2214,13 @@ pub async fn update_chat_group(
 }
 
 pub async fn service_power_status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let was_online = state.power_state.read().await.online;
-    match probe_openfang_health(&state).await {
-        Ok(health) => Json(json!({
-            "status": "online",
-            "online": true,
-            "error": null,
-            "health": health,
-            "openfangBaseUrl": state.config.openfang_base_url
-        })),
-        Err(error) => Json(json!({
-            "status": if was_online { "error" } else { "offline" },
-            "online": false,
-            "error": error.message,
-            "openfangBaseUrl": state.config.openfang_base_url
-        })),
-    }
+    let power = state.power_state.read().await;
+    Json(json!({
+        "status": if power.online { "online" } else if power.last_error.is_some() { "error" } else { "offline" },
+        "online": power.online,
+        "error": power.last_error,
+        "openfangBaseUrl": state.config.openfang_base_url
+    }))
 }
 
 pub async fn service_power_start(
@@ -2657,7 +2617,8 @@ const WORKSPACE_MCP_SERVER_PREFIX: &str = "agent-workspace-";
 const WORKSPACE_MCP_TIMEOUT_SECS: u64 = 20;
 const SYSTEM_HIDDEN_MCP_SERVER_NAMES: [&str; 2] = ["agent", "mcp"];
 const AGENT_PROFILE_DIR_NAME: &str = "agent_profile";
-const KNOWN_CONTEXT_FILES: [&str; 8] = [
+const EMBODIMENT_CONTEXT_FILE_NAME: &str = "EMBODIMENT.json";
+const KNOWN_CONTEXT_FILES: [&str; 9] = [
     "SOUL.md",
     "USER.md",
     "TOOLS.md",
@@ -2666,6 +2627,7 @@ const KNOWN_CONTEXT_FILES: [&str; 8] = [
     "BOOTSTRAP.md",
     "IDENTITY.md",
     "HEARTBEAT.md",
+    EMBODIMENT_CONTEXT_FILE_NAME,
 ];
 
 #[derive(Debug, Clone)]
@@ -2692,6 +2654,440 @@ fn normalize_context_file_name(file_name: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|item| item.eq_ignore_ascii_case(trimmed))
+}
+
+fn default_embodiment_json() -> Value {
+    json!({
+        "version": 1,
+        "assets": {}
+    })
+}
+
+fn normalize_embodiment_asset_kind(raw: Option<&str>, fallback: &str) -> String {
+    match raw.unwrap_or(fallback).trim() {
+        "avatar" | "portrait" | "self_photo" | "video_source" => {
+            raw.unwrap_or(fallback).trim().to_string()
+        }
+        _ => fallback.to_string(),
+    }
+}
+
+fn normalize_embodiment_asset_ref(
+    raw: &Value,
+    fallback_kind: &str,
+    fallback_url: Option<&str>,
+) -> Option<Value> {
+    let object = raw.as_object()?;
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            fallback_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })?;
+    let mut next = Map::new();
+    let source = object
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            matches!(
+                *value,
+                "managed_asset" | "managed_identity" | "external_url"
+            )
+        })
+        .unwrap_or("external_url");
+    next.insert("source".to_string(), Value::String(source.to_string()));
+    next.insert(
+        "kind".to_string(),
+        Value::String(normalize_embodiment_asset_kind(
+            object.get("kind").and_then(Value::as_str),
+            fallback_kind,
+        )),
+    );
+    next.insert("url".to_string(), Value::String(url.to_string()));
+    if let Some(asset_id) = object
+        .get("assetId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        next.insert("assetId".to_string(), Value::String(asset_id.to_string()));
+    }
+    if let Some(label) = object
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        next.insert("label".to_string(), Value::String(label.to_string()));
+    }
+    if let Some(mime_type) = object
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        next.insert("mimeType".to_string(), Value::String(mime_type.to_string()));
+    }
+    if let Some(metadata) = object.get("metadata").and_then(Value::as_object) {
+        next.insert("metadata".to_string(), Value::Object(metadata.clone()));
+    }
+    Some(Value::Object(next))
+}
+
+fn managed_identity_asset_ref(url: &str, kind: &str, label: &str) -> Value {
+    json!({
+        "source": "managed_identity",
+        "kind": kind,
+        "url": url,
+        "label": label,
+    })
+}
+
+fn media_asset_public_url(
+    agent_id: &str,
+    asset: &assignment_store::MediaAssetRecord,
+) -> Option<String> {
+    asset
+        .image_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            asset
+                .relative_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| build_agent_chat_asset_url(agent_id, value))
+        })
+}
+
+fn media_asset_embodiment_label(asset: &assignment_store::MediaAssetRecord) -> Option<String> {
+    asset
+        .metadata
+        .get("meta_label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            asset
+                .purpose
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            asset
+                .file_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn media_asset_to_embodiment_ref(
+    agent_id: &str,
+    asset: &assignment_store::MediaAssetRecord,
+    kind: &str,
+) -> Option<Value> {
+    let url = media_asset_public_url(agent_id, asset)?;
+    let mut object = Map::new();
+    object.insert(
+        "source".to_string(),
+        Value::String("managed_asset".to_string()),
+    );
+    object.insert("kind".to_string(), Value::String(kind.to_string()));
+    object.insert("assetId".to_string(), Value::String(asset.asset_id.clone()));
+    object.insert("url".to_string(), Value::String(url));
+    if !asset.mime_type.trim().is_empty() {
+        object.insert(
+            "mimeType".to_string(),
+            Value::String(asset.mime_type.trim().to_string()),
+        );
+    }
+    if let Some(label) = media_asset_embodiment_label(asset) {
+        object.insert("label".to_string(), Value::String(label));
+    }
+    if let Some(metadata) = asset.metadata.as_object() {
+        object.insert("metadata".to_string(), Value::Object(metadata.clone()));
+    }
+    Some(Value::Object(object))
+}
+
+fn build_self_photo_embodiment_refs(
+    agent_id: &str,
+    photo_assets: &[assignment_store::MediaAssetRecord],
+) -> Vec<Value> {
+    photo_assets
+        .iter()
+        .filter(|asset| asset.owner_scope.eq_ignore_ascii_case("self"))
+        .filter_map(|asset| media_asset_to_embodiment_ref(agent_id, asset, "self_photo"))
+        .collect()
+}
+
+fn normalize_embodiment_voice_ref(raw: &Value) -> Option<Value> {
+    let object = raw.as_object()?;
+    let mode = match object
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("speaker_profile")
+    {
+        "provider_voice" => "provider_voice",
+        _ => "speaker_profile",
+    };
+    let speaker_profile_id = object
+        .get("speakerProfileId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider = object
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let voice = object
+        .get("voice")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if speaker_profile_id.is_none() && provider.is_none() && voice.is_none() {
+        return None;
+    }
+    let mut next = Map::new();
+    next.insert("mode".to_string(), Value::String(mode.to_string()));
+    if let Some(value) = speaker_profile_id {
+        next.insert(
+            "speakerProfileId".to_string(),
+            Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = provider {
+        next.insert("provider".to_string(), Value::String(value.to_string()));
+    }
+    if let Some(value) = voice {
+        next.insert("voice".to_string(), Value::String(value.to_string()));
+    }
+    if let Some(label) = object
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        next.insert("label".to_string(), Value::String(label.to_string()));
+    }
+    if let Some(metadata) = object.get("metadata").and_then(Value::as_object) {
+        next.insert("metadata".to_string(), Value::Object(metadata.clone()));
+    }
+    Some(Value::Object(next))
+}
+
+fn build_legacy_embodiment_json(
+    profile: Option<&assignment_store::AgentProfileOverrideRecord>,
+    photo_assets: &[assignment_store::MediaAssetRecord],
+) -> Value {
+    let mut embodiment = default_embodiment_json();
+    let Some(object) = embodiment.as_object_mut() else {
+        return embodiment;
+    };
+    let Some(assets) = object.get_mut("assets").and_then(Value::as_object_mut) else {
+        return embodiment;
+    };
+
+    let default_avatar = profile
+        .and_then(|item| item.avatar_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| managed_identity_asset_ref(value, "avatar", "当前头像"));
+    let default_portrait = profile
+        .and_then(|item| item.portrait_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| managed_identity_asset_ref(value, "portrait", "当前立绘"));
+
+    if let Some(value) = default_avatar {
+        assets.insert("defaultAvatar".to_string(), value);
+    }
+    if let Some(value) = default_portrait {
+        assets.insert("defaultPortrait".to_string(), value.clone());
+        assets.insert(
+            "defaultVideoSource".to_string(),
+            managed_identity_asset_ref(
+                value.get("url").and_then(Value::as_str).unwrap_or_default(),
+                "video_source",
+                "当前视频源图",
+            ),
+        );
+    }
+    let agent_id = profile
+        .map(|item| item.agent_id.trim())
+        .filter(|value| !value.is_empty());
+    if let Some(agent_id) = agent_id {
+        let self_photos = build_self_photo_embodiment_refs(agent_id, photo_assets);
+        if !self_photos.is_empty() {
+            assets.insert("selfPhotos".to_string(), Value::Array(self_photos));
+        }
+    }
+
+    if let Some(tts_config) = profile.and_then(|item| item.tts_config.as_ref()) {
+        if let Some(speaker_profile_id) = tts_config
+            .get("speakerProfileId")
+            .or_else(|| tts_config.get("speaker_profile_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let label = profile
+                .and_then(|item| item.speaker_profiles.as_ref())
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items.iter().find_map(|item| {
+                        let id = item.get("id").and_then(Value::as_str)?.trim();
+                        if id != speaker_profile_id {
+                            return None;
+                        }
+                        item.get("name")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string)
+                    })
+                });
+            object.insert(
+                "voice".to_string(),
+                json!({
+                    "defaultVoice": {
+                        "mode": "speaker_profile",
+                        "speakerProfileId": speaker_profile_id,
+                        "label": label,
+                    }
+                }),
+            );
+        }
+    }
+
+    embodiment
+}
+
+fn normalize_embodiment_json(
+    raw: Option<&Value>,
+    profile: Option<&assignment_store::AgentProfileOverrideRecord>,
+    photo_assets: &[assignment_store::MediaAssetRecord],
+) -> Value {
+    let mut normalized = build_legacy_embodiment_json(profile, photo_assets);
+    let Some(raw_object) = raw.and_then(Value::as_object) else {
+        return normalized;
+    };
+    let Some(root) = normalized.as_object_mut() else {
+        return normalized;
+    };
+
+    root.insert("version".to_string(), Value::Number(1.into()));
+
+    let legacy_assets = root
+        .get("assets")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let raw_assets = raw_object.get("assets").and_then(Value::as_object);
+    let default_avatar = raw_assets
+        .and_then(|item| item.get("defaultAvatar"))
+        .and_then(|value| normalize_embodiment_asset_ref(value, "avatar", None))
+        .or_else(|| legacy_assets.get("defaultAvatar").cloned());
+    let default_portrait = raw_assets
+        .and_then(|item| item.get("defaultPortrait"))
+        .and_then(|value| normalize_embodiment_asset_ref(value, "portrait", None))
+        .or_else(|| legacy_assets.get("defaultPortrait").cloned());
+    let default_video_source = raw_assets
+        .and_then(|item| item.get("defaultVideoSource"))
+        .and_then(|value| normalize_embodiment_asset_ref(value, "video_source", None));
+    let legacy_self_photos = legacy_assets
+        .get("selfPhotos")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let self_photos = raw_assets
+        .and_then(|item| item.get("selfPhotos"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| normalize_embodiment_asset_ref(value, "self_photo", None))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or(legacy_self_photos);
+
+    root.insert(
+        "assets".to_string(),
+        json!({
+            "defaultAvatar": default_avatar,
+            "defaultPortrait": default_portrait,
+            "defaultVideoSource": default_video_source,
+            "selfPhotos": if self_photos.is_empty() { Value::Null } else { Value::Array(self_photos) },
+        }),
+    );
+
+    let legacy_voice = root.get("voice").cloned();
+    let raw_voice = raw_object.get("voice").and_then(Value::as_object);
+    let normalized_voice = raw_voice
+        .and_then(|value| value.get("defaultVoice"))
+        .and_then(normalize_embodiment_voice_ref)
+        .or_else(|| {
+            legacy_voice
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|item| item.get("defaultVoice"))
+                .cloned()
+        });
+    if normalized_voice.is_some() {
+        root.insert(
+            "voice".to_string(),
+            json!({
+                "defaultVoice": normalized_voice,
+            }),
+        );
+    }
+
+    normalized
+}
+
+fn embodiment_mirror_fields(
+    embodiment: &Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let avatar_url = embodiment
+        .get("assets")
+        .and_then(|value| value.get("defaultAvatar"))
+        .and_then(|value| value.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let portrait_url = embodiment
+        .get("assets")
+        .and_then(|value| value.get("defaultPortrait"))
+        .and_then(|value| value.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let speaker_profile_id = embodiment
+        .get("voice")
+        .and_then(|value| value.get("defaultVoice"))
+        .and_then(|value| value.get("speakerProfileId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    (avatar_url, portrait_url, speaker_profile_id)
 }
 
 fn normalize_generated_heading(raw: &str) -> String {
@@ -2880,6 +3276,39 @@ async fn write_context_file_to_openfang(
     Ok(())
 }
 
+async fn load_agent_embodiment_value(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    profile: Option<&assignment_store::AgentProfileOverrideRecord>,
+) -> Result<Value, ApiError> {
+    let raw_value = if let Some(record) =
+        assignment_store::get_agent_context_file(agent_id, EMBODIMENT_CONTEXT_FILE_NAME)
+            .map_err(storage_error)?
+    {
+        serde_json::from_str::<Value>(&record.content).ok()
+    } else if let Some(content) =
+        read_context_file_from_openfang(state, agent_id, EMBODIMENT_CONTEXT_FILE_NAME).await?
+    {
+        serde_json::from_str::<Value>(&content).ok()
+    } else {
+        None
+    };
+    let photo_assets = assignment_store::list_media_assets(assignment_store::MediaAssetListQuery {
+        agent_id: Some(agent_id.to_string()),
+        owner_scope: None,
+        asset_family: Some("photo".to_string()),
+        media_kind: Some("image".to_string()),
+        query: None,
+        limit: Some(64),
+    })
+    .map_err(storage_error)?;
+    Ok(normalize_embodiment_json(
+        raw_value.as_ref(),
+        profile,
+        &photo_assets,
+    ))
+}
+
 #[derive(Default, Debug, Clone)]
 struct AgentContextSyncStats {
     imported_to_db: usize,
@@ -3000,6 +3429,18 @@ fn validate_memory_id_segment(memory_id: &str) -> Result<(), ApiError> {
             axum::http::StatusCode::BAD_REQUEST,
             "无效的 memory id",
         ));
+    }
+    Ok(())
+}
+
+fn validate_task_path_segment(task_id: &str) -> Result<(), ApiError> {
+    let trimmed = task_id.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+    {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "无效的 task id"));
     }
     Ok(())
 }
@@ -3887,6 +4328,8 @@ fn chat_asset_kind_from_name(filename: &str) -> &'static str {
         .unwrap_or_default();
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" => "image",
+        "mp4" | "webm" | "mov" | "m4v" | "avi" | "mkv" => "video",
+        "mp3" | "wav" | "ogg" | "m4a" | "flac" => "audio",
         _ => "file",
     }
 }
@@ -3926,6 +4369,64 @@ fn chat_asset_content_type(filename: &str) -> &'static str {
         "webm" => "video/webm",
         _ => "application/octet-stream",
     }
+}
+
+fn parse_http_byte_range_header(range_header: &str, file_size: u64) -> Result<(u64, u64), ()> {
+    if file_size == 0 {
+        return Err(());
+    }
+    let trimmed = range_header.trim();
+    let Some(spec) = trimmed.strip_prefix("bytes=") else {
+        return Err(());
+    };
+    if spec.contains(',') {
+        return Err(());
+    }
+    let Some((raw_start, raw_end)) = spec.split_once('-') else {
+        return Err(());
+    };
+    if raw_start.is_empty() {
+        let suffix_len = raw_end.parse::<u64>().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        return Ok((start, file_size - 1));
+    }
+
+    let start = raw_start.parse::<u64>().map_err(|_| ())?;
+    if start >= file_size {
+        return Err(());
+    }
+    let end = if raw_end.trim().is_empty() {
+        file_size - 1
+    } else {
+        let parsed = raw_end.parse::<u64>().map_err(|_| ())?;
+        if parsed < start {
+            return Err(());
+        }
+        parsed.min(file_size - 1)
+    };
+    Ok((start, end))
+}
+
+fn read_file_byte_range(path: &StdPath, start: u64, end: u64) -> Result<Vec<u8>, ApiError> {
+    let len = end
+        .checked_sub(start)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| storage_error("读取附件分片范围非法"))?;
+    let mut file = fs::File::open(path)
+        .map_err(|e| storage_error(format!("打开聊天附件失败({}): {e}", path.display())))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| storage_error(format!("定位聊天附件失败({}): {e}", path.display())))?;
+    let mut buffer = vec![
+        0u8;
+        usize::try_from(len)
+            .map_err(|_| storage_error("附件分片过大，无法读取"))?
+    ];
+    file.read_exact(&mut buffer)
+        .map_err(|e| storage_error(format!("读取聊天附件分片失败({}): {e}", path.display())))?;
+    Ok(buffer)
 }
 
 fn sanitize_chat_asset_filename(raw: Option<&str>) -> String {
@@ -4234,8 +4735,11 @@ async fn save_agent_portrait_bytes(
 }
 
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    tracing::info!("route /api/management/agents started");
     ensure_online(&state).await?;
+    tracing::info!("route /api/management/agents after ensure_online");
     let mut data = state.openfang.get_json("/api/agents").await?;
+    tracing::info!("route /api/management/agents upstream /api/agents returned");
     let profiles = assignment_store::list_agent_profile_overrides().map_err(storage_error)?;
     let hidden = assignment_store::list_hidden_agent_ids()
         .map_err(storage_error)?
@@ -4260,12 +4764,8 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             if agent_id.is_empty() {
                 continue;
             }
-            if let Err(err) = resolve_agent_media_dirs(&state, &agent_id, Some(row)).await {
-                eprintln!(
-                    "[management] 迁移智能体媒体目录失败(agent_id={}): {}",
-                    agent_id, err.message
-                );
-            }
+            // 列表接口只负责返回摘要，避免在首屏阶段串行触发工作空间/媒体目录迁移。
+            // 这类磁盘整理在详情页或真正读写媒体资产时再懒执行，避免把桌面启动链路拖死。
             if let Some(profile) = profiles.get(&agent_id) {
                 merge_agent_profile_override(row, profile);
             }
@@ -4279,6 +4779,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             }
         }
     }
+    tracing::info!("route /api/management/agents finished");
     Ok(Json(data))
 }
 
@@ -4523,10 +5024,15 @@ pub async fn get_agent(
     let resolved = resolve_agent_id_alias(&state, &id).await?;
     let path = format!("/api/agents/{}", resolved.resolved);
     let mut data = state.openfang.get_json(&path).await?;
-    if let Some(profile) =
-        assignment_store::get_agent_profile_override(&resolved.resolved).map_err(storage_error)?
-    {
+    let profile =
+        assignment_store::get_agent_profile_override(&resolved.resolved).map_err(storage_error)?;
+    if let Some(profile) = profile.as_ref() {
         merge_agent_profile_override(&mut data, &profile);
+    }
+    let embodiment =
+        load_agent_embodiment_value(&state, &resolved.resolved, profile.as_ref()).await?;
+    if let Some(object) = data.as_object_mut() {
+        object.insert("embodiment".to_string(), embodiment);
     }
     if resolved.alias_used {
         if let Some(object) = data.as_object_mut() {
@@ -4551,8 +5057,67 @@ pub async fn update_agent_config(
     let mut overrides = extract_profile_override_patch(&payload);
     let current_override =
         assignment_store::get_agent_profile_override(&agent_id).map_err(storage_error)?;
+    let embodiment_payload = payload.get("embodiment").cloned();
     let mut workspace_migration_from: Option<String> = None;
     let mut workspace_migration_to: Option<String> = None;
+
+    let normalized_embodiment = if let Some(raw) = embodiment_payload.as_ref() {
+        if raw.is_null() {
+            Some(default_embodiment_json())
+        } else {
+            let photo_assets =
+                assignment_store::list_media_assets(assignment_store::MediaAssetListQuery {
+                    agent_id: Some(agent_id.clone()),
+                    owner_scope: None,
+                    asset_family: Some("photo".to_string()),
+                    media_kind: Some("image".to_string()),
+                    query: None,
+                    limit: Some(64),
+                })
+                .map_err(storage_error)?;
+            Some(normalize_embodiment_json(
+                Some(raw),
+                current_override.as_ref(),
+                &photo_assets,
+            ))
+        }
+    } else {
+        None
+    };
+    if let Some(embodiment) = normalized_embodiment.as_ref() {
+        let (avatar_url, portrait_url, speaker_profile_id) = embodiment_mirror_fields(embodiment);
+        overrides.avatar_url = Some(avatar_url.unwrap_or_default());
+        overrides.portrait_url = Some(portrait_url.unwrap_or_default());
+        let mut merged_tts_config = overrides
+            .tts_config
+            .clone()
+            .filter(Value::is_object)
+            .or_else(|| {
+                current_override
+                    .as_ref()
+                    .and_then(|item| item.tts_config.clone())
+                    .filter(Value::is_object)
+            })
+            .unwrap_or_else(|| json!({}));
+        if let Some(object) = merged_tts_config.as_object_mut() {
+            if let Some(value) = speaker_profile_id {
+                object.insert("speakerProfileId".to_string(), Value::String(value));
+                if !object.contains_key("enabled") {
+                    object.insert("enabled".to_string(), Value::Bool(true));
+                }
+                if !object.contains_key("serviceMode") && !object.contains_key("service_mode") {
+                    object.insert(
+                        "serviceMode".to_string(),
+                        Value::String("inherit_global".to_string()),
+                    );
+                }
+            } else {
+                object.remove("speakerProfileId");
+                object.remove("speaker_profile_id");
+            }
+        }
+        overrides.tts_config = Some(merged_tts_config);
+    }
 
     if let Some(requested_english_name) = overrides.english_name.clone() {
         let requested = requested_english_name.trim().to_string();
@@ -4670,6 +5235,7 @@ pub async fn update_agent_config(
         object.remove("channel_binding");
         object.remove("tts_config");
         object.remove("speaker_profiles");
+        object.remove("embodiment");
         if let Some(tags) = overrides.tags.as_ref() {
             object.insert("tags".to_string(), json!(tags));
         }
@@ -4711,6 +5277,22 @@ pub async fn update_agent_config(
     }
     if has_channel_binding {
         sync_channel_bindings_to_runtime(&state).await?;
+    }
+    if let Some(embodiment) = normalized_embodiment.as_ref() {
+        let content = serde_json::to_string_pretty(embodiment)
+            .map_err(|err| storage_error(format!("序列化 EMBODIMENT.json 失败: {err}")))?;
+        let _ =
+            persist_agent_context_file(&state, &agent_id, EMBODIMENT_CONTEXT_FILE_NAME, &content)
+                .await?;
+        if let Some(object) = data.as_object_mut() {
+            object.insert("embodiment".to_string(), embodiment.clone());
+        }
+    } else {
+        let embodiment =
+            load_agent_embodiment_value(&state, &agent_id, current_override.as_ref()).await?;
+        if let Some(object) = data.as_object_mut() {
+            object.insert("embodiment".to_string(), embodiment);
+        }
     }
     if let Some(to_segment) = workspace_migration_to
         .as_deref()
@@ -5055,7 +5637,7 @@ pub async fn get_agent_context_file(
     let normalized_file_name = normalize_context_file_name(&filename).ok_or_else(|| {
         ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
-            "不支持的身份文件（仅允许 SOUL.md/USER.md/TOOLS.md/MEMORY.md/AGENTS.md/BOOTSTRAP.md/IDENTITY.md/HEARTBEAT.md）",
+            "不支持的身份文件（仅允许 SOUL.md/USER.md/TOOLS.md/MEMORY.md/AGENTS.md/BOOTSTRAP.md/IDENTITY.md/HEARTBEAT.md/EMBODIMENT.json）",
         )
     })?;
 
@@ -5162,7 +5744,7 @@ pub async fn set_agent_context_file(
     let normalized_file_name = normalize_context_file_name(&filename).ok_or_else(|| {
         ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
-            "不支持的身份文件（仅允许 SOUL.md/USER.md/TOOLS.md/MEMORY.md/AGENTS.md/BOOTSTRAP.md/IDENTITY.md/HEARTBEAT.md）",
+            "不支持的身份文件（仅允许 SOUL.md/USER.md/TOOLS.md/MEMORY.md/AGENTS.md/BOOTSTRAP.md/IDENTITY.md/HEARTBEAT.md/EMBODIMENT.json）",
         )
     })?;
     let content = payload.content;
@@ -6723,7 +7305,8 @@ pub async fn get_agent_chat_asset_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<AgentChatAssetFileQuery>,
-) -> Result<impl axum::response::IntoResponse, ApiError> {
+    headers: AxumHeaderMap,
+) -> Result<Response<Body>, ApiError> {
     validate_agent_path_segment(&id)?;
     let resolved = resolve_agent_id_alias(&state, &id).await?;
     validate_agent_path_segment(&resolved.resolved)?;
@@ -6747,27 +7330,75 @@ pub async fn get_agent_chat_asset_file(
         ));
     }
 
-    let bytes = fs::read(&file_path)
-        .map_err(|e| storage_error(format!("读取聊天附件失败({}): {e}", file_path.display())))?;
     let file_name = file_path
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("attachment.bin");
-    Ok((
-        [
-            (header::CONTENT_TYPE, chat_asset_content_type(file_name)),
-            (header::CACHE_CONTROL, "private, max-age=300"),
-            (
-                header::CONTENT_DISPOSITION,
-                if chat_asset_kind_from_name(file_name) == "image" {
-                    "inline"
-                } else {
-                    "attachment"
-                },
-            ),
-        ],
-        bytes,
-    ))
+    let content_type = chat_asset_content_type(file_name);
+    let disposition = if matches!(
+        chat_asset_kind_from_name(file_name),
+        "image" | "video" | "audio"
+    ) {
+        "inline"
+    } else {
+        "attachment"
+    };
+    let file_size = fs::metadata(&file_path)
+        .map_err(|e| {
+            storage_error(format!(
+                "读取聊天附件元数据失败({}): {e}",
+                file_path.display()
+            ))
+        })?
+        .len();
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(range_header) = range_header {
+        let (start, end) = match parse_http_byte_range_header(range_header, file_size) {
+            Ok(range) => range,
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header(header::CACHE_CONTROL, "private, max-age=300")
+                    .header(header::CONTENT_DISPOSITION, disposition)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+                    .body(Body::empty())
+                    .map_err(|e| storage_error(format!("构建 Range 错误响应失败: {e}")));
+            }
+        };
+        let chunk = read_file_byte_range(&file_path, start, end)?;
+        return Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "private, max-age=300")
+            .header(header::CONTENT_DISPOSITION, disposition)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{file_size}"),
+            )
+            .header(header::CONTENT_LENGTH, chunk.len().to_string())
+            .body(Body::from(chunk))
+            .map_err(|e| storage_error(format!("构建聊天附件分片响应失败: {e}")));
+    }
+
+    let bytes = fs::read(&file_path)
+        .map_err(|e| storage_error(format!("读取聊天附件失败({}): {e}", file_path.display())))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=300")
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .body(Body::from(bytes))
+        .map_err(|e| storage_error(format!("构建聊天附件响应失败: {e}")))
 }
 
 pub async fn upload_agent_chat_asset(
@@ -7530,8 +8161,7 @@ pub async fn get_agent_skills(
     );
     let (global_custom_skills, global_component_skills) = global_skill_name_groups()?;
     let mut custom_available = canonicalize_skill_names(global_custom_skills, &skill_aliases);
-    let mut component_available =
-        canonicalize_skill_names(global_component_skills, &skill_aliases);
+    let mut component_available = canonicalize_skill_names(global_component_skills, &skill_aliases);
     let custom_available_set = custom_available
         .iter()
         .map(|name| name.to_ascii_lowercase())
@@ -9032,7 +9662,760 @@ pub async fn run_workflow(
     Ok(Json(data))
 }
 
-#[derive(Deserialize)]
+pub async fn list_managed_tasks_route(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ManagedTaskListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let mut params = Vec::new();
+    if let Some(agent_id) = query
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_agent_path_segment(agent_id)?;
+        params.push(("agent_id".to_string(), agent_id.to_string()));
+    }
+    let data = state
+        .openfang
+        .get_json_with_query("/api/tasks", &params)
+        .await?;
+    Ok(Json(data))
+}
+
+pub async fn create_managed_task_route(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let data = state.openfang.post_json("/api/tasks", payload).await?;
+    Ok(Json(data))
+}
+
+pub async fn get_managed_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}");
+    let data = state.openfang.get_json(&path).await?;
+    Ok(Json(data))
+}
+
+pub async fn delete_managed_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}");
+    let data = state.openfang.delete_json(&path).await?;
+    Ok(Json(data))
+}
+
+pub async fn publish_managed_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/publish");
+    let data = state.openfang.post_json(&path, json!({})).await?;
+    Ok(Json(data))
+}
+
+pub async fn pause_managed_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/pause");
+    let data = state.openfang.post_json(&path, json!({})).await?;
+    Ok(Json(data))
+}
+
+pub async fn run_managed_task_once_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/run-once");
+    let data = state.openfang.post_json(&path, json!({})).await?;
+    Ok(Json(data))
+}
+
+pub async fn list_managed_task_runs_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/runs");
+    let data = state.openfang.get_json(&path).await?;
+    Ok(Json(data))
+}
+
+pub async fn list_managed_task_events_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/events");
+    let data = state.openfang.get_json(&path).await?;
+    Ok(Json(data))
+}
+
+pub async fn list_managed_task_deliveries_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/deliveries");
+    let data = state.openfang.get_json(&path).await?;
+    Ok(Json(data))
+}
+
+pub async fn list_managed_task_delivery_attempts_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/delivery-attempts");
+    let data = state.openfang.get_json(&path).await?;
+    Ok(Json(data))
+}
+
+pub async fn list_managed_task_timeline_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/{id}/timeline");
+    let data = state.openfang.get_json(&path).await?;
+    Ok(Json(data))
+}
+
+pub async fn list_managed_task_pending_deliveries_route(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ManagedTaskPendingDeliveriesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let mut params = Vec::new();
+    if let Some(target_kind) = query
+        .target_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("target_kind".to_string(), target_kind.to_string()));
+    }
+    if let Some(chat_session_id) = query
+        .origin_chat_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push((
+            "origin_chat_session_id".to_string(),
+            chat_session_id.to_string(),
+        ));
+    }
+    let data = timeout(
+        Duration::from_secs(MANAGED_TASK_DELIVERY_UPSTREAM_TIMEOUT_SECS),
+        state
+            .openfang
+            .get_json_with_query("/api/tasks/deliveries/pending", &params),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "任务投递查询超时，请稍后重试。",
+        )
+    })??;
+    Ok(Json(data))
+}
+
+pub async fn update_managed_task_delivery_status_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateTaskDeliveryStatusRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let path = format!("/api/tasks/deliveries/{id}/status");
+    let data = timeout(
+        Duration::from_secs(MANAGED_TASK_DELIVERY_UPSTREAM_TIMEOUT_SECS),
+        state
+            .openfang
+            .post_json(&path, json!({ "status": payload.status })),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "任务投递状态更新超时，请稍后重试。",
+        )
+    })??;
+    Ok(Json(data))
+}
+
+fn parse_editable_messages_from_session_payload(
+    payload: &Value,
+) -> Vec<EditableChatSessionMessage> {
+    payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|item| {
+                    let role = item
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    let content = item
+                        .get("content")
+                        .and_then(|value| {
+                            value.as_str().map(ToString::to_string).or_else(|| {
+                                value
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string)
+                            })
+                        })
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())?;
+                    Some(EditableChatSessionMessage {
+                        role: role.to_string(),
+                        content,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn read_trimmed_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+    })
+}
+
+async fn resolve_managed_task_remote_chat_binding(
+    state: &Arc<AppState>,
+    task_id: &str,
+) -> Result<(String, String), ApiError> {
+    let detail_path = format!("/api/tasks/{task_id}");
+    let detail = state.openfang.get_json(&detail_path).await?;
+    let spec = detail
+        .get("spec")
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "任务详情不存在"))?;
+    let binding = spec.get("binding").unwrap_or(&Value::Null);
+    let owner_agent_id = read_trimmed_value(
+        binding,
+        &[
+            "remote_chat_session_owner_agent_id",
+            "remoteChatSessionOwnerAgentId",
+        ],
+    )
+    .or_else(|| read_trimmed_value(spec, &["agent_id", "agentId"]))
+    .map(ToString::to_string);
+    let remote_session_id =
+        read_trimmed_value(binding, &["remote_chat_session_id", "remoteChatSessionId"])
+            .map(ToString::to_string);
+
+    if let (Some(remote_session_id), Some(owner_agent_id)) = (remote_session_id, owner_agent_id) {
+        return Ok((remote_session_id, owner_agent_id));
+    }
+    Err(ApiError::new(StatusCode::CONFLICT, "任务未绑定远端会话 ID"))
+}
+
+async fn append_message_to_remote_chat_session(
+    state: &Arc<AppState>,
+    owner_agent_id: &str,
+    session_id: &str,
+    message_text: &str,
+) -> Result<usize, ApiError> {
+    let session_ctx = ensure_switched_to_session_id(state, owner_agent_id, session_id).await?;
+    let path = format!("/api/agents/{owner_agent_id}/session");
+    let session_payload = match state.openfang.get_json(&path).await {
+        Ok(value) => value,
+        Err(err) => {
+            if session_ctx.switched {
+                let _ = switch_openfang_session(
+                    state,
+                    owner_agent_id,
+                    &session_ctx.original_session_id,
+                )
+                .await;
+            }
+            return Err(err);
+        }
+    };
+
+    let mut messages = parse_editable_messages_from_session_payload(&session_payload);
+    let normalized_message = message_text.trim();
+    if !messages.iter().any(|item| {
+        item.role.eq_ignore_ascii_case("assistant") && item.content.trim() == normalized_message
+    }) {
+        messages.push(EditableChatSessionMessage {
+            role: "assistant".to_string(),
+            content: normalized_message.to_string(),
+        });
+    }
+
+    let update_path = format!("/api/sessions/{session_id}/content");
+    let update_result = state
+        .openfang
+        .put_json(
+            &update_path,
+            json!({
+                "messages": messages.iter().map(|item| json!({
+                    "role": item.role,
+                    "content": item.content,
+                })).collect::<Vec<_>>(),
+            }),
+        )
+        .await;
+
+    if session_ctx.switched {
+        let _ =
+            switch_openfang_session(state, owner_agent_id, &session_ctx.original_session_id).await;
+    }
+
+    match update_result {
+        Ok(_) => Ok(messages.len()),
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn writeback_managed_task_delivery_to_chat_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<ManagedTaskChatWritebackRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+
+    let task_id = payload.task_id.trim();
+    if task_id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "task_id 不能为空"));
+    }
+    let message_text = payload.message_text.trim();
+    if message_text.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "message_text 不能为空",
+        ));
+    }
+
+    let (remote_session_id, remote_session_owner_agent_id) =
+        resolve_managed_task_remote_chat_binding(&state, task_id).await?;
+
+    let deliveries_path = format!("/api/tasks/{task_id}/deliveries");
+    let deliveries = state.openfang.get_json(&deliveries_path).await?;
+    let delivery = deliveries
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find(|row| {
+                row.get("id").and_then(Value::as_str).map(str::trim) == Some(id.as_str())
+            })
+        })
+        .cloned()
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "任务 delivery 不存在"))?;
+
+    let target_kind = delivery
+        .get("target_kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if target_kind != "chat_message" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "仅支持 chat_message 类型的 delivery 回写",
+        ));
+    }
+
+    let message_count = append_message_to_remote_chat_session(
+        &state,
+        &remote_session_owner_agent_id,
+        &remote_session_id,
+        message_text,
+    )
+    .await?;
+
+    let current_status = delivery
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("pending");
+    let next_status = if current_status == "acknowledged" {
+        "acknowledged"
+    } else {
+        let status_path = format!("/api/tasks/deliveries/{id}/status");
+        let _ = state
+            .openfang
+            .post_json(&status_path, json!({ "status": "reported" }))
+            .await?;
+        "reported"
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "task_id": task_id,
+        "delivery_id": id,
+        "remote_session_id": remote_session_id,
+        "remote_session_owner_agent_id": remote_session_owner_agent_id,
+        "message_count": message_count,
+        "delivery_status": next_status,
+    })))
+}
+
+fn value_array(payload: &Value) -> Vec<Value> {
+    payload.as_array().cloned().unwrap_or_default()
+}
+
+fn read_delivery_field<'a>(delivery: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    read_trimmed_value(delivery, keys)
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|item| item.with_timezone(&chrono::Utc))
+}
+
+fn retry_delay_seconds(failure_count: usize) -> Option<i64> {
+    match failure_count {
+        1 => Some(5),
+        2 => Some(30),
+        3 => Some(120),
+        4 => Some(600),
+        5 => Some(1800),
+        _ => None,
+    }
+}
+
+async fn list_task_delivery_attempts_upstream(
+    state: &Arc<AppState>,
+    task_id: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let path = format!("/api/tasks/{task_id}/delivery-attempts");
+    let payload = state.openfang.get_json(&path).await?;
+    Ok(value_array(&payload))
+}
+
+async fn record_task_delivery_attempt_upstream(
+    state: &Arc<AppState>,
+    delivery: &Value,
+    consumer_kind: &str,
+    status: &str,
+    error: Option<String>,
+    metadata_json: Value,
+) -> Result<Value, ApiError> {
+    let delivery_id = read_delivery_field(delivery, &["id"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.id 缺失"))?;
+    let task_id = read_delivery_field(delivery, &["task_id", "taskId"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.task_id 缺失"))?;
+    let target_kind = read_delivery_field(delivery, &["target_kind", "targetKind"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.target_kind 缺失"))?;
+    let path = format!("/api/tasks/deliveries/{delivery_id}/attempts");
+    state
+        .openfang
+        .post_json(
+            &path,
+            json!({
+                "task_id": task_id,
+                "run_id": read_delivery_field(delivery, &["run_id", "runId"]),
+                "event_id": read_delivery_field(delivery, &["event_id", "eventId"]),
+                "target_kind": target_kind,
+                "consumer_kind": consumer_kind,
+                "status": status,
+                "error": error,
+                "metadata_json": metadata_json,
+                "started_at": chrono::Utc::now().to_rfc3339(),
+                "finished_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .await
+}
+
+async fn update_task_delivery_status_upstream(
+    state: &Arc<AppState>,
+    delivery_id: &str,
+    status: &str,
+) -> Result<Value, ApiError> {
+    let path = format!("/api/tasks/deliveries/{delivery_id}/status");
+    state
+        .openfang
+        .post_json(&path, json!({ "status": status }))
+        .await
+}
+
+async fn should_dispatch_delivery_now(
+    state: &Arc<AppState>,
+    delivery: &Value,
+) -> Result<bool, ApiError> {
+    let task_id = read_delivery_field(delivery, &["task_id", "taskId"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.task_id 缺失"))?;
+    let delivery_id = read_delivery_field(delivery, &["id"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.id 缺失"))?;
+    let attempts = list_task_delivery_attempts_upstream(state, task_id).await?;
+    let related = attempts.into_iter().filter(|item| {
+        read_delivery_field(item, &["delivery_id", "deliveryId"]) == Some(delivery_id)
+    });
+    let mut failure_count = 0usize;
+    let mut latest_finished_at = None;
+    let mut unrecoverable = false;
+    for attempt in related {
+        let status = read_delivery_field(&attempt, &["status"]).unwrap_or_default();
+        if status.eq_ignore_ascii_case("failed") {
+            failure_count += 1;
+        }
+        if let Some(value) = attempt
+            .get("metadata_json")
+            .or_else(|| attempt.get("metadata"))
+            .and_then(Value::as_object)
+            .and_then(|row| row.get("unrecoverable"))
+            .and_then(Value::as_bool)
+        {
+            unrecoverable = unrecoverable || value;
+        }
+        if let Some(finished_at) = read_delivery_field(&attempt, &["finished_at", "finishedAt"])
+            .and_then(parse_rfc3339_utc)
+        {
+            latest_finished_at = Some(match latest_finished_at {
+                Some(current) if current > finished_at => current,
+                _ => finished_at,
+            });
+        }
+    }
+    if unrecoverable || failure_count == 0 {
+        return Ok(true);
+    }
+    let Some(delay_seconds) = retry_delay_seconds(failure_count) else {
+        return Ok(true);
+    };
+    let Some(latest_finished_at) = latest_finished_at else {
+        return Ok(true);
+    };
+    Ok(chrono::Utc::now() >= latest_finished_at + chrono::Duration::seconds(delay_seconds))
+}
+
+async fn dispatch_chat_message_delivery(
+    state: &Arc<AppState>,
+    delivery: &Value,
+) -> Result<Value, ApiError> {
+    let delivery_id = read_delivery_field(delivery, &["id"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.id 缺失"))?;
+    let task_id = read_delivery_field(delivery, &["task_id", "taskId"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.task_id 缺失"))?;
+    let message_text = read_delivery_field(delivery, &["body"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.body 缺失"))?;
+
+    let attempts = list_task_delivery_attempts_upstream(state, task_id).await?;
+    let previous_failures = attempts
+        .iter()
+        .filter(|item| {
+            read_delivery_field(item, &["delivery_id", "deliveryId"]) == Some(delivery_id)
+                && read_delivery_field(item, &["status"]) == Some("failed")
+        })
+        .count();
+
+    match resolve_managed_task_remote_chat_binding(state, task_id).await {
+        Ok((remote_session_id, owner_agent_id)) => {
+            let message_count = append_message_to_remote_chat_session(
+                state,
+                &owner_agent_id,
+                &remote_session_id,
+                message_text,
+            )
+            .await?;
+            let _ = record_task_delivery_attempt_upstream(
+                state,
+                delivery,
+                "chat_message_dispatcher",
+                "succeeded",
+                None,
+                json!({
+                    "message_count": message_count,
+                    "remote_session_id": remote_session_id,
+                    "remote_chat_session_owner_agent_id": owner_agent_id,
+                }),
+            )
+            .await?;
+            let updated =
+                update_task_delivery_status_upstream(state, delivery_id, "reported").await?;
+            Ok(json!({
+                "ok": true,
+                "delivery": updated,
+                "message_count": message_count,
+            }))
+        }
+        Err(err) => {
+            let unrecoverable = err.status == StatusCode::CONFLICT;
+            let failure_count = previous_failures + 1;
+            let retry_after_seconds = if unrecoverable {
+                None
+            } else {
+                retry_delay_seconds(failure_count)
+            };
+            let error_text = err.message.clone();
+            let _ = record_task_delivery_attempt_upstream(
+                state,
+                delivery,
+                "chat_message_dispatcher",
+                "failed",
+                Some(error_text.clone()),
+                json!({
+                    "failure_count": failure_count,
+                    "retry_after_seconds": retry_after_seconds,
+                    "unrecoverable": unrecoverable,
+                }),
+            )
+            .await?;
+            if unrecoverable || failure_count >= 5 {
+                let updated =
+                    update_task_delivery_status_upstream(state, delivery_id, "failed").await?;
+                return Ok(json!({
+                    "ok": false,
+                    "delivery": updated,
+                    "failure_count": failure_count,
+                    "error": error_text,
+                }));
+            }
+            Err(ApiError::new(StatusCode::BAD_GATEWAY, error_text))
+        }
+    }
+}
+
+async fn dispatch_pc_notice_delivery(
+    state: &Arc<AppState>,
+    delivery: &Value,
+) -> Result<Value, ApiError> {
+    let delivery_id = read_delivery_field(delivery, &["id"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.id 缺失"))?;
+    let _ = record_task_delivery_attempt_upstream(
+        state,
+        delivery,
+        "pc_notice_bridge",
+        "succeeded",
+        None,
+        json!({
+            "reported_via": "compose_notice_feed",
+        }),
+    )
+    .await?;
+    Ok(json!({
+        "ok": true,
+        "delivery": delivery,
+        "delivery_id": delivery_id,
+    }))
+}
+
+async fn dispatch_webhook_delivery(
+    state: &Arc<AppState>,
+    delivery: &Value,
+) -> Result<Value, ApiError> {
+    let delivery_id = read_delivery_field(delivery, &["id"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.id 缺失"))?;
+    let _ = record_task_delivery_attempt_upstream(
+        state,
+        delivery,
+        "webhook_dispatcher",
+        "failed",
+        Some("webhook sender not implemented".to_string()),
+        json!({
+            "reserved": true,
+        }),
+    )
+    .await?;
+    let updated = update_task_delivery_status_upstream(state, delivery_id, "failed").await?;
+    Ok(json!({
+        "ok": false,
+        "delivery": updated,
+        "error": "webhook sender not implemented",
+    }))
+}
+
+async fn dispatch_managed_task_delivery(
+    state: &Arc<AppState>,
+    delivery: &Value,
+) -> Result<Value, ApiError> {
+    match read_delivery_field(delivery, &["target_kind", "targetKind"]).unwrap_or_default() {
+        "chat_message" => dispatch_chat_message_delivery(state, delivery).await,
+        "pc_notice" => dispatch_pc_notice_delivery(state, delivery).await,
+        "webhook" => dispatch_webhook_delivery(state, delivery).await,
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "不支持的任务 delivery target_kind",
+        )),
+    }
+}
+
+fn should_skip_auto_dispatch_for_frontend_bound_chat_delivery(delivery: &Value) -> bool {
+    let target_kind =
+        read_delivery_field(delivery, &["target_kind", "targetKind"]).unwrap_or_default();
+    if !target_kind.eq_ignore_ascii_case("chat_message") {
+        return false;
+    }
+    read_delivery_field(delivery, &["origin_chat_session_id", "originChatSessionId"])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+}
+
+pub async fn run_task_delivery_dispatch_cycle(state: Arc<AppState>) -> Result<usize, ApiError> {
+    let deliveries = state
+        .openfang
+        .get_json_with_query(
+            "/api/tasks/deliveries/pending",
+            &[("target_kind".to_string(), "chat_message".to_string())],
+        )
+        .await?;
+    let rows = value_array(&deliveries);
+    let mut handled = 0usize;
+    for delivery in rows {
+        if should_skip_auto_dispatch_for_frontend_bound_chat_delivery(&delivery) {
+            continue;
+        }
+        if !should_dispatch_delivery_now(&state, &delivery).await? {
+            continue;
+        }
+        match dispatch_managed_task_delivery(&state, &delivery).await {
+            Ok(_) => handled += 1,
+            Err(err) => {
+                tracing::warn!(error = %err.message, "task delivery dispatcher send failed");
+            }
+        }
+    }
+    Ok(handled)
+}
+
+pub async fn send_internal_task_delivery(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<InternalTaskDeliverySendRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    Ok(Json(
+        dispatch_managed_task_delivery(&state, &payload.delivery).await?,
+    ))
+}
+
+#[derive(Clone, Deserialize)]
 pub struct ChatMessageAttachmentRequest {
     pub file_id: Option<String>,
     pub filename: Option<String>,
@@ -9048,6 +10431,8 @@ pub struct ChatMessageRequest {
     pub session_id: Option<String>,
     pub session_label: Option<String>,
     pub request_origin: Option<String>,
+    #[serde(default)]
+    pub current_task_draft: Option<chat_task_draft::ChatTaskDraftPayload>,
     #[serde(default)]
     pub attachments: Vec<ChatMessageAttachmentRequest>,
 }
@@ -9086,6 +10471,17 @@ fn resolve_upstream_request_origin(
         (Some("group_auto"), Some(label)) if label.starts_with("groupmem_") => Some("group_auto"),
         _ => None,
     }
+}
+
+fn webot_chat_blocked_tools() -> Vec<&'static str> {
+    vec![
+        "cron_create",
+        "cron_list",
+        "cron_delete",
+        "schedule_create",
+        "schedule_list",
+        "schedule_delete",
+    ]
 }
 
 async fn get_openfang_agent_session_id(
@@ -10417,6 +11813,9 @@ fn ensure_visible_reply_for_chat_turn(message: &str) -> String {
         "必须给出面向用户的可见正文回复。",
         "禁止仅返回 NO_REPLY、[[silent]]、空字符串，或只有工具/记忆日志。",
         "如果需要先检索记忆、调用工具或做中间步骤，完成后仍必须继续输出最终正文。",
+        "当前轮次只是聊天交互，不代表任何任务、提醒、监控、定时器已经创建、发布、启动或设置完成。",
+        "除非系统已经明确返回任务卡片确认结果，或明确返回任务创建成功结果，否则禁止宣称“已为你设置”“已开始监控”“提醒已创建”“监控设置完成”。",
+        "当用户表达监控、提醒、定时、周期执行诉求时，未完成任务确认前，只能继续澄清参数、输出待确认方案，或提示需要确认，不能擅自执行。",
         "",
         message,
     ]
@@ -10654,6 +12053,32 @@ fn extract_done_usage_tokens(data: &str) -> (Option<u64>, Option<u64>) {
         .or_else(|| parsed.get("output_tokens").and_then(Value::as_u64));
 
     (input_tokens, output_tokens)
+}
+
+async fn send_sse_json_event(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    event: &str,
+    payload: Value,
+) -> bool {
+    let body = payload.to_string();
+    tx.send(Ok(Bytes::from(format!("event: {event}\ndata: {body}\n\n"))))
+        .await
+        .is_ok()
+}
+
+async fn send_sse_phase_event(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    phase: &str,
+    detail: Option<String>,
+) -> bool {
+    let detail = detail
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut payload = json!({ "phase": phase });
+    if let Some(detail) = detail {
+        payload["detail"] = Value::String(detail);
+    }
+    send_sse_json_event(tx, "phase", payload).await
 }
 
 fn extract_text_from_json(value: &Value) -> Option<String> {
@@ -11426,6 +12851,26 @@ pub async fn chat_message(
         );
     }
 
+    if let Some(task_draft_response) =
+        maybe_resolve_inline_chat_task_draft(&state, &agent_id, &payload).await
+    {
+        let session_id = payload
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let session_label = payload
+            .session_label
+            .as_deref()
+            .map(normalize_session_label)
+            .filter(|value| !value.is_empty());
+        return Ok(Json(build_inline_chat_task_draft_json(
+            &task_draft_response,
+            session_id,
+            session_label.as_deref(),
+        )));
+    }
+
     let session_ctx = ensure_switched_to_session_target(
         &state,
         &agent_id,
@@ -11453,6 +12898,7 @@ pub async fn chat_message(
         payload.session_label.as_deref(),
     );
     let path = format!("/api/agents/{agent_id}/message");
+    let blocked_tools = webot_chat_blocked_tools();
     let mut data = match state
         .openfang
         .post_json(
@@ -11461,6 +12907,7 @@ pub async fn chat_message(
                 "message": outgoing_message,
                 "attachments": attachments,
                 "request_origin": request_origin,
+                "blocked_tools": blocked_tools,
             }),
         )
         .await
@@ -11471,6 +12918,17 @@ pub async fn chat_message(
             return Err(err);
         }
     };
+
+    let bound_session_id = if session_ctx.target_session_id.trim().is_empty() {
+        get_openfang_agent_session_id(&state, &agent_id).await.ok()
+    } else {
+        Some(session_ctx.target_session_id.clone())
+    };
+    let bound_session_label = payload
+        .session_label
+        .as_deref()
+        .map(normalize_session_label)
+        .filter(|value| !value.is_empty());
 
     if session_ctx.switched {
         let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id).await;
@@ -11503,6 +12961,21 @@ pub async fn chat_message(
                     "chat_message: appearance auto-apply skipped due to error"
                 );
             }
+        }
+    }
+
+    if let Some(object) = data.as_object_mut() {
+        if let Some(session_id) = bound_session_id
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            object.insert("session_id".to_string(), Value::String(session_id.clone()));
+        }
+        if let Some(session_label) = bound_session_label.as_ref() {
+            object.insert(
+                "session_label".to_string(),
+                Value::String(session_label.clone()),
+            );
         }
     }
 
@@ -11565,66 +13038,124 @@ pub async fn chat_message_stream(
         );
     }
 
-    let session_ctx = ensure_switched_to_session_target(
-        &state,
-        &agent_id,
-        payload.session_id.as_deref(),
-        payload.session_label.as_deref(),
-    )
-    .await?;
-    let session_path = format!("/api/agents/{agent_id}/session");
-    let current_session = state.openfang.get_json(&session_path).await.ok();
-    let include_prompt_blocks = should_inject_prompt_blocks_for_session(current_session.as_ref());
-
-    let guarded_message = apply_system_prompt_guard(
-        &payload.message,
-        system_prompt.as_deref(),
-        collaboration_prompt.as_deref(),
-        semantic_memory_context
-            .as_ref()
-            .map(|item| item.prompt.as_str()),
-        include_prompt_blocks,
-    );
-    let outgoing_message = ensure_visible_reply_for_chat_turn(&guarded_message);
-    let attachments = build_openfang_attachment_payload(&payload.attachments);
-    let request_origin = resolve_upstream_request_origin(
-        payload.request_origin.as_deref(),
-        payload.session_label.as_deref(),
-    );
-    let baseline_assistant_count = current_session
-        .as_ref()
-        .map(|session| extract_assistant_texts(session).len())
-        .unwrap_or(0);
-
-    let path = format!("/api/agents/{agent_id}/message/stream");
-    let upstream = match state
-        .openfang
-        .post_stream(
-            &path,
-            json!({
-                "message": outgoing_message,
-                "attachments": attachments,
-                "request_origin": request_origin,
-            }),
+    let ChatMessageRequest {
+        message: user_message,
+        session_id: requested_session_id,
+        session_label: requested_session_label,
+        request_origin: requested_request_origin,
+        current_task_draft: requested_current_task_draft,
+        attachments: requested_attachments,
+    } = payload;
+    if let Some(task_draft_response) =
+        maybe_resolve_inline_chat_task_draft(
+            &state,
+            &agent_id,
+            &ChatMessageRequest {
+                message: user_message.clone(),
+                session_id: requested_session_id.clone(),
+                session_label: requested_session_label.clone(),
+                request_origin: requested_request_origin.clone(),
+                current_task_draft: requested_current_task_draft.clone(),
+                attachments: requested_attachments.clone(),
+            },
         )
         .await
     {
-        Ok(stream) => stream,
-        Err(err) => {
-            restore_and_cleanup_switched_session(&state.openfang, &agent_id, &session_ctx).await;
-            return Err(err);
-        }
-    };
+        let normalized_session_label = requested_session_label
+            .as_deref()
+            .map(normalize_session_label)
+            .filter(|value| !value.is_empty());
+        let session_id = requested_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let body = build_inline_chat_task_draft_json(
+            &task_draft_response,
+            session_id,
+            normalized_session_label.as_deref(),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(8);
+        tokio::spawn(async move {
+            let _ = send_sse_json_event(&tx, "done", body).await;
+        });
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let body = Body::from_stream(stream);
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(body)
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(response);
+    }
     let openfang = state.openfang.clone();
     let state_for_post_process = state.clone();
     let public_agent_id = public_agent_id;
     let agent_id = agent_id;
-    let message = outgoing_message;
-    let session_ctx = session_ctx;
     let semantic_memory_context = semantic_memory_context;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(128);
     tokio::spawn(async move {
+        if let Some(context) = semantic_memory_context.as_ref() {
+            if !send_sse_json_event(
+                &tx,
+                "phase",
+                json!({
+                    "phase": "unified_memory_recall",
+                    "detail": context.log_detail,
+                    "query": context.query,
+                    "hits": context.hit_count,
+                }),
+            )
+            .await
+            {
+                return;
+            }
+        }
+
+        let session_prepare_detail = match (
+            requested_session_label
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            requested_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ) {
+            (Some(label), _) => Some(format!("正在准备会话标签：{label}")),
+            (None, Some(session_id)) => Some(format!("正在准备会话 ID：{session_id}")),
+            (None, None) => Some("当前请求未指定会话目标，将沿用 OpenFang 当前会话。".to_string()),
+        };
+        if !send_sse_phase_event(&tx, "session_prepare", session_prepare_detail).await {
+            return;
+        }
+
+        let session_ctx = match ensure_switched_to_session_target(
+            &state_for_post_process,
+            &agent_id,
+            requested_session_id.as_deref(),
+            requested_session_label.as_deref(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = send_sse_json_event(
+                    &tx,
+                    "error",
+                    json!({
+                        "error": err.message,
+                        "fallback": "session_prepare",
+                    }),
+                )
+                .await;
+                return;
+            }
+        };
+
         let restore_original_session = || async {
             if !session_ctx.switched {
                 return;
@@ -11640,19 +13171,132 @@ pub async fn chat_message_stream(
             restore_and_cleanup_switched_session(&openfang, &agent_id, &session_ctx).await;
         };
 
-        if let Some(context) = semantic_memory_context.as_ref() {
-            let payload = json!({
-                "phase": "unified_memory_recall",
-                "detail": context.log_detail,
-                "query": context.query,
-                "hits": context.hit_count,
-            })
-            .to_string();
-            let event_bytes = Bytes::from(format!("event: phase\ndata: {payload}\n\n"));
-            if tx.send(Ok(event_bytes)).await.is_err() {
+        let session_path = format!("/api/agents/{agent_id}/session");
+        let current_session = match openfang.get_json(&session_path).await {
+            Ok(session) => Some(session),
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %err.message,
+                    "chat_message_stream: failed to inspect session after switch"
+                );
+                None
+            }
+        };
+        let bound_session_id = if session_ctx.target_session_id.trim().is_empty() {
+            get_openfang_agent_session_id(&state_for_post_process, &agent_id)
+                .await
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            Some(session_ctx.target_session_id.clone())
+        };
+        let bound_session_label = requested_session_label
+            .as_deref()
+            .map(normalize_session_label)
+            .filter(|value| !value.is_empty());
+
+        let session_ready_detail = if session_ctx.switched {
+            Some(format!(
+                "已切换到目标会话，session_id={}",
+                session_ctx.target_session_id
+            ))
+        } else if !session_ctx.target_session_id.trim().is_empty() {
+            Some(format!(
+                "目标会话已就绪，session_id={}",
+                session_ctx.target_session_id
+            ))
+        } else {
+            Some("沿用当前会话继续发送。".to_string())
+        };
+        if !send_sse_json_event(
+            &tx,
+            "phase",
+            json!({
+                "phase": "session_ready",
+                "detail": session_ready_detail,
+                "session_id": bound_session_id.clone(),
+                "session_label": bound_session_label.clone(),
+            }),
+        )
+        .await
+        {
+            restore_and_cleanup().await;
+            return;
+        }
+
+        let include_prompt_blocks =
+            should_inject_prompt_blocks_for_session(current_session.as_ref());
+        let guarded_message = apply_system_prompt_guard(
+            &user_message,
+            system_prompt.as_deref(),
+            collaboration_prompt.as_deref(),
+            semantic_memory_context
+                .as_ref()
+                .map(|item| item.prompt.as_str()),
+            include_prompt_blocks,
+        );
+        let outgoing_message = ensure_visible_reply_for_chat_turn(&guarded_message);
+        let attachments = build_openfang_attachment_payload(&requested_attachments);
+        let request_origin = resolve_upstream_request_origin(
+            requested_request_origin.as_deref(),
+            requested_session_label.as_deref(),
+        );
+        let baseline_assistant_count = current_session
+            .as_ref()
+            .map(|session| extract_assistant_texts(session).len())
+            .unwrap_or(0);
+
+        if !send_sse_phase_event(
+            &tx,
+            "upstream_connecting",
+            Some("会话已准备完成，正在连接上游模型流。".to_string()),
+        )
+        .await
+        {
+            restore_and_cleanup().await;
+            return;
+        }
+
+        let path = format!("/api/agents/{agent_id}/message/stream");
+        let blocked_tools = webot_chat_blocked_tools();
+        let upstream = match openfang
+            .post_stream(
+                &path,
+                json!({
+                    "message": outgoing_message,
+                    "attachments": attachments,
+                    "request_origin": request_origin,
+                    "blocked_tools": blocked_tools,
+                }),
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = send_sse_json_event(
+                    &tx,
+                    "error",
+                    json!({
+                        "error": err.message,
+                        "fallback": "upstream_connecting",
+                    }),
+                )
+                .await;
                 restore_and_cleanup().await;
                 return;
             }
+        };
+
+        if !send_sse_phase_event(
+            &tx,
+            "upstream_connected",
+            Some("已建立上游流式连接，等待模型返回首个内容块。".to_string()),
+        )
+        .await
+        {
+            restore_and_cleanup().await;
+            return;
         }
 
         let mut upstream_stream = upstream.bytes_stream();
@@ -11663,7 +13307,7 @@ pub async fn chat_message_stream(
         let mut saw_upstream_error = false;
         let mut upstream_done_input_tokens: Option<u64> = None;
         let mut upstream_done_output_tokens: Option<u64> = None;
-        let baseline_assistant_count = baseline_assistant_count;
+        let message = outgoing_message;
 
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
@@ -11705,9 +13349,8 @@ pub async fn chat_message_stream(
                     }
                 }
                 Err(err) => {
-                    let error = json!({ "error": err.to_string() }).to_string();
-                    let event_bytes = Bytes::from(format!("event: error\ndata: {error}\n\n"));
-                    let _ = tx.send(Ok(event_bytes)).await;
+                    let _ = send_sse_json_event(&tx, "error", json!({ "error": err.to_string() }))
+                        .await;
                     restore_and_cleanup().await;
                     return;
                 }
@@ -11728,7 +13371,6 @@ pub async fn chat_message_stream(
             return;
         }
 
-        let session_path = format!("/api/agents/{agent_id}/session");
         let recovered = match openfang.get_json(&session_path).await {
             Ok(session) => extract_new_assistant_text(&session, baseline_assistant_count),
             Err(_) => None,
@@ -11737,31 +13379,31 @@ pub async fn chat_message_stream(
         if let Some(text) = recovered {
             if !text.trim().is_empty() {
                 tracing::info!(agent_id = %agent_id, baseline_assistant_count = baseline_assistant_count, recovered_len = text.len(), "chat stream recovered final assistant text from session fallback");
-                let chunk_data = json!({
-                    "content": text,
-                    "done": false,
-                    "fallback": "session"
-                })
-                .to_string();
-                let done_data = json!({
-                    "done": true,
-                    "usage": {
-                        "input_tokens": 0,
-                        "output_tokens": 0
-                    },
-                    "fallback": "session"
-                })
-                .to_string();
-                let _ = tx
-                    .send(Ok(Bytes::from(format!(
-                        "event: chunk\ndata: {chunk_data}\n\n"
-                    ))))
-                    .await;
-                let _ = tx
-                    .send(Ok(Bytes::from(format!(
-                        "event: done\ndata: {done_data}\n\n"
-                    ))))
-                    .await;
+                let _ = send_sse_json_event(
+                    &tx,
+                    "chunk",
+                    json!({
+                        "content": text,
+                        "done": false,
+                        "fallback": "session"
+                    }),
+                )
+                .await;
+                let _ = send_sse_json_event(
+                    &tx,
+                    "done",
+                    json!({
+                        "done": true,
+                        "session_id": bound_session_id.clone(),
+                        "session_label": bound_session_label.clone(),
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0
+                        },
+                        "fallback": "session"
+                    }),
+                )
+                .await;
                 emit_stream_agent_appearance_updated_event(
                     &tx,
                     &state_for_post_process,
@@ -11791,31 +13433,31 @@ pub async fn chat_message_stream(
                 saw_tool_result = saw_tool_result,
                 "chat stream completed with zero output tokens and no renderable text; emitted fallback reply"
             );
-            let chunk_data = json!({
-                "content": fallback_text,
-                "done": false,
-                "fallback": "zero_output_done"
-            })
-            .to_string();
-            let done_data = json!({
-                "done": true,
-                "usage": {
-                    "input_tokens": upstream_done_input_tokens.unwrap_or(0),
-                    "output_tokens": upstream_done_output_tokens.unwrap_or(0)
-                },
-                "fallback": "zero_output_done"
-            })
-            .to_string();
-            let _ = tx
-                .send(Ok(Bytes::from(format!(
-                    "event: chunk\ndata: {chunk_data}\n\n"
-                ))))
-                .await;
-            let _ = tx
-                .send(Ok(Bytes::from(format!(
-                    "event: done\ndata: {done_data}\n\n"
-                ))))
-                .await;
+            let _ = send_sse_json_event(
+                &tx,
+                "chunk",
+                json!({
+                    "content": fallback_text,
+                    "done": false,
+                    "fallback": "zero_output_done"
+                }),
+            )
+            .await;
+            let _ = send_sse_json_event(
+                &tx,
+                "done",
+                json!({
+                    "done": true,
+                    "session_id": bound_session_id.clone(),
+                    "session_label": bound_session_label.clone(),
+                    "usage": {
+                        "input_tokens": upstream_done_input_tokens.unwrap_or(0),
+                        "output_tokens": upstream_done_output_tokens.unwrap_or(0)
+                    },
+                    "fallback": "zero_output_done"
+                }),
+            )
+            .await;
             restore_original_session().await;
             return;
         }
@@ -11839,18 +13481,17 @@ pub async fn chat_message_stream(
         }
 
         tracing::warn!(agent_id = %agent_id, streamed_text = %streamed_text, "chat stream ended without renderable final text");
-        let message_data = json!({
-            "error": "后端流式通道未返回可展示内容。",
-            "fallback": "empty_stream",
-            "agent_id": agent_id,
-            "message": message
-        })
-        .to_string();
-        let _ = tx
-            .send(Ok(Bytes::from(format!(
-                "event: error\ndata: {message_data}\n\n"
-            ))))
-            .await;
+        let _ = send_sse_json_event(
+            &tx,
+            "error",
+            json!({
+                "error": "后端流式通道未返回可展示内容。",
+                "fallback": "empty_stream",
+                "agent_id": agent_id,
+                "message": message
+            }),
+        )
+        .await;
 
         restore_original_session().await;
     });
@@ -13653,6 +15294,97 @@ pub async fn compose_dashboard(
         },
         "errors": errors
     })))
+}
+
+pub async fn compose_tasks_overview(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ManagedTaskListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let mut params = Vec::new();
+    if let Some(agent_id) = query
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("agent_id".to_string(), agent_id.to_string()));
+    }
+    let payload = if params.is_empty() {
+        state.openfang.get_json("/api/tasks").await?
+    } else {
+        state
+            .openfang
+            .get_json_with_query("/api/tasks", &params)
+            .await?
+    };
+    Ok(Json(payload))
+}
+
+pub async fn compose_task_full(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    validate_task_path_segment(&id)?;
+    let detail_path = format!("/api/tasks/{id}");
+    let runs_path = format!("/api/tasks/{id}/runs");
+    let events_path = format!("/api/tasks/{id}/events");
+    let deliveries_path = format!("/api/tasks/{id}/deliveries");
+    let attempts_path = format!("/api/tasks/{id}/delivery-attempts");
+    let timeline_path = format!("/api/tasks/{id}/timeline");
+
+    let (detail, runs, events, deliveries, attempts, timeline) = tokio::join!(
+        state.openfang.get_json(&detail_path),
+        state.openfang.get_json(&runs_path),
+        state.openfang.get_json(&events_path),
+        state.openfang.get_json(&deliveries_path),
+        state.openfang.get_json(&attempts_path),
+        state.openfang.get_json(&timeline_path),
+    );
+
+    let detail = detail?;
+    let full = json!({
+        "task": detail.clone(),
+        "runs": runs?,
+        "events": events?,
+        "deliveries": deliveries?,
+        "delivery_attempts": attempts?,
+        "final_summary": detail.get("final_summary").cloned().unwrap_or(Value::Null),
+        "timeline": timeline?,
+        "capabilities": detail.get("capabilities").cloned().unwrap_or_else(|| json!({})),
+        "delivery_stats": detail.get("delivery_stats").cloned().unwrap_or_else(|| json!({})),
+    });
+    Ok(Json(full))
+}
+
+pub async fn compose_task_notices_pending(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_online(&state).await?;
+    let payload = state
+        .openfang
+        .get_json_with_query(
+            "/api/tasks/deliveries/pending",
+            &[("target_kind".to_string(), "pc_notice".to_string())],
+        )
+        .await?;
+    let mut notices = Vec::new();
+    for delivery in value_array(&payload) {
+        notices.push(json!({
+            "id": read_delivery_field(&delivery, &["id"]).unwrap_or_default(),
+            "task_id": read_delivery_field(&delivery, &["task_id", "taskId"]).unwrap_or_default(),
+            "run_id": read_delivery_field(&delivery, &["run_id", "runId"]),
+            "event_id": read_delivery_field(&delivery, &["event_id", "eventId"]),
+            "title": read_delivery_field(&delivery, &["title"]).unwrap_or_default(),
+            "body": read_delivery_field(&delivery, &["body"]).unwrap_or_default(),
+            "status": read_delivery_field(&delivery, &["status"]).unwrap_or("pending"),
+            "created_at": read_delivery_field(&delivery, &["created_at", "createdAt"]).unwrap_or_default(),
+            "updated_at": read_delivery_field(&delivery, &["updated_at", "updatedAt"]).unwrap_or_default(),
+            "payload": delivery.get("payload").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    Ok(Json(json!({ "notices": notices })))
 }
 
 async fn sync_agent_skill_assignments(
@@ -15984,6 +17716,8 @@ fn resolve_assignment(
 mod tests {
     use crate::assignment_store::{make_model_id, normalize_provider_id};
 
+    use super::parse_http_byte_range_header;
+
     #[test]
     fn provider_id_keeps_original_config_value() {
         assert_eq!(normalize_provider_id(" nvidia-nim "), "nvidia-nim");
@@ -15996,5 +17730,37 @@ mod tests {
             make_model_id("nvidia-nim", "xianyu/glm-4.7"),
             "nvidia-nim::xianyu/glm-4.7"
         );
+    }
+
+    #[test]
+    fn parse_http_byte_range_header_supports_explicit_range() {
+        assert_eq!(
+            parse_http_byte_range_header("bytes=100-199", 1_000),
+            Ok((100, 199))
+        );
+    }
+
+    #[test]
+    fn parse_http_byte_range_header_supports_open_ended_range() {
+        assert_eq!(
+            parse_http_byte_range_header("bytes=900-", 1_000),
+            Ok((900, 999))
+        );
+    }
+
+    #[test]
+    fn parse_http_byte_range_header_supports_suffix_range() {
+        assert_eq!(
+            parse_http_byte_range_header("bytes=-128", 1_000),
+            Ok((872, 999))
+        );
+    }
+
+    #[test]
+    fn parse_http_byte_range_header_rejects_invalid_range() {
+        assert!(parse_http_byte_range_header("bytes=999-100", 1_000).is_err());
+        assert!(parse_http_byte_range_header("bytes=1000-1001", 1_000).is_err());
+        assert!(parse_http_byte_range_header("items=0-1", 1_000).is_err());
+        assert!(parse_http_byte_range_header("bytes=0-1,4-5", 1_000).is_err());
     }
 }

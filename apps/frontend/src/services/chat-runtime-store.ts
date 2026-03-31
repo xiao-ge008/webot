@@ -365,6 +365,20 @@ class ChatRuntimeStore {
     this.persistTimers.set(agentId, timeoutId);
   }
 
+  flushAgentState(agentId: string): void {
+    const key = agentId.trim();
+    if (!key) return;
+    const state = this.snapshot.agents[key];
+    if (!state || !state.sessionsReady || state.sessions.length === 0) {
+      return;
+    }
+    const resolvedActive = resolveActiveSessionId(state.sessions, state.activeSessionId);
+    saveAgentChatState(key, {
+      sessions: state.sessions,
+      activeSessionId: resolvedActive,
+    });
+  }
+
   private emit(): void {
     for (const listener of this.listeners) {
       listener();

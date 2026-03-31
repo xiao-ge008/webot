@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 12;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -49,6 +49,14 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 10 {
         migrate_v10(conn)?;
+    }
+
+    if current_version < 11 {
+        migrate_v11(conn)?;
+    }
+
+    if current_version < 12 {
+        migrate_v12(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -432,6 +440,101 @@ fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (10, datetime('now'), 'Add explicit memory event and projection tables');
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS managed_tasks (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            origin_chat_session_id TEXT NOT NULL DEFAULT '',
+            origin_message_id TEXT NOT NULL DEFAULT '',
+            cron_job_id TEXT NOT NULL DEFAULT '',
+            spec_json TEXT NOT NULL,
+            runtime_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_managed_tasks_agent ON managed_tasks(agent_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_managed_tasks_cron_job ON managed_tasks(cron_job_id);
+        CREATE INDEX IF NOT EXISTS idx_managed_tasks_chat_session ON managed_tasks(origin_chat_session_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS managed_task_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            run_no INTEGER NOT NULL DEFAULT 0,
+            run_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_managed_task_runs_task ON managed_task_runs(task_id, run_no DESC);
+
+        CREATE TABLE IF NOT EXISTS managed_task_events (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            run_id TEXT NOT NULL DEFAULT '',
+            event_type TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_managed_task_events_task ON managed_task_events(task_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS managed_task_deliveries (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            run_id TEXT NOT NULL DEFAULT '',
+            event_id TEXT NOT NULL DEFAULT '',
+            target_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            origin_chat_session_id TEXT NOT NULL DEFAULT '',
+            origin_message_id TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_managed_task_deliveries_task ON managed_task_deliveries(task_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_managed_task_deliveries_pending ON managed_task_deliveries(status, target_kind, origin_chat_session_id, created_at ASC);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (11, datetime('now'), 'Add managed task center tables');
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS managed_task_delivery_attempts (
+            id TEXT PRIMARY KEY,
+            delivery_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            run_id TEXT NOT NULL DEFAULT '',
+            event_id TEXT NOT NULL DEFAULT '',
+            target_kind TEXT NOT NULL,
+            consumer_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            started_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_managed_task_delivery_attempts_task
+            ON managed_task_delivery_attempts(task_id, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_managed_task_delivery_attempts_delivery
+            ON managed_task_delivery_attempts(delivery_id, started_at DESC);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (12, datetime('now'), 'Add managed task delivery attempts table');
         ",
     )?;
     Ok(())

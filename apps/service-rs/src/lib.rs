@@ -1,9 +1,12 @@
 pub mod assignment_store;
+pub mod capability_registry;
+pub mod chat_task_draft;
 pub mod component_center;
 pub mod config;
 pub mod error;
 pub mod image_generation;
 pub mod media_index;
+pub mod ocr_service;
 pub mod openfang;
 pub mod path_resolver;
 pub mod routes;
@@ -19,12 +22,15 @@ use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use axum::Json;
 use axum::Router;
 use config::ServiceConfig;
 use openfang::OpenFangClient;
+use serde_json::json;
 use serde_json::Value;
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex, RwLock};
+use tokio::time::sleep;
 use toml::value::Table as TomlTable;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -232,6 +238,12 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
 }
 
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    if ocr_service::should_run_sidecar_from_env() {
+        ocr_service::run_sidecar_from_env()
+            .await
+            .map_err(|error| std::io::Error::other(error))?;
+        return Ok(());
+    }
     let config = ServiceConfig::from_env();
     run_with_config(config).await
 }
@@ -249,6 +261,7 @@ pub async fn run_with_config(config: ServiceConfig) -> Result<(), Box<dyn std::e
     let state = build_state(config, openfang);
     let listen_addr = state.config.listen_addr;
     spawn_auto_power_on(state.clone());
+    spawn_task_delivery_dispatcher(state.clone());
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
@@ -312,6 +325,7 @@ async fn serve_with_shutdown(
     let state = build_state(config.clone(), openfang);
     let state_for_shutdown = state.clone();
     spawn_auto_power_on(state.clone());
+    spawn_task_delivery_dispatcher(state.clone());
 
     write_service_url_file(config.listen_addr);
     info!(
@@ -384,6 +398,17 @@ fn spawn_auto_power_on(state: Arc<AppState>) {
             Err(err) => {
                 warn!("auto power-on failed: {err}");
             }
+        }
+    });
+}
+
+fn spawn_task_delivery_dispatcher(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = routes::run_task_delivery_dispatch_cycle(state.clone()).await {
+                warn!(error = %err.message, "task delivery dispatcher cycle failed");
+            }
+            sleep(Duration::from_secs(5)).await;
         }
     });
 }
@@ -523,10 +548,8 @@ impl AppState {
             command.stderr(Stdio::null());
             #[cfg(target_os = "windows")]
             {
-                // 避免在 Windows 上弹出黑色控制台窗口
                 command.creation_flags(CREATE_NO_WINDOW);
             }
-
             match command.spawn() {
                 Ok(child) => {
                     let pid_text = child
@@ -672,6 +695,10 @@ fn build_app(state: Arc<AppState>) -> Router {
     // 导入智能体 zip 可能较大，这里统一放宽管理接口请求体上限。
     const MANAGEMENT_MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
     Router::new()
+        .route(
+            "/api/ping",
+            get(|| async { Json(json!({ "ok": true, "service": "webot-service-rs" })) }),
+        )
         .route("/api/health", get(routes::health))
         .route(
             "/api/service/power/status",
@@ -688,8 +715,23 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         .nest("/api/chat", routes::chat_router())
         .nest("/api/groups", routes::groups_router())
-        .nest("/api/tasks", routes::tasks_router())
         .route("/api/compose/dashboard", get(routes::compose_dashboard))
+        .route(
+            "/api/compose/tasks/overview",
+            get(routes::compose_tasks_overview),
+        )
+        .route(
+            "/api/compose/tasks/{id}/full",
+            get(routes::compose_task_full),
+        )
+        .route(
+            "/api/compose/tasks/notices/pending",
+            get(routes::compose_task_notices_pending),
+        )
+        .route(
+            "/internal/task-deliveries/send",
+            post(routes::send_internal_task_delivery),
+        )
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())

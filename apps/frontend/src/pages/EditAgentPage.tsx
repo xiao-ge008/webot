@@ -12,7 +12,6 @@ import {
   Hammer,
   Loader2,
   MessageSquare,
-  Plus,
   RefreshCw,
   Save,
   Share2,
@@ -22,7 +21,6 @@ import {
   Trash2,
   User,
   Users,
-  Volume2,
   X,
 } from 'lucide-react';
 
@@ -82,11 +80,11 @@ import {
   toggleAgentMcpServer,
   toggleAgentSkill,
   updateManagementAgentModel,
-  uploadManagementAgentChatAsset,
   uploadManagementAgentAvatar,
   uploadManagementAgentPortrait,
 } from '@/services/management-client';
-import { DEFAULT_AGENT_TTS_CONFIG, type AgentSpeakerProfile } from '@/types/tts';
+import { getTtsConfig } from '@/services/tts-client';
+import type { AgentEmbodimentConfig, EmbodimentAssetRef, EmbodimentVoiceRef } from '@/main/types';
 
 interface ModelOption {
   modelId: string;
@@ -128,6 +126,12 @@ interface ShareExportOptions {
   includeMemoryFiles: boolean;
   includeMediaFiles: boolean;
   includeAssignments: boolean;
+}
+
+interface GlobalVoiceOption {
+  value: string;
+  label: string;
+  voiceRef?: EmbodimentVoiceRef;
 }
 
 interface CollaborationWorkerCandidate {
@@ -579,9 +583,127 @@ function stripNicknamePromptBlock(prompt: string): string {
   return prompt.replace(/\[WEBOT_NICKNAME_BEGIN\][\s\S]*?\[WEBOT_NICKNAME_END\][\r\n]*/gim, '').trim();
 }
 
-function normalizeTtsMessageTag(value: string): string {
-  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
-  return normalized || (DEFAULT_AGENT_TTS_CONFIG.messageTag ?? 'speaker');
+function buildManagedIdentityAsset(
+  url: string,
+  kind: 'avatar' | 'portrait' | 'video_source',
+  label: string,
+): EmbodimentAssetRef | undefined {
+  const trimmed = url.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return {
+    source: 'managed_identity',
+    kind,
+    url: trimmed,
+    label,
+  };
+}
+
+function buildGlobalVoiceOptionValue(voice: EmbodimentVoiceRef): string {
+  if (voice.mode === 'speaker_profile' && voice.speakerProfileId?.trim()) {
+    return `speaker_profile:${voice.speakerProfileId.trim()}`;
+  }
+  const provider = voice.provider?.trim() || '';
+  const name = voice.voice?.trim() || '';
+  if (provider && name) {
+    return `provider_voice:${provider}:${name}`;
+  }
+  return '';
+}
+
+function buildGlobalVoiceOptionsFromConfig(config: Awaited<ReturnType<typeof getTtsConfig>>): GlobalVoiceOption[] {
+  const options: GlobalVoiceOption[] = [];
+  const seenValues = new Set<string>();
+  const pushOption = (option: GlobalVoiceOption) => {
+    if (!option.value || seenValues.has(option.value)) {
+      return;
+    }
+    seenValues.add(option.value);
+    options.push(option);
+  };
+  const pushProviderVoice = (provider: string, label: string, enabled: boolean, voice?: string) => {
+    const trimmedVoice = voice?.trim() || '';
+    if (!enabled || !trimmedVoice) {
+      return;
+    }
+    pushOption({
+      value: `provider_voice:${provider}:${trimmedVoice}`,
+      label: `${label} / ${trimmedVoice}`,
+      voiceRef: {
+        mode: 'provider_voice',
+        provider,
+        voice: trimmedVoice,
+        label: `${label} / ${trimmedVoice}`,
+      },
+    });
+  };
+  const pushSpeakerProfile = (id?: string, name?: string) => {
+    const trimmedId = id?.trim() || '';
+    const trimmedName = name?.trim() || '';
+    if (!trimmedId || !trimmedName) {
+      return;
+    }
+    pushOption({
+      value: `speaker_profile:${trimmedId}`,
+      label: `本地音色 / ${trimmedName}`,
+      voiceRef: {
+        mode: 'speaker_profile',
+        speakerProfileId: trimmedId,
+        label: trimmedName,
+      },
+    });
+  };
+
+  pushProviderVoice('openai', 'OpenAI', config.remote.openai.enabled, config.remote.openai.voice);
+  pushProviderVoice('cosyvoice3', 'CosyVoice3', config.remote.cosyvoice3.enabled, config.remote.cosyvoice3.voice);
+  pushProviderVoice('indextts', 'IndexTTS', config.remote.indextts.enabled, config.remote.indextts.voice);
+  pushProviderVoice('qwen_tts', 'QWEN-TTS', config.remote.qwenTts.enabled, config.remote.qwenTts.voice);
+  config.speakerProfiles.forEach((profile) => pushSpeakerProfile(profile.id, profile.name));
+
+  return options;
+}
+
+function resolveSelectedVoiceValue(
+  embodiment: AgentEmbodimentConfig | undefined,
+  options: GlobalVoiceOption[],
+): string {
+  const voiceRef = embodiment?.voice?.defaultVoice;
+  if (!voiceRef) {
+    return '';
+  }
+  const value = buildGlobalVoiceOptionValue(voiceRef);
+  if (!value) {
+    return '';
+  }
+  return options.some((item) => item.value === value) ? value : '';
+}
+
+function buildEmbodimentConfig(input: {
+  avatarUrl: string;
+  portraitUrl: string;
+  selectedVoiceOption?: GlobalVoiceOption | null;
+  existingEmbodiment?: AgentEmbodimentConfig;
+}): AgentEmbodimentConfig {
+  const normalizedPortraitUrl = input.portraitUrl.trim();
+  const inheritedVideoSource = input.existingEmbodiment?.assets.defaultVideoSource;
+  const defaultVideoSource = normalizedPortraitUrl
+    ? buildManagedIdentityAsset(normalizedPortraitUrl, 'video_source', '当前视频源图')
+    : inheritedVideoSource;
+  return {
+    version: 1,
+    assets: {
+      defaultAvatar: buildManagedIdentityAsset(input.avatarUrl, 'avatar', '当前头像'),
+      defaultPortrait: buildManagedIdentityAsset(input.portraitUrl, 'portrait', '当前立绘'),
+      defaultVideoSource: defaultVideoSource,
+      selfPhotos: input.existingEmbodiment?.assets.selfPhotos,
+    },
+    voice: input.selectedVoiceOption?.voiceRef
+      ? {
+          defaultVoice: input.selectedVoiceOption.voiceRef,
+        }
+      : undefined,
+  };
 }
 
 function stripTtsPromptBlock(prompt: string): string {
@@ -596,33 +718,12 @@ function buildPromptWithNickname(prompt: string, nickname: string): string {
   }
   const nicknameBlock = [
     '[WEBOT_NICKNAME_BEGIN]',
-    `你的显示称呼是「${trimmedNickname}」。`,
-    `当用户询问你是谁、你叫什么时，优先使用「${trimmedNickname}」回答。`,
-    '回答身份问题时不要使用智能体ID、英文昵称或模型名。',
+    `display_name=${JSON.stringify(trimmedNickname)}`,
+    'identity_reply.preferred_field=display_name',
+    'identity_reply.forbid=["agent_id","english_name","model_name"]',
     '[WEBOT_NICKNAME_END]',
   ].join('\n');
   return `${nicknameBlock}\n\n${base}`.trim();
-}
-
-function buildPromptWithTtsDirective(
-  prompt: string,
-  options: { enabled: boolean; messageTag: string },
-): string {
-  const base = stripTtsPromptBlock(prompt);
-  if (!options.enabled) {
-    return base;
-  }
-  const normalizedTag = normalizeTtsMessageTag(options.messageTag);
-  const ttsBlock = [
-    TTS_PROMPT_BEGIN,
-    '当你判断当前回复适合被播报成语音时，额外输出一个语音触发标签。',
-    `语音触发标签固定写成 <${normalizedTag}> 。`,
-    '如果这条回复不需要播报，就不要输出这个标签。',
-    '不要解释标签，不要把标签当成正文，不要描述你是否加了标签。',
-    '标签可以放在回复开头或结尾，系统会自动隐藏它。',
-    TTS_PROMPT_END,
-  ].join('\n');
-  return `${ttsBlock}\n\n${base}`.trim();
 }
 
 function buildPreviewMarkdown(draft: ContextDraft): string {
@@ -1050,32 +1151,6 @@ function dedupeWorkspacePaths(paths: string[]): string[] {
   return output;
 }
 
-function nowIsoString(): string {
-  return new Date().toISOString();
-}
-
-function createSpeakerProfileId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `speaker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function createDefaultSpeakerProfile(): AgentSpeakerProfile {
-  const timestamp = nowIsoString();
-  return {
-    id: createSpeakerProfileId(),
-    name: '新音色样本',
-    engine: 'f5-tts-onnx',
-    refAudioPath: undefined,
-    refText: '',
-    language: 'zh-CN',
-    notes: '',
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-}
-
 type SemanticFeedbackAction = 'confirm' | 'weaken' | 'outdated' | 'revoke' | 'reject';
 
 export function EditAgentPage() {
@@ -1178,16 +1253,9 @@ export function EditAgentPage() {
   const [channelStatuses, setChannelStatuses] = useState<ManagementChannelStatusItem[]>([]);
   const [channelStatusLoading, setChannelStatusLoading] = useState(false);
   const [channelTestLoading, setChannelTestLoading] = useState<ChannelBindingType | null>(null);
-  const [ttsEnabled, setTtsEnabled] = useState(DEFAULT_AGENT_TTS_CONFIG.enabled);
-  const [ttsServiceMode, setTtsServiceMode] = useState(DEFAULT_AGENT_TTS_CONFIG.serviceMode);
-  const [ttsSpeakerProfileId, setTtsSpeakerProfileId] = useState<string>('');
-  const [ttsMessageTag, setTtsMessageTag] = useState(DEFAULT_AGENT_TTS_CONFIG.messageTag ?? 'speaker');
-  const [ttsSpeed, setTtsSpeed] = useState(String(DEFAULT_AGENT_TTS_CONFIG.speed ?? 1));
-  const [ttsPitch, setTtsPitch] = useState(String(DEFAULT_AGENT_TTS_CONFIG.pitch ?? 1));
-  const [ttsSplitStrategy, setTtsSplitStrategy] = useState(DEFAULT_AGENT_TTS_CONFIG.splitStrategy ?? 'sentence');
-  const [ttsMaxChunkChars, setTtsMaxChunkChars] = useState(String(DEFAULT_AGENT_TTS_CONFIG.maxChunkChars ?? 180));
-  const [speakerProfiles, setSpeakerProfiles] = useState<AgentSpeakerProfile[]>([]);
-  const [uploadingSpeakerProfileId, setUploadingSpeakerProfileId] = useState<string | null>(null);
+  const [globalVoiceOptions, setGlobalVoiceOptions] = useState<GlobalVoiceOption[]>([]);
+  const [selectedEmbodimentVoiceValue, setSelectedEmbodimentVoiceValue] = useState('');
+  const [loadedEmbodiment, setLoadedEmbodiment] = useState<AgentEmbodimentConfig | undefined>(undefined);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [exportingBundle, setExportingBundle] = useState(false);
   const [shareExportOptions, setShareExportOptions] = useState<ShareExportOptions>(
@@ -1199,12 +1267,11 @@ export function EditAgentPage() {
 
   const navItems = [
     { id: 'basic', label: t('edit.nav.basic'), icon: User },
-    { id: 'visual', label: t('edit.nav.visual'), icon: Camera },
+    { id: 'visual', label: '拟人化配置', icon: Camera },
     { id: 'model', label: '模型设定', icon: Bot },
     { id: 'skills', label: t('edit.nav.skills'), icon: Hammer },
     { id: 'mcp', label: t('edit.nav.mcp'), icon: Database },
     { id: 'channel', label: '渠道绑定', icon: MessageSquare },
-    { id: 'tts', label: 'TTS 服务', icon: Volume2 },
     { id: 'collaboration', label: '协同办公', icon: Users },
     { id: 'memory', label: t('edit.nav.memory'), icon: BrainCircuit },
     { id: 'workspace', label: t('edit.nav.workspace'), icon: Settings2 },
@@ -1323,10 +1390,6 @@ export function EditAgentPage() {
   const collaborationCandidateMap = useMemo(() => {
     return new Map(collaborationCandidates.map((item) => [item.key, item]));
   }, [collaborationCandidates]);
-  const activeSpeakerProfile = useMemo(
-    () => speakerProfiles.find((item) => item.id === ttsSpeakerProfileId) ?? null,
-    [speakerProfiles, ttsSpeakerProfileId],
-  );
   const selectedCollaborationWorkers = useMemo(() => {
     return collaborationSelectedWorkers
       .map((key) => collaborationCandidateMap.get(key))
@@ -1871,19 +1934,14 @@ export function EditAgentPage() {
       setWorkspaceExtraPaths([]);
       setCollaborationCandidates([]);
       setCollaborationLoadedAt(null);
-      setTtsEnabled(DEFAULT_AGENT_TTS_CONFIG.enabled);
-      setTtsServiceMode(DEFAULT_AGENT_TTS_CONFIG.serviceMode);
-      setTtsSpeakerProfileId('');
-      setTtsMessageTag(DEFAULT_AGENT_TTS_CONFIG.messageTag ?? 'speaker');
-      setTtsSpeed(String(DEFAULT_AGENT_TTS_CONFIG.speed ?? 1));
-      setTtsPitch(String(DEFAULT_AGENT_TTS_CONFIG.pitch ?? 1));
-      setTtsSplitStrategy(DEFAULT_AGENT_TTS_CONFIG.splitStrategy ?? 'sentence');
-      setTtsMaxChunkChars(String(DEFAULT_AGENT_TTS_CONFIG.maxChunkChars ?? 180));
-      setSpeakerProfiles([]);
+      setGlobalVoiceOptions([]);
+      setSelectedEmbodimentVoiceValue('');
+      setLoadedEmbodiment(undefined);
       try {
-        const [detail, fileMap] = await Promise.all([
+        const [detail, fileMap, globalTtsConfig] = await Promise.all([
           getManagementAgentDetail(id),
           loadContextFiles(id),
+          getTtsConfig(),
         ]);
 
         const resolvedEnglishName = detail.english_name?.trim();
@@ -1943,21 +2001,13 @@ export function EditAgentPage() {
         );
         setCollaborationSelectedWorkers(normalizeCollaborationWorkerKeys(parsedCollaboration?.selectedWorkers || []));
         setChannelBinding(applyChannelBindingDefaults(detail.channel_binding, detail.id || id || ''));
-        const nextTtsConfig = detail.tts_config || DEFAULT_AGENT_TTS_CONFIG;
-        const nextSpeakerProfiles = detail.speaker_profiles || [];
-        setTtsEnabled(Boolean(nextTtsConfig.enabled));
-        setTtsServiceMode(nextTtsConfig.serviceMode ?? DEFAULT_AGENT_TTS_CONFIG.serviceMode);
-        setTtsSpeakerProfileId(
-          nextTtsConfig.speakerProfileId && nextSpeakerProfiles.some((item) => item.id === nextTtsConfig.speakerProfileId)
-            ? nextTtsConfig.speakerProfileId
-            : nextSpeakerProfiles[0]?.id || '',
+        const embodiment = detail.embodiment;
+        setLoadedEmbodiment(embodiment);
+        const nextVoiceOptions = buildGlobalVoiceOptionsFromConfig(globalTtsConfig).filter(
+          (option, index, items) => items.findIndex((entry) => entry.value === option.value) === index,
         );
-        setTtsMessageTag(normalizeTtsMessageTag(nextTtsConfig.messageTag || DEFAULT_AGENT_TTS_CONFIG.messageTag || 'speaker'));
-        setTtsSpeed(String(nextTtsConfig.speed ?? DEFAULT_AGENT_TTS_CONFIG.speed ?? 1));
-        setTtsPitch(String(nextTtsConfig.pitch ?? DEFAULT_AGENT_TTS_CONFIG.pitch ?? 1));
-        setTtsSplitStrategy(nextTtsConfig.splitStrategy ?? DEFAULT_AGENT_TTS_CONFIG.splitStrategy ?? 'sentence');
-        setTtsMaxChunkChars(String(nextTtsConfig.maxChunkChars ?? DEFAULT_AGENT_TTS_CONFIG.maxChunkChars ?? 180));
-        setSpeakerProfiles(nextSpeakerProfiles);
+        setGlobalVoiceOptions(nextVoiceOptions);
+        setSelectedEmbodimentVoiceValue(resolveSelectedVoiceValue(embodiment, nextVoiceOptions));
         await loadChannelStatuses();
 
         const initialSystemPrompt = statePayload?.initialSystemPrompt
@@ -2150,54 +2200,6 @@ export function EditAgentPage() {
     });
   };
 
-  const updateSpeakerProfile = (profileId: string, patch: Partial<AgentSpeakerProfile>) => {
-    setSpeakerProfiles((prev) =>
-      prev.map((item) =>
-        item.id === profileId
-          ? {
-              ...item,
-              ...patch,
-              updatedAt: nowIsoString(),
-            }
-          : item,
-      ),
-    );
-  };
-
-  const handleAddSpeakerProfile = () => {
-    const profile = createDefaultSpeakerProfile();
-    setSpeakerProfiles((prev) => [...prev, profile]);
-    setTtsSpeakerProfileId(profile.id);
-  };
-
-  const handleRemoveSpeakerProfile = (profileId: string) => {
-    setSpeakerProfiles((prev) => {
-      const next = prev.filter((item) => item.id !== profileId);
-      setTtsSpeakerProfileId((current) => {
-        if (current !== profileId) {
-          return current;
-        }
-        return next[0]?.id || '';
-      });
-      return next;
-    });
-  };
-
-  const handleUploadSpeakerSample = async (profileId: string, file: File) => {
-    if (!id) {
-      return;
-    }
-    setUploadingSpeakerProfileId(profileId);
-    try {
-      const uploaded = await uploadManagementAgentChatAsset(id, file);
-      updateSpeakerProfile(profileId, { refAudioPath: uploaded.relativePath });
-    } catch (error) {
-      alert(error instanceof Error ? error.message : '上传音色样本失败');
-    } finally {
-      setUploadingSpeakerProfileId(null);
-    }
-  };
-
   const handleOptimize = async () => {
     if (!bio.trim() && !buildPreviewMarkdown(draft).trim()) {
       alert('请先输入简介或已有内容');
@@ -2313,28 +2315,19 @@ export function EditAgentPage() {
         channelBinding,
         agentId || id || normalizedEnglishName,
       );
-      const normalizedTtsSpeed = Number.parseFloat(ttsSpeed);
-      const normalizedTtsPitch = Number.parseFloat(ttsPitch);
-      const normalizedTtsMaxChunkChars = Number.parseInt(ttsMaxChunkChars, 10);
-      const normalizedSpeakerProfiles = speakerProfiles.map((item) => ({
-        ...item,
-        refText: item.refText?.trim() || undefined,
-        refAudioPath: item.refAudioPath?.trim() || undefined,
-        language: item.language?.trim() || undefined,
-        notes: item.notes?.trim() || undefined,
-      }));
-      const normalizedSpeakerProfileId =
-        ttsSpeakerProfileId && normalizedSpeakerProfiles.some((item) => item.id === ttsSpeakerProfileId)
-          ? ttsSpeakerProfileId
-          : undefined;
-      const normalizedTtsMessageTag = normalizeTtsMessageTag(ttsMessageTag);
-      const normalizedSystemPrompt = buildPromptWithTtsDirective(
-        buildPromptWithNickname(draft.system, nickname.trim()),
-        {
-          enabled: ttsEnabled,
-          messageTag: normalizedTtsMessageTag,
-        },
+      const normalizedSystemPrompt = buildPromptWithNickname(
+        stripTtsPromptBlock(draft.system),
+        nickname.trim(),
       );
+      const selectedVoiceOption =
+        globalVoiceOptions.find((item) => item.value === selectedEmbodimentVoiceValue)
+        || null;
+      const embodiment = buildEmbodimentConfig({
+        avatarUrl,
+        portraitUrl,
+        selectedVoiceOption,
+        existingEmbodiment: loadedEmbodiment,
+      });
 
       const configPatch: AgentConfigPatchInput = {
         english_name: normalizedEnglishName || undefined,
@@ -2346,22 +2339,10 @@ export function EditAgentPage() {
         system_prompt: normalizedSystemPrompt,
         avatar_url: avatarUrl || undefined,
         portrait_url: portraitUrl || undefined,
-        tts_config: {
-          enabled: ttsEnabled,
-          serviceMode: ttsServiceMode,
-          speakerProfileId: normalizedSpeakerProfileId,
-          messageTag: normalizedTtsMessageTag,
-          playbackMode: 'auto',
-          speed: Number.isFinite(normalizedTtsSpeed) ? normalizedTtsSpeed : DEFAULT_AGENT_TTS_CONFIG.speed,
-          pitch: Number.isFinite(normalizedTtsPitch) ? normalizedTtsPitch : DEFAULT_AGENT_TTS_CONFIG.pitch,
-          splitStrategy: ttsSplitStrategy,
-          maxChunkChars: Number.isFinite(normalizedTtsMaxChunkChars)
-            ? normalizedTtsMaxChunkChars
-            : DEFAULT_AGENT_TTS_CONFIG.maxChunkChars,
-        },
-        speaker_profiles: normalizedSpeakerProfiles,
+        embodiment,
       };
       await patchManagementAgentConfig(id, configPatch);
+      setLoadedEmbodiment(embodiment);
 
       const nextContextFiles: Partial<Record<ManagementContextFileName, string>> = {
         ...contextFiles,
@@ -2860,6 +2841,9 @@ export function EditAgentPage() {
                 onUploadPortrait={() => pickAndUpload('image/*', handleUploadPortrait)}
                 uploadingAvatar={uploadingAvatar}
                 uploadingPortrait={uploadingPortrait}
+                voiceOptions={globalVoiceOptions}
+                selectedVoiceValue={selectedEmbodimentVoiceValue}
+                onSelectedVoiceValueChange={setSelectedEmbodimentVoiceValue}
               />
             )}
 
@@ -3416,214 +3400,6 @@ export function EditAgentPage() {
                       )}
                     </div>
                   )}
-                </CardContent>
-              </Card>
-            )}
-
-            {activeTab === 'tts' && (
-              <Card className="rounded-3xl shadow-none border-muted-foreground/10 overflow-hidden bg-card/50 animate-fade-in">
-                <CardHeader className="p-8 pb-4">
-                  <CardTitle className="text-xl font-black tracking-tight flex items-center gap-3">
-                    <Volume2 className="w-6 h-6 text-primary" /> TTS 服务
-                  </CardTitle>
-                  <CardDescription className="text-sm font-medium">
-                    只配置两件事: 用哪种 TTS，以及语音标签是什么。
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="p-8 pt-4 space-y-6">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="rounded-2xl border bg-background px-4 py-3 flex items-center justify-between gap-3">
-                      <div>
-                        <div className="text-sm font-semibold">启用智能体 TTS</div>
-                        <div className="text-xs text-muted-foreground">关闭后，这个智能体不会挂语音标签，也不会显示小喇叭。</div>
-                      </div>
-                      <Switch checked={ttsEnabled} onCheckedChange={setTtsEnabled} />
-                    </div>
-                    <div className="space-y-2 rounded-2xl border bg-background px-4 py-3">
-                      <Label className="text-xs font-black uppercase tracking-widest text-foreground/50">服务模式</Label>
-                      <Select value={ttsServiceMode} onValueChange={(value) => setTtsServiceMode(value as typeof ttsServiceMode)}>
-                        <SelectTrigger className="rounded-xl h-11 bg-muted/20 border-border shadow-inner">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="inherit_global">继承全局</SelectItem>
-                          <SelectItem value="local_f5">本地 F5-TTS-ONNX</SelectItem>
-                          <SelectItem value="remote_openai">远程 OpenAI</SelectItem>
-                          <SelectItem value="remote_cosyvoice3">远程 CosyVoice3</SelectItem>
-                          <SelectItem value="remote_indextts">远程 IndexTTS</SelectItem>
-                          <SelectItem value="remote_qwen_tts">远程 QWEN-TTS</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">语音标签</Label>
-                      <Input
-                        value={ttsMessageTag}
-                        onChange={(e) => setTtsMessageTag(normalizeTtsMessageTag(e.target.value))}
-                        className="rounded-xl h-11 bg-muted/20 border-border shadow-inner"
-                        placeholder="speaker"
-                      />
-                    </div>
-                    <div className="rounded-2xl border bg-background px-4 py-3">
-                      <div className="text-sm font-semibold">命中标签后自动播报</div>
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        AI 只有输出 <code>{`<${normalizeTtsMessageTag(ttsMessageTag)}>`}</code> 时，聊天里才会自动生成并播放语音，同时在昵称后显示小喇叭。
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="rounded-xl border bg-muted/20 px-4 py-3 text-xs text-muted-foreground space-y-1">
-                    <div>当全局 TTS 和本智能体 TTS 同时开启时，模型只要在回复里输出 <code>{`<${normalizeTtsMessageTag(ttsMessageTag)}>`}</code>，聊天昵称后面就会出现小喇叭。</div>
-                    <div>没有标签的正文不会做 TTS，这样能避开 UI 标签、工具输出和无意义内容的浪费生成。</div>
-                  </div>
-
-                  <div className="rounded-3xl border bg-background p-5 space-y-5">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <div className="text-sm font-semibold">音色样本</div>
-                        <div className="text-xs text-muted-foreground">每个智能体可维护多套参考音色，保存后写入本地管理存储。</div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Button type="button" variant="outline" size="sm" className="gap-2" onClick={handleAddSpeakerProfile}>
-                          <Plus className="w-4 h-4" /> 新增音色
-                        </Button>
-                      </div>
-                    </div>
-
-                    {speakerProfiles.length === 0 ? (
-                      <div className="rounded-2xl border border-dashed bg-muted/20 px-4 py-8 text-sm text-muted-foreground text-center">
-                        还没有音色样本。点击“新增音色”，再上传参考音频。
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-1 xl:grid-cols-[280px_minmax(0,1fr)] gap-5">
-                        <div className="space-y-3">
-                          {speakerProfiles.map((profile) => {
-                            const selected = profile.id === ttsSpeakerProfileId;
-                            return (
-                              <button
-                                key={profile.id}
-                                type="button"
-                                onClick={() => setTtsSpeakerProfileId(profile.id)}
-                                className={cn(
-                                  'w-full rounded-2xl border px-4 py-3 text-left transition-all',
-                                  selected ? 'border-primary bg-primary/5 shadow-sm' : 'bg-muted/20 hover:bg-muted/30',
-                                )}
-                              >
-                                <div className="flex items-start justify-between gap-3">
-                                  <div>
-                                    <div className="text-sm font-semibold">{profile.name}</div>
-                                    <div className="mt-1 text-xs text-muted-foreground">{profile.refAudioPath || '未上传参考音频'}</div>
-                                  </div>
-                                  <Badge variant={selected ? 'default' : 'outline'}>{selected ? '当前' : '样本'}</Badge>
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-
-                        {activeSpeakerProfile ? (
-                          <div className="space-y-4 rounded-2xl border bg-muted/10 p-5">
-                            <div className="flex items-center justify-between gap-3">
-                              <div>
-                                <div className="text-sm font-semibold">编辑当前音色</div>
-                                <div className="text-xs text-muted-foreground">上传参考音频后，可继续补参考文本与语言标签。</div>
-                              </div>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon"
-                                className="rounded-xl"
-                                onClick={() => handleRemoveSpeakerProfile(activeSpeakerProfile.id)}
-                              >
-                                <Trash2 className="w-4 h-4 text-destructive" />
-                              </Button>
-                            </div>
-
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                              <div className="space-y-2">
-                                <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">名称</Label>
-                                <Input
-                                  value={activeSpeakerProfile.name}
-                                  onChange={(e) => updateSpeakerProfile(activeSpeakerProfile.id, { name: e.target.value })}
-                                  className="rounded-xl h-11 bg-background border-border shadow-inner"
-                                />
-                              </div>
-                              <div className="space-y-2">
-                                <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">语言</Label>
-                                <Input
-                                  value={activeSpeakerProfile.language || ''}
-                                  onChange={(e) => updateSpeakerProfile(activeSpeakerProfile.id, { language: e.target.value })}
-                                  className="rounded-xl h-11 bg-background border-border shadow-inner"
-                                  placeholder="zh-CN"
-                                />
-                              </div>
-                              <div className="space-y-2 md:col-span-2">
-                                <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">参考音频</Label>
-                                <div className="rounded-2xl border bg-background px-4 py-4 space-y-3">
-                                  <div className="text-xs text-muted-foreground break-all">
-                                    {activeSpeakerProfile.refAudioPath || '未上传，支持 wav / mp3 / m4a / flac 等音频文件。'}
-                                  </div>
-                                  <Input
-                                    type="file"
-                                    accept="audio/*"
-                                    onChange={(e) => {
-                                      const file = e.target.files?.[0];
-                                      if (file) {
-                                        void handleUploadSpeakerSample(activeSpeakerProfile.id, file);
-                                      }
-                                      e.currentTarget.value = '';
-                                    }}
-                                    className="rounded-xl h-11 bg-background border-border shadow-inner"
-                                  />
-                                  {uploadingSpeakerProfileId === activeSpeakerProfile.id ? (
-                                    <div className="text-xs text-muted-foreground">正在上传参考音频...</div>
-                                  ) : null}
-                                </div>
-                              </div>
-                              <div className="space-y-2 md:col-span-2">
-                                <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">参考文本</Label>
-                                <Textarea
-                                  value={activeSpeakerProfile.refText || ''}
-                                  onChange={(e) => updateSpeakerProfile(activeSpeakerProfile.id, { refText: e.target.value })}
-                                  className="min-h-[100px] rounded-2xl bg-background border-border shadow-inner resize-y"
-                                  placeholder="填入参考音频对应的真实文本，F5 克隆效果会更稳定。"
-                                />
-                              </div>
-                              <div className="space-y-2 md:col-span-2">
-                                <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">备注</Label>
-                                <Textarea
-                                  value={activeSpeakerProfile.notes || ''}
-                                  onChange={(e) => updateSpeakerProfile(activeSpeakerProfile.id, { notes: e.target.value })}
-                                  className="min-h-[90px] rounded-2xl bg-background border-border shadow-inner resize-y"
-                                  placeholder="例如：偏温柔、偏御姐、适合旁白。"
-                                />
-                              </div>
-                            </div>
-                          </div>
-                        ) : null}
-                      </div>
-                    )}
-
-                    <div className="space-y-2">
-                      <Label className="text-xs font-black uppercase tracking-widest text-foreground/50 ml-1">当前默认音色</Label>
-                      <Select value={ttsSpeakerProfileId || '__none__'} onValueChange={(value) => setTtsSpeakerProfileId(value === '__none__' ? '' : value)}>
-                        <SelectTrigger className="rounded-xl h-11 bg-muted/20 border-border shadow-inner">
-                          <SelectValue placeholder="未选择" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="__none__">不指定，运行时按服务默认值处理</SelectItem>
-                          {speakerProfiles.map((profile) => (
-                            <SelectItem key={profile.id} value={profile.id}>
-                              {profile.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
                 </CardContent>
               </Card>
             )}

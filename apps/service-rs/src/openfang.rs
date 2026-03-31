@@ -4,6 +4,7 @@ use axum::http::{Method, StatusCode};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::Client;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::error::ApiError;
 
@@ -212,6 +213,7 @@ impl OpenFangClient {
         body: Option<Value>,
     ) -> Result<Value, ApiError> {
         let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        let started_at = std::time::Instant::now();
         let mut req = self.client.request(method, &url);
 
         if let Some(key) = &self.api_key {
@@ -222,6 +224,13 @@ impl OpenFangClient {
         }
 
         let resp = req.send().await.map_err(|e| {
+            warn!(
+                path = %path,
+                url = %url,
+                latency_ms = started_at.elapsed().as_millis() as u64,
+                error = %e,
+                "OpenFang upstream request failed"
+            );
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 format!("OpenFang 请求失败({url}): {e}"),
@@ -230,12 +239,19 @@ impl OpenFangClient {
 
         let status = resp.status();
         let text = resp.text().await.map_err(|e| {
+            warn!(
+                path = %path,
+                url = %url,
+                status = %status,
+                latency_ms = started_at.elapsed().as_millis() as u64,
+                error = %e,
+                "OpenFang upstream response read failed"
+            );
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 format!("OpenFang 响应读取失败({url}): {e}"),
             )
         })?;
-
         if !status.is_success() {
             return Err(ApiError::new(
                 status,

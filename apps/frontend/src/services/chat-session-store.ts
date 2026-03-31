@@ -2,6 +2,7 @@ import type { ChatAttachment, Message, MessageToolCall, MessageTrace } from '@/d
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import type { ChatTaskLifecycleItem } from '@/types/chat-task';
 import {
+  buildRenderableSpecFromToolLog,
   cleanupAssistantText,
   normalizeIncomingSpec,
   tryParseInlineSpecFromText,
@@ -63,7 +64,7 @@ function isTauriRuntime(): boolean {
 }
 
 function canUsePersistentBrowserStorage(): boolean {
-  return isTauriRuntime();
+  return typeof window !== 'undefined' && typeof localStorage !== 'undefined';
 }
 
 function purgeWebSessionStorageIfNeeded(): void {
@@ -86,8 +87,12 @@ function createSessionId(): string {
 }
 
 function cloneMessage(message: Message): Message {
+  const sanitizedText = message.role === 'agent'
+    ? cleanupAssistantText(message.text || '', message.spec)
+    : message.text;
   return {
     ...message,
+    text: sanitizedText,
     attachments: message.attachments?.map((attachment) => ({ ...attachment })),
     tools: message.tools?.map((tool) => ({ ...tool, running: false })),
     thinkingTrace: message.thinkingTrace?.map((trace) => ({ ...trace })),
@@ -398,6 +403,35 @@ function normalizeTrace(raw: unknown, index: number): MessageTrace | null {
   };
 }
 
+function buildRenderableSpecFromMarkdownText(text: string): unknown | undefined {
+  const matches = Array.from(text.matchAll(/!\[([^\]]*)\]\((\/api\/uploads\/[^)\s]+|https?:\/\/[^)\s]+)\)/g));
+  if (matches.length === 0) {
+    return undefined;
+  }
+  const images = matches.map((match, index) => {
+    const alt = (match[1] || '').trim() || `图片 ${index + 1}`;
+    return {
+      src: match[2],
+      alt,
+      title: alt,
+    };
+  });
+  if (images.length === 1) {
+    return {
+      type: 'ImageCover',
+      props: images[0],
+    };
+  }
+  return {
+    type: 'ImageCarousel',
+    props: {
+      images,
+      title: '图片结果',
+      showThumbs: true,
+    },
+  };
+}
+
 function normalizeMessage(raw: unknown, index: number): Message | null {
   const item = isRecord(raw) ? raw : null;
   if (!item) return null;
@@ -458,6 +492,28 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
     if (tools.length > 0) {
       message.tools = tools;
     }
+  }
+  if (message.spec === undefined && message.tools?.length) {
+    for (let toolIndex = message.tools.length - 1; toolIndex >= 0; toolIndex -= 1) {
+      const result = (message.tools[toolIndex]?.result || '').trim();
+      if (!result) {
+        continue;
+      }
+      const renderableSpec = normalizeIncomingSpec(buildRenderableSpecFromToolLog(result));
+      if (renderableSpec !== undefined) {
+        message.spec = renderableSpec;
+        break;
+      }
+    }
+  }
+  if (message.spec === undefined && text.trim()) {
+    const markdownSpec = normalizeIncomingSpec(buildRenderableSpecFromMarkdownText(text));
+    if (markdownSpec !== undefined) {
+      message.spec = markdownSpec;
+    }
+  }
+  if (message.spec !== undefined && role === 'agent') {
+    message.text = cleanupAssistantText(message.text, message.spec);
   }
   if (Array.isArray(item.thinkingTrace)) {
     const traces = item.thinkingTrace
@@ -557,7 +613,6 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
           : undefined,
       reportStatus:
         item.taskCard.reportStatus === 'pending'
-        || item.taskCard.reportStatus === 'reported'
         || item.taskCard.reportStatus === 'acknowledged'
           ? item.taskCard.reportStatus
           : undefined,
@@ -783,8 +838,14 @@ function readRootState(): StoredRootState {
         root.agents[agentId] = normalized;
       }
     }
+    const normalizedSerialized = JSON.stringify(root);
+    if (normalizedSerialized !== raw) {
+      localStorage.setItem(STORAGE_KEY, normalizedSerialized);
+      cachedSerializedRoot = normalizedSerialized;
+    } else {
+      cachedSerializedRoot = raw;
+    }
     cachedRootState = root;
-    cachedSerializedRoot = raw;
     return root;
   } catch {
     const empty = createEmptyRoot();

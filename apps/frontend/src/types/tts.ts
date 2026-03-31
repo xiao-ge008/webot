@@ -57,6 +57,7 @@ export interface AppTtsSettings {
   activeLocalEngine: LocalTtsEngine;
   local: LocalTtsSettings;
   remote: RemoteTtsSettings;
+  speakerProfiles: AgentSpeakerProfile[];
 }
 
 export interface AgentTtsConfig {
@@ -167,6 +168,7 @@ export const DEFAULT_APP_TTS_SETTINGS: AppTtsSettings = {
     indextts: { ...DEFAULT_REMOTE_TTS_PROVIDER_CONFIG },
     qwenTts: { ...DEFAULT_REMOTE_TTS_PROVIDER_CONFIG },
   },
+  speakerProfiles: [],
 };
 
 export const DEFAULT_AGENT_TTS_CONFIG: AgentTtsConfig = {

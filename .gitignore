@@ -5,6 +5,7 @@
 **/dist/
 **/target/
 **/target-temp*/
+.codex-build/
 *.log
 log/
 .DS_Store

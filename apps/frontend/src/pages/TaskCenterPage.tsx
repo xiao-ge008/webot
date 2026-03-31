@@ -16,7 +16,8 @@ import {
     CheckCircle2,
     Filter,
     CalendarDays,
-    Square
+    Square,
+    Zap
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { resolveTaskLifecycle, taskLifecycleLabel, type TaskLifecycleState } from '@/lib/task-lifecycle';
@@ -51,11 +52,11 @@ import {
     listTaskRuns,
     listTasks,
     pauseTask,
-    runTaskNow,
+    publishTask,
+    runTaskOnce,
     setTaskCenterAgentId,
 } from '@/services/task-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
-import { parseChatTaskIntent } from '@/services/chat-task-intent';
 import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 
 const TASK_CENTER_AGENT_KEY = 'webot-task-center-agent-id';
@@ -503,7 +504,13 @@ export function TaskCenterPage() {
                                     setIsDetailsOpen(true);
                                 }}
                                 onRunNow={async () => {
-                                    const ok = await runTaskAction(task.id, async () => runTaskNow(task.id));
+                                    const ok = await runTaskAction(task.id, async () => publishTask(task.id));
+                                    if (ok) {
+                                        await refreshTasks(selectedAgentId);
+                                    }
+                                }}
+                                onRunOnce={async () => {
+                                    const ok = await runTaskAction(task.id, async () => runTaskOnce(task.id));
                                     if (ok) {
                                         await refreshTasks(selectedAgentId);
                                     }
@@ -584,6 +591,7 @@ function TaskCard({
     onEdit,
     onViewDetails,
     onRunNow,
+    onRunOnce,
     onStopNow,
     onDelete,
     busy
@@ -592,6 +600,7 @@ function TaskCard({
     onEdit: () => void;
     onViewDetails: () => void;
     onRunNow: () => Promise<void>;
+    onRunOnce: () => Promise<void>;
     onStopNow: () => Promise<void>;
     onDelete: () => Promise<void>;
     busy: boolean;
@@ -602,8 +611,9 @@ function TaskCard({
     const statusColor = lifecycleBadgeClass(lifecycle);
     const statusLabel = lifecycleBadgeLabel(lifecycle);
     const canDelete = canDeleteTask(task);
-    const canPublish = lifecycle === 'pending' && !task.enabled && task.sourceType !== 'chat';
-    const canTerminate = task.enabled && lifecycle === 'running';
+    const canPublish = Boolean(task.capabilities?.publish) && task.sourceType !== 'chat';
+    const canRunOnce = Boolean(task.capabilities?.runOnce);
+    const canTerminate = Boolean(task.capabilities?.pause);
     const canEdit = lifecycle === 'pending' && !task.enabled;
 
     // 进度计算
@@ -728,20 +738,39 @@ function TaskCard({
                             )}
 
                             {/* 待执行(未发布) -> 运行 */}
-                            {canPublish && (
-                                <Button
-                                    variant="default"
-                                    size="sm"
-                                    className="h-9 px-4 rounded-xl gap-2 font-black shadow-lg shadow-primary/20 bg-primary text-primary-foreground hover:scale-105 transition-all"
-                                    onClick={async (e) => {
-                                        e.stopPropagation();
-                                        await onRunNow();
-                                    }}
-                                    disabled={busy}
-                                >
-                                    <Play className="w-4 h-4" />
-                                    {t('tasks.list.runNow')}
-                                </Button>
+                            {(canPublish || canRunOnce) && (
+                                <>
+                                    {canRunOnce ? (
+                                        <Button
+                                            variant="secondary"
+                                            size="sm"
+                                            className="h-9 px-4 rounded-xl gap-2 font-bold border border-primary/20 text-primary hover:bg-primary/10 transition-all"
+                                            onClick={async (e) => {
+                                                e.stopPropagation();
+                                                await onRunOnce();
+                                            }}
+                                            disabled={busy}
+                                        >
+                                            <Zap className="w-4 h-4" />
+                                            立即执行一次
+                                        </Button>
+                                    ) : null}
+                                    {canPublish ? (
+                                        <Button
+                                            variant="default"
+                                            size="sm"
+                                            className="h-9 px-4 rounded-xl gap-2 font-black shadow-lg shadow-primary/20 bg-primary text-primary-foreground hover:scale-105 transition-all"
+                                            onClick={async (e) => {
+                                                e.stopPropagation();
+                                                await onRunNow();
+                                            }}
+                                            disabled={busy}
+                                        >
+                                            <Play className="w-4 h-4" />
+                                            发布任务
+                                        </Button>
+                                    ) : null}
+                                </>
                             )}
 
                             <Button
@@ -853,13 +882,36 @@ function everyMsToCron(everyMs: number): string {
     return '*/30 * * * *';
 }
 
+function inferEveryMsFromText(text: string): number | null {
+    const raw = text.trim();
+    if (!raw) return null;
+    const patterns: RegExp[] = [
+        /每\s*(\d+)\s*(分钟|分|小时|天)/i,
+        /(\d+)\s*(分钟|分|小时|天)\s*(?:执行|运行|提醒|检查|查询|同步)/i,
+    ];
+    for (const pattern of patterns) {
+        const match = raw.match(pattern);
+        if (!match) continue;
+        const value = Number(match[1]);
+        const unit = String(match[2] || '');
+        if (!Number.isFinite(value) || value <= 0) continue;
+        if (unit === '分钟' || unit === '分') return value * 60_000;
+        if (unit === '小时') return value * 3_600_000;
+        if (unit === '天') return value * 86_400_000;
+    }
+    if (/每分钟/.test(raw)) return 60_000;
+    if (/每小时/.test(raw)) return 3_600_000;
+    if (/每天/.test(raw)) return 86_400_000;
+    return null;
+}
+
 function inferCronFromSemantic(text: string): string | null {
     const raw = text.trim();
     if (!raw) return null;
 
-    const parsed = parseChatTaskIntent(raw);
-    if (parsed?.everyMs) {
-        return everyMsToCron(parsed.everyMs);
+    const everyMs = inferEveryMsFromText(raw);
+    if (everyMs != null) {
+        return everyMsToCron(everyMs);
     }
 
     if (/工作日/.test(raw)) {

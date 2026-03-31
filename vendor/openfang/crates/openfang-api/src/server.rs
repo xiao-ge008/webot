@@ -302,6 +302,58 @@ pub async fn build_router(
             "/api/schedules/{id}/run",
             axum::routing::post(routes::run_schedule),
         )
+        .route(
+            "/api/tasks",
+            axum::routing::get(routes::list_tasks).post(routes::create_task),
+        )
+        .route(
+            "/api/tasks/deliveries/pending",
+            axum::routing::get(routes::list_pending_task_deliveries),
+        )
+        .route(
+            "/api/tasks/deliveries/{id}/status",
+            axum::routing::post(routes::update_task_delivery_status),
+        )
+        .route(
+            "/api/tasks/deliveries/{id}/attempts",
+            axum::routing::post(routes::create_task_delivery_attempt),
+        )
+        .route(
+            "/api/tasks/{id}",
+            axum::routing::get(routes::get_task).delete(routes::delete_task),
+        )
+        .route(
+            "/api/tasks/{id}/publish",
+            axum::routing::post(routes::publish_task),
+        )
+        .route(
+            "/api/tasks/{id}/pause",
+            axum::routing::post(routes::pause_task),
+        )
+        .route(
+            "/api/tasks/{id}/run-once",
+            axum::routing::post(routes::run_task_once),
+        )
+        .route(
+            "/api/tasks/{id}/runs",
+            axum::routing::get(routes::list_task_runs),
+        )
+        .route(
+            "/api/tasks/{id}/events",
+            axum::routing::get(routes::list_task_events),
+        )
+        .route(
+            "/api/tasks/{id}/deliveries",
+            axum::routing::get(routes::list_task_deliveries),
+        )
+        .route(
+            "/api/tasks/{id}/delivery-attempts",
+            axum::routing::get(routes::list_task_delivery_attempts),
+        )
+        .route(
+            "/api/tasks/{id}/timeline",
+            axum::routing::get(routes::list_task_timeline),
+        )
         // Workflow endpoints
         .route(
             "/api/workflows",

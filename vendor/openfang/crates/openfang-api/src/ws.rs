@@ -1056,33 +1056,137 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
         StreamEvent::ToolExecutionResult {
             name,
             result_preview,
+            structured_result,
             is_error,
             input,
-        } => match verbose {
-            VerboseLevel::Off => Some(serde_json::json!({
-                "type": "tool_result",
-                "tool": name,
-                "is_error": is_error,
-                "input": input,
-            })),
-            VerboseLevel::On => {
-                let truncated: String = result_preview.chars().take(200).collect();
-                Some(serde_json::json!({
+        } => {
+            let route = structured_result
+                .as_ref()
+                .and_then(|value| value.get("route"))
+                .cloned();
+            let provider_id = structured_result
+                .as_ref()
+                .and_then(|value| value.get("provider_id"))
+                .cloned();
+            let provider_type = structured_result
+                .as_ref()
+                .and_then(|value| value.get("provider_type"))
+                .cloned();
+            let provider_tool = structured_result
+                .as_ref()
+                .and_then(|value| value.get("provider_tool"))
+                .cloned();
+            let summary = structured_result
+                .as_ref()
+                .and_then(|value| value.get("summary"))
+                .cloned();
+            let attempts = structured_result
+                .as_ref()
+                .and_then(|value| value.get("attempts"))
+                .cloned();
+            let hint = structured_result
+                .as_ref()
+                .and_then(|value| value.get("hint"))
+                .cloned();
+            let self_expression = structured_result
+                .as_ref()
+                .and_then(|value| value.get("self_expression"))
+                .cloned()
+                .or_else(|| {
+                    input
+                        .as_ref()
+                        .and_then(|value| value.get("webot_self_expression_request"))
+                        .cloned()
+                });
+            let auto_injected_video_source = structured_result
+                .as_ref()
+                .and_then(|value| value.get("auto_injected_video_source"))
+                .cloned()
+                .or_else(|| {
+                    input
+                        .as_ref()
+                        .and_then(|value| value.get("webot_auto_injected_video_source"))
+                        .cloned()
+                });
+            let auto_injected_video_source_url = structured_result
+                .as_ref()
+                .and_then(|value| value.get("auto_injected_video_source_url"))
+                .cloned()
+                .or_else(|| {
+                    input
+                        .as_ref()
+                        .and_then(|value| value.get("webot_auto_injected_video_source_url"))
+                        .cloned()
+                });
+            let has_source_image = structured_result
+                .as_ref()
+                .and_then(|value| value.get("has_source_image"))
+                .cloned();
+            match verbose {
+                VerboseLevel::Off => Some(serde_json::json!({
                     "type": "tool_result",
                     "tool": name,
-                    "result": truncated,
                     "is_error": is_error,
                     "input": input,
-                }))
+                    "route": route,
+                    "provider_id": provider_id,
+                    "provider_type": provider_type,
+                    "provider_tool": provider_tool,
+                    "summary": summary,
+                    "attempts": attempts,
+                    "hint": hint,
+                    "self_expression": self_expression,
+                    "auto_injected_video_source": auto_injected_video_source,
+                    "auto_injected_video_source_url": auto_injected_video_source_url,
+                    "has_source_image": has_source_image,
+                    "presentable_result": structured_result.as_ref().and_then(|value| value.get("presentable_result")).cloned(),
+                    "job_result": structured_result.as_ref().and_then(|value| value.get("job_result")).cloned(),
+                })),
+                VerboseLevel::On => {
+                    let truncated: String = result_preview.chars().take(200).collect();
+                    Some(serde_json::json!({
+                        "type": "tool_result",
+                        "tool": name,
+                        "result": truncated,
+                        "is_error": is_error,
+                        "input": input,
+                        "route": route,
+                        "provider_id": provider_id,
+                        "provider_type": provider_type,
+                        "provider_tool": provider_tool,
+                        "summary": summary,
+                        "attempts": attempts,
+                        "hint": hint,
+                        "self_expression": self_expression,
+                        "auto_injected_video_source": auto_injected_video_source,
+                        "auto_injected_video_source_url": auto_injected_video_source_url,
+                        "has_source_image": has_source_image,
+                        "presentable_result": structured_result.as_ref().and_then(|value| value.get("presentable_result")).cloned(),
+                        "job_result": structured_result.as_ref().and_then(|value| value.get("job_result")).cloned(),
+                    }))
+                }
+                VerboseLevel::Full => Some(serde_json::json!({
+                    "type": "tool_result",
+                    "tool": name,
+                    "result": result_preview,
+                    "is_error": is_error,
+                    "input": input,
+                    "route": route,
+                    "provider_id": provider_id,
+                    "provider_type": provider_type,
+                    "provider_tool": provider_tool,
+                    "summary": summary,
+                    "attempts": attempts,
+                    "hint": hint,
+                    "self_expression": self_expression,
+                    "auto_injected_video_source": auto_injected_video_source,
+                    "auto_injected_video_source_url": auto_injected_video_source_url,
+                    "has_source_image": has_source_image,
+                    "presentable_result": structured_result.as_ref().and_then(|value| value.get("presentable_result")).cloned(),
+                    "job_result": structured_result.as_ref().and_then(|value| value.get("job_result")).cloned(),
+                })),
             }
-            VerboseLevel::Full => Some(serde_json::json!({
-                "type": "tool_result",
-                "tool": name,
-                "result": result_preview,
-                "is_error": is_error,
-                "input": input,
-            })),
-        },
+        }
         StreamEvent::PhaseChange { phase, detail } => Some(serde_json::json!({
             "type": "phase",
             "phase": phase,

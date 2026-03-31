@@ -17,7 +17,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+use crate::assignment_store::{
+    self, CapabilityDescriptorRecord, CapabilityProviderBindingRecord, CapabilityProviderRecord,
+    ProviderHealthStateRecord,
+};
 use crate::error::ApiError;
+use crate::ocr_service;
 use crate::path_resolver;
 
 #[cfg(target_os = "windows")]
@@ -49,6 +54,20 @@ pub struct VisionAnalysisConfig {
     pub auto_analyze_chat_images: bool,
     #[serde(default = "default_auto_download_on_enable")]
     pub auto_download_on_enable: bool,
+    #[serde(default)]
+    pub ocr_enabled: bool,
+    #[serde(default = "default_ocr_provider")]
+    pub ocr_provider: String,
+    #[serde(default)]
+    pub ocr_service_url: String,
+    #[serde(default = "default_ocr_model_variant")]
+    pub ocr_model_variant: String,
+    #[serde(default = "default_ocr_auto_download_on_enable")]
+    pub ocr_auto_download_on_enable: bool,
+    #[serde(default = "default_ocr_merge_into_summary")]
+    pub ocr_merge_into_summary: bool,
+    #[serde(default = "default_ocr_prefer_for_text_heavy_images")]
+    pub ocr_prefer_for_text_heavy_images: bool,
 }
 
 impl Default for VisionAnalysisConfig {
@@ -61,6 +80,13 @@ impl Default for VisionAnalysisConfig {
             cache_enabled: default_cache_enabled(),
             auto_analyze_chat_images: default_auto_analyze_chat_images(),
             auto_download_on_enable: default_auto_download_on_enable(),
+            ocr_enabled: false,
+            ocr_provider: default_ocr_provider(),
+            ocr_service_url: String::new(),
+            ocr_model_variant: default_ocr_model_variant(),
+            ocr_auto_download_on_enable: default_ocr_auto_download_on_enable(),
+            ocr_merge_into_summary: default_ocr_merge_into_summary(),
+            ocr_prefer_for_text_heavy_images: default_ocr_prefer_for_text_heavy_images(),
         }
     }
 }
@@ -91,6 +117,18 @@ pub struct VisionAnalysisStatus {
     pub cache_dir: String,
     pub missing_files: Vec<String>,
     pub files: Vec<VisionModelFileStatus>,
+    pub ocr_provider_available: bool,
+    pub ocr_model_ready: bool,
+    pub ocr_download_active: bool,
+    pub ocr_downloaded_bytes: u64,
+    pub ocr_total_bytes: u64,
+    pub ocr_progress_percent: f64,
+    pub ocr_current_file: Option<String>,
+    pub ocr_last_error: Option<String>,
+    pub ocr_model_root_dir: String,
+    pub ocr_model_dir: String,
+    pub ocr_missing_files: Vec<String>,
+    pub ocr_files: Vec<ocr_service::OcrModelFileStatus>,
     pub updated_at_ms: u64,
 }
 
@@ -118,6 +156,16 @@ pub struct VisionCacheRecord {
     pub upstream_file_id: Option<String>,
     #[serde(default)]
     pub file_name: Option<String>,
+    #[serde(default)]
+    pub ocr_enabled: bool,
+    #[serde(default)]
+    pub vision_summary: Option<String>,
+    #[serde(default)]
+    pub ocr_summary: Option<String>,
+    #[serde(default)]
+    pub ocr_text: Option<String>,
+    #[serde(default)]
+    pub ocr_lines: Vec<ocr_service::OcrLine>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -149,6 +197,16 @@ pub struct UpsertVisionCacheRequest {
     pub upstream_file_id: Option<String>,
     #[serde(default)]
     pub file_name: Option<String>,
+    #[serde(default)]
+    pub ocr_enabled: bool,
+    #[serde(default)]
+    pub vision_summary: Option<String>,
+    #[serde(default)]
+    pub ocr_summary: Option<String>,
+    #[serde(default)]
+    pub ocr_text: Option<String>,
+    #[serde(default)]
+    pub ocr_lines: Vec<ocr_service::OcrLine>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,6 +242,11 @@ pub struct AnalyzeVisionImageResponse {
     pub mime_type: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub vision_summary: Option<String>,
+    pub ocr_summary: Option<String>,
+    pub ocr_text: Option<String>,
+    pub ocr_lines: Vec<ocr_service::OcrLine>,
+    pub ocr_enabled: bool,
     pub cached: bool,
 }
 
@@ -340,6 +403,26 @@ fn default_auto_analyze_chat_images() -> bool {
 }
 
 fn default_auto_download_on_enable() -> bool {
+    true
+}
+
+fn default_ocr_provider() -> String {
+    ocr_service::OCR_PROVIDER_SIDECAR_LOCAL.to_string()
+}
+
+fn default_ocr_model_variant() -> String {
+    ocr_service::default_model_variant()
+}
+
+fn default_ocr_auto_download_on_enable() -> bool {
+    true
+}
+
+fn default_ocr_merge_into_summary() -> bool {
+    true
+}
+
+fn default_ocr_prefer_for_text_heavy_images() -> bool {
     true
 }
 
@@ -641,6 +724,283 @@ fn build_presented_summary(summary: &str, user_text: &str, mode: VisionFocusMode
     .join("\n")
 }
 
+fn build_mixed_summary(
+    vision_summary: Option<&str>,
+    ocr_summary: Option<&str>,
+    prefer_ocr_first: bool,
+) -> String {
+    let normalized_vision = vision_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let normalized_ocr = ocr_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    match (normalized_vision, normalized_ocr) {
+        (Some(vision), Some(ocr)) => {
+            if prefer_ocr_first {
+                format!("检测到文本：{ocr}\n图像语义：{vision}")
+            } else {
+                format!("图像语义：{vision}\n检测到文本：{ocr}")
+            }
+        }
+        (Some(vision), None) => vision,
+        (None, Some(ocr)) => format!("检测到文本：{ocr}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn should_prefer_ocr_first(user_text: &str, config: &VisionAnalysisConfig) -> bool {
+    if !config.ocr_prefer_for_text_heavy_images {
+        return false;
+    }
+    let normalized = normalize_focus_text(user_text).to_ascii_lowercase();
+    normalized.is_empty()
+        || text_contains_any(
+            &normalized,
+            &[
+                "文字",
+                "文本",
+                "ocr",
+                "识别",
+                "读一下",
+                "读出",
+                "翻译",
+                "字幕",
+                "票据",
+                "表格",
+                "文档",
+                "pdf",
+                "海报",
+                "界面",
+                "ui",
+                "截图",
+                "标题",
+                "logo",
+                "数字",
+            ],
+        )
+}
+
+fn ocr_provider_supports_local_download(config: &VisionAnalysisConfig) -> bool {
+    ocr_service::normalize_provider_name(&config.ocr_provider)
+        != ocr_service::OCR_PROVIDER_SIDECAR_HTTP
+}
+
+fn build_local_vision_provider_record(
+    config: &VisionAnalysisConfig,
+    status: &VisionAnalysisStatus,
+) -> CapabilityProviderRecord {
+    let enabled = config.enabled || config.ocr_enabled;
+    let health_state = if !enabled {
+        "disabled".to_string()
+    } else if status.model_ready || status.ocr_model_ready {
+        "ready".to_string()
+    } else if status.download_active || status.ocr_download_active {
+        "downloading".to_string()
+    } else {
+        "degraded".to_string()
+    };
+    CapabilityProviderRecord {
+        provider_id: "runtime_native:local_vision_service".to_string(),
+        provider_type: "runtime_native".to_string(),
+        display_name: Some("本地混合视觉".to_string()),
+        capabilities: vec![CapabilityDescriptorRecord {
+            key: "analyze.media".to_string(),
+            scope: "generic".to_string(),
+        }],
+        supported_scopes: vec!["generic".to_string()],
+        priority: 15,
+        requirements: json!({
+            "florence2Enabled": config.enabled,
+            "ocrEnabled": config.ocr_enabled,
+        }),
+        supports_job: true,
+        enabled,
+        health_state,
+        input_contract: json!({
+            "type": "object",
+            "required": ["imagePath"],
+            "properties": {
+                "imagePath": { "type": "string" },
+                "mimeType": { "type": "string" },
+                "userText": { "type": "string" }
+            }
+        }),
+        output_contract: json!({
+            "kind": "media_result",
+            "mediaType": "image",
+            "summaryFields": ["summary", "visionSummary", "ocrSummary", "ocrLines"]
+        }),
+        metadata: json!({
+            "providerStack": {
+                "florence2": {
+                    "enabled": config.enabled,
+                    "ready": status.model_ready,
+                    "modelId": config.model_id,
+                },
+                "ocr": {
+                    "enabled": config.ocr_enabled,
+                    "ready": status.ocr_model_ready,
+                    "provider": config.ocr_provider,
+                    "modelVariant": config.ocr_model_variant,
+                }
+            }
+        }),
+        is_removed: false,
+        updated_at: String::new(),
+    }
+}
+
+fn build_ocr_provider_record(
+    config: &VisionAnalysisConfig,
+    status: &VisionAnalysisStatus,
+) -> CapabilityProviderRecord {
+    let health_state = if !config.ocr_enabled {
+        "disabled".to_string()
+    } else if status.ocr_model_ready {
+        "ready".to_string()
+    } else if status.ocr_download_active {
+        "downloading".to_string()
+    } else {
+        "degraded".to_string()
+    };
+    let provider_kind = ocr_service::normalize_provider_name(&config.ocr_provider);
+    let is_http_sidecar = provider_kind == ocr_service::OCR_PROVIDER_SIDECAR_HTTP;
+    CapabilityProviderRecord {
+        provider_id: if is_http_sidecar {
+            "generic_provider:ocr_sidecar".to_string()
+        } else {
+            "runtime_native:ocr_service".to_string()
+        },
+        provider_type: if is_http_sidecar {
+            "generic_provider".to_string()
+        } else {
+            "runtime_native".to_string()
+        },
+        display_name: Some(if is_http_sidecar {
+            "OCR Remote Sidecar 服务".to_string()
+        } else if provider_kind == ocr_service::OCR_PROVIDER_SIDECAR_LOCAL {
+            "OCR Local Sidecar".to_string()
+        } else {
+            "Paddle OCR 服务".to_string()
+        }),
+        capabilities: vec![
+            CapabilityDescriptorRecord {
+                key: "analyze.media".to_string(),
+                scope: "generic".to_string(),
+            },
+            CapabilityDescriptorRecord {
+                key: "parse.document".to_string(),
+                scope: "generic".to_string(),
+            },
+            CapabilityDescriptorRecord {
+                key: "extract.document".to_string(),
+                scope: "generic".to_string(),
+            },
+        ],
+        supported_scopes: vec!["generic".to_string()],
+        priority: 18,
+        requirements: json!({
+            "modelVariant": config.ocr_model_variant,
+            "serviceUrl": if config.ocr_service_url.trim().is_empty() {
+                Value::Null
+            } else {
+                Value::String(config.ocr_service_url.trim().to_string())
+            },
+        }),
+        supports_job: true,
+        enabled: config.ocr_enabled,
+        health_state,
+        input_contract: json!({
+            "type": "object",
+            "required": ["imagePath"],
+            "properties": {
+                "imagePath": { "type": "string" }
+            }
+        }),
+        output_contract: json!({
+            "kind": "text_result",
+            "fields": ["summary", "text", "lines"]
+        }),
+        metadata: json!({
+            "provider": provider_kind,
+            "modelVariant": config.ocr_model_variant,
+            "serviceUrl": if config.ocr_service_url.trim().is_empty() {
+                Value::Null
+            } else {
+                Value::String(config.ocr_service_url.trim().to_string())
+            },
+            "documentCapabilities": ["parse.document", "extract.document"],
+        }),
+        is_removed: false,
+        updated_at: String::new(),
+    }
+}
+
+fn sync_capability_registry_status(config: &VisionAnalysisConfig, status: &VisionAnalysisStatus) {
+    let local_provider = build_local_vision_provider_record(config, status);
+    let local_message = if local_provider.enabled {
+        Some(
+            status
+                .last_error
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "本地混合视觉状态已同步".to_string()),
+        )
+    } else {
+        Some("本地混合视觉已禁用".to_string())
+    };
+    let _ = assignment_store::upsert_capability_provider(local_provider.clone());
+    let _ = assignment_store::upsert_capability_provider_binding(CapabilityProviderBindingRecord {
+        capability_key: "analyze.media".to_string(),
+        capability_scope: "generic".to_string(),
+        provider_id: local_provider.provider_id.clone(),
+        enabled: local_provider.enabled,
+        updated_at: String::new(),
+    });
+    let _ = assignment_store::upsert_provider_health_state(ProviderHealthStateRecord {
+        provider_id: local_provider.provider_id.clone(),
+        health_state: local_provider.health_state.clone(),
+        message: local_message,
+        checked_at: now_ms().to_string(),
+        updated_at: String::new(),
+    });
+
+    let ocr_provider = build_ocr_provider_record(config, status);
+    let ocr_message = if ocr_provider.enabled {
+        Some(
+            status
+                .ocr_last_error
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "OCR 服务状态已同步".to_string()),
+        )
+    } else {
+        Some("OCR 服务已禁用".to_string())
+    };
+    let _ = assignment_store::upsert_capability_provider(ocr_provider.clone());
+    for capability_key in ["analyze.media", "parse.document", "extract.document"] {
+        let _ =
+            assignment_store::upsert_capability_provider_binding(CapabilityProviderBindingRecord {
+                capability_key: capability_key.to_string(),
+                capability_scope: "generic".to_string(),
+                provider_id: ocr_provider.provider_id.clone(),
+                enabled: ocr_provider.enabled,
+                updated_at: String::new(),
+            });
+    }
+    let _ = assignment_store::upsert_provider_health_state(ProviderHealthStateRecord {
+        provider_id: ocr_provider.provider_id.clone(),
+        health_state: ocr_provider.health_state.clone(),
+        message: ocr_message,
+        checked_at: now_ms().to_string(),
+        updated_at: String::new(),
+    });
+}
+
 fn normalize_model_id(model_id: &str) -> String {
     let trimmed = model_id.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(LEGACY_FLORENCE_MODEL_ID) {
@@ -662,6 +1022,17 @@ fn normalize_config(config: &mut VisionAnalysisConfig) {
     } else {
         config.task_prompt.trim().to_string()
     };
+    config.ocr_provider = if config.ocr_provider.trim().is_empty() {
+        default_ocr_provider()
+    } else {
+        ocr_service::normalize_provider_name(&config.ocr_provider)
+    };
+    config.ocr_service_url = config
+        .ocr_service_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    config.ocr_model_variant = ocr_service::normalize_model_variant(&config.ocr_model_variant);
 }
 
 fn vision_analysis_config_path() -> Result<PathBuf, String> {
@@ -820,6 +1191,20 @@ fn write_vision_cache_record(
             .file_name
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        ocr_enabled: payload.ocr_enabled,
+        vision_summary: payload
+            .vision_summary
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ocr_summary: payload
+            .ocr_summary
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ocr_text: payload
+            .ocr_text
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ocr_lines: payload.ocr_lines,
         created_at_ms: existing
             .as_ref()
             .map(|item| item.created_at_ms)
@@ -996,6 +1381,7 @@ fn model_file_download_url(relative_path: &str) -> String {
 fn compute_model_status(
     config: VisionAnalysisConfig,
     state: &VisionDownloadState,
+    ocr_status: ocr_service::OcrRuntimeStatus,
 ) -> VisionAnalysisStatus {
     let model_root = vision_model_root_dir().unwrap_or_else(|_| PathBuf::from("."));
     let model_dir =
@@ -1059,14 +1445,33 @@ fn compute_model_status(
         cache_dir: cache_dir.to_string_lossy().to_string(),
         missing_files,
         files,
-        updated_at_ms: state.updated_at_ms,
+        ocr_provider_available: ocr_status.provider_available,
+        ocr_model_ready: ocr_status.model_ready,
+        ocr_download_active: ocr_status.download_active,
+        ocr_downloaded_bytes: ocr_status.downloaded_bytes,
+        ocr_total_bytes: ocr_status.total_bytes,
+        ocr_progress_percent: ocr_status.progress_percent,
+        ocr_current_file: ocr_status.current_file,
+        ocr_last_error: ocr_status.last_error,
+        ocr_model_root_dir: ocr_status.model_root_dir,
+        ocr_model_dir: ocr_status.model_dir,
+        ocr_missing_files: ocr_status.missing_files,
+        ocr_files: ocr_status.files,
+        updated_at_ms: state.updated_at_ms.max(ocr_status.updated_at_ms),
     }
 }
 
 async fn refresh_status() -> Result<VisionAnalysisStatus, String> {
     let config = read_vision_analysis_config()?;
     let state = download_state().lock().await.clone();
-    Ok(compute_model_status(config, &state))
+    let ocr_status = ocr_service::refresh_status_with_provider(
+        config.ocr_enabled,
+        &config.ocr_provider,
+        &config.ocr_model_variant,
+        Some(&config.ocr_service_url),
+    )
+    .await?;
+    Ok(compute_model_status(config, &state, ocr_status))
 }
 
 async fn set_download_state(
@@ -1207,35 +1612,85 @@ pub async fn set_vision_analysis_config(
     Json(payload): Json<VisionAnalysisConfig>,
 ) -> Result<Json<Value>, ApiError> {
     let config = write_vision_analysis_config(payload).map_err(internal_error)?;
+    if let Ok(status) = refresh_status().await {
+        sync_capability_registry_status(&config, &status);
+    }
     Ok(Json(json!({ "config": config })))
 }
 
 pub async fn get_vision_analysis_status() -> Result<Json<Value>, ApiError> {
     let status = refresh_status().await.map_err(internal_error)?;
+    sync_capability_registry_status(&status.config, &status);
     Ok(Json(json!({ "status": status })))
 }
 
 pub async fn start_vision_analysis_download() -> Result<Json<Value>, ApiError> {
     let status = refresh_status().await.map_err(internal_error)?;
-    if status.model_ready {
+    let ocr_needs_local_download = status.config.ocr_enabled
+        && ocr_provider_supports_local_download(&status.config)
+        && !status.ocr_model_ready;
+    if (!status.config.enabled || status.model_ready) && !ocr_needs_local_download {
         return Ok(Json(json!({ "status": status })));
     }
 
     {
         let guard = download_state().lock().await;
-        if guard.active {
-            return Ok(Json(
-                json!({ "status": compute_model_status(status.config, &guard) }),
-            ));
+        if guard.active || status.ocr_download_active {
+            return Ok(Json(json!({
+                "status": compute_model_status(
+                    status.config.clone(),
+                    &guard,
+                    ocr_service::refresh_status_with_provider(
+                        status.config.ocr_enabled,
+                        &status.config.ocr_provider,
+                        &status.config.ocr_model_variant,
+                        Some(&status.config.ocr_service_url),
+                    )
+                    .await
+                    .map_err(internal_error)?,
+                )
+            })));
         }
     }
 
     let config = status.config.clone();
     tokio::spawn(async move {
-        if let Err(err) = download_model_files().await {
+        let mut last_error = None;
+        if config.enabled && !status.model_ready {
+            if let Err(err) = download_model_files().await {
+                set_download_state(false, 0, 0, None, Some(err.clone())).await;
+                last_error = Some(err);
+            }
+        }
+        if last_error.is_none()
+            && config.ocr_enabled
+            && ocr_provider_supports_local_download(&config)
+            && !status.ocr_model_ready
+        {
+            if let Err(err) = ocr_service::download_model_files_with_provider(
+                &config.ocr_provider,
+                &config.ocr_model_variant,
+                Some(&config.ocr_service_url),
+            )
+            .await
+            {
+                last_error = Some(err);
+            }
+        }
+        if let Some(err) = last_error {
+            let _ = ocr_service::refresh_status_with_provider(
+                config.ocr_enabled,
+                &config.ocr_provider,
+                &config.ocr_model_variant,
+                Some(&config.ocr_service_url),
+            )
+            .await;
             set_download_state(false, 0, 0, None, Some(err)).await;
         } else {
-            let _ = write_vision_analysis_config(config);
+            let _ = write_vision_analysis_config(config.clone());
+        }
+        if let Ok(next_status) = refresh_status().await {
+            sync_capability_registry_status(&config, &next_status);
         }
     });
 
@@ -1247,16 +1702,15 @@ pub async fn analyze_vision_image(
     Json(payload): Json<AnalyzeVisionImageRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let status = refresh_status().await.map_err(internal_error)?;
-    if !status.config.enabled || status.config.provider != FLORENCE_PROVIDER {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "本地 Florence-2 视觉未启用",
-        ));
+    let florence_enabled = status.config.enabled && status.config.provider == FLORENCE_PROVIDER;
+    let ocr_enabled = status.config.ocr_enabled;
+    if !florence_enabled && !ocr_enabled {
+        return Err(ApiError::new(StatusCode::CONFLICT, "本地混合视觉未启用"));
     }
-    if !status.model_ready {
+    if !status.model_ready && !status.ocr_model_ready {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "Florence-2 模型尚未就绪",
+            "本地视觉与 OCR 模型都尚未就绪",
         ));
     }
 
@@ -1270,7 +1724,9 @@ pub async fn analyze_vision_image_best_effort(
     payload: AnalyzeVisionImageRequest,
 ) -> Result<Option<AnalyzeVisionImageResponse>, String> {
     let status = refresh_status().await?;
-    if !status.config.enabled || status.config.provider != FLORENCE_PROVIDER || !status.model_ready
+    let florence_enabled = status.config.enabled && status.config.provider == FLORENCE_PROVIDER;
+    if (!florence_enabled || !status.model_ready)
+        && (!status.config.ocr_enabled || !status.ocr_model_ready)
     {
         return Ok(None);
     }
@@ -1300,6 +1756,9 @@ async fn analyze_vision_image_with_status(
         .await
         .map_err(|err| format!("读取图片文件失败({}): {err}", path.display()))?;
     let focus_plan = resolve_focus_plan(&payload.user_text, &status.config.task_prompt);
+    let should_use_florence =
+        status.config.enabled && status.config.provider == FLORENCE_PROVIDER && status.model_ready;
+    let should_use_ocr = status.config.ocr_enabled && status.ocr_model_ready;
     let sha256 = payload
         .sha256
         .as_deref()
@@ -1309,35 +1768,79 @@ async fn analyze_vision_image_with_status(
 
     if status.config.cache_enabled && focus_plan.cacheable {
         if let Some(record) = read_cached_record(&sha256)? {
-            let response = AnalyzeVisionImageResponse {
-                sha256: record.sha256,
-                summary: build_presented_summary(
-                    &record.summary,
-                    &payload.user_text,
-                    focus_plan.mode,
-                ),
-                provider: record.provider,
-                model: record.model,
-                task_prompt: record.task_prompt,
-                mime_type: record.mime_type,
-                width: record.width,
-                height: record.height,
-                cached: true,
-            };
-            return Ok(response);
+            if record.task_prompt == focus_plan.task_prompt && record.ocr_enabled == should_use_ocr
+            {
+                let response = AnalyzeVisionImageResponse {
+                    sha256: record.sha256,
+                    summary: build_presented_summary(
+                        &record.summary,
+                        &payload.user_text,
+                        focus_plan.mode,
+                    ),
+                    provider: record.provider,
+                    model: record.model,
+                    task_prompt: record.task_prompt,
+                    mime_type: record.mime_type,
+                    width: record.width,
+                    height: record.height,
+                    vision_summary: record.vision_summary,
+                    ocr_summary: record.ocr_summary,
+                    ocr_text: record.ocr_text,
+                    ocr_lines: record.ocr_lines,
+                    ocr_enabled: record.ocr_enabled,
+                    cached: true,
+                };
+                return Ok(response);
+            }
         }
     }
 
-    let sidecar =
-        analyze_with_florence_sidecar(&path, &status.config.model_id, &focus_plan.task_prompt)
-            .await
-            .map_err(|err| err.to_string())?;
-    let raw_summary = sidecar
-        .summary
-        .clone()
+    let florence_result = if should_use_florence {
+        Some(
+            analyze_with_florence_sidecar(&path, &status.config.model_id, &focus_plan.task_prompt)
+                .await
+                .map_err(|err| err.to_string())?,
+        )
+    } else {
+        None
+    };
+    let ocr_result = if should_use_ocr {
+        Some(
+            ocr_service::analyze_image_with_provider(
+                &path,
+                &status.config.ocr_provider,
+                &status.config.ocr_model_variant,
+                Some(&status.config.ocr_service_url),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let vision_summary = florence_result
+        .as_ref()
+        .and_then(|result| result.summary.clone())
         .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
-        .ok_or_else(|| "Florence-2 未返回可用摘要".to_string())?;
+        .filter(|item| !item.is_empty());
+    let ocr_summary = ocr_result
+        .as_ref()
+        .map(|result| result.summary.trim().to_string())
+        .filter(|item| !item.is_empty());
+    let raw_summary = if status.config.ocr_merge_into_summary {
+        build_mixed_summary(
+            vision_summary.as_deref(),
+            ocr_summary.as_deref(),
+            should_prefer_ocr_first(&payload.user_text, &status.config),
+        )
+    } else {
+        vision_summary
+            .clone()
+            .or(ocr_summary.clone())
+            .unwrap_or_default()
+    };
+    if raw_summary.trim().is_empty() {
+        return Err("本地视觉未返回可用摘要".to_string());
+    }
     let presented_summary =
         build_presented_summary(&raw_summary, &payload.user_text, focus_plan.mode);
     let mime_type = if payload.mime_type.trim().is_empty() {
@@ -1345,14 +1848,32 @@ async fn analyze_vision_image_with_status(
     } else {
         payload.mime_type.trim().to_string()
     };
-    let provider = sidecar
-        .provider
-        .clone()
-        .unwrap_or_else(|| FLORENCE_PROVIDER.to_string());
-    let model = sidecar
-        .model
-        .clone()
-        .unwrap_or_else(|| status.config.model_id.clone());
+    let provider = match (florence_result.as_ref(), ocr_result.as_ref()) {
+        (Some(_), Some(_)) => "local_vision_stack".to_string(),
+        (Some(sidecar), None) => sidecar
+            .provider
+            .clone()
+            .unwrap_or_else(|| FLORENCE_PROVIDER.to_string()),
+        (None, Some(result)) => result.provider.clone(),
+        (None, None) => FLORENCE_PROVIDER.to_string(),
+    };
+    let model = match (florence_result.as_ref(), ocr_result.as_ref()) {
+        (Some(_), Some(result)) => format!("{} + {}", status.config.model_id, result.model),
+        (Some(sidecar), None) => sidecar
+            .model
+            .clone()
+            .unwrap_or_else(|| status.config.model_id.clone()),
+        (None, Some(result)) => result.model.clone(),
+        (None, None) => status.config.model_id.clone(),
+    };
+    let ocr_lines = ocr_result
+        .as_ref()
+        .map(|result| result.lines.clone())
+        .unwrap_or_default();
+    let ocr_text = ocr_result
+        .as_ref()
+        .map(|result| result.text.clone())
+        .filter(|value| !value.trim().is_empty());
     let response = if status.config.cache_enabled && focus_plan.cacheable {
         let record = write_vision_cache_record(UpsertVisionCacheRequest {
             sha256: sha256.clone(),
@@ -1366,8 +1887,8 @@ async fn analyze_vision_image_with_status(
             } else {
                 payload.source.trim().to_string()
             },
-            width: sidecar.width,
-            height: sidecar.height,
+            width: florence_result.as_ref().and_then(|result| result.width),
+            height: florence_result.as_ref().and_then(|result| result.height),
             relative_path: payload.relative_path.clone(),
             saved_path: payload
                 .saved_path
@@ -1375,6 +1896,11 @@ async fn analyze_vision_image_with_status(
                 .or_else(|| Some(path.to_string_lossy().to_string())),
             upstream_file_id: payload.upstream_file_id.clone(),
             file_name: payload.file_name.clone(),
+            ocr_enabled: should_use_ocr,
+            vision_summary: vision_summary.clone(),
+            ocr_summary: ocr_summary.clone(),
+            ocr_text: ocr_text.clone(),
+            ocr_lines: ocr_lines.clone(),
         })?;
         AnalyzeVisionImageResponse {
             sha256: record.sha256,
@@ -1385,6 +1911,11 @@ async fn analyze_vision_image_with_status(
             mime_type: record.mime_type,
             width: record.width,
             height: record.height,
+            vision_summary: record.vision_summary,
+            ocr_summary: record.ocr_summary,
+            ocr_text: record.ocr_text,
+            ocr_lines: record.ocr_lines,
+            ocr_enabled: record.ocr_enabled,
             cached: false,
         }
     } else {
@@ -1395,8 +1926,13 @@ async fn analyze_vision_image_with_status(
             model,
             task_prompt: focus_plan.task_prompt,
             mime_type,
-            width: sidecar.width,
-            height: sidecar.height,
+            width: florence_result.as_ref().and_then(|result| result.width),
+            height: florence_result.as_ref().and_then(|result| result.height),
+            vision_summary,
+            ocr_summary,
+            ocr_text,
+            ocr_lines,
+            ocr_enabled: should_use_ocr,
             cached: false,
         }
     };

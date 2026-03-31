@@ -49,6 +49,8 @@ pub struct PromptContext {
     pub workspace_context: Option<String>,
     /// IDENTITY.md content (visual identity + personality frontmatter).
     pub identity_md: Option<String>,
+    /// Summarized embodiment config (default image/voice/style bindings).
+    pub embodiment_summary: Option<String>,
     /// HEARTBEAT.md content (autonomous agent checklist).
     pub heartbeat_md: Option<String>,
     /// Peer agents visible to this agent: (name, state, model).
@@ -112,6 +114,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent {
         let persona = build_persona_section(
             ctx.identity_md.as_deref(),
+            ctx.embodiment_summary.as_deref(),
             ctx.soul_md.as_deref(),
             ctx.user_md.as_deref(),
             ctx.memory_md.as_deref(),
@@ -217,11 +220,24 @@ const TOOL_CALL_BEHAVIOR: &str = "\
 - If the user is asking about an uploaded/local image and no local image-analysis text is present in context, you MUST call `image_analyze` or `media_describe` before answering. Do not guess what is in the image.
 - Do not use `browser_navigate` for local files, `file://` images, `/api/uploads/...` images, screenshots, or other non-web image sources. Use `image_analyze` or `media_describe` instead.
 - For your own identity, long-term memories, prompt files, or self-photo workflows, prefer the dedicated self-management tools when they are available: `my_identity_patch`, `my_memory_patch`, `my_photo_generate`, and `my_photo_edit`.
+- For self video requests, use `video_generate` or `video_edit` instead of `my_photo_generate`. When the user wants a video of your current self and no explicit source image/video is provided, `video_generate` can automatically reuse your current default video source, portrait, or self photo.
+- For `video_generate`, choose one stable mode: `source_mode='self_default'` for a video of your current self, `source_mode='image_to_video'` when the user already gave you a source image, or `source_mode='text_to_video'` for prompt-only generation.
+- For a self video request such as “你的视频”“你来出镜”“用你的立绘生成视频”, call `video_generate` with the user's prompt and `source_mode='self_default'`. Do NOT manually pass `image_path`, `image_url`, `image_base64`, `source_image`, or `reference_image` unless the user explicitly supplied a different source asset.
+- For normal image-to-video generation, pass exactly one source image input (`image_path`, `image_url`, or `image_base64` + `mime_type`). For prompt-only text-to-video generation, do not pass any image/video source fields.
+- Use `video_edit` only when the user wants to transform an existing source video or a source image-conditioned video edit. Pass a source video/image field in that case; otherwise prefer `video_generate`.
+- Videos should use the standardized `job_result` to `media_result(video)` pipeline. Do not synthesize temporary video preview cards or placeholder UI JSON when the runtime already returns `job_result`.
+- Only use `save_target='agent_profile_meta'` for the current agent's own personal media. Normal user-requested videos should stay on the default `output` path.
 - For image tasks, distinguish brand-new generation from editing an existing image. If the user wants to modify, retouch, restyle, change clothes, or continue from an existing image, you MUST use `image_edit`, not `image_generate`.
 - Image generation does NOT reliably preserve the exact same person/identity from an existing image. If identity consistency matters, reuse the existing image with `image_edit`.
 - When editing an image, always reuse the best available source image from the current message, the workspace, or the recent chat context. Prefer `image_path` for workspace files, then `image_url`, then `image_base64`.
 - When the source image comes from chat history as `/api/uploads/...`, treat it as an `image_url` (or reuse the recovered original workspace file). Do not treat `/api/uploads/...` as a filesystem directory.
 - Use `image_edit` for fine or medium changes where the original person, object, or scene should remain recognizable.
+- Image workflow rules are strict:
+- `image_generate`: pure text-to-image only, for brand-new pictures from scratch.
+- `image_edit` with exactly one image: single-image edit. That image is the base image to preserve and modify.
+- `image_edit` with a second `reference_image*` input: dual-image merge. The first/base image remains the main subject and composition; the second/reference image only contributes the requested clothing, object, material, makeup, hairstyle, or style elements.
+- Never let the second/reference image replace the identity, pose, camera framing, or scene ownership of the first/base image unless the user explicitly asked for that replacement.
+- For self-image requests, keep the boundary explicit: `my_photo_generate` / `my_photo_edit` own the current agent identity anchor, while any user-supplied external picture should be passed only as `reference_image`, `reference_image_path`, `reference_image_url`, or `reference_image_base64` when it is merely a material/style source.
 - When writing an `image_edit` prompt, preserve the original person/identity, face, body, style, composition, camera angle, lighting, colors, and background by default. Only change the exact parts the user explicitly requested.
 - For `image_edit`, do NOT add extra accessories, props, pose changes, outfit redesigns, beautification, scene rewrites, or any other \"improvements\" unless the user explicitly asked for them.
 - If the user only asked for one local change, write the edit prompt as a minimal delta: state what to change, and explicitly state that everything else must remain unchanged.
@@ -334,6 +350,7 @@ fn build_mcp_section(mcp_summary: &str) -> String {
 
 fn build_persona_section(
     identity_md: Option<&str>,
+    embodiment_summary: Option<&str>,
     soul_md: Option<&str>,
     user_md: Option<&str>,
     memory_md: Option<&str>,
@@ -349,6 +366,12 @@ fn build_persona_section(
     if let Some(identity) = identity_md {
         if !identity.trim().is_empty() {
             parts.push(format!("## Identity\n{}", cap_str(identity, 500)));
+        }
+    }
+
+    if let Some(summary) = embodiment_summary {
+        if !summary.trim().is_empty() {
+            parts.push(format!("## Embodiment Snapshot\n{}", cap_str(summary, 400)));
         }
     }
 
@@ -557,9 +580,9 @@ pub fn tool_hint(name: &str) -> &'static str {
         "my_identity_patch" => "patch your own identity files, system prompt, or avatar fields",
         "my_memory_patch" => "write or supersede your own long-term memory notes",
         "my_photo_generate" => {
-            "create a new photo of yourself while preserving the same identity anchor by default"
+            "create a new photo of yourself while preserving the same identity anchor by default; optional second reference image can supply clothing or object elements without replacing your identity"
         }
-        "my_photo_edit" => "edit an existing photo of yourself while preserving the same identity",
+        "my_photo_edit" => "edit an existing photo of yourself while preserving the same identity; optional second reference image can supply transfer elements",
 
         // Agents
         "agent_send" => "send a message to another agent",
@@ -576,7 +599,7 @@ pub fn tool_hint(name: &str) -> &'static str {
             "summarize a local/workspace/chat-uploaded image; auto-prefers local Florence-2 when enabled"
         }
         "image_generate" => "generate a brand-new image from scratch; not suitable for preserving the exact same person/identity from an existing image",
-        "image_edit" => "edit a single existing image while preserving the original as the base; prefer image_path for workspace files, otherwise image_url or image_base64",
+        "image_edit" => "edit an existing image while preserving the first image as the base; optional second reference image can contribute requested elements without taking over the base identity",
         "audio_transcribe" => "transcribe audio to text",
         "tts_speak" => "convert text to speech",
 
@@ -849,9 +872,20 @@ mod tests {
     }
 
     #[test]
+    fn test_persona_section_with_embodiment_snapshot() {
+        let mut ctx = basic_ctx();
+        ctx.embodiment_summary =
+            Some("- Default portrait: current portrait\n- Default voice: warm clone".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Embodiment Snapshot"));
+        assert!(prompt.contains("Default portrait"));
+        assert!(prompt.contains("Default voice"));
+    }
+
+    #[test]
     fn test_persona_soul_capped_at_1000() {
         let long_soul = "x".repeat(2000);
-        let section = build_persona_section(None, Some(&long_soul), None, None, None);
+        let section = build_persona_section(None, None, Some(&long_soul), None, None, None);
         assert!(section.contains("..."));
         // The raw soul content in the section should be at most 1003 chars (1000 + "...")
         assert!(section.len() < 1200);

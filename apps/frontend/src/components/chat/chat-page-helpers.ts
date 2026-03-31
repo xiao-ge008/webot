@@ -6,10 +6,83 @@ import type {
   ManagementAgentDetail,
   ManagementAgentSummary,
   ManagementComponentInvokeResult,
+  ManagementRendererBindingRecord,
 } from '@/services/management-client';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 
 const HIDDEN_COLLAB_TAGS = new Set(['webot:collab_discoverable', 'webot:collab_dispatcher']);
+const rendererBindingCache = new Map<string, ManagementRendererBindingRecord>();
+
+function buildRendererBindingCacheKey(
+  channel: string,
+  resultKind: string,
+  mediaType?: string,
+  documentType?: string,
+): string {
+  return [
+    channel.trim().toLowerCase(),
+    resultKind.trim().toLowerCase(),
+    (mediaType || '').trim().toLowerCase(),
+    (documentType || '').trim().toLowerCase(),
+  ].join('::');
+}
+
+function normalizeRendererBindingRecord(
+  binding: ManagementRendererBindingRecord,
+): ManagementRendererBindingRecord {
+  return {
+    ...binding,
+    channel: binding.channel.trim().toLowerCase(),
+    result_kind: binding.result_kind.trim().toLowerCase(),
+    media_type: binding.media_type?.trim().toLowerCase() || undefined,
+    document_type: binding.document_type?.trim().toLowerCase() || undefined,
+    renderer_key: binding.renderer_key.trim(),
+    fallback_channel: binding.fallback_channel?.trim().toLowerCase() || undefined,
+  };
+}
+
+export function primeRendererBindingCache(
+  bindings: readonly ManagementRendererBindingRecord[],
+): void {
+  rendererBindingCache.clear();
+  bindings.forEach((binding) => {
+    const normalized = normalizeRendererBindingRecord(binding);
+    rendererBindingCache.set(
+      buildRendererBindingCacheKey(
+        normalized.channel,
+        normalized.result_kind,
+        normalized.media_type,
+        normalized.document_type,
+      ),
+      normalized,
+    );
+  });
+}
+
+function resolveDesktopRendererBinding(
+  resultKind: string,
+  options: {
+    mediaType?: string;
+    documentType?: string;
+  } = {},
+): ManagementRendererBindingRecord | undefined {
+  const normalizedResultKind = resultKind.trim().toLowerCase();
+  const normalizedMediaType = options.mediaType?.trim().toLowerCase() || undefined;
+  const normalizedDocumentType = options.documentType?.trim().toLowerCase() || undefined;
+  const candidates = [
+    buildRendererBindingCacheKey('desktop', normalizedResultKind, normalizedMediaType, normalizedDocumentType),
+    buildRendererBindingCacheKey('desktop', normalizedResultKind, normalizedMediaType, undefined),
+    buildRendererBindingCacheKey('desktop', normalizedResultKind, undefined, normalizedDocumentType),
+    buildRendererBindingCacheKey('desktop', normalizedResultKind, undefined, undefined),
+  ];
+  for (const key of candidates) {
+    const binding = rendererBindingCache.get(key);
+    if (binding) {
+      return binding;
+    }
+  }
+  return undefined;
+}
 
 function filterCollaborationTags(tags: string[]): string[] {
   return tags.filter((tag) => !HIDDEN_COLLAB_TAGS.has(tag.trim().toLowerCase()));
@@ -75,6 +148,7 @@ const COMPONENT_TYPE_ALIASES: Record<string, string> = {
   audioplaylist: 'AudioPlaylist',
   markdownpreviewcard: 'MarkdownPreviewCard',
   officepreviewcard: 'OfficePreviewCard',
+  jobprogresscard: 'JobProgressCard',
   chart: 'ChartCard',
   chartcard: 'ChartCard',
   piechart: 'PieChartCard',
@@ -1083,7 +1157,11 @@ function buildComponentInvokeHistorySupplement(message: Message): string {
       : typeof payload.componentName === 'string'
         ? payload.componentName.trim()
         : '组件';
-    const summary = buildComponentInvokeSummaryText(componentName, payload.result, { includeUrls: true });
+    const summary = buildComponentInvokeSummaryText(
+      componentName,
+      pickNestedToolResultPayload(payload) ?? payload.result,
+      { includeUrls: true },
+    );
     if (!summary) {
       continue;
     }
@@ -1157,11 +1235,20 @@ export function parseTraceFromLog(chunk: AgentChatStreamChunk): ParsedTrace | nu
 
   if (event === 'phase') {
     const phase = typeof payloadPhase === 'string' ? payloadPhase : raw;
-    const detail = payload && typeof payload.detail === 'string' ? payload.detail : '';
     const normalizedPhase = String(phase).trim().toLowerCase();
-    if (!detail && /^(streaming|done|typing)$/i.test(normalizedPhase)) {
-      return null;
-    }
+    const fallbackPhaseDetail: Record<string, string> = {
+      streaming: '模型已开始处理本轮请求，正在等待首个内容块。',
+      thinking: '模型正在思考并组织回复。',
+      typing: '模型正在整理输出内容。',
+      done: '本轮流式输出已结束。',
+      session_prepare: '正在准备并切换目标会话。',
+      session_ready: '目标会话已准备完成。',
+      upstream_connecting: '正在连接上游模型流。',
+      upstream_connected: '已建立上游流式连接，等待首个内容块。',
+    };
+    const detail = payload && typeof payload.detail === 'string' && payload.detail.trim()
+      ? payload.detail.trim()
+      : (fallbackPhaseDetail[normalizedPhase] || '');
     if (normalizedPhase === 'semantic_memory_recall' || normalizedPhase === 'unified_memory_recall') {
       return { target: 'tool', title: '记忆召回', detail };
     }
@@ -1170,6 +1257,27 @@ export function parseTraceFromLog(chunk: AgentChatStreamChunk): ParsedTrace | nu
     }
     if (normalizedPhase === 'thinking' && detail) {
       return { target: 'thinking', title: '深度思考', detail };
+    }
+    if (normalizedPhase === 'session_prepare') {
+      return { target: 'tool', title: '会话准备', detail };
+    }
+    if (normalizedPhase === 'session_ready') {
+      return { target: 'tool', title: '会话就绪', detail };
+    }
+    if (normalizedPhase === 'upstream_connecting') {
+      return { target: 'tool', title: '连接模型', detail };
+    }
+    if (normalizedPhase === 'upstream_connected') {
+      return { target: 'tool', title: '模型连接已建立', detail };
+    }
+    if (normalizedPhase === 'streaming') {
+      return { target: 'thinking', title: '开始生成', detail };
+    }
+    if (normalizedPhase === 'typing') {
+      return { target: 'thinking', title: '整理输出', detail };
+    }
+    if (normalizedPhase === 'done') {
+      return { target: 'thinking', title: '生成完成', detail };
     }
     return { target: 'thinking', title: `阶段: ${phase}`, detail };
   }
@@ -1703,21 +1811,105 @@ export function cleanupAssistantText(rawText: string, spec?: unknown): string {
   const specType = isRecordValue(normalizedSpec) && typeof normalizedSpec.type === 'string'
     ? normalizedSpec.type.trim().toLowerCase()
     : '';
-  if (specType !== 'audioplayer' && specType !== 'audioplaylist') {
+  const shouldStripAssetMarkdown = new Set([
+    'imagecover',
+    'imagecarousel',
+    'videocover',
+    'videogallery',
+    'audioplayer',
+    'audioplaylist',
+    'officepreviewcard',
+    'markdownpreviewcard',
+    'jobprogresscard',
+  ]).has(specType);
+  if (!shouldStripAssetMarkdown) {
     return cleaned;
   }
   const filtered = cleaned
+    .replace(/!\[[^\]]*\]\((?:\/api\/uploads\/|\/api\/management\/|https?:\/\/)[^)]+\)/gi, '')
+    .replace(/\[[^\]]*\]\((?:\/api\/uploads\/|\/api\/management\/|https?:\/\/)[^)]+\)/gi, '')
     .split('\n')
     .map((line) => line.trimEnd())
     .filter((line) => {
       const normalizedLine = line.trim().toLowerCase();
       if (!normalizedLine) return false;
+      if (normalizedLine.includes('/api/uploads/')) return false;
       if (normalizedLine.includes('/api/management/agents/')) return false;
+      if (/^(图片地址|图片链接|视频地址|视频链接|文档地址|文件地址|下载地址|链接)\s*[:：]/i.test(normalizedLine)) return false;
       if (/^(音频在这|音频地址|语音地址)\s*[:：]/i.test(normalizedLine)) return false;
       return true;
     })
     .join('\n');
-  return sanitizeAssistantText(filtered);
+  const sanitizedFiltered = sanitizeAssistantText(filtered);
+  if (specType !== 'jobprogresscard') {
+    return sanitizedFiltered;
+  }
+  const nonEmptyLines = sanitizedFiltered
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (nonEmptyLines.length === 0) {
+    return '';
+  }
+  const jobProgressBoilerplatePattern = /生成中|处理中|排队|提交|等待|出结果|回填|占位|源图|时长|内容|当前状态|查看|问安视频|状态[:：]|status\s*:|source\s+image|duration\s*:|queued|submitted|pending|processing|fill in|placeholder/i;
+  const matchedBoilerplateLines = nonEmptyLines.filter((line) => jobProgressBoilerplatePattern.test(line)).length;
+  if (matchedBoilerplateLines >= Math.max(1, Math.ceil(nonEmptyLines.length * 0.6))) {
+    return '';
+  }
+  return sanitizedFiltered;
+}
+
+function isRenderableMarkdownAssetSource(value: string): boolean {
+  const source = value.trim();
+  if (!source) {
+    return false;
+  }
+  return /^https?:\/\//i.test(source)
+    || /^\/?api\/uploads\//i.test(source)
+    || /^\/?api\/management\/agents\//i.test(source);
+}
+
+export function buildRenderableSpecFromMarkdownMedia(rawText: string): unknown | undefined {
+  const text = unwrapResponseEnvelopeText(rawText).trim();
+  if (!text) {
+    return undefined;
+  }
+
+  const matches = Array.from(
+    text.matchAll(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g),
+  );
+  const images = matches
+    .map((match, index) => {
+      const rawSrc = (match[2] || '').trim();
+      if (!isRenderableMarkdownAssetSource(rawSrc)) {
+        return null;
+      }
+      const alt = (match[1] || '').trim() || `图片 ${index + 1}`;
+      return {
+        src: rawSrc,
+        alt,
+        title: alt,
+      };
+    })
+    .filter((item): item is { src: string; alt: string; title: string } => item != null);
+
+  if (images.length === 0) {
+    return undefined;
+  }
+  if (images.length === 1) {
+    return {
+      type: 'ImageCover',
+      props: images[0],
+    };
+  }
+  return {
+    type: 'ImageCarousel',
+    props: {
+      images,
+      title: '图片结果',
+      showThumbs: true,
+    },
+  };
 }
 
 export function tryParseInlineSpecFromText(rawText: string): unknown | undefined {
@@ -1770,6 +1962,10 @@ export function tryParseInlineSpecFromText(rawText: string): unknown | undefined
   const mergedAll = mergeUiSpecs(allCandidates);
   if (mergedAll) {
     return mergedAll;
+  }
+  const markdownMediaSpec = normalizeUiSpecCandidate(buildRenderableSpecFromMarkdownMedia(text));
+  if (markdownMediaSpec) {
+    return markdownMediaSpec;
   }
   return undefined;
 }
@@ -2040,6 +2236,15 @@ function parseNestedToolPayload(value: unknown): Record<string, unknown> | undef
   return parsed as Record<string, unknown>;
 }
 
+function pickNestedToolResultPayload(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  return parseNestedToolPayload(payload.structured_result)
+    || parseNestedToolPayload(payload.structuredResult)
+    || parseNestedToolPayload(payload.result)
+    || parseNestedToolPayload(payload.output)
+    || parseNestedToolPayload(payload.response)
+    || parseNestedToolPayload(payload.data);
+}
+
 function pickStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -2106,7 +2311,300 @@ function normalizeComponentInvokeResult(result: unknown): ManagementComponentInv
     text: typeof result.text === 'string' ? result.text.trim() : undefined,
     items: normalizeComponentInvokeItems(result),
     raw: result.raw,
+    presentableResult: isRecordValue(result.presentableResult)
+      ? result.presentableResult
+      : isRecordValue(result.presentable_result)
+        ? result.presentable_result
+        : undefined,
+    providerMeta: isRecordValue(result.providerMeta)
+      ? result.providerMeta
+      : isRecordValue(result.provider_meta)
+        ? result.provider_meta
+        : undefined,
   };
+}
+
+function inferPresentableAssetKind(uri: string): string {
+  const normalized = uri.trim().toLowerCase();
+  if (!normalized) {
+    return 'remote_url';
+  }
+  if (normalized.startsWith('data:')) {
+    return 'data_url';
+  }
+  if (normalized.startsWith('/api/uploads/')) {
+    return 'upload_url';
+  }
+  if (normalized.startsWith('/api/management/')) {
+    return 'management_media_url';
+  }
+  if (/^https?:\/\//.test(normalized)) {
+    return 'remote_url';
+  }
+  if (/^[a-z]:[\\/]/i.test(uri.trim()) || normalized.startsWith('file://') || normalized.startsWith('/')) {
+    return 'absolute_file';
+  }
+  return 'workspace_file';
+}
+
+function inferFileNameFromUri(uri: string): string | undefined {
+  const normalized = uri.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  const withoutQuery = normalized.split(/[?#]/, 1)[0] || normalized;
+  const segments = withoutQuery.split(/[\\/]/).filter(Boolean);
+  const last = segments[segments.length - 1]?.trim();
+  return last || undefined;
+}
+
+function buildPresentableAssetRef(
+  uri: string,
+  options?: {
+    durationMs?: number;
+    fileName?: string;
+    metadata?: Record<string, unknown>;
+    mimeType?: string;
+  },
+): Record<string, unknown> {
+  const asset: Record<string, unknown> = {
+    kind: inferPresentableAssetKind(uri),
+    uri: uri.trim(),
+  };
+  if (options?.mimeType?.trim()) {
+    asset.mimeType = options.mimeType.trim();
+  }
+  const fileName = options?.fileName?.trim() || inferFileNameFromUri(uri);
+  if (fileName) {
+    asset.fileName = fileName;
+  }
+  if (typeof options?.durationMs === 'number' && Number.isFinite(options.durationMs)) {
+    asset.durationMs = Math.max(0, options.durationMs);
+  }
+  if (options?.metadata && Object.keys(options.metadata).length > 0) {
+    asset.metadata = options.metadata;
+  }
+  return asset;
+}
+
+function pickFirstString(...candidates: unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function pickAssetUriCandidates(value: unknown): string[] {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => pickAssetUriCandidates(item));
+  }
+  if (!isRecordValue(value)) {
+    return [];
+  }
+  return [
+    ...pickStringCandidates(value.uri),
+    ...pickStringCandidates(value.url),
+    ...pickStringCandidates(value.src),
+    ...pickStringCandidates(value.path),
+    ...pickStringCandidates(value.file),
+    ...pickStringCandidates(value.filePath),
+    ...pickStringCandidates(value.assetUrl),
+    ...pickStringCandidates(value.asset_url),
+    ...pickStringCandidates(value.downloadUrl),
+    ...pickStringCandidates(value.download_url),
+  ];
+}
+
+function inferDocumentTypeFromUri(uri: string): string | undefined {
+  const fileName = inferFileNameFromUri(uri)?.toLowerCase() || '';
+  const ext = fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.') + 1) : '';
+  if (!ext) {
+    return undefined;
+  }
+  if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'ppt', 'pptx', 'txt', 'md', 'json'].includes(ext)) {
+    return ext;
+  }
+  return undefined;
+}
+
+function inferDocumentTypeFromRecord(value: Record<string, unknown>): string {
+  const explicit = pickFirstString(value.documentType, value.document_type, value.fileType, value.file_type, value.mimeType, value.mime_type);
+  if (explicit) {
+    const normalized = explicit.toLowerCase();
+    if (normalized.includes('pdf')) return 'pdf';
+    if (normalized.includes('docx')) return 'docx';
+    if (normalized === 'doc' || normalized.includes('msword')) return 'doc';
+    if (normalized.includes('xlsx')) return 'xlsx';
+    if (normalized === 'xls') return 'xls';
+    if (normalized.includes('csv')) return 'csv';
+    if (normalized.includes('pptx')) return 'pptx';
+    if (normalized === 'ppt') return 'ppt';
+    if (normalized.includes('markdown') || normalized === 'md') return 'md';
+    if (normalized.includes('json')) return 'json';
+    if (normalized.includes('text') || normalized === 'txt') return 'txt';
+    if (['compare', 'convert', 'unknown'].includes(normalized)) return normalized;
+  }
+
+  const candidates = [
+    ...pickAssetUriCandidates(value.sourceAsset),
+    ...pickAssetUriCandidates(value.source_asset),
+    ...pickAssetUriCandidates(value.previewAsset),
+    ...pickAssetUriCandidates(value.preview_asset),
+    ...pickAssetUriCandidates(value.downloadAsset),
+    ...pickAssetUriCandidates(value.download_asset),
+    ...pickAssetUriCandidates(value.url),
+    ...pickAssetUriCandidates(value.path),
+    ...pickAssetUriCandidates(value.file),
+  ];
+  for (const candidate of candidates) {
+    const detected = inferDocumentTypeFromUri(candidate);
+    if (detected) {
+      return detected;
+    }
+  }
+  return 'unknown';
+}
+
+function extractReadableTextFromPresentableResult(result: unknown): string | undefined {
+  if (!isRecordValue(result)) {
+    return undefined;
+  }
+  const kind = typeof result.kind === 'string' ? result.kind.trim().toLowerCase() : '';
+  if (kind === 'text_result') {
+    return pickFirstString(result.markdown, result.text, result.summary, result.title);
+  }
+  if (kind === 'media_result') {
+    const itemSummaries = Array.isArray(result.items)
+      ? result.items
+        .filter(isRecordValue)
+        .map((item) => pickFirstString(item.transcript, item.caption, item.title))
+        .filter((item): item is string => Boolean(item))
+      : [];
+    return pickFirstString(result.summary, ...itemSummaries, result.title);
+  }
+  if (kind === 'document_result') {
+    return pickFirstString(result.summaryText, result.summary_text, result.summary, result.extractedText, result.extracted_text, result.title);
+  }
+  if (kind === 'patch_result' || kind === 'review_result' || kind === 'confirm_result') {
+    return pickFirstString(result.summary, result.title) || buildDocumentPreviewMarkdown(result);
+  }
+  if (kind === 'error_result') {
+    return pickFirstString(result.message, result.summary, result.title);
+  }
+  if (kind === 'job_result') {
+    return pickFirstString(result.summary, result.title);
+  }
+  return pickFirstString(result.summary, result.title);
+}
+
+export function buildPresentableResultFromComponentInvokeResult(
+  result: unknown,
+  fallbackTitle = '组件结果',
+  options?: { posterUrl?: string },
+): Record<string, unknown> | undefined {
+  const normalized = normalizeComponentInvokeResult(result);
+  if (!normalized) {
+    return undefined;
+  }
+  if (isRecordValue(normalized.presentableResult)) {
+    return normalized.presentableResult;
+  }
+
+  const items = Array.isArray(normalized.items) ? normalized.items : [];
+  const title = (normalized.text || fallbackTitle || '组件结果').trim().slice(0, 48) || '组件结果';
+  const summary = normalized.text?.trim() || undefined;
+  const providerMeta = isRecordValue(normalized.providerMeta) ? normalized.providerMeta : undefined;
+  const images = items.filter((item) => item.kind === 'image' || (item.mimeType || '').startsWith('image/'));
+  const preferredPosterUrl = options?.posterUrl?.trim() || images[0]?.url || undefined;
+  const videos = items.filter((item) => item.kind === 'video' || (item.mimeType || '').startsWith('video/'));
+  if (videos.length > 0) {
+    return {
+      kind: 'media_result',
+      mediaType: 'video',
+      title,
+      ...(summary ? { summary } : {}),
+      ...(providerMeta ? { providerMeta } : {}),
+      items: videos
+        .map((item, index) => {
+          const assetUrl = item.url || '';
+          if (!assetUrl) return null;
+          return {
+            mediaType: 'video',
+            asset: buildPresentableAssetRef(assetUrl, {
+              mimeType: item.mimeType || 'video/mp4',
+              metadata: { source: 'component_invoke' },
+            }),
+            ...(preferredPosterUrl ? { posterAsset: buildPresentableAssetRef(preferredPosterUrl, { mimeType: 'image/png' }) } : {}),
+            caption: item.text || `${title} ${index + 1}`,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item)),
+    };
+  }
+  const audios = items.filter((item) => item.kind === 'audio' || (item.mimeType || '').startsWith('audio/'));
+  if (audios.length > 0) {
+    return {
+      kind: 'media_result',
+      mediaType: 'audio',
+      title,
+      ...(summary ? { summary } : {}),
+      ...(providerMeta ? { providerMeta } : {}),
+      items: audios
+        .map((item, index) => {
+          const assetUrl = item.url || '';
+          if (!assetUrl) return null;
+          return {
+            mediaType: 'audio',
+            asset: buildPresentableAssetRef(assetUrl, {
+              mimeType: item.mimeType || 'audio/mpeg',
+              metadata: { source: 'component_invoke' },
+            }),
+            caption: item.text || `${title} ${index + 1}`,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item)),
+    };
+  }
+  if (images.length > 0) {
+    return {
+      kind: 'media_result',
+      mediaType: 'image',
+      title,
+      ...(summary ? { summary } : {}),
+      ...(providerMeta ? { providerMeta } : {}),
+      items: images
+        .map((item, index) => {
+          const assetUrl = item.url || '';
+          if (!assetUrl) return null;
+          return {
+            mediaType: 'image',
+            asset: buildPresentableAssetRef(assetUrl, {
+              mimeType: item.mimeType || 'image/png',
+              metadata: { source: 'component_invoke' },
+            }),
+            caption: item.text || `${title} ${index + 1}`,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item)),
+    };
+  }
+
+  if ((normalized.outputType || '').trim().toLowerCase() === 'text' && normalized.text) {
+    return {
+      kind: 'text_result',
+      title,
+      text: normalized.text,
+      ...(providerMeta ? { providerMeta } : {}),
+    };
+  }
+
+  return undefined;
 }
 
 function formatComponentInvokeKindLabel(kind: string): string {
@@ -2133,6 +2631,8 @@ export function buildComponentInvokeSummaryText(
   if (!normalized) {
     return undefined;
   }
+  const presentableResult = buildPresentableResultFromComponentInvokeResult(result, componentName);
+  const presentableText = extractReadableTextFromPresentableResult(presentableResult);
   const items = Array.isArray(normalized.items) ? normalized.items : [];
   const lines: string[] = [];
   const header = componentName.trim() || '组件';
@@ -2150,7 +2650,9 @@ export function buildComponentInvokeSummaryText(
       lines.push(`组件 ${header} 已返回 ${summary}。`);
     }
   }
-  if (normalized.text) {
+  if (presentableText) {
+    lines.push(presentableText);
+  } else if (normalized.text) {
     lines.push(normalized.text);
   }
   if (options?.includeUrls) {
@@ -2174,6 +2676,10 @@ export function buildRenderableSpecFromComponentInvokeResult(
   fallbackTitle = '组件结果',
   options?: { posterUrl?: string },
 ): unknown | undefined {
+  const presentableResult = buildPresentableResultFromComponentInvokeResult(result, fallbackTitle, options);
+  if (presentableResult) {
+    return buildRenderableSpecFromPresentableResult(presentableResult);
+  }
   const normalized = normalizeComponentInvokeResult(result);
   if (!normalized) {
     return undefined;
@@ -2273,6 +2779,729 @@ export function buildRenderableSpecFromComponentInvokeResult(
   return undefined;
 }
 
+function readPresentableAssetUrl(value: unknown): string | undefined {
+  if (!isRecordValue(value)) {
+    return undefined;
+  }
+  const direct = typeof value.uri === 'string' ? value.uri.trim() : '';
+  if (direct) {
+    return direct;
+  }
+  const metadata = isRecordValue(value.metadata) ? value.metadata : {};
+  const fallbacks = [
+    metadata.url,
+    metadata.src,
+    metadata.path,
+    metadata.filePath,
+  ];
+  for (const candidate of fallbacks) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function readPresentableAssetMimeType(value: unknown): string | undefined {
+  if (!isRecordValue(value)) {
+    return undefined;
+  }
+  const direct = typeof value.mimeType === 'string' ? value.mimeType.trim() : '';
+  if (direct) {
+    return direct;
+  }
+  const metadata = isRecordValue(value.metadata) ? value.metadata : {};
+  const fallbacks = [
+    metadata.mimeType,
+    metadata.mime_type,
+    metadata.contentType,
+    metadata.content_type,
+  ];
+  for (const candidate of fallbacks) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function looksLikePresentableAssetUrl(url: string | undefined, pattern: RegExp): boolean {
+  if (!url) {
+    return false;
+  }
+  const normalized = url.trim().toLowerCase();
+  return pattern.test(normalized);
+}
+
+function isPresentableVideoAsset(value: unknown): boolean {
+  const mimeType = readPresentableAssetMimeType(value)?.toLowerCase();
+  if (mimeType?.startsWith('video/')) {
+    return true;
+  }
+  return looksLikePresentableAssetUrl(
+    readPresentableAssetUrl(value),
+    /\.(mp4|webm|mov|m4v|avi|mkv|gif)(?:[?#].*)?$/,
+  );
+}
+
+function isPresentableImageAsset(value: unknown): boolean {
+  const mimeType = readPresentableAssetMimeType(value)?.toLowerCase();
+  if (mimeType?.startsWith('image/')) {
+    return true;
+  }
+  return looksLikePresentableAssetUrl(
+    readPresentableAssetUrl(value),
+    /\.(png|jpe?g|webp|gif|bmp|svg)(?:[?#].*)?$/,
+  );
+}
+
+function readPresentableAssetName(value: unknown): string | undefined {
+  if (!isRecordValue(value)) {
+    return undefined;
+  }
+  const direct = typeof value.fileName === 'string' ? value.fileName.trim() : '';
+  return direct || undefined;
+}
+
+function buildDocumentPreviewMarkdown(result: Record<string, unknown>): string {
+  const lines: string[] = [];
+  const summary = typeof result.summaryText === 'string'
+    ? result.summaryText.trim()
+    : typeof result.summary === 'string'
+      ? result.summary.trim()
+      : '';
+  if (summary) {
+    lines.push(summary);
+  }
+  const extractedText = typeof result.extractedText === 'string'
+    ? result.extractedText.trim()
+    : typeof result.extracted_text === 'string'
+      ? result.extracted_text.trim()
+      : '';
+  if (extractedText) {
+    lines.push('');
+    lines.push('```text');
+    lines.push(extractedText.slice(0, 2000));
+    lines.push('```');
+  }
+  const compareDiff = isRecordValue(result.compareDiff)
+    ? result.compareDiff
+    : isRecordValue(result.compare_diff)
+      ? result.compare_diff
+      : null;
+  if (compareDiff) {
+    const markdown = typeof compareDiff.markdown === 'string' ? compareDiff.markdown.trim() : '';
+    const diffSummary = typeof compareDiff.summary === 'string' ? compareDiff.summary.trim() : '';
+    if (diffSummary) {
+      lines.push('');
+      lines.push(`差异摘要：${diffSummary}`);
+    }
+    if (markdown) {
+      lines.push('');
+      lines.push(markdown);
+    }
+  }
+  const conversionOutputs = Array.isArray(result.conversionOutputs)
+    ? result.conversionOutputs
+    : Array.isArray(result.conversion_outputs)
+      ? result.conversion_outputs
+      : [];
+  if (conversionOutputs.length > 0) {
+    lines.push('');
+    lines.push('转换产物：');
+    conversionOutputs.forEach((item, index) => {
+      if (!isRecordValue(item)) {
+        return;
+      }
+      const format = typeof item.format === 'string' ? item.format.trim() : `output-${index + 1}`;
+      const assetUrl = readPresentableAssetUrl(item.asset);
+      if (assetUrl) {
+        lines.push(`${index + 1}. [${format}](${assetUrl})`);
+      } else {
+        lines.push(`${index + 1}. ${format}`);
+      }
+    });
+  }
+  return lines.join('\n').trim();
+}
+
+function buildMediaPreviewMarkdown(
+  result: Record<string, unknown>,
+  mediaType: string,
+  title: string,
+): string {
+  const lines: string[] = [];
+  const summary = typeof result.summary === 'string' ? result.summary.trim() : '';
+  if (summary) {
+    lines.push(summary);
+  }
+  const items = Array.isArray(result.items) ? result.items.filter(isRecordValue) : [];
+  if (items.length > 0) {
+    if (lines.length > 0) {
+      lines.push('');
+    }
+    lines.push(`${title}资源：`);
+    items.forEach((item, index) => {
+      const assetUrl = readPresentableAssetUrl(item.asset);
+      const label = typeof item.caption === 'string' && item.caption.trim()
+        ? item.caption.trim()
+        : typeof item.title === 'string' && item.title.trim()
+          ? item.title.trim()
+          : `${title} ${index + 1}`;
+      const linePrefix = `${index + 1}. `;
+      if (assetUrl) {
+        lines.push(`${linePrefix}[${label}](${assetUrl})`);
+        return;
+      }
+      const assetName = readPresentableAssetName(item.asset);
+      if (assetName) {
+        lines.push(`${linePrefix}${label} (${assetName})`);
+        return;
+      }
+      lines.push(`${linePrefix}${label}`);
+    });
+  }
+  if (lines.length === 0) {
+    lines.push(`${mediaType} 结果已生成，但当前渲染器已降级为文本模式。`);
+  }
+  return lines.join('\n').trim();
+}
+
+function buildPlainTextFallbackCard(
+  title: string,
+  markdown: string,
+  description?: string,
+): unknown | undefined {
+  const normalizedMarkdown = markdown.trim();
+  if (!normalizedMarkdown) {
+    return undefined;
+  }
+  return {
+    type: 'MarkdownPreviewCard',
+    props: {
+      title,
+      markdown: normalizedMarkdown,
+      description,
+    },
+  };
+}
+
+function shouldUsePlainTextRenderer(
+  binding: ManagementRendererBindingRecord | undefined,
+): boolean {
+  if (!binding) {
+    return false;
+  }
+  return !binding.enabled || binding.renderer_key.trim().toLowerCase() === 'plain_text';
+}
+
+function pickJobResultNumber(result: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = result[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function pickJobPreviewUrlFromRecord(record: Record<string, unknown> | undefined): string | undefined {
+  if (!record) {
+    return undefined;
+  }
+  return pickFirstString(
+    record.previewUrl,
+    record.preview_url,
+    record.poster,
+    record.posterUrl,
+    record.poster_url,
+    record.cover,
+    record.coverUrl,
+    record.cover_url,
+    record.thumbnail,
+    record.thumbnailUrl,
+    record.thumbnail_url,
+    record.image,
+    record.imageUrl,
+    record.image_url,
+    record.sourceImage,
+    record.source_image,
+    record.sourceVideo,
+    record.source_video,
+    record.src,
+    record.url,
+    record.path,
+    record.autoInjectedVideoSourceUrl,
+    record.auto_injected_video_source_url,
+  );
+}
+
+function readJobPreviewUrl(result: Record<string, unknown>): string | undefined {
+  const metadata = isRecordValue(result.metadata) ? result.metadata : undefined;
+  const providerMeta = isRecordValue(result.providerMeta)
+    ? result.providerMeta
+    : isRecordValue(result.provider_meta)
+      ? result.provider_meta
+      : undefined;
+  const resultPayload = isRecordValue(result.resultPayload)
+    ? result.resultPayload
+    : isRecordValue(result.result_payload)
+      ? result.result_payload
+      : undefined;
+  const requestPayload = resultPayload && isRecordValue(resultPayload.request_payload)
+    ? resultPayload.request_payload
+    : resultPayload && isRecordValue(resultPayload.requestPayload)
+      ? resultPayload.requestPayload
+      : undefined;
+  const inputPayload = resultPayload && isRecordValue(resultPayload.input_payload)
+    ? resultPayload.input_payload
+    : resultPayload && isRecordValue(resultPayload.inputPayload)
+      ? resultPayload.inputPayload
+      : undefined;
+
+  return pickJobPreviewUrlFromRecord(metadata)
+    || pickJobPreviewUrlFromRecord(providerMeta)
+    || pickJobPreviewUrlFromRecord(requestPayload)
+    || pickJobPreviewUrlFromRecord(inputPayload)
+    || pickJobPreviewUrlFromRecord(resultPayload)
+    || pickJobPreviewUrlFromRecord(result);
+}
+
+function buildJobResultMarkdown(result: Record<string, unknown>, title: string): string {
+  const lines: string[] = [`# ${title}`];
+  const status = pickFirstString(result.status, result.state);
+  const summary = pickFirstString(result.summary, result.description);
+  const stage = pickFirstString(result.stage, result.currentStage, result.current_stage);
+  const jobType = pickFirstString(result.jobType, result.job_type, result.mediaType, result.media_type);
+  const etaText = pickFirstString(result.etaText, result.eta_text, result.eta);
+  const jobId = pickFirstString(result.jobId, result.job_id, result.id);
+  const progress = pickJobResultNumber(result, 'progressPercent', 'progress_percent', 'progress', 'percent', 'value');
+
+  if (summary) lines.push('', summary);
+  if (status) lines.push('', `- 状态：${status}`);
+  if (stage) lines.push(`- 阶段：${stage}`);
+  if (typeof progress === 'number') lines.push(`- 进度：${Math.max(0, Math.min(100, Math.round(progress)))}%`);
+  if (jobType) lines.push(`- 任务类型：${jobType}`);
+  if (etaText) lines.push(`- 预计完成：${etaText}`);
+  if (jobId) lines.push(`- 任务 ID：${jobId}`);
+
+  if (Array.isArray(result.steps)) {
+    const stepLines = result.steps
+      .filter(isRecordValue)
+      .map((step) => {
+        const label = pickFirstString(step.label, step.title, step.name);
+        if (!label) return undefined;
+        const stepStatus = pickFirstString(step.status, step.state);
+        return stepStatus ? `- ${label}：${stepStatus}` : `- ${label}`;
+      })
+      .filter((item): item is string => Boolean(item));
+    if (stepLines.length > 0) {
+      lines.push('', '## 步骤', ...stepLines);
+    }
+  }
+
+  return lines.join('\n').trim();
+}
+
+export function buildRenderableSpecFromPresentableResult(
+  result: unknown,
+): unknown | undefined {
+  if (!isRecordValue(result)) {
+    return undefined;
+  }
+  const kind = typeof result.kind === 'string' ? result.kind.trim().toLowerCase() : '';
+  const title = typeof result.title === 'string' && result.title.trim()
+    ? result.title.trim()
+    : typeof result.summary === 'string' && result.summary.trim()
+      ? result.summary.trim().slice(0, 48)
+      : '结果';
+
+  if (kind === 'media_result') {
+    const mediaType = typeof result.mediaType === 'string'
+      ? result.mediaType.trim().toLowerCase()
+      : typeof result.media_type === 'string'
+        ? result.media_type.trim().toLowerCase()
+        : '';
+    const items = Array.isArray(result.items) ? result.items : [];
+    const rendererBinding = resolveDesktopRendererBinding('media_result', { mediaType });
+    if (shouldUsePlainTextRenderer(rendererBinding)) {
+      return buildPlainTextFallbackCard(
+        title,
+        buildMediaPreviewMarkdown(result, mediaType || 'media', title),
+        typeof result.summary === 'string' ? result.summary.trim() : undefined,
+      );
+    }
+    const rendererKey = rendererBinding?.renderer_key.trim().toLowerCase() || '';
+    if (mediaType === 'image') {
+      const images = items
+        .filter(isRecordValue)
+        .map((item, index) => {
+          const src = readPresentableAssetUrl(item.asset);
+          if (!src) return null;
+          const label = typeof item.caption === 'string' && item.caption.trim()
+            ? item.caption.trim()
+            : typeof item.title === 'string' && item.title.trim()
+              ? item.title.trim()
+              : `${title} ${index + 1}`;
+          return {
+            src,
+            alt: label,
+            title: label,
+            description: typeof result.summary === 'string' ? result.summary.trim() : undefined,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item));
+      if (images.length === 1 && rendererKey !== 'imagecarousel' && rendererKey !== 'imagealbum') {
+        return {
+          type: 'ImageCover',
+          props: images[0],
+        };
+      }
+      if (images.length > 1) {
+        return {
+          type: 'ImageCarousel',
+          props: {
+            images,
+            title,
+            showThumbs: true,
+          },
+        };
+      }
+    }
+
+    if (mediaType === 'video') {
+      const normalizedItems = items.filter(isRecordValue);
+      const posterCandidates = normalizedItems
+        .flatMap((item) => {
+          const explicitPoster = readPresentableAssetUrl(item.posterAsset);
+          if (explicitPoster) {
+            return [explicitPoster];
+          }
+          if (isPresentableImageAsset(item.asset)) {
+            const imageAssetUrl = readPresentableAssetUrl(item.asset);
+            return imageAssetUrl ? [imageAssetUrl] : [];
+          }
+          return [];
+        });
+      const videos = normalizedItems
+        .filter((item) => isPresentableVideoAsset(item.asset))
+        .map((item, index) => {
+          const src = readPresentableAssetUrl(item.asset);
+          if (!src) return null;
+          return {
+            src,
+            poster: readPresentableAssetUrl(item.posterAsset) || posterCandidates[index] || posterCandidates[0],
+            title: typeof item.caption === 'string' && item.caption.trim()
+              ? item.caption.trim()
+              : `${title} ${index + 1}`,
+            description: typeof result.summary === 'string' ? result.summary.trim() : undefined,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item));
+      if (videos.length === 1 && rendererKey !== 'videogallery' && rendererKey !== 'videocarousel') {
+        return {
+          type: 'VideoCover',
+          props: videos[0],
+        };
+      }
+      if (videos.length > 1) {
+        return {
+          type: 'VideoGallery',
+          props: {
+            items: videos,
+            title,
+            compact: true,
+          },
+        };
+      }
+    }
+
+    if (mediaType === 'audio') {
+      const audios = items
+        .filter(isRecordValue)
+        .map((item, index) => {
+          const src = readPresentableAssetUrl(item.asset);
+          if (!src) return null;
+          return {
+            src,
+            title: typeof item.caption === 'string' && item.caption.trim()
+              ? item.caption.trim()
+              : `${title} ${index + 1}`,
+            subtitle: typeof result.summary === 'string' ? result.summary.trim() : undefined,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item));
+      if (audios.length === 1 && rendererKey !== 'audioplaylist') {
+        return {
+          type: 'AudioPlayer',
+          props: audios[0],
+        };
+      }
+      if (audios.length > 1) {
+        return {
+          type: 'AudioPlaylist',
+          props: {
+            items: audios,
+            title,
+            description: typeof result.summary === 'string' ? result.summary.trim() : undefined,
+            showQueue: true,
+          },
+        };
+      }
+    }
+  }
+
+  if (kind === 'document_result') {
+    const documentType = typeof result.documentType === 'string'
+      ? result.documentType.trim().toLowerCase()
+      : typeof result.document_type === 'string'
+        ? result.document_type.trim().toLowerCase()
+        : 'unknown';
+    const rendererBinding = resolveDesktopRendererBinding('document_result', { documentType });
+    const sourceAsset = readPresentableAssetUrl(result.previewAsset)
+      ?? readPresentableAssetUrl(result.preview_asset)
+      ?? readPresentableAssetUrl(result.downloadAsset)
+      ?? readPresentableAssetUrl(result.download_asset)
+      ?? readPresentableAssetUrl(result.sourceAsset)
+      ?? readPresentableAssetUrl(result.source_asset);
+    const fileName = readPresentableAssetName(result.sourceAsset)
+      ?? readPresentableAssetName(result.source_asset)
+      ?? title;
+    const description = typeof result.summaryText === 'string'
+      ? result.summaryText.trim()
+      : typeof result.summary === 'string'
+        ? result.summary.trim()
+        : undefined;
+    const markdown = buildDocumentPreviewMarkdown(result);
+
+    if (shouldUsePlainTextRenderer(rendererBinding)) {
+      return buildPlainTextFallbackCard(title, markdown || description || '', description);
+    }
+
+    const rendererKey = rendererBinding?.renderer_key.trim().toLowerCase() || '';
+
+    if (
+      rendererKey === 'officepreviewcard'
+      && sourceAsset
+    ) {
+      return {
+        type: 'OfficePreviewCard',
+        props: {
+          src: sourceAsset,
+          fileName,
+          fileType: documentType,
+          title,
+          description,
+        },
+      };
+    }
+
+    if (rendererKey === 'markdownpreviewcard') {
+      if (markdown) {
+        return {
+          type: 'MarkdownPreviewCard',
+          props: {
+            title,
+            markdown,
+            description,
+          },
+        };
+      }
+    }
+
+    if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'ppt', 'pptx'].includes(documentType) && sourceAsset) {
+      return {
+        type: 'OfficePreviewCard',
+        props: {
+          src: sourceAsset,
+          fileName,
+          fileType: documentType,
+          title,
+          description,
+        },
+      };
+    }
+
+    if (['txt', 'md', 'json', 'compare', 'convert', 'unknown'].includes(documentType)) {
+      if (markdown) {
+        return {
+          type: 'MarkdownPreviewCard',
+          props: {
+            title,
+            markdown,
+            description,
+          },
+        };
+      }
+    }
+  }
+
+  if (kind === 'review_result') {
+    const rendererBinding = resolveDesktopRendererBinding('review_result');
+    const markdown = buildDocumentPreviewMarkdown(result);
+    if (shouldUsePlainTextRenderer(rendererBinding)) {
+      return buildPlainTextFallbackCard(title, markdown, typeof result.summary === 'string' ? result.summary.trim() : undefined);
+    }
+    return {
+      type: 'ReviewResultCard',
+      props: {
+        title,
+        summary: pickFirstString(result.summary, result.description),
+        targetScope: pickFirstString(result.targetScope, result.target_scope),
+        riskLevel: pickFirstString(result.riskLevel, result.risk_level),
+        reviewId: pickFirstString(result.reviewId, result.review_id),
+        reason: pickFirstString(result.reason),
+        requiresConfirmation: typeof result.requiresConfirmation === 'boolean'
+          ? result.requiresConfirmation
+          : typeof result.requires_confirmation === 'boolean'
+            ? result.requires_confirmation
+            : true,
+        proposedChanges: Array.isArray(result.proposedChanges)
+          ? result.proposedChanges
+          : Array.isArray(result.proposed_changes)
+            ? result.proposed_changes
+            : [],
+        confirmAction: pickFirstString(result.confirmAction, result.confirm_action),
+        cancelAction: pickFirstString(result.cancelAction, result.cancel_action),
+        confirmLabel: pickFirstString(result.confirmLabel, result.confirm_label),
+        cancelLabel: pickFirstString(result.cancelLabel, result.cancel_label),
+        payload: isRecordValue(result.payload) ? result.payload : undefined,
+      },
+    };
+  }
+
+  if (kind === 'confirm_result') {
+    const rendererBinding = resolveDesktopRendererBinding('confirm_result');
+    const markdown = buildDocumentPreviewMarkdown(result);
+    if (shouldUsePlainTextRenderer(rendererBinding)) {
+      return buildPlainTextFallbackCard(title, markdown, typeof result.summary === 'string' ? result.summary.trim() : undefined);
+    }
+    return {
+      type: 'ConfirmResultCard',
+      props: {
+        title,
+        summary: pickFirstString(result.summary, result.description),
+        description: pickFirstString(result.description),
+        riskLevel: pickFirstString(result.riskLevel, result.risk_level),
+        confirmAction: pickFirstString(result.confirmAction, result.confirm_action),
+        cancelAction: pickFirstString(result.cancelAction, result.cancel_action),
+        confirmLabel: pickFirstString(result.confirmLabel, result.confirm_label),
+        cancelLabel: pickFirstString(result.cancelLabel, result.cancel_label),
+        payload: isRecordValue(result.payload) ? result.payload : undefined,
+      },
+    };
+  }
+
+  if (kind === 'patch_result') {
+    const rendererBinding = resolveDesktopRendererBinding('patch_result');
+    const markdown = buildDocumentPreviewMarkdown(result);
+    if (shouldUsePlainTextRenderer(rendererBinding)) {
+      return buildPlainTextFallbackCard(title, markdown, typeof result.summary === 'string' ? result.summary.trim() : undefined);
+    }
+    return {
+      type: 'PatchResultCard',
+      props: {
+        title,
+        summary: pickFirstString(result.summary, result.description),
+        targetScope: pickFirstString(result.targetScope, result.target_scope),
+        riskLevel: pickFirstString(result.riskLevel, result.risk_level),
+        reviewId: pickFirstString(result.reviewId, result.review_id),
+        appliedChanges: Array.isArray(result.appliedChanges)
+          ? result.appliedChanges
+          : Array.isArray(result.applied_changes)
+            ? result.applied_changes
+            : [],
+      },
+    };
+  }
+
+  if (kind === 'error_result') {
+    const message = typeof result.message === 'string' ? result.message.trim() : '能力暂不可用';
+    return {
+      type: 'card',
+      props: {
+        title: title || '能力错误',
+        content: message,
+        footer: typeof result.code === 'string' && result.code.trim()
+          ? `错误码：${result.code.trim()}`
+          : '来源：presentable_result',
+      },
+    };
+  }
+
+  if (kind === 'job_result') {
+    const rendererBinding = resolveDesktopRendererBinding('job_result');
+    const summary = typeof result.summary === 'string' ? result.summary.trim() : undefined;
+    const markdown = buildJobResultMarkdown(result, title);
+    if (shouldUsePlainTextRenderer(rendererBinding)) {
+      return buildPlainTextFallbackCard(title, markdown, summary);
+    }
+    const rendererKey = rendererBinding?.renderer_key.trim().toLowerCase() || '';
+    const progress = pickJobResultNumber(result, 'progressPercent', 'progress_percent', 'progress', 'percent', 'value');
+    const steps = Array.isArray(result.steps)
+      ? result.steps
+        .filter(isRecordValue)
+        .map((step) => {
+          const label = pickFirstString(step.label, step.title, step.name);
+          if (!label) return null;
+          const stepStatus = pickFirstString(step.status, step.state);
+          return {
+            label,
+            ...(stepStatus ? { status: stepStatus } : {}),
+          };
+        })
+        .filter((step): step is { label: string; status?: string } => Boolean(step))
+      : [];
+    if (rendererKey === 'jobprogresscard' || !rendererKey) {
+      const previewUrl = readJobPreviewUrl(result);
+      return {
+        type: 'JobProgressCard',
+        props: {
+          title,
+          ...(summary ? { summary } : {}),
+          ...(pickFirstString(result.status, result.state) ? { status: pickFirstString(result.status, result.state) } : {}),
+          ...(pickFirstString(result.stage, result.currentStage, result.current_stage) ? { stage: pickFirstString(result.stage, result.currentStage, result.current_stage) } : {}),
+          ...(pickFirstString(result.jobType, result.job_type, result.mediaType, result.media_type) ? { jobType: pickFirstString(result.jobType, result.job_type, result.mediaType, result.media_type) } : {}),
+          ...(pickFirstString(result.etaText, result.eta_text, result.eta) ? { etaText: pickFirstString(result.etaText, result.eta_text, result.eta) } : {}),
+          ...(pickFirstString(result.jobId, result.job_id, result.id) ? { jobId: pickFirstString(result.jobId, result.job_id, result.id) } : {}),
+          ...(pickFirstString(result.capabilityKey, result.capability_key) ? { capabilityKey: pickFirstString(result.capabilityKey, result.capability_key) } : {}),
+          ...(pickFirstString(result.capabilityScope, result.capability_scope) ? { capabilityScope: pickFirstString(result.capabilityScope, result.capability_scope) } : {}),
+          ...(pickFirstString(result.providerId, result.provider_id) ? { providerId: pickFirstString(result.providerId, result.provider_id) } : {}),
+          ...(pickFirstString(result.providerType, result.provider_type) ? { providerType: pickFirstString(result.providerType, result.provider_type) } : {}),
+          ...(pickFirstString(result.route) ? { route: pickFirstString(result.route) } : {}),
+          ...(typeof result.metadata === 'object' && result.metadata !== null ? { metadata: result.metadata } : {}),
+          ...(typeof result.resultPayload === 'object' && result.resultPayload !== null
+            ? { resultPayload: result.resultPayload }
+            : typeof result.result_payload === 'object' && result.result_payload !== null
+              ? { resultPayload: result.result_payload }
+              : {}),
+          ...(previewUrl ? { previewUrl } : {}),
+          ...(typeof progress === 'number' ? { progressPercent: progress } : {}),
+          ...(steps.length > 0 ? { steps } : {}),
+        },
+      };
+    }
+    return buildPlainTextFallbackCard(title, markdown, summary);
+  }
+
+  if (kind === 'text_result') {
+    const markdown = typeof result.markdown === 'string' ? result.markdown.trim() : '';
+    const text = typeof result.text === 'string' ? result.text.trim() : '';
+    if (markdown || text) {
+      return {
+        type: 'MarkdownPreviewCard',
+        props: {
+          title,
+          markdown: markdown || text,
+          description: typeof result.summary === 'string' ? result.summary.trim() : undefined,
+        },
+      };
+    }
+  }
+
+  return undefined;
+}
+
 function buildComponentInvokeFallbackSpec(payload: Record<string, unknown>): unknown | undefined {
   if (getToolNameFromLogPayload(payload).toLowerCase() !== 'component_invoke' || payload.is_error === true) {
     return undefined;
@@ -2282,11 +3511,407 @@ function buildComponentInvokeFallbackSpec(payload: Record<string, unknown>): unk
     : typeof payload.componentName === 'string'
       ? payload.componentName.trim()
       : '组件';
-  const resultPayload = parseNestedToolPayload(payload.result) || payload.result;
+  const resultPayload = pickNestedToolResultPayload(payload) || payload.result;
   const title = typeof payload.summary === 'string' && payload.summary.trim()
     ? payload.summary.trim()
     : componentName;
   return buildRenderableSpecFromComponentInvokeResult(resultPayload, title);
+}
+
+function buildImagePresentableResult(payload: Record<string, unknown>, toolName: string): Record<string, unknown> | undefined {
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
+  const imageUrls = pickStringArray(resultPayload.image_urls ?? resultPayload.imageUrls);
+  const savedPaths = pickStringArray(resultPayload.saved_to ?? resultPayload.savedTo);
+  const sources = imageUrls.length > 0 ? imageUrls : savedPaths;
+  if (sources.length === 0) {
+    return undefined;
+  }
+
+  const model = pickFirstString(resultPayload.model, resultPayload.engine, resultPayload.provider);
+  const prompt = parseNestedToolPayload(payload.input)?.prompt;
+  const title = typeof prompt === 'string' && prompt.trim()
+    ? prompt.trim().slice(0, 48)
+    : toolName === 'image_edit' || toolName === 'my_photo_edit'
+      ? '图片修改结果'
+      : toolName === 'my_photo_generate'
+        ? '自我照片生成结果'
+        : '图片生成结果';
+
+  return {
+    kind: 'media_result',
+    mediaType: 'image',
+    title,
+    ...(model ? { summary: model } : {}),
+    items: sources.map((src, index) => ({
+      mediaType: 'image',
+      asset: buildPresentableAssetRef(src, {
+        mimeType: 'image/png',
+        metadata: {
+          tool: toolName,
+          source: imageUrls.includes(src) ? 'url' : 'saved_path',
+        },
+      }),
+      caption: `${title} ${index + 1}`,
+    })),
+  };
+}
+
+function buildVideoPresentableResult(payload: Record<string, unknown>, toolName: string): Record<string, unknown> | undefined {
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
+  const videoUrls = pickStringArray(resultPayload.video_urls ?? resultPayload.videoUrls);
+  const savedPaths = pickStringArray(resultPayload.saved_to ?? resultPayload.savedTo);
+  const posterUrls = pickStringArray(resultPayload.poster_urls ?? resultPayload.posterUrls);
+  const sources = videoUrls.length > 0 ? videoUrls : savedPaths;
+  const inputPayload = parseNestedToolPayload(payload.input);
+  const prompt = typeof inputPayload?.prompt === 'string' ? inputPayload.prompt.trim() : '';
+  const title = prompt
+    ? prompt.slice(0, 48)
+    : toolName === 'video_edit'
+      ? '视频编辑结果'
+      : '视频生成结果';
+  if (sources.length === 0) {
+    return buildPresentableResultFromComponentInvokeResult(resultPayload, title, {
+      posterUrl: posterUrls[0],
+    });
+  }
+  const summary = pickFirstString(
+    resultPayload.summary,
+    resultPayload.model,
+    resultPayload.provider,
+    resultPayload.route,
+  );
+  const providerMeta = isRecordValue(resultPayload.provider_meta)
+    ? resultPayload.provider_meta
+    : isRecordValue(resultPayload.providerMeta)
+      ? resultPayload.providerMeta
+      : undefined;
+  return {
+    kind: 'media_result',
+    mediaType: 'video',
+    title,
+    ...(summary ? { summary } : {}),
+    ...(providerMeta ? { providerMeta } : {}),
+    items: sources.map((src, index) => ({
+      mediaType: 'video',
+      asset: buildPresentableAssetRef(src, {
+        mimeType: 'video/mp4',
+        metadata: {
+          tool: toolName,
+          source: videoUrls.includes(src) ? 'url' : 'saved_path',
+        },
+      }),
+      ...(posterUrls[index] || posterUrls[0]
+        ? {
+          posterAsset: buildPresentableAssetRef(posterUrls[index] || posterUrls[0], {
+            mimeType: 'image/png',
+            metadata: { tool: toolName, source: 'poster' },
+          }),
+        }
+        : {}),
+      caption: sources.length === 1 ? title : `${title} ${index + 1}`,
+    })),
+  };
+}
+
+function buildTextToSpeechPresentableResult(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
+  const sources = [
+    ...pickStringCandidates(resultPayload.asset_url ?? resultPayload.assetUrl),
+    ...pickStringCandidates(resultPayload.saved_to ?? resultPayload.savedTo),
+  ];
+  const uniqueSources = Array.from(new Set(sources));
+  if (uniqueSources.length === 0) {
+    return undefined;
+  }
+
+  const inputPayload = parseNestedToolPayload(payload.input);
+  const rawText = typeof inputPayload?.text === 'string'
+    ? inputPayload.text.trim()
+    : typeof resultPayload.requested_text === 'string'
+      ? resultPayload.requested_text.trim()
+      : '';
+  const title = rawText
+    ? `语音: ${rawText.slice(0, 32)}${rawText.length > 32 ? '…' : ''}`
+    : '语音合成结果';
+  const engine = pickFirstString(resultPayload.engine, resultPayload.provider, resultPayload.device);
+  const durationEstimateMs = typeof resultPayload.duration_estimate_ms === 'number'
+    ? resultPayload.duration_estimate_ms
+    : typeof resultPayload.durationEstimateMs === 'number'
+      ? resultPayload.durationEstimateMs
+      : typeof resultPayload.duration_secs === 'number'
+        ? resultPayload.duration_secs * 1000
+        : typeof resultPayload.durationSecs === 'number'
+          ? resultPayload.durationSecs * 1000
+          : undefined;
+
+  return {
+    kind: 'media_result',
+    mediaType: 'audio',
+    title,
+    ...(engine ? { summary: engine } : {}),
+    items: uniqueSources.map((src, index) => ({
+      mediaType: 'audio',
+      asset: buildPresentableAssetRef(src, {
+        mimeType: 'audio/mpeg',
+        durationMs: durationEstimateMs,
+        metadata: { tool: 'text_to_speech' },
+      }),
+      caption: uniqueSources.length === 1 ? title : `${title} ${index + 1}`,
+      ...(rawText ? { transcript: rawText } : {}),
+      ...(typeof durationEstimateMs === 'number' ? { durationMs: durationEstimateMs } : {}),
+    })),
+  };
+}
+
+function buildSpeechToTextPresentableResult(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
+  const transcript = pickFirstString(resultPayload.transcript, resultPayload.text, resultPayload.content, resultPayload.output);
+  if (!transcript) {
+    return undefined;
+  }
+  const summary = [pickFirstString(resultPayload.provider), pickFirstString(resultPayload.model)]
+    .filter(Boolean)
+    .join(' · ');
+  const sourceAsset = isRecordValue(resultPayload.sourceAsset)
+    ? resultPayload.sourceAsset
+    : isRecordValue(resultPayload.source_asset)
+      ? resultPayload.source_asset
+      : undefined;
+  return {
+    kind: 'text_result',
+    title: '语音转文本结果',
+    text: transcript,
+    ...(summary ? { summary } : {}),
+    ...(sourceAsset
+      ? {
+        metadata: {
+          sourceAsset,
+        },
+      }
+      : {}),
+  };
+}
+
+function buildMediaDescribePresentableResult(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
+  const text = extractReadableText(resultPayload);
+  if (!text) {
+    return undefined;
+  }
+  const mediaType = pickFirstString(resultPayload.mediaType, resultPayload.media_type)?.toLowerCase() || 'media';
+  const title = mediaType === 'image'
+    ? '图片理解结果'
+    : mediaType === 'audio'
+      ? '音频理解结果'
+      : mediaType === 'video'
+        ? '视频理解结果'
+        : '媒体理解结果';
+  const sourceAsset = isRecordValue(resultPayload.sourceAsset)
+    ? resultPayload.sourceAsset
+    : isRecordValue(resultPayload.source_asset)
+      ? resultPayload.source_asset
+      : undefined;
+  return {
+    kind: 'text_result',
+    title,
+    text,
+    ...(pickFirstString(resultPayload.provider, resultPayload.model) ? { summary: pickFirstString(resultPayload.provider, resultPayload.model) } : {}),
+    ...(sourceAsset
+      ? {
+        metadata: {
+          sourceAsset,
+          mediaType,
+        },
+      }
+      : {}),
+  };
+}
+
+function buildDocumentPresentableResult(payload: Record<string, unknown>, toolName: string): Record<string, unknown> | undefined {
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
+  const inputPayload = parseNestedToolPayload(payload.input);
+  const sourceUri = pickFirstString(
+    ...pickAssetUriCandidates(resultPayload.sourceAsset),
+    ...pickAssetUriCandidates(resultPayload.source_asset),
+    ...pickAssetUriCandidates(resultPayload.document),
+    ...pickAssetUriCandidates(resultPayload.file),
+    ...pickAssetUriCandidates(resultPayload.path),
+    ...pickAssetUriCandidates(resultPayload.url),
+    ...pickAssetUriCandidates(inputPayload?.file),
+    ...pickAssetUriCandidates(inputPayload?.path),
+    ...pickAssetUriCandidates(inputPayload?.url),
+  );
+  const previewUri = pickFirstString(
+    ...pickAssetUriCandidates(resultPayload.previewAsset),
+    ...pickAssetUriCandidates(resultPayload.preview_asset),
+    ...pickAssetUriCandidates(resultPayload.previewUrl),
+    ...pickAssetUriCandidates(resultPayload.preview_url),
+  );
+  const downloadUri = pickFirstString(
+    ...pickAssetUriCandidates(resultPayload.downloadAsset),
+    ...pickAssetUriCandidates(resultPayload.download_asset),
+    ...pickAssetUriCandidates(resultPayload.downloadUrl),
+    ...pickAssetUriCandidates(resultPayload.download_url),
+    ...pickAssetUriCandidates(resultPayload.outputFile),
+    ...pickAssetUriCandidates(resultPayload.output_file),
+  );
+  const documentType = toolName === 'document_compare'
+    ? 'compare'
+    : toolName === 'document_convert'
+      ? 'convert'
+      : inferDocumentTypeFromRecord(resultPayload);
+  const summaryText = pickFirstString(resultPayload.summaryText, resultPayload.summary_text, resultPayload.summary, resultPayload.description);
+  const extractedText = pickFirstString(resultPayload.extractedText, resultPayload.extracted_text, resultPayload.text, resultPayload.content);
+  const compareDiff = isRecordValue(resultPayload.compareDiff)
+    ? resultPayload.compareDiff
+    : isRecordValue(resultPayload.compare_diff)
+      ? resultPayload.compare_diff
+      : undefined;
+  const rawConversionOutputs = Array.isArray(resultPayload.conversionOutputs)
+    ? resultPayload.conversionOutputs
+    : Array.isArray(resultPayload.conversion_outputs)
+      ? resultPayload.conversion_outputs
+      : [];
+  const conversionOutputs = rawConversionOutputs
+    .filter(isRecordValue)
+    .map((item, index) => {
+      const assetUri = pickFirstString(
+        ...pickAssetUriCandidates(item.asset),
+        ...pickAssetUriCandidates(item.url),
+        ...pickAssetUriCandidates(item.path),
+        ...pickAssetUriCandidates(item.downloadUrl),
+      );
+      if (!assetUri) {
+        return null;
+      }
+      const format = pickFirstString(item.format, item.type, item.label) || `output-${index + 1}`;
+      return {
+        format,
+        asset: buildPresentableAssetRef(assetUri, {
+          mimeType: pickFirstString(item.mimeType, item.mime_type),
+          fileName: pickFirstString(item.fileName, item.file_name),
+        }),
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item));
+
+  if (!sourceUri && !previewUri && !downloadUri && !summaryText && !extractedText && !compareDiff && conversionOutputs.length === 0) {
+    return undefined;
+  }
+
+  const title = pickFirstString(resultPayload.title, resultPayload.fileName, resultPayload.file_name)
+    || (toolName === 'document_compare'
+      ? '文档对比结果'
+      : toolName === 'document_convert'
+        ? '文档转换结果'
+        : toolName === 'document_preview'
+          ? '文档预览结果'
+          : '文档处理结果');
+  const bestSourceUri = sourceUri || previewUri || downloadUri || '';
+  const sourceAsset = bestSourceUri
+    ? buildPresentableAssetRef(bestSourceUri, {
+      mimeType: pickFirstString(resultPayload.mimeType, resultPayload.mime_type),
+      fileName: pickFirstString(resultPayload.fileName, resultPayload.file_name),
+    })
+    : undefined;
+
+  return {
+    kind: 'document_result',
+    title,
+    documentType,
+    ...(sourceAsset ? { sourceAsset } : {}),
+    ...(previewUri ? { previewAsset: buildPresentableAssetRef(previewUri) } : {}),
+    ...(downloadUri ? { downloadAsset: buildPresentableAssetRef(downloadUri) } : {}),
+    ...(typeof resultPayload.pageCount === 'number' ? { pageCount: resultPayload.pageCount } : typeof resultPayload.page_count === 'number' ? { pageCount: resultPayload.page_count } : {}),
+    ...(summaryText ? { summaryText } : {}),
+    ...(extractedText ? { extractedText } : {}),
+    ...(compareDiff ? { compareDiff } : {}),
+    ...(conversionOutputs.length > 0 ? { conversionOutputs } : {}),
+  };
+}
+
+export function buildPresentableResultFromToolLog(raw: string): Record<string, unknown> | undefined {
+  const payload = parseToolLogPayload(raw);
+  if (!payload) {
+    return undefined;
+  }
+  if (isRecordValue(payload.presentableResult)) {
+    return payload.presentableResult;
+  }
+  if (isRecordValue(payload.presentable_result)) {
+    return payload.presentable_result;
+  }
+  if (isRecordValue(payload.jobResult)) {
+    return payload.jobResult;
+  }
+  if (isRecordValue(payload.job_result)) {
+    return payload.job_result;
+  }
+  const nestedResult = pickNestedToolResultPayload(payload);
+  if (isRecordValue(nestedResult?.presentableResult)) {
+    return nestedResult.presentableResult;
+  }
+  if (isRecordValue(nestedResult?.presentable_result)) {
+    return nestedResult.presentable_result;
+  }
+  if (isRecordValue(nestedResult?.jobResult)) {
+    return nestedResult.jobResult;
+  }
+  if (isRecordValue(nestedResult?.job_result)) {
+    return nestedResult.job_result;
+  }
+  if (isRecordValue(nestedResult) && typeof nestedResult.kind === 'string') {
+    return nestedResult;
+  }
+
+  const toolName = getToolNameFromLogPayload(payload).toLowerCase();
+  if (payload.is_error === true) {
+    const message = extractReadableText(pickNestedToolResultPayload(payload) || payload);
+    if (!message) {
+      return undefined;
+    }
+    return {
+      kind: 'error_result',
+      title: toolName || '工具错误',
+      code: `${toolName || 'tool'}_failed`,
+      message,
+    };
+  }
+
+  switch (toolName) {
+    case 'image_generate':
+    case 'image_edit':
+    case 'my_photo_generate':
+    case 'my_photo_edit':
+      return buildImagePresentableResult(payload, toolName);
+    case 'video_generate':
+    case 'video_edit':
+      return buildVideoPresentableResult(payload, toolName);
+    case 'text_to_speech':
+      return buildTextToSpeechPresentableResult(payload);
+    case 'speech_to_text':
+      return buildSpeechToTextPresentableResult(payload);
+    case 'media_describe':
+      return buildMediaDescribePresentableResult(payload);
+    case 'component_invoke': {
+      const componentName = pickFirstString(payload.component_name, payload.componentName) || '组件';
+      const title = pickFirstString(payload.summary) || componentName;
+      return buildPresentableResultFromComponentInvokeResult(
+        pickNestedToolResultPayload(payload) ?? payload.result,
+        title,
+      );
+    }
+    case 'document_parse':
+    case 'document_extract':
+    case 'document_summarize':
+    case 'document_convert':
+    case 'document_compare':
+    case 'document_preview':
+    case 'document_chunk':
+      return buildDocumentPresentableResult(payload, toolName);
+    default:
+      return undefined;
+  }
 }
 
 function getToolNameFromLogPayload(payload: Record<string, unknown> | undefined): string {
@@ -2309,6 +3934,11 @@ function hasMeaningfulToolLogContent(payload: Record<string, unknown>): boolean 
 }
 
 export function extractReadableTextFromLog(raw: string): string | undefined {
+  const presentableResult = buildPresentableResultFromToolLog(raw);
+  const presentableText = extractReadableTextFromPresentableResult(presentableResult);
+  if (presentableText) {
+    return presentableText.slice(0, 2400);
+  }
   const payload = parseToolLogPayload(raw);
   if (!payload) return undefined;
   if (!hasMeaningfulToolLogContent(payload)) return undefined;
@@ -2336,7 +3966,7 @@ function buildImageFallbackSpec(payload: Record<string, unknown>): unknown | und
     return undefined;
   }
 
-  const resultPayload = parseNestedToolPayload(payload.result) || payload;
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
   const imageUrls = pickStringArray(resultPayload.image_urls ?? resultPayload.imageUrls);
   const savedPaths = pickStringArray(resultPayload.saved_to ?? resultPayload.savedTo);
   const sources = imageUrls.length > 0 ? imageUrls : savedPaths;
@@ -2382,7 +4012,7 @@ function buildTextToSpeechFallbackSpec(payload: Record<string, unknown>): unknow
     return undefined;
   }
 
-  const resultPayload = parseNestedToolPayload(payload.result) || payload;
+  const resultPayload = pickNestedToolResultPayload(payload) || payload;
   const sources = [
     ...pickStringCandidates(resultPayload.asset_url ?? resultPayload.assetUrl),
     ...pickStringCandidates(resultPayload.saved_to ?? resultPayload.savedTo),
@@ -2447,6 +4077,10 @@ function buildTextToSpeechFallbackSpec(payload: Record<string, unknown>): unknow
 }
 
 export function buildRenderableSpecFromToolLog(raw: string): unknown | undefined {
+  const presentableResult = buildPresentableResultFromToolLog(raw);
+  if (presentableResult) {
+    return buildRenderableSpecFromPresentableResult(presentableResult);
+  }
   const payload = parseToolLogPayload(raw);
   if (!payload) {
     return undefined;
@@ -2482,10 +4116,6 @@ ${row.detail || ''}`));
   const detail = (latestTool.detail || '').trim();
   const title = latestTool.title.trim() || '工具结果';
   const payload = parseToolLogPayload(detail);
-  const renderableSpec = payload ? buildImageFallbackSpec(payload) : undefined;
-  if (renderableSpec != null) {
-    return renderableSpec;
-  }
   const payloadToolName = getToolNameFromLogPayload(payload);
   const readable = extractReadableTextFromLog(detail);
 

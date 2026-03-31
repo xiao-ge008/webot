@@ -79,7 +79,104 @@ const GROUP_SESSION_LABEL_PREFIX: &str = "groupmem_";
 const META_CONVERSATION_SCOPE: &str = "conversation_scope";
 const META_PARTICIPANT_SCOPE: &str = "participant_scope";
 
-fn tool_result_guidance(tool_name: &str, is_error: bool) -> Option<ContentBlock> {
+fn tool_result_text_hint(content: &str) -> String {
+    let mut parts = Vec::new();
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+        for key in ["message", "hint", "error"] {
+            if let Some(value) = parsed.get(key).and_then(|value| value.as_str()) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+        }
+        if let Some(value) = parsed
+            .get("presentable_result")
+            .and_then(|value| value.get("message"))
+            .and_then(|value| value.as_str())
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        content.to_string()
+    } else {
+        parts.push(content.to_string());
+        parts.join("\n")
+    }
+}
+
+fn tool_result_contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn media_tool_error_is_capability_unavailable(content: &str) -> bool {
+    let text = tool_result_text_hint(content).to_ascii_lowercase();
+    tool_result_contains_any(
+        &text,
+        &[
+            "disabled_by_registry",
+            "当前模型",
+            "尚未接入原生视频生成能力",
+            "尚未接入原生视频编辑能力",
+            "不支持图片编辑",
+            "not support native video",
+            "native video",
+            "no available video provider",
+            "no available image provider",
+            "没有可用的视频 provider",
+            "没有可用的视频 provider 或组件",
+            "没有可用的视频组件",
+            "没有可用的组件技能",
+            "没有可用的图片 provider",
+        ],
+    )
+}
+
+fn media_tool_error_is_transient(content: &str) -> bool {
+    let text = tool_result_text_hint(content).to_ascii_lowercase();
+    tool_result_contains_any(
+        &text,
+        &[
+            "下载",
+            "download",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "temporarily unavailable",
+            "temporary failure",
+            "upstream",
+            "network error",
+            "send request",
+            "error sending request",
+            "unknown status code",
+            "bad gateway",
+            "gateway timeout",
+            "internal server error",
+            "(500",
+            "(502",
+            "(503",
+            "(504",
+            " 500 ",
+            " 502 ",
+            " 503 ",
+            " 504 ",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "服务返回错误",
+            "本地图片修改服务返回错误",
+            "下载组件图片资源返回错误",
+        ],
+    )
+}
+
+fn tool_result_guidance(tool_name: &str, is_error: bool, content: &str) -> Option<ContentBlock> {
     match (tool_name, is_error) {
         ("image_edit", true) => Some(ContentBlock::Text {
             text: "[System: image_edit failed. This request is still an edit of an existing image. Do NOT fall back to image_generate, because generation will create a different image/person and break continuity. Instead, explain the image_edit failure to the user and ask for the missing prerequisite, permission, or image-service fix.]".to_string(),
@@ -87,6 +184,32 @@ fn tool_result_guidance(tool_name: &str, is_error: bool) -> Option<ContentBlock>
         ("my_photo_edit", true) => Some(ContentBlock::Text {
             text: "[System: my_photo_edit failed. This request is still about your own existing self image. Do NOT fall back to image_generate. Explain the failure, ask for the missing source image or permission, or use my_photo_generate only if the user actually wanted a new self photo of the same identity.]".to_string(),
         }),
+        ("video_generate", true) | ("video_edit", true) => {
+            let tool_label = if tool_name == "video_edit" {
+                "video_edit"
+            } else {
+                "video_generate"
+            };
+            let action_label = if tool_name == "video_edit" {
+                "video edit"
+            } else {
+                "video generation"
+            };
+            let text = if media_tool_error_is_capability_unavailable(content) {
+                format!(
+                    "[System: {tool_label} failed and the error indicates {action_label} is currently unavailable or disabled. This is still a video request. Do NOT switch to image_generate or my_photo_generate just because the video tool failed. Clearly explain that the current runtime/provider/registry does not have working video capability, and tell the user which dependency is missing or disabled.]"
+                )
+            } else if media_tool_error_is_transient(content) {
+                format!(
+                    "[System: {tool_label} failed, but the error looks temporary (for example download/network/provider/5xx failure). This is still a video request. Do NOT switch to image_generate or my_photo_generate. First inspect the error reason, then retry the same video request once, or retry the same video capability through another available video provider/component. If a retry already happened in this turn, stop retrying and explain the failure precisely.]"
+                )
+            } else {
+                format!(
+                    "[System: {tool_label} failed. This is still a video request. Do NOT immediately switch to image_generate or my_photo_generate. First explain the real failure reason. Retry once only if the error looks temporary; otherwise tell the user that the current video capability is unavailable and what needs to be fixed.]"
+                )
+            };
+            Some(ContentBlock::Text { text })
+        }
         ("image_generate", false) => Some(ContentBlock::Text {
             text: "[System: image_generate succeeded. Reuse the image URLs/paths from this successful result. If you now have enough images to satisfy the user's request, finalize immediately and stop generating more images. Do NOT call image_generate again unless the user explicitly asked for more versions or alternatives, or the current result is clearly unusable.]".to_string(),
         }),
@@ -96,6 +219,45 @@ fn tool_result_guidance(tool_name: &str, is_error: bool) -> Option<ContentBlock>
         _ => None,
     }
 }
+
+fn extract_structured_tool_result_for_stream(content: &str) -> Option<serde_json::Value> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let object = parsed.as_object()?;
+    let mut compact = serde_json::Map::new();
+
+    let presentable = object
+        .get("presentable_result")
+        .cloned()
+        .or_else(|| object.get("presentableResult").cloned());
+    let job_result = object
+        .get("job_result")
+        .cloned()
+        .or_else(|| object.get("jobResult").cloned());
+
+    if let Some(value) = presentable.clone() {
+        compact.insert("presentable_result".to_string(), value.clone());
+        if value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("job_result"))
+        {
+            compact.entry("job_result".to_string()).or_insert(value);
+        }
+    }
+    if let Some(value) = job_result {
+        compact.insert("job_result".to_string(), value.clone());
+        compact
+            .entry("presentable_result".to_string())
+            .or_insert(value);
+    }
+
+    if compact.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(compact))
+    }
+}
+
 const MANIFEST_MEMORY_TURN_CONTEXT_KEY: &str = "memory_turn_context";
 const PARTICIPANT_RECALL_BOOST: f32 = 0.35;
 const RECALL_CANDIDATE_LIMIT_MULTIPLIER: usize = 2;
@@ -1432,13 +1594,15 @@ pub async fn run_agent_loop(
                         content
                     };
 
+                    let guidance =
+                        tool_result_guidance(&tool_call.name, result.is_error, &final_content);
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
                         tool_name: tool_call.name.clone(),
                         content: final_content,
                         is_error: result.is_error,
                     });
-                    if let Some(guidance) = tool_result_guidance(&tool_call.name, result.is_error) {
+                    if let Some(guidance) = guidance {
                         tool_result_blocks.push(guidance);
                     }
                 }
@@ -2302,10 +2466,13 @@ pub async fn run_agent_loop_streaming(
 
                     // Notify client of tool execution result (detect dead consumer)
                     let preview: String = final_content.chars().take(300).collect();
+                    let structured_result =
+                        extract_structured_tool_result_for_stream(&final_content);
                     if stream_tx
                         .send(StreamEvent::ToolExecutionResult {
                             name: tool_call.name.clone(),
                             result_preview: preview,
+                            structured_result,
                             is_error: result.is_error,
                             input: Some(tool_call.input.clone()),
                         })
@@ -2315,13 +2482,15 @@ pub async fn run_agent_loop_streaming(
                         warn!(agent = %manifest.name, "Stream consumer disconnected — continuing tool loop but will not stream further");
                     }
 
+                    let guidance =
+                        tool_result_guidance(&tool_call.name, result.is_error, &final_content);
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
                         tool_name: tool_call.name.clone(),
                         content: final_content,
                         is_error: result.is_error,
                     });
-                    if let Some(guidance) = tool_result_guidance(&tool_call.name, result.is_error) {
+                    if let Some(guidance) = guidance {
                         tool_result_blocks.push(guidance);
                     }
                 }
@@ -3418,7 +3587,7 @@ mod tests {
 
     #[test]
     fn test_tool_result_guidance_blocks_image_generate_fallback() {
-        let guidance = tool_result_guidance("image_edit", true);
+        let guidance = tool_result_guidance("image_edit", true, "image edit failed");
         match guidance {
             Some(ContentBlock::Text { text }) => {
                 assert!(text.contains("Do NOT fall back to image_generate"));
@@ -3426,9 +3595,9 @@ mod tests {
             other => panic!("expected image_edit recovery guidance, got {other:?}"),
         }
 
-        assert!(tool_result_guidance("image_generate", true).is_none());
-        assert!(tool_result_guidance("image_edit", false).is_none());
-        let self_guidance = tool_result_guidance("my_photo_edit", true);
+        assert!(tool_result_guidance("image_generate", true, "failed").is_none());
+        assert!(tool_result_guidance("image_edit", false, "ok").is_none());
+        let self_guidance = tool_result_guidance("my_photo_edit", true, "photo edit failed");
         match self_guidance {
             Some(ContentBlock::Text { text }) => {
                 assert!(text.contains("still about your own existing self image"));
@@ -3439,7 +3608,7 @@ mod tests {
 
     #[test]
     fn test_tool_result_guidance_stops_after_successful_image_generate() {
-        let guidance = tool_result_guidance("image_generate", false);
+        let guidance = tool_result_guidance("image_generate", false, "ok");
         match guidance {
             Some(ContentBlock::Text { text }) => {
                 assert!(text.contains("finalize immediately"));
@@ -3448,13 +3617,99 @@ mod tests {
             other => panic!("expected image_generate success guidance, got {other:?}"),
         }
 
-        let self_guidance = tool_result_guidance("my_photo_generate", false);
+        let self_guidance = tool_result_guidance("my_photo_generate", false, "ok");
         match self_guidance {
             Some(ContentBlock::Text { text }) => {
                 assert!(text.contains("current self-photo candidate"));
             }
             other => panic!("expected my_photo_generate success guidance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_tool_result_guidance_retries_video_on_transient_failure() {
+        let content = serde_json::json!({
+            "ok": false,
+            "message": "视频生成当前不可用。已尝试路径：component_skill_error({\"error\":\"下载组件图片资源返回错误(500 Internal Server Error)\"})"
+        })
+        .to_string();
+        let guidance = tool_result_guidance("video_generate", true, &content);
+        match guidance {
+            Some(ContentBlock::Text { text }) => {
+                assert!(text.contains("retry the same video request once"));
+                assert!(text.contains("Do NOT switch to image_generate or my_photo_generate"));
+            }
+            other => panic!("expected transient video retry guidance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_guidance_stops_video_retry_when_capability_missing() {
+        let content = serde_json::json!({
+            "ok": false,
+            "message": "视频生成当前不可用。已尝试路径：component_skill(image2video/video_generate/text2video) -> generic_provider(disabled_by_registry) -> model_fallback(当前模型 'MiniMax-M2.7' 尚未接入原生视频生成能力)"
+        })
+        .to_string();
+        let guidance = tool_result_guidance("video_generate", true, &content);
+        match guidance {
+            Some(ContentBlock::Text { text }) => {
+                assert!(text.contains("currently unavailable or disabled"));
+                assert!(text.contains("Do NOT switch to image_generate or my_photo_generate"));
+            }
+            other => panic!("expected unavailable video guidance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_structured_tool_result_for_stream_keeps_presentable_and_job_results() {
+        let content = serde_json::json!({
+            "image_urls": ["/api/uploads/demo"],
+            "presentable_result": {
+                "kind": "media_result",
+                "mediaType": "image",
+                "assets": [{ "kind": "upload_url", "uri": "/api/uploads/demo" }]
+            },
+            "job_result": {
+                "kind": "job_result",
+                "job_id": "job-123"
+            }
+        })
+        .to_string();
+
+        let extracted =
+            extract_structured_tool_result_for_stream(&content).expect("structured result");
+        assert_eq!(extracted["presentable_result"]["kind"], "media_result");
+        assert_eq!(extracted["job_result"]["job_id"], "job-123");
+        assert!(extracted.get("image_urls").is_none());
+    }
+
+    #[test]
+    fn test_extract_structured_tool_result_for_stream_ignores_legacy_only_payloads() {
+        let content = serde_json::json!({
+            "image_urls": ["/api/uploads/demo"],
+            "images_generated": 1
+        })
+        .to_string();
+
+        assert!(extract_structured_tool_result_for_stream(&content).is_none());
+    }
+
+    #[test]
+    fn test_extract_structured_tool_result_for_stream_supports_camel_case_job_results() {
+        let content = serde_json::json!({
+            "outputType": "video",
+            "presentableResult": {
+                "kind": "job_result",
+                "job_id": "component-job-3",
+                "status": "queued"
+            }
+        })
+        .to_string();
+
+        let extracted =
+            extract_structured_tool_result_for_stream(&content).expect("structured result");
+        assert_eq!(extracted["presentable_result"]["kind"], "job_result");
+        assert_eq!(extracted["job_result"]["job_id"], "component-job-3");
     }
 
     #[test]

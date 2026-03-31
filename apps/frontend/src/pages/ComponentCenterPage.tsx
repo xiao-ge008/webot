@@ -409,69 +409,369 @@ function createMappingDraft(field: WorkflowNodeField, node: WorkflowNode, existi
   };
 }
 
-function summarizeInlinePreview(value: string, max = 72): string {
-  const compact = value.replace(/\s+/g, ' ').trim();
-  if (compact.length <= max) {
-    return compact;
+function inferDocumentCapabilityKeyFromDraft(draft: Pick<ComponentDefinition, 'returnType' | 'name' | 'englishName' | 'componentType' | 'description' | 'workflow'>): string | undefined {
+  if (draft.returnType !== 'text') return undefined;
+  const mappingHints = draft.workflow.parameterMappings
+    .map((mapping) => `${mapping.parameterName} ${mapping.fieldName} ${mapping.label} ${mapping.description}`)
+    .join(' ');
+  const combined = `${draft.name} ${draft.englishName} ${draft.componentType} ${draft.description} ${mappingHints}`.toLowerCase();
+  if (!combined.trim()) return undefined;
+  if (/compare|diff|比较|对比/.test(combined)) return 'compare.document';
+  if (/convert|conversion|export|转换|导出/.test(combined)) return 'convert.document';
+  if (/preview|viewer|render|预览|浏览/.test(combined)) return 'preview.document';
+  if (/chunk|segment|split|分块|切片/.test(combined)) return 'chunk.document';
+  if (/summary|summarize|摘要|总结|概括/.test(combined)) return 'summarize.document';
+  if (/extract|extractor|提取|抽取/.test(combined)) return 'extract.document';
+  if (/parse|parser|reader|ocr|pdf|docx|xlsx|pptx|word|excel|office|markdown|json|txt|csv|文档|解析|识别/.test(combined)) {
+    return 'parse.document';
   }
-  return `${compact.slice(0, max)}...`;
+  return undefined;
 }
 
-function buildMappingExampleValue(mapping: ComponentParameterMapping): unknown {
-  const key = mapping.parameterName.trim().toLowerCase();
-  if (mapping.valueType === 'number') {
-    if (typeof mapping.defaultValue === 'number') return mapping.defaultValue;
-    if (key.includes('duration') || key.includes('second')) return 120;
-    return 1;
-  }
-  if (mapping.valueType === 'boolean') {
-    return typeof mapping.defaultValue === 'boolean' ? mapping.defaultValue : true;
-  }
-  if (mapping.valueType === 'json') {
-    return mapping.defaultValue ?? {};
-  }
-  if (
-    typeof mapping.defaultValue === 'string'
-    && mapping.defaultValue.trim()
-    && !isLikelyLongPromptLikeField(mapping.parameterName)
-    && mapping.defaultValue.trim().length <= 48
-  ) {
-    return summarizeInlinePreview(mapping.defaultValue, 72);
-  }
-  if (key.includes('lyrics')) return '请填写歌词正文，支持分段换行';
-  if (key.includes('tag') || key.includes('prompt') || key.includes('style') || key.includes('desc')) {
-    return '请填写风格、情绪、乐器、节奏与演唱方式等描述';
-  }
-  if (key.includes('language')) return 'zh';
-  return `请填写${mapping.label || mapping.parameterName}`;
-}
-
-function buildPreviewExampleValues(draft: ComponentDefinition): Record<string, unknown> {
-  const requiredMappings = draft.workflow.parameterMappings.filter((mapping) => mapping.required);
-  const chosen = requiredMappings.length > 0
-    ? requiredMappings
-    : draft.workflow.parameterMappings.slice(0, 3);
-  return Object.fromEntries(chosen.map((mapping) => [mapping.parameterName, buildMappingExampleValue(mapping)]));
-}
-
-function buildRenderPreview(draft: ComponentDefinition): Record<string, unknown> {
+function buildDocumentCapabilityDefaults(capabilityKey: string) {
+  const specialization = capabilityKey.split('.')[0] || 'parse';
+  const baseToolByCapability: Record<string, string> = {
+    'parse.document': 'document_parse',
+    'extract.document': 'document_extract',
+    'summarize.document': 'document_summarize',
+    'convert.document': 'document_convert',
+    'compare.document': 'document_compare',
+    'preview.document': 'document_preview',
+    'chunk.document': 'document_chunk',
+  };
+  const requiresSlotsByCapability: Record<string, string[]> = {
+    'compare.document': ['left_document', 'right_document'],
+    'convert.document': ['document', 'target_format'],
+  };
+  const optionalSlotsByCapability: Record<string, string[]> = {
+    'compare.document': ['left_type', 'right_type'],
+    'convert.document': ['document_type'],
+  };
   return {
-    type: draft.componentType || 'ExactComponentType',
-    props: {
-      autoRun: false,
-      initialValues: buildPreviewExampleValues(draft),
+    capabilityBinding: {
+      capabilityKey,
+      capabilityScope: 'generic',
+      baseTool: baseToolByCapability[capabilityKey] || 'document_parse',
+      toolMode: specialization,
+      sourcePolicy: 'required',
+      fallbackPolicy: 'allow_generic_provider',
+      enabled: true,
+      priority: 100,
+    },
+    selectorMeta: {
+      specialization,
+      intentTags: ['document', specialization],
+      subjectPolicy: 'document',
+      supportsTextOnly: capabilityKey === 'summarize.document' || capabilityKey === 'chunk.document',
+      requiresSlots: requiresSlotsByCapability[capabilityKey] || ['document'],
+      optionalSlots: optionalSlotsByCapability[capabilityKey] || ['document_type'],
+      preferredMimeTypes: [
+        'application/pdf',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'text/csv',
+        'application/vnd.ms-powerpoint',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'text/plain',
+        'text/markdown',
+        'application/json',
+      ],
     },
   };
 }
 
-function buildInvokePreview(draft: ComponentDefinition): Record<string, unknown> {
+type BindingPresetId =
+  | 'text_to_image'
+  | 'image_to_video'
+  | 'text_to_video'
+  | 'text_to_audio'
+  | 'text_result'
+  | 'document_parse'
+  | 'document_extract'
+  | 'document_summarize'
+  | 'document_preview'
+  | 'document_compare'
+  | 'document_convert'
+  | 'document_chunk'
+  | 'custom';
+
+const BINDING_PRESET_OPTIONS: Array<{ id: Exclude<BindingPresetId, 'custom'>; label: string; description: string }> = [
+  { id: 'text_to_image', label: '文字生成图片', description: '文案直接生成图片。' },
+  { id: 'image_to_video', label: '图片生成视频', description: '必须上传图片，再根据描述生成视频。' },
+  { id: 'text_to_video', label: '文字生成视频', description: '只靠描述词直接生成视频。' },
+  { id: 'text_to_audio', label: '文字转语音', description: '文本直出音频。' },
+  { id: 'text_result', label: '普通文字结果', description: '返回文字内容，不做媒体渲染。' },
+  { id: 'document_parse', label: '文档解析', description: '读取并解析上传文档。' },
+  { id: 'document_extract', label: '文档抽取', description: '抽取文档正文或结构化内容。' },
+  { id: 'document_summarize', label: '文档摘要', description: '对文档生成摘要。' },
+  { id: 'document_preview', label: '文档预览', description: '返回文档预览结果。' },
+  { id: 'document_compare', label: '文档对比', description: '对两份文档进行比对。' },
+  { id: 'document_convert', label: '文档转换', description: '把文档转成指定格式。' },
+  { id: 'document_chunk', label: '文档分块', description: '把长文档切分为片段。' },
+];
+
+function getBindingPresetMeta(
+  draft: Pick<ComponentDefinition, 'returnType' | 'name' | 'englishName' | 'componentType' | 'description' | 'workflow' | 'capabilityBinding' | 'selectorMeta'>,
+): { label: string; description: string } {
+  const presetId = inferBindingPresetIdFromDraft(draft);
+  const matched = BINDING_PRESET_OPTIONS.find((option) => option.id === presetId);
+  if (matched) {
+    return {
+      label: matched.label,
+      description: matched.description,
+    };
+  }
   return {
-    type: 'ComponentInvokeAction',
-    props: {
-      componentName: draft.englishName || 'exact-component-name',
-      params: buildPreviewExampleValues(draft),
-      renderResult: draft.returnType !== 'text',
-      exposeToAgent: true,
+    label: '自定义绑定',
+    description: '当前未命中标准预设，系统保留原始配置。',
+  };
+}
+
+function inferMappingSlotFromDraft(
+  returnType: ComponentReturnType,
+  mapping: ComponentParameterMapping,
+): string | null {
+  const combined = `${mapping.parameterName} ${mapping.fieldName} ${mapping.label} ${mapping.description}`.toLowerCase();
+  if (!combined.trim()) return null;
+  if (/left_document|left file|左文档/.test(combined)) return 'left_document';
+  if (/right_document|right file|右文档/.test(combined)) return 'right_document';
+  if (/target_format|target format|目标格式/.test(combined)) return 'target_format';
+  if (/document_type|文档类型/.test(combined)) return 'document_type';
+  if (/left_type/.test(combined)) return 'left_type';
+  if (/right_type/.test(combined)) return 'right_type';
+  if (/document|file|pdf|docx|xlsx|pptx|markdown|文档|文件/.test(combined)) return 'document';
+  if (/source_image|reference_image|image|photo|poster|cover|图片|图像/.test(combined)) return 'image';
+  if (/source_video|video|clip|movie|视频/.test(combined)) return 'video';
+  if (/voice|speaker|音色/.test(combined)) return 'voice';
+  if (/audio|record|speech|音频|录音/.test(combined)) return 'audio';
+  if (/prompt|text|message|description|question|content|script|story|tag|lyrics|提示词|文本|描述/.test(combined)) {
+    return returnType === 'audio' ? 'text' : 'prompt';
+  }
+  return null;
+}
+
+function inferBindingPresetIdFromDraft(
+  draft: Pick<ComponentDefinition, 'returnType' | 'name' | 'englishName' | 'componentType' | 'description' | 'workflow' | 'capabilityBinding' | 'selectorMeta'>,
+): BindingPresetId {
+  const capabilityKey = draft.capabilityBinding.capabilityKey;
+  const documentPresetMap: Record<string, BindingPresetId> = {
+    'parse.document': 'document_parse',
+    'extract.document': 'document_extract',
+    'summarize.document': 'document_summarize',
+    'preview.document': 'document_preview',
+    'compare.document': 'document_compare',
+    'convert.document': 'document_convert',
+    'chunk.document': 'document_chunk',
+  };
+  if (documentPresetMap[capabilityKey]) {
+    return documentPresetMap[capabilityKey];
+  }
+  const documentCapabilityKey = draft.returnType === 'text'
+    ? inferDocumentCapabilityKeyFromDraft(draft)
+    : undefined;
+  if (documentCapabilityKey && documentPresetMap[documentCapabilityKey]) {
+    return documentPresetMap[documentCapabilityKey];
+  }
+
+  let hasRequiredImage = false;
+  let hasRequiredVideo = false;
+  let hasRequiredText = false;
+  for (const mapping of draft.workflow.parameterMappings) {
+    const slot = inferMappingSlotFromDraft(draft.returnType, mapping);
+    if (!slot || !mapping.required) continue;
+    if (slot === 'image') hasRequiredImage = true;
+    if (slot === 'video') hasRequiredVideo = true;
+    if (slot === 'prompt' || slot === 'text') hasRequiredText = true;
+  }
+
+  if (draft.returnType === 'video') {
+    if (hasRequiredImage || draft.capabilityBinding.sourcePolicy === 'requires_image') return 'image_to_video';
+    return 'text_to_video';
+  }
+  if (draft.returnType === 'audio') return 'text_to_audio';
+  if (draft.returnType === 'image') return 'text_to_image';
+  if (draft.returnType === 'text' && !hasRequiredVideo && !hasRequiredImage && !hasRequiredText) {
+    return 'text_result';
+  }
+  if (draft.returnType === 'text' && capabilityKey === 'generate.text') {
+    return 'text_result';
+  }
+  return 'custom';
+}
+
+function buildBindingPresetDefaults(
+  presetId: Exclude<BindingPresetId, 'custom'>,
+) {
+  switch (presetId) {
+    case 'image_to_video':
+      return {
+        capabilityBinding: {
+          capabilityKey: 'generate.video',
+          capabilityScope: 'generic',
+          baseTool: 'video_generate',
+          toolMode: 'generate',
+          sourcePolicy: 'requires_image',
+          fallbackPolicy: 'allow_generic_provider',
+          enabled: true,
+          priority: 100,
+        },
+        selectorMeta: {
+          specialization: 'general',
+          intentTags: [],
+          subjectPolicy: 'generic',
+          supportsTextOnly: false,
+          requiresSlots: ['image', 'prompt'],
+          optionalSlots: [],
+          preferredMimeTypes: ['video/*'],
+        },
+      };
+    case 'text_to_video':
+      return {
+        capabilityBinding: {
+          capabilityKey: 'generate.video',
+          capabilityScope: 'generic',
+          baseTool: 'video_generate',
+          toolMode: 'generate',
+          sourcePolicy: 'text_only',
+          fallbackPolicy: 'allow_generic_provider',
+          enabled: true,
+          priority: 100,
+        },
+        selectorMeta: {
+          specialization: 'general',
+          intentTags: [],
+          subjectPolicy: 'generic',
+          supportsTextOnly: true,
+          requiresSlots: ['prompt'],
+          optionalSlots: [],
+          preferredMimeTypes: ['video/*'],
+        },
+      };
+    case 'text_to_audio':
+      return {
+        capabilityBinding: {
+          capabilityKey: 'generate.audio',
+          capabilityScope: 'generic',
+          baseTool: 'text_to_speech',
+          toolMode: 'generate',
+          sourcePolicy: 'text_only',
+          fallbackPolicy: 'allow_generic_provider',
+          enabled: true,
+          priority: 100,
+        },
+        selectorMeta: {
+          specialization: 'general',
+          intentTags: [],
+          subjectPolicy: 'generic',
+          supportsTextOnly: true,
+          requiresSlots: ['text'],
+          optionalSlots: ['voice'],
+          preferredMimeTypes: ['audio/*'],
+        },
+      };
+    case 'text_result':
+      return {
+        capabilityBinding: {
+          capabilityKey: 'generate.text',
+          capabilityScope: 'generic',
+          baseTool: 'component_invoke',
+          toolMode: 'generate',
+          sourcePolicy: 'optional',
+          fallbackPolicy: 'manual_only',
+          enabled: true,
+          priority: 100,
+        },
+        selectorMeta: {
+          specialization: 'general',
+          intentTags: [],
+          subjectPolicy: 'generic',
+          supportsTextOnly: true,
+          requiresSlots: [],
+          optionalSlots: [],
+          preferredMimeTypes: ['text/plain'],
+        },
+      };
+    case 'document_parse':
+      return buildDocumentCapabilityDefaults('parse.document');
+    case 'document_extract':
+      return buildDocumentCapabilityDefaults('extract.document');
+    case 'document_summarize':
+      return buildDocumentCapabilityDefaults('summarize.document');
+    case 'document_preview':
+      return buildDocumentCapabilityDefaults('preview.document');
+    case 'document_compare':
+      return buildDocumentCapabilityDefaults('compare.document');
+    case 'document_convert':
+      return buildDocumentCapabilityDefaults('convert.document');
+    case 'document_chunk':
+      return buildDocumentCapabilityDefaults('chunk.document');
+    case 'text_to_image':
+    default:
+      return {
+        capabilityBinding: {
+          capabilityKey: 'generate.image',
+          capabilityScope: 'generic',
+          baseTool: 'image_generate',
+          toolMode: 'generate',
+          sourcePolicy: 'optional',
+          fallbackPolicy: 'allow_generic_provider',
+          enabled: true,
+          priority: 100,
+        },
+        selectorMeta: {
+          specialization: 'general',
+          intentTags: [],
+          subjectPolicy: 'generic',
+          supportsTextOnly: true,
+          requiresSlots: ['prompt'],
+          optionalSlots: [],
+          preferredMimeTypes: ['image/*'],
+        },
+      };
+  }
+}
+
+function buildCapabilityDefaults(
+  returnType: ComponentReturnType,
+  draft?: Pick<ComponentDefinition, 'returnType' | 'name' | 'englishName' | 'componentType' | 'description' | 'workflow' | 'capabilityBinding' | 'selectorMeta'>,
+) {
+  const presetId = inferBindingPresetIdFromDraft({
+    returnType,
+    name: draft?.name || '',
+    englishName: draft?.englishName || '',
+    componentType: draft?.componentType || '',
+    description: draft?.description || '',
+    workflow: draft?.workflow || { requestUrl: '', appId: '', rawPayload: null, nodes: [], parameterMappings: [], runninghubInstanceType: 'default', runninghubUsePersonalQueue: false },
+    capabilityBinding: draft?.capabilityBinding || { capabilityKey: '', capabilityScope: 'generic', baseTool: '', toolMode: 'generate', sourcePolicy: 'optional', fallbackPolicy: 'allow_generic_provider', enabled: true, priority: 100 },
+    selectorMeta: draft?.selectorMeta || { specialization: 'general', intentTags: [], subjectPolicy: 'generic', supportsTextOnly: false, requiresSlots: [], optionalSlots: [], preferredMimeTypes: [] },
+  });
+  const fallbackPreset: Exclude<BindingPresetId, 'custom'> =
+    returnType === 'video'
+      ? 'text_to_video'
+      : returnType === 'audio'
+        ? 'text_to_audio'
+        : returnType === 'text'
+          ? 'text_result'
+          : 'text_to_image';
+  return buildBindingPresetDefaults(presetId === 'custom' ? fallbackPreset : presetId);
+}
+
+function normalizeDraftBindingPreset(draft: ComponentDefinition): ComponentDefinition {
+  const presetId = inferBindingPresetIdFromDraft(draft);
+  if (presetId === 'custom') {
+    return draft;
+  }
+  const defaults = buildBindingPresetDefaults(presetId);
+  return {
+    ...draft,
+    capabilityBinding: {
+      ...defaults.capabilityBinding,
+      enabled: draft.capabilityBinding.enabled,
+    },
+    selectorMeta: {
+      ...defaults.selectorMeta,
     },
   };
 }
@@ -561,21 +861,10 @@ export function ComponentCenterPage() {
     };
   }, [items]);
 
-  const aiUsagePreview = useMemo(() => {
-    const renderPreview = toPrettyJson(buildRenderPreview(draft));
-    const invokePreview = toPrettyJson(buildInvokePreview(draft));
-    const requiredParams = draft.workflow.parameterMappings
-      .filter((mapping) => mapping.required)
-      .map((mapping) => mapping.parameterName);
-    return {
-      renderType: draft.componentType || 'ExactComponentType',
-      invokeName: draft.englishName || 'exact-component-name',
-      requiredParams,
-      renderPreview,
-      invokePreview,
-      preferInvoke: draft.returnType !== 'text',
-    };
-  }, [draft]);
+  const currentBindingPreset = useMemo(
+    () => inferBindingPresetIdFromDraft(draft),
+    [draft],
+  );
 
   const openCreate = (providerType: ComponentProviderType) => {
     setEditingKey(null);
@@ -589,12 +878,13 @@ export function ComponentCenterPage() {
   };
 
   const openEdit = (item: ComponentDefinition) => {
+    const normalizedItem = normalizeDraftBindingPreset(item);
     setEditingKey(item.englishName);
-    setDraft(item);
-    const serializedWorkflow = item.workflow.rawPayload == null ? '' : toPrettyJson(item.workflow.rawPayload);
+    setDraft(normalizedItem);
+    const serializedWorkflow = normalizedItem.workflow.rawPayload == null ? '' : toPrettyJson(normalizedItem.workflow.rawPayload);
     setWorkflowText(serializedWorkflow);
-    setLastParsedWorkflowText(item.workflow.nodes.length > 0 ? serializedWorkflow.trim() : '');
-    setSelectedNodeId(item.workflow.nodes[0]?.nodeId || '');
+    setLastParsedWorkflowText(normalizedItem.workflow.nodes.length > 0 ? serializedWorkflow.trim() : '');
+    setSelectedNodeId(normalizedItem.workflow.nodes[0]?.nodeId || '');
     setEditorTab('workflow');
     setDialogOpen(true);
   };
@@ -793,11 +1083,16 @@ export function ComponentCenterPage() {
                   <span>{t('components.labels.nodeCount', { count: item.workflow.nodes.length })}</span>
                   <span>{t('components.labels.mappingCount', { count: item.workflow.parameterMappings.length })}</span>
                 </div>
-                <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 px-3 py-2 text-xs text-foreground-secondary">
-                  AI 渲染 type: <span className="font-mono text-foreground">{item.componentType}</span>
-                  {' · '}
-                  AI 调用 componentName: <span className="font-mono text-foreground">{item.englishName}</span>
-                </div>
+                {(() => {
+                  const bindingMeta = getBindingPresetMeta(item);
+                  return (
+                    <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 px-3 py-2 text-xs text-foreground-secondary">
+                      组件绑定：<span className="font-medium text-foreground">{bindingMeta.label}</span>
+                      {' · '}
+                      {bindingMeta.description}
+                    </div>
+                  );
+                })()}
               </div>
               <div className="flex items-center gap-2">
                 <Button variant="outline" size="sm" className="gap-2" onClick={() => openEdit(item)}>
@@ -862,10 +1157,31 @@ export function ComponentCenterPage() {
                   </div>
                   <div className="grid gap-2">
                     <Label>{t('components.editor.returnType')}</Label>
-                    <Select
-                      value={draft.returnType}
-                      onValueChange={(value: ComponentReturnType) => setDraft((prev) => ({ ...prev, returnType: value }))}
-                    >
+                        <Select
+                          value={draft.returnType}
+                          onValueChange={(value: ComponentReturnType) => {
+                            setDraft((prev) => ({
+                              ...(() => {
+                                const nextDraft = {
+                                  ...prev,
+                                  returnType: value,
+                                };
+                                const defaults = buildCapabilityDefaults(value, nextDraft);
+                                return {
+                                  ...prev,
+                                  returnType: value,
+                                  capabilityBinding: {
+                                    ...defaults.capabilityBinding,
+                                    enabled: prev.capabilityBinding.enabled,
+                                  },
+                                  selectorMeta: {
+                                    ...defaults.selectorMeta,
+                                  },
+                                };
+                              })(),
+                            }));
+                          }}
+                        >
                       <SelectTrigger>
                         <SelectValue />
                       </SelectTrigger>
@@ -898,33 +1214,61 @@ export function ComponentCenterPage() {
 
               <Card className="border-border-light/40 shadow-none">
                 <CardHeader>
-                  <CardTitle className="text-base">AI 使用预览</CardTitle>
+                  <CardTitle className="text-base">组件绑定</CardTitle>
                 </CardHeader>
-                <CardContent className="grid gap-4">
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 p-4">
-                      <div className="text-xs font-medium uppercase tracking-[0.18em] text-foreground-tertiary">渲染通道</div>
-                      <div className="mt-2 text-sm text-foreground-secondary">当参数还不完整，或者你想让 AI 先把组件卡片展示出来时使用。</div>
-                      <div className="mt-3 text-sm text-foreground">type 必须精确写成 <span className="font-mono">{aiUsagePreview.renderType}</span></div>
+                <CardContent className="grid gap-4 md:grid-cols-2">
+                  <div className="grid gap-2 md:col-span-2">
+                    <Label>组件绑定</Label>
+                    <Select
+                      value={currentBindingPreset}
+                      onValueChange={(value: BindingPresetId) => {
+                        if (value === 'custom') {
+                          return;
+                        }
+                        const defaults = buildBindingPresetDefaults(value);
+                        setDraft((prev) => ({
+                          ...prev,
+                          capabilityBinding: {
+                            ...defaults.capabilityBinding,
+                            enabled: prev.capabilityBinding.enabled,
+                          },
+                          selectorMeta: {
+                            ...defaults.selectorMeta,
+                          },
+                        }));
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="选择组件绑定" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {BINDING_PRESET_OPTIONS
+                          .filter((option) => {
+                            if (draft.returnType === 'image') return option.id === 'text_to_image';
+                            if (draft.returnType === 'video') {
+                              return option.id === 'text_to_video' || option.id === 'image_to_video';
+                            }
+                            if (draft.returnType === 'audio') return option.id === 'text_to_audio';
+                            if (draft.returnType === 'text') {
+                              return option.id === 'text_result' || option.id.startsWith('document_');
+                            }
+                            return false;
+                          })
+                          .map((option) => (
+                            <SelectItem key={option.id} value={option.id}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        {currentBindingPreset === 'custom' ? (
+                          <SelectItem value="custom">自定义绑定</SelectItem>
+                        ) : null}
+                      </SelectContent>
+                    </Select>
+                    <div className="text-xs text-foreground-secondary">
+                      这里只选业务语义，底层的基础工具、能力 Key、Source Policy、Selector slots 都会自动映射，不需要再手填专业字段。
                     </div>
-                    <div className="rounded-2xl border border-border-light/50 bg-background-secondary/20 p-4">
-                      <div className="text-xs font-medium uppercase tracking-[0.18em] text-foreground-tertiary">调用通道</div>
-                      <div className="mt-2 text-sm text-foreground-secondary">当参数已经齐全，且希望 AI 直接发起生成并把结果回填聊天时使用。</div>
-                      <div className="mt-3 text-sm text-foreground">componentName 必须精确写成 <span className="font-mono">{aiUsagePreview.invokeName}</span></div>
-                    </div>
-                  </div>
-                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-4 text-sm leading-6 text-emerald-900">
-                    推荐策略：{aiUsagePreview.preferInvoke ? '图片 / 视频 / 音频组件在参数齐全时优先走调用通道，并设置 renderResult=true；参数不全时再走渲染通道。' : '文本类组件通常可以直接调用；如果需要用户补参或想先展示表单，再走渲染通道。'}
-                    {aiUsagePreview.requiredParams.length > 0 ? ` 当前必填参数：${aiUsagePreview.requiredParams.join('、')}` : ' 当前还没有标记必填参数，这会显著增加 AI 乱补字段和错误调用的概率。'}
-                  </div>
-                  <div className="grid gap-4 xl:grid-cols-2">
-                    <div className="grid gap-2">
-                      <Label>渲染通道 UI_JSON 示例</Label>
-                      <Textarea value={aiUsagePreview.renderPreview} readOnly className="min-h-[220px] font-mono text-xs" />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label>调用通道 UI_JSON 示例</Label>
-                      <Textarea value={aiUsagePreview.invokePreview} readOnly className="min-h-[220px] font-mono text-xs" />
+                    <div className="text-sm text-foreground-secondary">
+                      {BINDING_PRESET_OPTIONS.find((option) => option.id === currentBindingPreset)?.description || '当前绑定没有命中预设，系统会保留原始配置。'}
                     </div>
                   </div>
                 </CardContent>
