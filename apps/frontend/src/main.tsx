@@ -9,14 +9,6 @@ import './index.css';
 import App from './App.tsx';
 import { requestJson } from '@/services/transport';
 
-declare global {
-  interface Window {
-    __WEBOT_API__?: {
-      requestJson: typeof requestJson;
-    };
-  }
-}
-
 window.__WEBOT_API__ = {
   requestJson,
 };

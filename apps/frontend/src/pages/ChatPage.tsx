@@ -21,7 +21,7 @@ import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog';
 import type { TaskDetailsTask } from '@/components/tasks/TaskDetailsDialog';
 import { A2AWorkDetailsDialog } from '@/components/tasks/A2AWorkDetailsDialog';
 import type { Agent } from '@/types';
-import type { Task, TaskConversationType, TaskRunRecord } from '@/types/tasks';
+import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord } from '@/types/tasks';
 import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import type { GroupQueueItem, GroupQueueReason, GroupQueueStatus, GroupSessionRuntime } from '@/types/group';
@@ -56,7 +56,6 @@ import {
     deleteTask,
     getTaskDetail,
     getTaskFinalSummary,
-    hasTaskFinalSummaryDelivered,
     listPendingTaskReportDeliveries,
     listTaskRuns,
     markTaskFinalSummaryDelivered,
@@ -71,7 +70,6 @@ import {
     normalizeChatTaskDraftState,
     normalizeChatTaskDraftTaskCard,
 } from '@/services/chat-task-draft-client';
-import type { ChatTaskDraftStatePayload } from '@/services/chat-task-draft-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import { useResolvedRuntimeAssetSrc } from '@/lib/runtime-asset-url';
 import {
@@ -635,14 +633,6 @@ function normalizeLabelComponent(raw: string, maxLen: number): string {
 
 function buildLocalSessionLabel(sessionId: string): string {
     return normalizeLabelComponent(sessionId, 96);
-}
-
-function isWebRuntime(): boolean {
-    if (typeof window === 'undefined') {
-        return false;
-    }
-    const globalWindow = window as unknown as { __TAURI_INTERNALS__?: unknown };
-    return !globalWindow.__TAURI_INTERNALS__;
 }
 
 function parseBackendMessageRole(value: unknown): Message['role'] {
@@ -1771,19 +1761,26 @@ function buildSessionFromBackendPayload(
         } as Message);
     });
 
-    if (pendingRecoveredAgentPayload && (pendingRecoveredAgentPayload.spec != null || pendingRecoveredAgentPayload.readableText?.trim() || (pendingRecoveredAgentPayload.tools?.length ?? 0) > 0)) {
-        const text = pendingRecoveredAgentPayload.readableText?.trim() || '';
-        messages.push({
-            id: buildStableRemoteMessageId(rawSessionId, { kind: 'pending_tool_result' }, rows.length, 'agent', text),
-            role: 'agent',
-            agentId: ownerAgentId?.trim() || undefined,
-            text: cleanupAssistantText(text, pendingRecoveredAgentPayload.spec),
-            tools: pendingRecoveredAgentPayload.tools,
-            spec: pendingRecoveredAgentPayload.spec,
-            uiStreamState: pendingRecoveredAgentPayload.spec != null ? 'ready' : 'idle',
-            debugSpecSource: pendingRecoveredAgentPayload.spec != null ? 'recovered' : 'none',
-            timestamp: new Date(startAt + rows.length * 1000).toISOString(),
-        } as Message);
+    if (pendingRecoveredAgentPayload !== null) {
+        const remainingRecoveredPayload = pendingRecoveredAgentPayload as {
+            readableText?: string;
+            spec?: unknown;
+            tools?: MessageToolCall[];
+        };
+        if (remainingRecoveredPayload.spec != null || remainingRecoveredPayload.readableText?.trim() || (remainingRecoveredPayload.tools?.length ?? 0) > 0) {
+            const text = remainingRecoveredPayload.readableText?.trim() || '';
+            messages.push({
+                id: buildStableRemoteMessageId(rawSessionId, { kind: 'pending_tool_result' }, rows.length, 'agent', text),
+                role: 'agent',
+                agentId: ownerAgentId?.trim() || undefined,
+                text: cleanupAssistantText(text, remainingRecoveredPayload.spec),
+                tools: remainingRecoveredPayload.tools,
+                spec: remainingRecoveredPayload.spec,
+                uiStreamState: remainingRecoveredPayload.spec != null ? 'ready' : 'idle',
+                debugSpecSource: remainingRecoveredPayload.spec != null ? 'recovered' : 'none',
+                timestamp: new Date(startAt + rows.length * 1000).toISOString(),
+            } as Message);
+        }
     }
     const rawSessionLabel = typeof source.label === 'string'
         ? source.label.trim()
@@ -2744,10 +2741,6 @@ function resolveTaskConversationScope(
     };
 }
 
-function isTaskDeliveryPayloadRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value != null && !Array.isArray(value);
-}
-
 function hasAsyncWorkHandoff(message: Message): boolean {
     if (message.taskCard?.taskKind === 'chat_async'
         && message.taskCard.stage === 'running') {
@@ -3587,17 +3580,6 @@ export function ChatPage({
                 .map((card) => card.taskId as string),
         )]
     ), [messages]);
-    const sessionTaskSummaries = useMemo(() => {
-        const latestByKey = new Map<string, { messageId: string; card: ChatTaskCardData }>();
-        for (const message of messages) {
-            const card = message.taskCard;
-            if (!card) continue;
-            const key = card.taskId?.trim() || `draft:${message.id}`;
-            latestByKey.set(key, { messageId: message.id, card });
-        }
-        return [...latestByKey.values()]
-            .sort((left, right) => Date.parse(right.card.updatedAt || right.card.createdAt) - Date.parse(left.card.updatedAt || left.card.createdAt));
-    }, [messages]);
     const sessionKeywordNormalized = useMemo(() => sessionKeyword.trim().toLocaleLowerCase(), [sessionKeyword]);
     const visibleSessions = useMemo(
         () => {
@@ -7409,8 +7391,37 @@ export function ChatPage({
         })();
     }, [chatAgentId, mentionDispatchMaxDepth, mentionDispatchMaxTargets, messages]);
 
+    const buildQuickActionPrompt = (
+        intent: Exclude<NonNullable<ChatSendPayload['intent']>, 'default'>,
+        extraInstruction: string,
+    ): string => {
+        const normalizedExtra = extraInstruction.trim();
+        if (intent === 'continue') {
+            return [
+                '[system:quick-action=continue]',
+                '请基于当前会话上下文继续输出，直接衔接上一轮，不要重复已经说过的内容，不要重新开场。',
+                '如果上一条回复未完成，请优先续写未完成部分；如果上一条已经结束，请沿着当前主题继续推进最有价值的下一步。',
+                '保持当前语言、语气和格式一致，默认直接给内容，不要解释你在“继续”。',
+                normalizedExtra ? `额外要求：${normalizedExtra}` : '',
+            ].filter(Boolean).join('\n');
+        }
+        return [
+            '[system:quick-action=options]',
+            '请根据当前会话状态输出一个供用户选择下一步的 OptionSelector 卡片。',
+            '回复要求：可以先给一句不超过30字的简短引导，然后紧跟一个合法、完整、闭合的 <UI_JSON>...</UI_JSON>。',
+            '卡片要求：type 必须为 "OptionSelector"；props.mode="single"；props.submitAction="submit_option"；props.title 和 props.description 要贴合当前上下文；props.options 提供 3 到 5 个选项。',
+            '每个选项必须包含 label、hint、prompt、value，其中 prompt 必须是用户点击后可直接发送给 AI 的自然语言指令。',
+            groupRuntimeEnabled
+                ? '当前是群聊语境，请优先给出继续讨论、指定成员协作、收敛结论、切换执行方式等选项。'
+                : '当前是私聊语境，请优先给出继续展开、澄清需求、切换方案、落地执行等选项。',
+            '不要输出代码块，不要输出多个 UI_JSON，不要把整条回复包装成 response JSON。',
+            normalizedExtra ? `额外要求：${normalizedExtra}` : '',
+        ].filter(Boolean).join('\n');
+    };
+
     const handleSendMessage = async (payload: ChatSendPayload): Promise<boolean> => {
         if (inputLocked || isSendingRef.current || silentDispatchingRef.current || multiReplyDispatchingRef.current) return false;
+        const intent = payload.intent ?? 'default';
         const rawText = payload.rawText.trim();
         const displayText = payload.displayText.trim();
         const routingText = rawText || displayText;
@@ -7420,8 +7431,12 @@ export function ChatPage({
         const transformedPromptText = rawText
             ? (transformUserMessage ? transformUserMessage(rawText) : rawText)
             : '';
-        const transformed = transformedPromptText
-            || (transformUserMessage ? transformUserMessage(routingText) : routingText);
+        const actionPromptText = intent === 'default'
+            ? ''
+            : buildQuickActionPrompt(intent, transformedPromptText);
+        const transformed = intent === 'default'
+            ? (transformedPromptText || (transformUserMessage ? transformUserMessage(routingText) : routingText))
+            : actionPromptText;
         const primaryReplyAgent = (() => {
             const resolver = resolvePrimaryReplyAgentRef.current;
             if (!resolver) return null;
@@ -7455,8 +7470,8 @@ export function ChatPage({
             appendUser: true,
             agentIdOverride: primaryReplyAgentId,
             agentOverride: primaryReplyAgent ?? undefined,
-            userPromptText: transformedPromptText,
-            userDisplayText: displayText || transformed,
+            userPromptText: actionPromptText || transformedPromptText,
+            userDisplayText: displayText || (intent === 'continue' ? '继续' : intent === 'options' ? '选项' : transformed),
             userAttachments: payload.attachments,
             groupQueueItemId: primaryQueueItem.id,
         });

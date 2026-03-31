@@ -55,14 +55,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-function isTauriRuntime(): boolean {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-  const globalWindow = window as unknown as { __TAURI_INTERNALS__?: unknown };
-  return Boolean(globalWindow.__TAURI_INTERNALS__);
-}
-
 function canUsePersistentBrowserStorage(): boolean {
   return typeof window !== 'undefined' && typeof localStorage !== 'undefined';
 }

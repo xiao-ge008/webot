@@ -6,7 +6,7 @@ import {
   listAgents,
   type AgentSessionMessage,
 } from '@/services/agent-client';
-import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord } from '@/types/tasks';
+import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord, TaskTimelineEntry } from '@/types/tasks';
 
 const TASK_CLIENT_AGENT_ID_KEY = 'webot-task-center-agent-id';
 const TASK_LOCAL_META_KEY = 'webot-task-local-meta-v1';
@@ -357,7 +357,7 @@ function mapTaskFinalSummary(input: unknown): Task['finalSummary'] | null | unde
   };
 }
 
-function mapTaskTimelineEntry(input: unknown): Task['timeline'][number] | null {
+function mapTaskTimelineEntry(input: unknown): TaskTimelineEntry | null {
   if (!isRecord(input)) return null;
   const id = trimToUndefined(typeof input.id === 'string' ? input.id : undefined);
   const sourceKind = trimToUndefined(typeof input.source_kind === 'string' ? input.source_kind : (typeof input.sourceKind === 'string' ? input.sourceKind : undefined));
@@ -382,9 +382,10 @@ function mapTaskTimelineEntry(input: unknown): Task['timeline'][number] | null {
 }
 
 function mapManagedTaskDetail(input: unknown): Task | null {
-  const row = isRecord(input) ? input : null;
-  const spec = row && isRecord(row.spec) ? row.spec : null;
-  const runtime = row && isRecord(row.runtime) ? row.runtime : null;
+  if (!isRecord(input)) return null;
+  const row = input;
+  const spec = isRecord(row.spec) ? row.spec : null;
+  const runtime = isRecord(row.runtime) ? row.runtime : null;
   if (!spec || !runtime) return null;
 
   const id = trimToUndefined(typeof spec.id === 'string' ? spec.id : undefined);

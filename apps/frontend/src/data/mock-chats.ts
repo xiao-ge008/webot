@@ -58,7 +58,7 @@ export interface Message {
     debugPromptChannel?: string;
     debugRenderMode?: string;
     debugHasUiJson?: boolean;
-    debugSpecSource?: 'none' | 'done' | 'tool_result' | 'patch' | 'inline';
+    debugSpecSource?: 'none' | 'done' | 'tool_result' | 'patch' | 'inline' | 'recovered' | 'task_card';
     debugNormalizedUiRawText?: string;
     debugRepairedUiRawText?: string;
     debugUiContractWarnings?: string;

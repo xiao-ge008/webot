@@ -1,5 +1,5 @@
 import { saveOfficeBinaryAs } from '@/services/office-file-client';
-import { getApiBaseUrl, getOpenFangBaseUrl, requestJson, requestOpenFangJson } from '@/services/transport';
+import { getApiBaseUrl, getOpenFangBaseUrl, requestJson } from '@/services/transport';
 import {
   DEFAULT_AGENT_TTS_CONFIG,
   type AgentSpeakerProfile,

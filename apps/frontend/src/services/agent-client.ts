@@ -306,14 +306,6 @@ function toBooleanValue(value: unknown, fallback = false): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
-function isTauriRuntime(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-  const globalWindow = window as unknown as { __TAURI_INTERNALS__?: unknown };
-  return Boolean(globalWindow.__TAURI_INTERNALS__);
-}
-
 function toNumberValue(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }

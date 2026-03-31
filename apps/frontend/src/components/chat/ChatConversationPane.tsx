@@ -338,6 +338,7 @@ export interface ChatSendPayload {
   rawText: string;
   displayText: string;
   attachments?: ChatAttachment[];
+  intent?: 'default' | 'continue' | 'options';
 }
 
 export interface ChatContextUsageMeter {
@@ -553,16 +554,6 @@ function shouldRenderStructuredSpec(spec: unknown): boolean {
     return true;
   }
   return isComponentInvokeJobProgressSpec(spec);
-}
-
-function stripMarkdownAssetSyntax(markdown: string): string {
-  return markdown
-    .replace(/!\[[^\]]*\]\([^)]+\)/g, ' ')
-    .replace(/\[[^\]]*\]\((?:https?:\/\/|\/api\/uploads\/)[^)]+\)/g, ' ')
-    .replace(/(?:https?:\/\/|\/api\/uploads\/)\S+/gu, ' ')
-    .replace(/[`>#*\-|]/gu, ' ')
-    .replace(/\s+/gu, ' ')
-    .trim();
 }
 
 function sanitizeMarkdownForRenderableSpec(markdown: string, spec: unknown): string {
@@ -1452,6 +1443,38 @@ export function ChatConversationPane({
         return;
       }
       draftAttachments.forEach((item) => revokeComposerPreview(item.previewUrl));
+    } catch {
+      setInputValue(draftInputValue);
+      setComposerAttachments(draftAttachments);
+    } finally {
+      setComposerSubmitting(false);
+    }
+  };
+
+  const handleQuickActionSend = async (intent: 'continue' | 'options') => {
+    const draftInputValue = inputValue;
+    const draftAttachments = composerAttachments.map((item) => ({ ...item }));
+    const uploadingCount = composerAttachments.filter((item) => item.status === 'uploading').length;
+    if (inputLocked || composerSubmitting || uploadingCount > 0 || composerAttachments.length > 0) {
+      return;
+    }
+    if (typeof onUserActivity === 'function') {
+      onUserActivity('send');
+    }
+    const userText = inputValue.trim();
+    setInputValue('');
+    setComposerSubmitting(true);
+    const payload: ChatSendPayload = {
+      rawText: userText,
+      displayText: intent === 'continue' ? '继续' : '选项',
+      intent,
+    };
+    try {
+      const accepted = await onSendMessage(payload);
+      if (accepted === false) {
+        setInputValue(draftInputValue);
+        setComposerAttachments(draftAttachments);
+      }
     } catch {
       setInputValue(draftInputValue);
       setComposerAttachments(draftAttachments);
@@ -2898,6 +2921,7 @@ export function ChatConversationPane({
   const readyAttachmentCount = composerAttachments.filter((item) => item.status === 'ready').length;
   const uploadingAttachmentCount = composerAttachments.filter((item) => item.status === 'uploading').length;
   const canSendMessage = !inputLocked && !composerSubmitting && uploadingAttachmentCount === 0 && (inputValue.trim().length > 0 || readyAttachmentCount > 0);
+  const canUseQuickAction = !inputLocked && !composerSubmitting && !isSending && uploadingAttachmentCount === 0 && composerAttachments.length === 0;
   const showAutoConversationToggle = typeof onToggleAutoConversation === 'function';
 
   return (
@@ -3179,14 +3203,44 @@ export function ChatConversationPane({
                     </span>
                   </Button>
                 ) : (
-                  <Button
-                    onClick={() => void handleSend()}
-                    disabled={!canSendMessage}
-                    size="icon"
-                    className="h-8 w-8 rounded-full shadow-md bg-black text-white hover:bg-zinc-800 active:scale-95 transition-all disabled:opacity-30"
-                  >
-                    <Send className="w-3.5 h-3.5" />
-                  </Button>
+                  <>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-8 rounded-full px-3 text-xs"
+                      disabled={!canUseQuickAction}
+                      onClick={() => void handleQuickActionSend('continue')}
+                      title="让 AI 基于当前上下文继续输出"
+                    >
+                      <span className="inline-flex items-center gap-1.5">
+                        <ChevronDown className="h-3.5 w-3.5" />
+                        继续
+                      </span>
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-8 rounded-full px-3 text-xs"
+                      disabled={!canUseQuickAction}
+                      onClick={() => void handleQuickActionSend('options')}
+                      title="让 AI 生成当前情境下的选项卡片"
+                    >
+                      <span className="inline-flex items-center gap-1.5">
+                        <ListChecks className="h-3.5 w-3.5" />
+                        选项
+                      </span>
+                    </Button>
+                    <Button
+                      onClick={() => void handleSend()}
+                      disabled={!canSendMessage}
+                      size="icon"
+                      className="h-8 w-8 rounded-full shadow-md bg-black text-white hover:bg-zinc-800 active:scale-95 transition-all disabled:opacity-30"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                    </Button>
+                  </>
                 )}
               </div>
             </div>

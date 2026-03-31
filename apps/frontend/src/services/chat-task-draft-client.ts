@@ -64,37 +64,46 @@ function asTimeline(value: unknown): ChatTaskLifecycleItem[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
   }
-  const rows = value
-    .filter((item): item is Record<string, unknown> => typeof item === 'object' && item != null)
-    .map((item) => {
-      const kind = asString(item.kind);
-      const at = asString(item.at);
-      const title = asString(item.title);
-      if (!kind || !at || !title) {
-        return null;
-      }
-      return {
-        id: asString(item.id) || `${kind}-${at}`,
-        kind: (
-          kind === 'created'
-          || kind === 'started'
-          || kind === 'progress'
-          || kind === 'anomaly'
-          || kind === 'final'
-          || kind === 'failed'
-          || kind === 'cancelled'
-        ) ? kind : 'progress',
-        title,
-        detail: asString(item.detail),
-        at,
-        runCount: asNumber(item.run_count ?? item.runCount),
-        level: (() => {
-          const level = asString(item.level);
-          return level === 'info' || level === 'success' || level === 'error' ? level : undefined;
-        })(),
-      } satisfies ChatTaskLifecycleItem;
-    })
-    .filter((item): item is ChatTaskLifecycleItem => item != null);
+  const rows: ChatTaskLifecycleItem[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item == null) {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const kind = asString(record.kind);
+    const at = asString(record.at);
+    const title = asString(record.title);
+    if (!kind || !at || !title) {
+      continue;
+    }
+    const timelineItem: ChatTaskLifecycleItem = {
+      id: asString(record.id) || `${kind}-${at}`,
+      kind: (
+        kind === 'created'
+        || kind === 'started'
+        || kind === 'progress'
+        || kind === 'anomaly'
+        || kind === 'final'
+        || kind === 'failed'
+        || kind === 'cancelled'
+      ) ? kind : 'progress',
+      title,
+      at,
+    };
+    const detail = asString(record.detail);
+    if (detail) {
+      timelineItem.detail = detail;
+    }
+    const runCount = asNumber(record.run_count ?? record.runCount);
+    if (runCount !== undefined) {
+      timelineItem.runCount = runCount;
+    }
+    const level = asString(record.level);
+    if (level === 'info' || level === 'success' || level === 'error') {
+      timelineItem.level = level;
+    }
+    rows.push(timelineItem);
+  }
   return rows.length > 0 ? rows : undefined;
 }
 

@@ -13,6 +13,7 @@ declare global {
           body?: unknown;
           headers?: Record<string, string>;
           signal?: AbortSignal;
+          timeoutMs?: number;
         },
       ) => Promise<TResponse>;
     };
