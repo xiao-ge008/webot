@@ -1,0 +1,4 @@
+apps/frontend/src-tauri/resources/openfang/openfang.exe filter=lfs diff=lfs merge=lfs -text
+apps/frontend/src-tauri/resources/openfang/windows/openfang.exe filter=lfs diff=lfs merge=lfs -text
+apps/frontend/src-tauri/resources/openfang/win-x86_64/openfang.exe filter=lfs diff=lfs merge=lfs -text
+apps/frontend/src-tauri/resources/openfang/win/openfang.exe filter=lfs diff=lfs merge=lfs -text
