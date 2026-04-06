@@ -38,10 +38,8 @@ import {
 } from "@/services/transport";
 import {
   getAgentSkillAssignments,
-  getManagementAgentDetail,
-  listManagementA2aAgents,
-  listManagementAgents,
 } from "@/services/management-client";
+import type { ChatTaskDraftStatePayload } from "@/services/chat-task-draft-client";
 
 function isTauriRuntime(): boolean {
   if (typeof window === "undefined") {
@@ -187,20 +185,12 @@ const skillComponentManifestCache = new Map<
   }
 >();
 const managementComponentInvokeContextCache = new Map<string, string>();
-const collaborationHintCache = new Map<
-  string,
-  { expiresAt: number; hint: string }
->();
-const COLLABORATION_HINT_TTL_MS = 5_000;
 const STREAM_FIRST_EVENT_TIMEOUT_MS = 20_000;
 const STREAM_IDLE_TIMEOUT_MS = 60_000;
 const STREAM_TOOL_IDLE_TIMEOUT_MS = 10 * 60_000;
 const STREAM_IMAGE_TOOL_IDLE_TIMEOUT_MS = 20 * 60_000;
 const STREAM_MAX_TIMEOUT_MS = 3_600_000;
 const CHAT_RECOVERY_SETTLE_MS = 500;
-const COLLAB_TAG_DISPATCH = "webot:collab_dispatcher";
-const COLLAB_CONFIG_BEGIN = "[WEBOT_COLLAB_CONFIG_BEGIN]";
-const COLLAB_CONFIG_END = "[WEBOT_COLLAB_CONFIG_END]";
 
 function normalizeStreamToolName(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -233,12 +223,6 @@ export function invalidateComponentSkillRuntimeCaches(): void {
   availableSkillComponentsCache.clear();
   skillComponentManifestCache.clear();
   managementComponentInvokeContextCache.clear();
-}
-
-interface CollaborationConfigPayload {
-  discoverable: boolean;
-  dispatchEnabled: boolean;
-  selectedWorkers: string[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -369,72 +353,6 @@ function parseAgentAppearanceUpdatedFromPayload(
   }
   return parseAgentAppearanceUpdated(
     payload.appearanceUpdated ?? payload.appearance_updated,
-  );
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return Array.from(new Set(values.map((item) => item.trim()).filter(Boolean)));
-}
-
-function escapeRegexText(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function parseCollaborationConfigFromText(
-  rawText: string,
-): CollaborationConfigPayload | null {
-  const text = rawText.trim();
-  if (!text) {
-    return null;
-  }
-  const pattern = new RegExp(
-    `${escapeRegexText(COLLAB_CONFIG_BEGIN)}\\s*([\\s\\S]*?)\\s*${escapeRegexText(COLLAB_CONFIG_END)}`,
-    "m",
-  );
-  const matched = pattern.exec(text);
-  if (!matched?.[1]) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(matched[1]);
-    if (!isRecord(parsed)) {
-      return null;
-    }
-    const selectedWorkers = Array.isArray(parsed.selectedWorkers)
-      ? parsed.selectedWorkers.filter(
-          (item): item is string =>
-            typeof item === "string" && item.trim().length > 0,
-        )
-      : [];
-    return {
-      discoverable: Boolean(parsed.discoverable),
-      dispatchEnabled: Boolean(parsed.dispatchEnabled),
-      selectedWorkers,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function hasTag(tags: string[], target: string): boolean {
-  const normalizedTarget = target.trim().toLowerCase();
-  return tags.some((tag) => tag.trim().toLowerCase() === normalizedTarget);
-}
-
-function normalizeCollaborationWorkerKey(value: string): string {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return "";
-  }
-  if (trimmed.startsWith("local:") || trimmed.startsWith("a2a:")) {
-    return trimmed;
-  }
-  return `local:${trimmed}`;
-}
-
-function normalizeCollaborationWorkerKeys(values: string[]): string[] {
-  return uniqueStrings(
-    values.map(normalizeCollaborationWorkerKey).filter(Boolean),
   );
 }
 
@@ -857,20 +775,21 @@ function buildOutgoingAttachmentRefs(
 function normalizeOutgoingCurrentTaskDraft(
   draft: AgentChatInput["currentTaskDraft"] | undefined,
 ): Record<string, unknown> | undefined {
-  if (!draft) {
+  if (!isRecord(draft)) {
     return undefined;
   }
+  const taskDraft = draft as ChatTaskDraftStatePayload;
   return {
-    objective: draft.objective,
-    report_condition: draft.reportCondition,
-    every_ms: draft.everyMs,
-    max_runs: draft.maxRuns,
-    duration_ms: draft.durationMs,
-    schedule_text: draft.scheduleText,
-    source_message_text: draft.sourceMessageText,
-    created_at: draft.createdAt,
-    missing_slots: draft.missingSlots,
-    ready_to_confirm: draft.readyToConfirm,
+    objective: taskDraft.objective,
+    report_condition: taskDraft.reportCondition,
+    every_ms: taskDraft.everyMs,
+    max_runs: taskDraft.maxRuns,
+    duration_ms: taskDraft.durationMs,
+    schedule_text: taskDraft.scheduleText,
+    source_message_text: taskDraft.sourceMessageText,
+    created_at: taskDraft.createdAt,
+    missing_slots: taskDraft.missingSlots,
+    ready_to_confirm: taskDraft.readyToConfirm,
   };
 }
 
@@ -1003,82 +922,6 @@ async function recoverAgentChatSession(
       sessionLabel: recoveredSessionLabel,
     },
   };
-}
-
-async function buildCollaborationAgentHint(
-  currentAgentId: string,
-): Promise<string> {
-  const cacheHit = collaborationHintCache.get(currentAgentId);
-  const now = Date.now();
-  if (cacheHit && cacheHit.expiresAt > now) {
-    return cacheHit.hint;
-  }
-
-  let hint = "";
-  try {
-    const [currentAgent, agents] = await Promise.all([
-      getManagementAgentDetail(currentAgentId),
-      listManagementAgents(),
-    ]);
-    const parsedConfig =
-      currentAgent.collaboration ||
-      parseCollaborationConfigFromText(currentAgent.system_prompt || "");
-    const dispatchEnabled = parsedConfig
-      ? parsedConfig.dispatchEnabled
-      : hasTag(currentAgent.tags || [], COLLAB_TAG_DISPATCH);
-    if (!dispatchEnabled) {
-      hint = "";
-    } else {
-      const selectedWorkerKeys = normalizeCollaborationWorkerKeys(
-        parsedConfig?.selectedWorkers || [],
-      );
-      const hasA2aWorkers = selectedWorkerKeys.some((key) =>
-        key.startsWith("a2a:"),
-      );
-      const a2aCards = hasA2aWorkers
-        ? await listManagementA2aAgents().catch(() => [])
-        : [];
-      const selectedLines = selectedWorkerKeys.map((key) => {
-        if (key.startsWith("local:")) {
-          const id = key.slice("local:".length).trim();
-          const hit = agents.find((item) => item.id === id);
-          const alias =
-            hit?.nickname?.trim() || hit?.name || id || "unknown-local-worker";
-          const profile = (hit?.description || "").trim().replace(/\s+/g, " ");
-          return `- local worker: agent_id=${id}; display_name=${alias}${profile ? `; profile=${profile.slice(0, 120)}` : ""}`;
-        }
-        if (key.startsWith("a2a:")) {
-          const name = key.slice("a2a:".length).trim();
-          const hit = a2aCards.find((item) => item.name === name);
-          const skillNames = (hit?.skills || [])
-            .map((skill) => (skill.name || skill.id || "").trim())
-            .filter((item) => item.length > 0)
-            .slice(0, 4);
-          const skillsText =
-            skillNames.length > 0 ? `；skills=${skillNames.join(", ")}` : "";
-          return `- external a2a worker: exact_name=${name || "unknown-a2a-worker"}${skillsText}`;
-        }
-        return `- ${key}`;
-      });
-      hint = [
-        "[multi-agent-hints]",
-        "你当前可调度的白名单如下（仅以下对象允许委派）：",
-        selectedLines.length > 0 ? selectedLines.join("\n") : "- 无",
-        "严格规则：当用户询问“你有几个小伙伴/可调度对象”时，只能按上述白名单数量回答。",
-        "强制规则：调用本地智能体时，agent_find / agent_send 的参数必须使用 agent_id，绝对不能使用昵称、中文名、display_name 或口头称呼。",
-        "如果是 external a2a worker，只有在白名单未提供 id 时，才允许使用 exact_name，而且必须原样填写。",
-        "委派策略：当任务可拆分或需专长时，优先执行 agent_find，再执行 agent_send，并在最终回复汇总每个子智能体的结果。",
-      ].join("\n");
-    }
-  } catch {
-    hint = "";
-  }
-
-  collaborationHintCache.set(currentAgentId, {
-    expiresAt: now + COLLABORATION_HINT_TTL_MS,
-    hint,
-  });
-  return hint;
 }
 
 function parseWsMessageFrame(data: string): Record<string, unknown> | null {
@@ -1302,9 +1145,42 @@ async function runTextToolCallFallback(
   return null;
 }
 
-async function buildUiEnvironmentSystemPrompt(
+type PromptContextSlotName =
+  | "host_policy"
+  | "global_policy"
+  | "execution_protocol"
+  | "identity_context"
+  | "capability_context"
+  | "memory_context"
+  | "session_context"
+  | "task_input";
+
+type PromptContextSlotFragment = {
+  slot: PromptContextSlotName;
+  content: string;
+};
+
+const CONTEXT_SLOT_OPEN_PREFIX = "[[CONTEXT_SLOT:";
+const CONTEXT_SLOT_CLOSE = "[[/CONTEXT_SLOT]]";
+
+function hasStructuredPromptSlots(message: string): boolean {
+  return message.includes(CONTEXT_SLOT_OPEN_PREFIX);
+}
+
+function wrapPromptContextSlot(
+  slot: PromptContextSlotName,
+  content: string,
+): string {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return [`[[CONTEXT_SLOT:${slot}]]`, trimmed, CONTEXT_SLOT_CLOSE].join("\n");
+}
+
+async function buildStructuredPromptContext(
   input: AgentChatInput,
-): Promise<string> {
+): Promise<PromptContextSlotFragment[]> {
   const channel = toStringValue(input.channel, CHAT_CHANNELS.app);
   const renderMode = toStringValue(
     input.renderMode,
@@ -1380,12 +1256,28 @@ async function buildUiEnvironmentSystemPrompt(
     })
     .filter(Boolean);
   const injectedComponentInvokeContexts = componentInvokeContexts.filter(Boolean);
-  const collaborationHint = await buildCollaborationAgentHint(input.agentId);
-
-  return [
+  const globalPolicy = [
     "[system:ui-environment]",
     `Current UI environment: channel=${channel}, renderMode=${renderMode}, A2UI rendering is available.`,
     "You are replying in chat mode for a json-render capable client, not a pure generation-only mode.",
+    components.length > 0
+      ? `Available custom dynamic components right now: ${components.join(", ")}.`
+      : "No custom dynamic component is currently available.",
+    "Use plain Markdown unless a valid UI block is required.",
+    "Custom dynamic UI components are compatibility-only local render helpers; they are not the primary capability protocol.",
+    "Prefer runtime tools and standardized `presentable_result` / `job_result`; only use UI_JSON when an explicit local interactive card is truly required.",
+    "Standard media/document outputs are provided by runtime `presentable_result`; do not synthesize preview cards in UI_JSON.",
+    "When using UI_JSON, each block must contain exactly one complete valid JSON object and nothing else.",
+    "Never output response envelopes, result JSON, tool_call XML, YAML, comments, explanations about the schema, or any wrapper object around the UI object.",
+    "If you output UI_JSON, it must be directly parseable by JSON.parse without any preprocessing and must use ASCII punctuation.",
+    "Never wrap the whole reply as response JSON.",
+    "Never put <UI_JSON> inside a fenced code block.",
+    "If valid JSON cannot be guaranteed, fall back to pure Markdown.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const executionProtocol = [
     "[system:reasoning-flow]",
     "Before producing the final answer, internally organize your work in this order and keep the chain coherent across the whole turn.",
     "Step 0. Connection/bootstrap: recognize the current chat request has started, note any frontend-provided UI/runtime context, and treat it as part of the execution environment.",
@@ -1397,13 +1289,9 @@ async function buildUiEnvironmentSystemPrompt(
     "Do not expose this full internal chain verbatim unless the product explicitly asks for it, but make your reasoning and tool choices actually follow this structure.",
     "If the model supports hidden reasoning text or `<think>` blocks, keep the chain observable with compact private checkpoints in this exact style when you reach each stage: `[stage:identity] ...`, `[stage:intent] ...`, `[stage:memory] ...`, `[stage:tools] ...`, `[stage:render] ...`.",
     "Each private checkpoint should be 1-2 short lines, concrete, and consistent with the actual next action. Do not leak these stage markers into the final visible answer outside hidden reasoning or tool logs.",
-    components.length > 0
-      ? `Available custom dynamic components right now: ${components.join(", ")}.`
-      : "No custom dynamic component is currently available.",
-    "Use plain Markdown unless a valid UI block is required.",
-    "Custom dynamic UI components are compatibility-only local render helpers; they are not the primary capability protocol.",
-    "Prefer runtime tools and standardized `presentable_result` / `job_result`; only use UI_JSON when an explicit local interactive card is truly required.",
-    "Standard media/document outputs are provided by runtime `presentable_result`; do not synthesize preview cards in UI_JSON.",
+  ].join("\n");
+
+  const capabilityContext = [
     "[system:video-tool-routing]",
     "For video creation, prefer runtime `video_generate` / `video_edit` and let the runtime own the placeholder -> job_result -> media_result(video) chain.",
     "When the user asks for the current agent itself to appear in the video, call `video_generate` with the prompt and `source_mode=\"self_default\"`; do not manually pass image/video source fields unless the user explicitly supplied a different source asset. The runtime will inject the current agent default portrait/video source automatically.",
@@ -1419,19 +1307,9 @@ async function buildUiEnvironmentSystemPrompt(
     "Never let the second reference image replace the identity, framing, or ownership of the first base image unless the user explicitly asked for that replacement.",
     "For requests about the current agent itself, prefer `my_photo_generate` or `my_photo_edit` instead of the generic image tools.",
     "If the user wants the current agent to wear, hold, or adopt something from another image, keep the current agent default portrait/self photo as the identity anchor and pass the external picture only as `reference_image*`.",
-    "When using UI_JSON, each block must contain exactly one complete valid JSON object and nothing else.",
-    "Never output response envelopes, result JSON, tool_call XML, YAML, comments, explanations about the schema, or any wrapper object around the UI object.",
-    "If you output UI_JSON, it must be directly parseable by JSON.parse without any preprocessing and must use ASCII punctuation.",
-    "Never wrap the whole reply as response JSON.",
-    "Never put <UI_JSON> inside a fenced code block.",
-    "If valid JSON cannot be guaranteed, fall back to pure Markdown.",
     supportsSelfManagementAgent ? "[system:self-management-protocol]" : "",
-    supportsSelfManagementAgent
-      ? `selfAgentId=${input.agentId}`
-      : "",
-    supportsSelfManagementAgent
-      ? "selfManagement.scope=self_only"
-      : "",
+    supportsSelfManagementAgent ? `selfAgentId=${input.agentId}` : "",
+    supportsSelfManagementAgent ? "selfManagement.scope=self_only" : "",
     supportsSelfManagementAgent
       ? 'selfManagement.resultKinds=["review_result","confirm_result","patch_result"]'
       : "",
@@ -1447,9 +1325,7 @@ async function buildUiEnvironmentSystemPrompt(
     supportsSelfManagementAgent
       ? "selfManagement.proposedChangesIsDisplayOnly=true"
       : "",
-    supportsSelfManagementAgent
-      ? "identityWrites.requireConfirmCard=true"
-      : "",
+    supportsSelfManagementAgent ? "identityWrites.requireConfirmCard=true" : "",
     supportsSelfManagementAgent
       ? 'managementConfirm.type=AgentManagementConfirmCard'
       : "",
@@ -1463,17 +1339,13 @@ async function buildUiEnvironmentSystemPrompt(
     isNuwaManagementAgent
       ? 'managementConfirm.actions=["confirm_agent_management","cancel_agent_management"]'
       : "",
-    isNuwaManagementAgent
-      ? 'managementConfirm.mode=["create","update"]'
-      : "",
+    isNuwaManagementAgent ? 'managementConfirm.mode=["create","update"]' : "",
     isNuwaManagementAgent
       ? 'managementConfirm.allowedFields=["mode","agentId","targetName","englishName","nickname","description","tags","workspaces","provider","model","avatarUrl","portraitUrl","color","rewriteContextFiles","contextFiles","items"]'
       : "",
     isNuwaManagementAgent
       ? 'managementConfirm.requiredContextFiles=["IDENTITY.md","SOUL.md","USER.md","MEMORY.md","TOOLS.md","AGENTS.md","BOOTSTRAP.md","HEARTBEAT.md","SYSTEM_PROMPT"]'
       : "",
-    collaborationHint ? "[system:multi-agent-collaboration]" : "",
-    collaborationHint,
     injectedManifestContexts.length > 0
       ? "[system:skill-component-manifests]"
       : "",
@@ -1489,6 +1361,18 @@ async function buildUiEnvironmentSystemPrompt(
   ]
     .filter(Boolean)
     .join("\n");
+
+  const sessionContext =
+    typeof input.systemPreamble === "string" ? input.systemPreamble.trim() : "";
+  const taskInput = toStringValue(input.message).trim();
+
+  return [
+    { slot: "global_policy", content: globalPolicy },
+    { slot: "execution_protocol", content: executionProtocol },
+    { slot: "capability_context", content: capabilityContext },
+    { slot: "session_context", content: sessionContext },
+    { slot: "task_input", content: taskInput },
+  ];
 }
 
 function shouldInjectUiRenderHint(input: AgentChatInput): boolean {
@@ -1521,17 +1405,14 @@ async function buildOutgoingMessage(input: AgentChatInput): Promise<string> {
   if (!shouldInjectUiRenderHint(input)) {
     return message;
   }
-  if (message.includes("[system:ui-environment]")) {
+  if (hasStructuredPromptSlots(message) || message.includes("[system:ui-environment]")) {
     return message;
   }
-  const systemPreamble =
-    typeof input.systemPreamble === "string" ? input.systemPreamble.trim() : "";
-  return [
-    await buildUiEnvironmentSystemPrompt(input),
-    systemPreamble,
-    "[user]",
-    message,
-  ].join("\n\n");
+  const slots = await buildStructuredPromptContext(input);
+  return slots
+    .map((entry) => wrapPromptContextSlot(entry.slot, entry.content))
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 export function withChatRenderContext(
@@ -2882,7 +2763,7 @@ export async function sendAgentChat(
   requestAbortControllers.set(requestId, controller);
 
   try {
-    const outgoingMessage = input.message;
+    const outgoingMessage = await buildOutgoingMessage(input);
     const attachmentRefs = buildOutgoingAttachmentRefs(input.attachments);
     if (import.meta.env.DEV) {
       console.debug("[Chat] non-stream outgoing message prepared", {
@@ -2917,6 +2798,7 @@ export async function sendAgentChat(
           method: "POST",
           body: {
             message: outgoingMessage,
+            raw_user_message: input.message,
             attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
             session_id: nextSessionId || undefined,
             session_label: nextSessionLabel || undefined,

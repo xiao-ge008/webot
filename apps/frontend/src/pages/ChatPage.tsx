@@ -59,7 +59,6 @@ import {
     getTaskDetail,
     getTaskFinalSummary,
     listTaskRuns,
-    markTaskFinalSummaryDelivered,
     pauseTask,
     publishTask,
     runTaskOnce,
@@ -2121,7 +2120,14 @@ function shouldMergeSessionEntries(left: StoredChatSession, right: StoredChatSes
 function normalizeSessionCollection(sessions: StoredChatSession[], preferredSessionId = ''): StoredChatSession[] {
     const visibleSessions = sessions.filter((session) => !isInternalTaskSessionLabel((session.sessionLabel || '').trim()));
     if (visibleSessions.length === 0) {
-        return sessions.length > 0 ? [createEmptySession(1)] : [];
+        return sessions.length > 0 ? [{
+            id: generateId(),
+            title: '新对话 1',
+            updatedAt: Date.now(),
+            messages: [],
+            autoTitle: true,
+            streamState: 'idle',
+        }] : [];
     }
     if (visibleSessions.length <= 1) {
         return visibleSessions.slice().sort((left, right) => right.updatedAt - left.updatedAt);
@@ -8118,7 +8124,7 @@ export function ChatPage({
                             `模型：${executorProvider}/${executorModel}`,
                             `原因：${modelProbe.message || modelProbe.status || '未知错误'}`,
                         ].join('\n'),
-                        level: 'warning',
+                        level: 'info',
                     });
                 }
             }

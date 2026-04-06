@@ -423,7 +423,6 @@ function isConnectionToolRow(row: MessageTrace): boolean {
 }
 
 function isGenericProgressThinkingRow(row: MessageTrace): boolean {
-  const title = row.title.trim().toLowerCase();
   const detail = (row.detail || '').trim().toLowerCase();
   if (/开始生成|整理输出|生成完成|阶段:/.test(row.title.trim())) {
     return true;
@@ -456,19 +455,6 @@ function summarizeTraceDetails(
     return fallback;
   }
   return picked.join('\n');
-}
-
-function summarizeTraceRowsWithLead(
-  lead: string,
-  rows: MessageTrace[],
-  summarize: (row: MessageTrace) => string | undefined,
-  maxItems = 3,
-): string {
-  const detail = summarizeTraceDetails(rows, summarize, '', maxItems).trim();
-  if (!detail) {
-    return lead;
-  }
-  return `${lead}\n${detail}`;
 }
 
 function summarizeThinkingStageEvidence(
@@ -1257,7 +1243,6 @@ export function ChatConversationPane({
   onCancelTaskCard,
   onDeleteTaskCard,
   onToggleAutoConversation,
-  onOpenTaskCardDetails,
   onOpenA2aCardDetails,
   onConfirmGroupUpgrade,
   onCancelGroupUpgrade,
@@ -2555,7 +2540,6 @@ export function ChatConversationPane({
     const count = rows?.length ?? 0;
     if (count <= 0) return null;
     const opened = traceOpen[key] ?? live;
-    const latestAt = rows?.[count - 1]?.at;
     const totalDuration = count > 1
       ? formatTraceDuration(Math.max(0, getTraceTimeMs(rows![count - 1]) - getTraceTimeMs(rows![0])))
       : formatTraceDuration(0);
@@ -2769,7 +2753,7 @@ export function ChatConversationPane({
       ));
     }
 
-    return stageRows.filter((row) => row.detail.trim().length > 0);
+    return stageRows.filter((row) => (row.detail ?? '').trim().length > 0);
   }, []);
 
   const buildRuntimeLogRowsForMessages = useCallback((items: Message[], includeAllStages = false): MessageTrace[] =>

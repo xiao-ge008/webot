@@ -22,6 +22,7 @@ export interface TaskDetailsTask {
     name: string;
     jobType: string;
     enabled?: boolean;
+    runtimeState?: string;
     agentId?: string;
     teamId?: string;
     agentName?: string;
