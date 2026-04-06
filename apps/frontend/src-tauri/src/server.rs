@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use serde_json::Value;
 use webot_service_rs::assignment_store;
 use webot_service_rs::config::ServiceConfig;
 use webot_service_rs::EmbeddedServerHandle;
@@ -20,6 +21,7 @@ pub struct DesktopState {
 }
 
 const DEFAULT_UI_SKILL_NAME: &str = "ui-skill";
+const LEGACY_CHAT_TASK_PROMPT_MARKER: &str = "你是任务执行助手。请直接执行以下任务并给出简洁结果：";
 
 fn files_equal(source: &PathBuf, target: &PathBuf) -> io::Result<bool> {
     if !target.is_file() {
@@ -209,9 +211,8 @@ fn sync_dir_recursive(source: &PathBuf, target: &PathBuf) -> Result<bool, String
 
         if file_type.is_dir() {
             if target_path.is_file() {
-                fs::remove_file(&target_path).map_err(|err| {
-                    format!("删除冲突文件失败({}): {err}", target_path.display())
-                })?;
+                fs::remove_file(&target_path)
+                    .map_err(|err| format!("删除冲突文件失败({}): {err}", target_path.display()))?;
                 changed = true;
             }
             if sync_dir_recursive(&source_path, &target_path)? {
@@ -221,9 +222,8 @@ fn sync_dir_recursive(source: &PathBuf, target: &PathBuf) -> Result<bool, String
         }
 
         if target_path.is_dir() {
-            fs::remove_dir_all(&target_path).map_err(|err| {
-                format!("删除冲突目录失败({}): {err}", target_path.display())
-            })?;
+            fs::remove_dir_all(&target_path)
+                .map_err(|err| format!("删除冲突目录失败({}): {err}", target_path.display()))?;
             changed = true;
         }
 
@@ -330,6 +330,9 @@ pub fn bootstrap() -> Result<DesktopState, String> {
     assignment_store::bootstrap_storage().map_err(|err| format!("初始化本地目录失败: {err}"))?;
     ensure_default_ui_skill(&webot_home)?;
     ensure_default_comfyui_assets(&webot_home)?;
+    if let Err(err) = disable_legacy_chat_cron_jobs(&webot_home) {
+        eprintln!("[webot-desktop] 停用旧版聊天 cron 失败: {err}");
+    }
 
     env::set_var("OPENFANG_BASE_URL", "http://127.0.0.1:4200");
 
@@ -396,11 +399,158 @@ fn resolve_webot_home_dir() -> Result<PathBuf, String> {
     Ok(user_home.join(".webot"))
 }
 
+fn disable_legacy_chat_cron_jobs(webot_home: &PathBuf) -> Result<(), String> {
+    let cron_jobs_path = webot_home.join("cron_jobs.json");
+    if !cron_jobs_path.is_file() {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&cron_jobs_path).map_err(|err| {
+        format!(
+            "读取 cron_jobs.json 失败({}): {err}",
+            cron_jobs_path.display()
+        )
+    })?;
+    let mut entries = serde_json::from_str::<Vec<Value>>(&raw).map_err(|err| {
+        format!(
+            "解析 cron_jobs.json 失败({}): {err}",
+            cron_jobs_path.display()
+        )
+    })?;
+
+    let mut changed = false;
+    let mut disabled_job_ids: Vec<String> = Vec::new();
+
+    for entry in &mut entries {
+        let Some(job) = entry.get_mut("job").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if !is_legacy_chat_cron_job(job) {
+            continue;
+        }
+        let enabled = job.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        if !enabled {
+            continue;
+        }
+        job.insert("enabled".to_string(), Value::Bool(false));
+        let job_id = job
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        disabled_job_ids.push(job_id.to_string());
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    let backup_path = webot_home.join(format!(
+        "cron_jobs.legacy-chat-backup-{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
+    ));
+    fs::copy(&cron_jobs_path, &backup_path).map_err(|err| {
+        format!(
+            "备份旧 cron_jobs.json 失败({} -> {}): {err}",
+            cron_jobs_path.display(),
+            backup_path.display()
+        )
+    })?;
+
+    let serialized = serde_json::to_string_pretty(&entries).map_err(|err| {
+        format!(
+            "序列化更新后的 cron_jobs.json 失败({}): {err}",
+            cron_jobs_path.display()
+        )
+    })?;
+    fs::write(&cron_jobs_path, serialized).map_err(|err| {
+        format!(
+            "写回 cron_jobs.json 失败({}): {err}",
+            cron_jobs_path.display()
+        )
+    })?;
+
+    eprintln!(
+        "[webot-desktop] 已停用 {} 个旧版聊天 cron 任务: {}",
+        disabled_job_ids.len(),
+        disabled_job_ids.join(", ")
+    );
+    Ok(())
+}
+
+fn is_legacy_chat_cron_job(job: &serde_json::Map<String, Value>) -> bool {
+    let name = job
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let action_kind = job
+        .get("action")
+        .and_then(Value::as_object)
+        .and_then(|action| action.get("kind"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let prompt = job
+        .get("action")
+        .and_then(Value::as_object)
+        .and_then(|action| action.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+
+    if !action_kind.eq_ignore_ascii_case("agent_turn") {
+        return false;
+    }
+
+    prompt.contains(LEGACY_CHAT_TASK_PROMPT_MARKER)
+        || name.starts_with("chat-task-")
+        || name.starts_with("chat_task_")
+}
+
 pub fn shutdown(state: &DesktopState) {
     if let Ok(mut guard) = state.handle.lock() {
         if let Some(handle) = guard.take() {
             handle.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::is_legacy_chat_cron_job;
+
+    #[test]
+    fn detects_legacy_chat_cron_by_prompt_marker() {
+        let payload = json!({
+            "name": "黄金监控",
+            "action": {
+                "kind": "agent_turn",
+                "message": "你是任务执行助手。请直接执行以下任务并给出简洁结果：\n监控黄金价格"
+            }
+        });
+        let job = payload.as_object().expect("job object");
+        assert!(is_legacy_chat_cron_job(job));
+    }
+
+    #[test]
+    fn ignores_manual_non_chat_cron_jobs() {
+        let payload = json!({
+            "name": "黄金日报",
+            "action": {
+                "kind": "agent_turn",
+                "message": "请整理今天的黄金日报"
+            }
+        });
+        let job = payload.as_object().expect("job object");
+        assert!(!is_legacy_chat_cron_job(job));
     }
 }
 

@@ -12,6 +12,7 @@ import { Progress } from '@/components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 import {
   deleteGlobalSpeakerProfile,
   getTtsStatus,
@@ -85,6 +86,7 @@ function formatDateLabel(raw?: string): string {
 
 export function TtsTab() {
   const { t } = useTranslation();
+  const { showConfirm } = useGlobalAlert();
   const [config, setConfig] = useState<AppTtsSettings>(DEFAULT_APP_TTS_SETTINGS);
   const [status, setStatus] = useState<TtsManagementStatus>(EMPTY_STATUS);
   const [loading, setLoading] = useState(false);
@@ -247,7 +249,12 @@ export function TtsTab() {
   };
 
   const handleDeleteSpeaker = async (profileId: string) => {
-    if (!window.confirm('删除后会从全局音色库移除，是否继续？')) return;
+    if (!await showConfirm('删除后会从全局音色库移除，是否继续？', {
+      title: '删除全局音色',
+      confirmText: '删除',
+      cancelText: '取消',
+      variant: 'destructive',
+    })) return;
     setDeletingId(profileId);
     try {
       const next = await deleteGlobalSpeakerProfile(profileId);
@@ -563,3 +570,5 @@ export function TtsTab() {
     setUploadNotes('');
   }
 }
+
+

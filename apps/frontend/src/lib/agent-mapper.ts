@@ -1,4 +1,4 @@
-import type { AgentProfile } from '@/main/types';
+import type { AgentProfile } from '@/shared/desktop/types';
 import type { Agent } from '@/types';
 
 const FALLBACK_COLORS = ['#60a5fa', '#34d399', '#f472b6', '#fb923c', '#2dd4bf'];

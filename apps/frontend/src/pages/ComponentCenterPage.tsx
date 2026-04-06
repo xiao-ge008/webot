@@ -26,6 +26,7 @@ import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 import {
   createEmptyComponentDefinition,
   createComponentDefinition,
@@ -804,6 +805,7 @@ function StatsCard({
 
 export function ComponentCenterPage() {
   const { t } = useTranslation();
+  const { showConfirm } = useGlobalAlert();
   const [items, setItems] = useState<ComponentDefinition[]>([]);
   const [loading, setLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -994,7 +996,11 @@ export function ComponentCenterPage() {
     if (
       draft.returnType !== 'text'
       && requiredMappings.length === 0
-      && !window.confirm('当前组件没有标记任何必填参数。媒体生成类组件如果没有必填参数，AI 很容易乱补字段并错误调用。确定仍然保存吗？')
+      && !await showConfirm('当前组件没有标记任何必填参数。媒体生成类组件如果没有必填参数，AI 很容易乱补字段并错误调用。确定仍然保存吗？', {
+        title: '继续保存组件？',
+        confirmText: '继续保存',
+        cancelText: '返回检查',
+      })
     ) {
       return;
     }
@@ -1020,7 +1026,12 @@ export function ComponentCenterPage() {
   };
 
   const handleDelete = async (englishName: string) => {
-    if (!window.confirm(t('components.deleteConfirm'))) {
+    if (!await showConfirm(t('components.deleteConfirm'), {
+      title: '删除组件',
+      confirmText: '删除',
+      cancelText: '取消',
+      variant: 'destructive',
+    })) {
       return;
     }
     try {
@@ -1714,3 +1725,5 @@ export function ComponentCenterPage() {
     </div>
   );
 }
+
+

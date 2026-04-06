@@ -91,6 +91,16 @@ impl OpenFangClient {
         self.request_json(Method::POST, path, Some(body)).await
     }
 
+    pub async fn post_json_with_timeout(
+        &self,
+        path: &str,
+        body: Value,
+        timeout: Duration,
+    ) -> Result<Value, ApiError> {
+        self.request_json_with_timeout(Method::POST, path, Some(body), timeout)
+            .await
+    }
+
     pub async fn put_json(&self, path: &str, body: Value) -> Result<Value, ApiError> {
         self.request_json(Method::PUT, path, Some(body)).await
     }
@@ -212,9 +222,34 @@ impl OpenFangClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, ApiError> {
+        self.request_json_with_timeout(method, path, body, Duration::from_secs(0))
+            .await
+    }
+
+    pub async fn request_json_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, ApiError> {
         let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
         let started_at = std::time::Instant::now();
-        let mut req = self.client.request(method, &url);
+        let client = if timeout.is_zero() {
+            self.client.clone()
+        } else {
+            Client::builder()
+                .connect_timeout(timeout)
+                .timeout(timeout)
+                .build()
+                .map_err(|e| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("OpenFang 超时客户端创建失败({url}): {e}"),
+                    )
+                })?
+        };
+        let mut req = client.request(method, &url);
 
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);

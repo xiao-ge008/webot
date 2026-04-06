@@ -1,7 +1,7 @@
 export type TaskSourceType = 'chat' | 'manual' | 'custom';
 export type ScheduleKind = 'cron' | 'at' | 'every';
 export type JobType = 'agent' | 'shell';
-export type SessionTarget = 'isolated' | 'main';
+export type SessionTarget = 'isolated' | 'main' | string;
 export type DeliveryMode = 'none' | 'announce';
 export type RunStatus = 'ok' | 'error' | 'running' | 'idle';
 export type TaskConversationType = 'dm' | 'group';

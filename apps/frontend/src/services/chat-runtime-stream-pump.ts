@@ -1,5 +1,5 @@
 import { compileSpecStream } from '@json-render/core';
-import type { AgentChatStreamChunk } from '@/main/types';
+import type { AgentChatStreamChunk } from '@/shared/desktop/types';
 import { subscribeAgentChatStream } from '@/services/agent-client';
 import { chatRuntimeStore } from '@/services/chat-runtime-store';
 import {

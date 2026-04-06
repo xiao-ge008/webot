@@ -1,7 +1,7 @@
 import { compileSpecStream } from '@json-render/core';
 import type { MessageTrace, Message } from '@/data/mock-chats';
 import type { Agent } from '@/types';
-import type { AgentChatMessage, AgentChatStreamChunk } from '@/main/types';
+import type { AgentChatMessage, AgentChatStreamChunk } from '@/shared/desktop/types';
 import type {
   ManagementAgentDetail,
   ManagementAgentSummary,
@@ -9,6 +9,7 @@ import type {
   ManagementRendererBindingRecord,
 } from '@/services/management-client';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
+import { localizeSelfUpgradeErrorMessage } from '@/components/chat/self-upgrade-guards';
 
 const HIDDEN_COLLAB_TAGS = new Set(['webot:collab_discoverable', 'webot:collab_dispatcher']);
 const rendererBindingCache = new Map<string, ManagementRendererBindingRecord>();
@@ -3416,7 +3417,8 @@ export function buildRenderableSpecFromPresentableResult(
   }
 
   if (kind === 'error_result') {
-    const message = typeof result.message === 'string' ? result.message.trim() : '能力暂不可用';
+    const rawMessage = typeof result.message === 'string' ? result.message.trim() : '能力暂不可用';
+    const message = localizeSelfUpgradeErrorMessage(rawMessage);
     return {
       type: 'card',
       props: {

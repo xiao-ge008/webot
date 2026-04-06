@@ -4,6 +4,7 @@ type RunStatusLike = 'ok' | 'error' | 'running' | 'idle';
 
 export interface TaskLifecycleInput {
   enabled?: boolean;
+  runtimeState?: string;
   maxRuns?: number;
   runInfo?: {
     lastStatus?: string;
@@ -23,6 +24,20 @@ export function resolveTaskLifecycle(task: TaskLifecycleInput): TaskLifecycleSta
   const hasLimit = Boolean(task.maxRuns && task.maxRuns > 0);
   const runCount = Math.max(0, Number(task.runInfo?.runCount || 0));
   const lastStatus = normalizeRunStatus(task.runInfo?.lastStatus);
+  const runtimeState = (task.runtimeState || '').trim().toLowerCase();
+
+  if (runtimeState === 'completed') {
+    return lastStatus === 'error' ? 'failed' : 'success';
+  }
+  if (runtimeState === 'failed') {
+    return 'failed';
+  }
+  if (runtimeState === 'paused' || runtimeState === 'disabled' || runtimeState === 'draft') {
+    return 'pending';
+  }
+  if (runtimeState === 'scheduled' || runtimeState === 'running') {
+    return 'running';
+  }
 
   if (hasLimit) {
     const reachedFinal = runCount >= (task.maxRuns || 0);

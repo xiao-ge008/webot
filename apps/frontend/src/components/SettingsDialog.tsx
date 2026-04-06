@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/select';
 import { useTheme, type ThemeMode } from '@/providers/ThemeProvider';
 import { useUpdateManager } from '@/providers/UpdateProvider';
+import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 import { changeLanguage } from '@/i18n';
 import { cn } from '@/lib/utils';
 import {
@@ -43,7 +44,7 @@ import {
   UploadCloud,
   Volume2,
 } from 'lucide-react';
-import type { SkillItem } from '@/main/skills-mcp-types';
+import type { SkillItem } from '@/shared/desktop/skills-mcp-types';
 import { ProvidersTab } from '@/components/settings/ProvidersTab';
 import { ModelsTab } from '@/components/settings/ModelsTab';
 import { MemoryEnhancementTab } from '@/components/settings/MemoryEnhancementTab';
@@ -792,6 +793,7 @@ function GeneralTab() {
 /** Skills 设置页 */
 function SkillsTab() {
   const { t } = useTranslation();
+  const { showConfirm } = useGlobalAlert();
   const isDesktopRuntime = useMemo(() => {
     if (typeof window === 'undefined') {
       return false;
@@ -843,7 +845,16 @@ function SkillsTab() {
   }, []);
 
   // 删除 Skill
-  const handleDelete = async (skillId: string) => {
+  const handleDelete = async (skillId: string, skillName: string) => {
+    const confirmed = await showConfirm(t('settings.skillsDeleteConfirm', { name: skillName }), {
+      title: '删除技能',
+      confirmText: t('settings.delete'),
+      cancelText: '取消',
+      variant: 'destructive',
+    });
+    if (!confirmed) {
+      return;
+    }
     try {
       await deleteGlobalSkill(skillId);
       await loadSkills();
@@ -1101,9 +1112,7 @@ function SkillsTab() {
                   size="sm"
                   className="text-sm text-destructive hover:text-destructive hover:bg-destructive/10 ml-4"
                   onClick={() => {
-                    if (confirm(t('settings.skillsDeleteConfirm', { name: skill.metadata.name }))) {
-                      handleDelete(skill.id);
-                    }
+                    void handleDelete(skill.id, skill.metadata.name);
                   }}
                 >
                   <Trash2 className="w-4 h-4 mr-1" />
@@ -1128,6 +1137,7 @@ function SkillsTab() {
 /** MCP 设置页 */
 function McpTab() {
   const { t } = useTranslation();
+  const { showConfirm } = useGlobalAlert();
   const [mcpServers, setMcpServers] = useState<McpServerView[]>([]);
   const [configMode, setConfigMode] = useState<McpConfigMode>('mcpServers');
   const [configTemplate, setConfigTemplate] = useState<JsonRecord>({});
@@ -1223,7 +1233,13 @@ function McpTab() {
   const handleDelete = async (serverId: string) => {
     const target = mcpServers.find((item) => item.id === serverId);
     if (!target) return;
-    if (!confirm(t('settings.mcpDeleteConfirm', { name: target.name }))) return;
+    const confirmed = await showConfirm(t('settings.mcpDeleteConfirm', { name: target.name }), {
+      title: '删除 MCP 服务',
+      confirmText: t('settings.delete'),
+      cancelText: '取消',
+      variant: 'destructive',
+    });
+    if (!confirmed) return;
     try {
       const nextMap: Record<string, JsonRecord> = { ...storedMcpMap };
       delete nextMap[serverId];
@@ -1263,7 +1279,13 @@ function McpTab() {
   };
 
   const handleClear = async () => {
-    if (!confirm('确认清空全局 MCP 配置吗？')) {
+    const confirmed = await showConfirm('确认清空全局 MCP 配置吗？此操作会移除当前全部全局 MCP 服务。', {
+      title: '清空 MCP 配置',
+      confirmText: '确认清空',
+      cancelText: '取消',
+      variant: 'destructive',
+    });
+    if (!confirmed) {
       return;
     }
     try {
@@ -1610,3 +1632,5 @@ function McpTab() {
     </div>
   );
 }
+
+

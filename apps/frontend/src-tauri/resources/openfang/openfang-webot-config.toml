@@ -1,0 +1,7 @@
+api_listen = "127.0.0.1:4200"
+language = "en"
+
+[channels]
+
+[memory]
+decay_rate = 0.05

@@ -90,7 +90,6 @@ fn spawn_default_agent_ensure(state: Arc<AppState>) {
         if let Err(err) = maybe_ensure_default_agents(&state).await {
             tracing::warn!(error = %err.message, "auto-create default agents failed");
         }
-        chat_task_draft::warm_task_draft_parser_agent(&state).await;
     });
 }
 
@@ -217,7 +216,25 @@ async fn clear_nuwa_agent_id_cache() {
 async fn resolve_nuwa_agent_id(state: &Arc<AppState>) -> Result<String, ApiError> {
     let cache = NUWA_AGENT_ID_CACHE.get_or_init(|| Mutex::new(None));
     if let Some(agent_id) = cache.lock().await.clone() {
-        return Ok(agent_id);
+        let detail_path = format!("/api/agents/{agent_id}");
+        match state.openfang.get_json(&detail_path).await {
+            Ok(_) => return Ok(agent_id),
+            Err(error) => {
+                tracing::warn!(
+                    cached_agent_id = %agent_id,
+                    error = %error.message,
+                    "cached nuwa agent id is stale, refreshing"
+                );
+                let mut guard = cache.lock().await;
+                if guard
+                    .as_ref()
+                    .map(|value| value == &agent_id)
+                    .unwrap_or(false)
+                {
+                    *guard = None;
+                }
+            }
+        }
     }
     ensure_nuwa_agent(state)
         .await?
@@ -724,6 +741,19 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/channels/status", get(get_channel_status))
         .route("/channels/test", post(test_channel_connection))
         .route("/channels/notify", post(send_channel_notification))
+        .route("/notifications", get(list_notifications_route))
+        .route("/notifications/unread-count", get(get_notifications_unread_count_route))
+        .route("/notifications/read-all", post(mark_all_notifications_read_route))
+        .route(
+            "/notifications/settings",
+            get(get_notification_settings_route).put(update_notification_settings_route),
+        )
+        .route(
+            "/notifications/{id}",
+            get(get_notification_route).delete(delete_notification_route),
+        )
+        .route("/notifications/{id}/read", post(mark_notification_read_route))
+        .route("/notifications/{id}/archive", post(archive_notification_route))
         .route("/models", get(list_models))
         .route("/models/test", post(test_model_connection))
         .route(
@@ -1190,102 +1220,145 @@ fn should_try_inline_chat_task_draft(payload: &ChatMessageRequest) -> bool {
     if !payload.attachments.is_empty() {
         return false;
     }
-    looks_like_inline_chat_task_draft_intent(
-        &payload.message,
-        payload.current_task_draft.is_some(),
-    )
+    let inline_task_draft_message = payload
+        .raw_user_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(payload.message.as_str());
+    !inline_task_draft_message.trim().is_empty()
 }
 
-fn looks_like_inline_chat_task_draft_intent(message: &str, has_current_draft: bool) -> bool {
-    if has_current_draft {
-        return true;
+fn extract_inline_task_draft_context_messages(
+    session: &Value,
+) -> Vec<chat_task_draft::ChatTaskContextMessage> {
+    let Some(rows) = session.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let role = row
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if role != "user" && role != "assistant" && role != "agent" {
+            continue;
+        }
+
+        let text = row
+            .get("content")
+            .and_then(extract_text_from_json)
+            .or_else(|| row.get("message").and_then(extract_text_from_json));
+        let Some(text) = text else {
+            continue;
+        };
+        let Some(text) = sanitize_inline_task_draft_context_text(&role, &text) else {
+            continue;
+        };
+        if looks_like_protocol_only_text(&text) {
+            continue;
+        }
+
+        messages.push(chat_task_draft::ChatTaskContextMessage {
+            role,
+            content: text,
+        });
     }
 
-    let trimmed = message.trim();
+    const MAX_CONTEXT_MESSAGES: usize = 8;
+    if messages.len() > MAX_CONTEXT_MESSAGES {
+        messages = messages.split_off(messages.len() - MAX_CONTEXT_MESSAGES);
+    }
+    messages
+}
+
+fn sanitize_inline_task_draft_context_text(role: &str, text: &str) -> Option<String> {
+    let trimmed = text.trim();
     if trimmed.is_empty() {
-        return false;
+        return None;
+    }
+    if !trimmed.contains("[system:") && !trimmed.contains("[AGENT_IDENTITY_PROFILE]") {
+        return Some(trimmed.to_string());
     }
 
-    let normalized = trimmed.to_ascii_lowercase();
-    let keyword_hits = [
-        "提醒",
-        "定时",
-        "定期",
-        "监控",
-        "监测",
-        "告警",
-        "通知",
-        "汇报",
-        "跟踪",
-        "追踪",
-        "轮询",
-        "自动执行",
-        "自动检查",
-        "自动提醒",
-        "自动监控",
-        "帮我盯",
-        "帮我看",
-        "到点",
-        "记得",
-        "取消提醒",
-        "停止提醒",
-        "关闭提醒",
-        "取消监控",
-        "停止监控",
-        "关闭监控",
-        "every ",
-        "hourly",
-        "daily",
-        "weekly",
-        "monthly",
-        "remind",
-        "reminder",
-        "monitor",
-        "alert",
-        "notify",
-        "notification",
-        "schedule",
-        "scheduled",
-        "recurring",
-        "periodic",
-    ]
-    .iter()
-    .any(|keyword| trimmed.contains(keyword) || normalized.contains(keyword));
-
-    if keyword_hits {
-        return true;
+    let lines: Vec<&str> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
     }
 
-    let has_cn_schedule = trimmed.contains('每')
-        && ["秒", "分钟", "小时", "天", "周", "月", "次"]
-            .iter()
-            .any(|unit| trimmed.contains(unit));
-    if has_cn_schedule {
-        return true;
+    let mut tail_lines = Vec::new();
+    for line in lines.iter().rev() {
+        if line.starts_with('[') && line.ends_with(']') {
+            if tail_lines.is_empty() {
+                continue;
+            }
+            break;
+        }
+        tail_lines.push(*line);
+        if role == "user" && tail_lines.len() >= 3 {
+            break;
+        }
     }
+    tail_lines.reverse();
+    let candidate = tail_lines.join("\n").trim().to_string();
+    if candidate.is_empty() || candidate.starts_with("[system:") {
+        None
+    } else {
+        Some(candidate)
+    }
+}
 
-    let has_cn_trigger = ["达到", "超过", "低于", "跌破", "涨到", "触发"]
-        .iter()
-        .any(|keyword| trimmed.contains(keyword));
-    if has_cn_trigger
-        && ["提醒", "通知", "汇报", "告诉我", "告警", "监控"]
-            .iter()
-            .any(|keyword| trimmed.contains(keyword))
+async fn load_inline_chat_task_draft_context_messages(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    payload: &ChatMessageRequest,
+) -> Vec<chat_task_draft::ChatTaskContextMessage> {
+    let session_path = format!("/api/agents/{agent_id}/session");
+    if payload
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+        && payload
+            .session_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
     {
-        return true;
+        return state
+            .openfang
+            .get_json(&session_path)
+            .await
+            .map(|session| extract_inline_task_draft_context_messages(&session))
+            .unwrap_or_default();
     }
 
-    let has_en_schedule = normalized.contains("every ")
-        && [" second", " minute", " hour", " day", " week", " month"]
-            .iter()
-            .any(|unit| normalized.contains(unit));
-    if has_en_schedule {
-        return true;
-    }
+    let session_ctx = match ensure_switched_to_session_target(
+        state,
+        agent_id,
+        payload.session_id.as_deref(),
+        payload.session_label.as_deref(),
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(_) => return Vec::new(),
+    };
 
-    ["when ", "if price", "if it", "above ", "below "]
-        .iter()
-        .any(|keyword| normalized.contains(keyword))
+    let session_payload = state.openfang.get_json(&session_path).await.ok();
+    restore_and_cleanup_switched_session(&state.openfang, agent_id, &session_ctx).await;
+    session_payload
+        .map(|session| extract_inline_task_draft_context_messages(&session))
+        .unwrap_or_default()
 }
 
 async fn maybe_resolve_inline_chat_task_draft(
@@ -1296,16 +1369,63 @@ async fn maybe_resolve_inline_chat_task_draft(
     if !should_try_inline_chat_task_draft(payload) {
         return None;
     }
+    let inline_task_draft_message = payload
+        .raw_user_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(payload.message.as_str());
+    let session_messages = load_inline_chat_task_draft_context_messages(state, agent_id, payload).await;
     let response = chat_task_draft::analyze_chat_task_draft(
         state,
         agent_id,
         chat_task_draft::AnalyzeChatTaskDraftRequest {
-            message: payload.message.clone(),
+            message: inline_task_draft_message.to_string(),
             current_draft: payload.current_task_draft.clone(),
+            session_messages,
         },
     )
     .await;
     response.matched.then_some(response)
+}
+
+async fn resolve_inline_chat_task_draft_binding(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    payload: &ChatMessageRequest,
+) -> (Option<String>, Option<String>) {
+    let session_id = payload
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let session_label = payload
+        .session_label
+        .as_deref()
+        .map(normalize_session_label)
+        .filter(|value| !value.is_empty());
+
+    if session_id.is_some() {
+        return (session_id, session_label);
+    }
+
+    if let Some(label) = session_label.clone() {
+        if let Ok(session_ctx) = ensure_switched_to_session_label(state, agent_id, &label).await {
+            if session_ctx.switched {
+                restore_openfang_session_with_client(
+                    &state.openfang,
+                    agent_id,
+                    &session_ctx.original_session_id,
+                )
+                .await;
+            }
+            return (Some(session_ctx.target_session_id), Some(label));
+        }
+        return (None, Some(label));
+    }
+
+    (get_openfang_agent_session_id(state, agent_id).await.ok(), None)
 }
 
 fn build_inline_chat_task_draft_json(
@@ -1353,6 +1473,19 @@ pub struct ManagedTaskListQuery {
 pub struct ManagedTaskPendingDeliveriesQuery {
     pub target_kind: Option<String>,
     pub origin_chat_session_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct NotificationsListQuery {
+    pub unread_only: Option<bool>,
+    pub include_archived: Option<bool>,
+    pub notification_type: Option<String>,
+    pub source_domain: Option<String>,
+    pub agent_id: Option<String>,
+    pub q: Option<String>,
+    pub created_from: Option<String>,
+    pub created_to: Option<String>,
+    pub limit: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -4772,6 +4905,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             if is_nuwa {
                 if let Some(object) = row.as_object_mut() {
                     object.insert(
+                        "resolved_agent_id".to_string(),
+                        Value::String(agent_id.clone()),
+                    );
+                    object.insert(
                         "id".to_string(),
                         Value::String(DEFAULT_NUWA_AGENT_ID.to_string()),
                     );
@@ -5036,6 +5173,10 @@ pub async fn get_agent(
     }
     if resolved.alias_used {
         if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "resolved_agent_id".to_string(),
+                Value::String(resolved.resolved.clone()),
+            );
             object.insert(
                 "id".to_string(),
                 Value::String(DEFAULT_NUWA_AGENT_ID.to_string()),
@@ -9686,11 +9827,49 @@ pub async fn list_managed_tasks_route(
 
 pub async fn create_managed_task_route(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<Value>,
+    Json(mut payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_online(&state).await?;
+    normalize_managed_task_create_payload(&state, &mut payload).await?;
     let data = state.openfang.post_json("/api/tasks", payload).await?;
     Ok(Json(data))
+}
+
+async fn normalize_managed_task_create_payload(
+    state: &Arc<AppState>,
+    payload: &mut Value,
+) -> Result<(), ApiError> {
+    let Some(object) = payload.as_object_mut() else {
+        return Ok(());
+    };
+    normalize_agent_id_alias_field(state, object, "agent_id").await?;
+    if let Some(binding) = object.get_mut("binding").and_then(Value::as_object_mut) {
+        normalize_agent_id_alias_field(state, binding, "remote_chat_session_owner_agent_id")
+            .await?;
+        normalize_agent_id_alias_field(state, binding, "executor_agent_id").await?;
+        normalize_agent_id_alias_field(state, binding, "report_actor_agent_id").await?;
+    }
+    Ok(())
+}
+
+async fn normalize_agent_id_alias_field(
+    state: &Arc<AppState>,
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<(), ApiError> {
+    let Some(raw_id) = object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let resolved = resolve_agent_id_alias(state, raw_id).await?;
+    if resolved.alias_used {
+        object.insert(key.to_string(), Value::String(resolved.resolved));
+    }
+    Ok(())
 }
 
 pub async fn get_managed_task_route(
@@ -9744,8 +9923,31 @@ pub async fn run_managed_task_once_route(
     ensure_online(&state).await?;
     validate_task_path_segment(&id)?;
     let path = format!("/api/tasks/{id}/run-once");
-    let data = state.openfang.post_json(&path, json!({})).await?;
-    Ok(Json(data))
+    let state_for_run = state.clone();
+    let task_id = id.clone();
+    let path_for_run = path.clone();
+    tokio::spawn(async move {
+        match state_for_run
+            .openfang
+            .post_json_with_timeout(
+                &path_for_run,
+                json!({}),
+                std::time::Duration::from_secs(240),
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(task_id = %task_id, "managed task run-once accepted by OpenFang");
+            }
+            Err(error) => {
+                tracing::warn!(task_id = %task_id, error = %error.message, "managed task run-once background trigger failed");
+            }
+        }
+    });
+    Ok(Json(json!({
+        "status": "accepted",
+        "task_id": id,
+    })))
 }
 
 pub async fn list_managed_task_runs_route(
@@ -9778,6 +9980,11 @@ pub async fn list_managed_task_deliveries_route(
     validate_task_path_segment(&id)?;
     let path = format!("/api/tasks/{id}/deliveries");
     let data = state.openfang.get_json(&path).await?;
+    if let Some(rows) = data.as_array() {
+        for row in rows {
+            let _ = upsert_local_task_delivery_from_upstream(row);
+        }
+    }
     Ok(Json(data))
 }
 
@@ -9841,7 +10048,130 @@ pub async fn list_managed_task_pending_deliveries_route(
             "任务投递查询超时，请稍后重试。",
         )
     })??;
+    if let Some(rows) = data.as_array() {
+        for row in rows {
+            let _ = upsert_local_task_delivery_from_upstream(row);
+        }
+    }
     Ok(Json(data))
+}
+
+pub async fn list_notifications_route(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<NotificationsListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let _ = sync_notifications_from_runtime(&state).await;
+    let rows = assignment_store::list_notifications(&assignment_store::NotificationListQuery {
+        unread_only: query.unread_only.unwrap_or(false),
+        include_archived: query.include_archived.unwrap_or(false),
+        notification_type: query
+            .notification_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        source_domain: query
+            .source_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        agent_id: query
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        query: query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        created_from: query
+            .created_from
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        created_to: query
+            .created_to
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        limit: query.limit,
+    })
+    .map_err(storage_error)?;
+    Ok(Json(json!({ "notifications": rows })))
+}
+
+pub async fn get_notification_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let _ = sync_notifications_from_runtime(&state).await;
+    let record = assignment_store::get_notification_by_id(id.trim())
+        .map_err(storage_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "通知不存在"))?;
+    Ok(Json(json!({ "notification": record })))
+}
+
+pub async fn mark_notification_read_route(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::mark_notification_read(id.trim()).map_err(storage_error)?;
+    let record = assignment_store::get_notification_by_id(id.trim()).map_err(storage_error)?;
+    Ok(Json(json!({ "notification": record })))
+}
+
+pub async fn mark_all_notifications_read_route() -> Result<Json<Value>, ApiError> {
+    let updated = assignment_store::mark_all_notifications_read().map_err(storage_error)?;
+    Ok(Json(json!({ "updated_count": updated })))
+}
+
+pub async fn archive_notification_route(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    assignment_store::archive_notification(id.trim()).map_err(storage_error)?;
+    let record = assignment_store::get_notification_by_id(id.trim()).map_err(storage_error)?;
+    Ok(Json(json!({ "notification": record })))
+}
+
+pub async fn delete_notification_route(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = assignment_store::delete_notification(id.trim()).map_err(storage_error)?;
+    if deleted == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "通知不存在"));
+    }
+    Ok(Json(json!({
+        "status": "deleted",
+        "notification_id": id.trim(),
+    })))
+}
+
+pub async fn get_notifications_unread_count_route(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    let _ = sync_notifications_from_runtime(&state).await;
+    let unread_count = assignment_store::count_unread_notifications().map_err(storage_error)?;
+    Ok(Json(json!({ "unread_count": unread_count })))
+}
+
+pub async fn get_notification_settings_route() -> Result<Json<Value>, ApiError> {
+    let value = merge_notification_settings_with_defaults(
+        assignment_store::get_notification_settings().map_err(storage_error)?,
+    );
+    Ok(Json(value))
+}
+
+pub async fn update_notification_settings_route(
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let normalized = merge_notification_settings_with_defaults(Some(payload));
+    assignment_store::set_notification_settings(&normalized).map_err(storage_error)?;
+    Ok(Json(normalized))
 }
 
 pub async fn update_managed_task_delivery_status_route(
@@ -9914,6 +10244,600 @@ fn read_trimmed_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     })
 }
 
+fn default_notification_settings_value() -> Value {
+    json!({
+        "version": 1,
+        "enabled_channels": ["system"],
+        "targets": {
+            "telegram": "",
+            "feishu": "",
+            "qqbot": "",
+            "whatsapp": ""
+        },
+        "fallback_to_system": true
+    })
+}
+
+fn merge_notification_settings_with_defaults(input: Option<Value>) -> Value {
+    let mut base = default_notification_settings_value();
+    let Some(next) = input.and_then(|value| value.as_object().cloned()) else {
+        return base;
+    };
+    if let Some(object) = base.as_object_mut() {
+        for (key, value) in next {
+            object.insert(key, value);
+        }
+        let enabled_channels = object
+            .get("enabled_channels")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(Value::as_str)
+                    .map(|item| item.trim().to_ascii_lowercase())
+                    .filter(|item| {
+                        matches!(
+                            item.as_str(),
+                            "system" | "telegram" | "feishu" | "qqbot" | "whatsapp"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["system".to_string()]);
+        object.insert(
+            "enabled_channels".to_string(),
+            Value::Array(
+                enabled_channels
+                    .into_iter()
+                    .map(Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    base
+}
+
+fn notification_settings_enabled_channels(settings: &Value) -> Vec<String> {
+    settings
+        .get("enabled_channels")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec!["system".to_string()])
+}
+
+fn upsert_local_task_delivery_from_upstream(delivery: &Value) -> Result<(), ApiError> {
+    let id = read_trimmed_value(delivery, &["id"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.id 缺失"))?;
+    let task_id = read_trimmed_value(delivery, &["task_id", "taskId"])
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "delivery.task_id 缺失"))?;
+    let owner_agent_id =
+        read_trimmed_value(delivery, &["owner_agent_id", "ownerAgentId"]).unwrap_or_default();
+    let source_run_id = read_trimmed_value(delivery, &["run_id", "runId"]).map(ToString::to_string);
+    let payload = delivery
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let delivery_kind = read_trimmed_value(delivery, &["delivery_kind", "deliveryKind"])
+        .or_else(|| read_trimmed_value(&payload, &["delivery_kind", "deliveryKind"]))
+        .unwrap_or("final")
+        .to_string();
+    let task_name = read_trimmed_value(delivery, &["task_name", "taskName"])
+        .or_else(|| read_trimmed_value(&payload, &["task_name", "taskName"]))
+        .map(ToString::to_string);
+    let run_count = delivery
+        .get("run_count")
+        .and_then(Value::as_i64)
+        .or_else(|| payload.get("run_count").and_then(Value::as_i64));
+    assignment_store::create_or_update_task_delivery(&assignment_store::TaskDeliveryRecord {
+        id: id.to_string(),
+        task_id: task_id.to_string(),
+        owner_agent_id: owner_agent_id.to_string(),
+        runtime_key: read_trimmed_value(delivery, &["runtime_key", "runtimeKey"])
+            .map(ToString::to_string),
+        delivery_kind,
+        dedupe_key: read_trimmed_value(delivery, &["dedupe_key", "dedupeKey"])
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("task-delivery:{id}")),
+        status: read_trimmed_value(delivery, &["status"])
+            .unwrap_or("pending")
+            .to_string(),
+        origin_conversation_type: read_trimmed_value(
+            delivery,
+            &["origin_conversation_type", "originConversationType"],
+        )
+        .map(ToString::to_string),
+        origin_conversation_id: read_trimmed_value(
+            delivery,
+            &["origin_conversation_id", "originConversationId"],
+        )
+        .map(ToString::to_string),
+        origin_chat_session_id: read_trimmed_value(
+            delivery,
+            &["origin_chat_session_id", "originChatSessionId"],
+        )
+        .map(ToString::to_string),
+        origin_message_id: read_trimmed_value(delivery, &["origin_message_id", "originMessageId"])
+            .map(ToString::to_string),
+        creator_participant_id: read_trimmed_value(
+            delivery,
+            &["creator_participant_id", "creatorParticipantId"],
+        )
+        .map(ToString::to_string),
+        creator_participant_name: read_trimmed_value(
+            delivery,
+            &["creator_participant_name", "creatorParticipantName"],
+        )
+        .map(ToString::to_string),
+        executor_agent_id: read_trimmed_value(delivery, &["executor_agent_id", "executorAgentId"])
+            .map(ToString::to_string),
+        executor_agent_name: read_trimmed_value(
+            delivery,
+            &["executor_agent_name", "executorAgentName"],
+        )
+        .map(ToString::to_string),
+        report_actor_agent_id: read_trimmed_value(
+            delivery,
+            &["report_actor_agent_id", "reportActorAgentId"],
+        )
+        .map(ToString::to_string),
+        report_actor_agent_name: read_trimmed_value(
+            delivery,
+            &["report_actor_agent_name", "reportActorAgentName"],
+        )
+        .map(ToString::to_string),
+        task_name,
+        run_count,
+        summary_text: read_trimmed_value(delivery, &["summary_text", "summaryText", "body"])
+            .map(ToString::to_string),
+        error_text: read_trimmed_value(delivery, &["error_text", "errorText"]).map(ToString::to_string),
+        payload,
+        created_at: read_trimmed_value(delivery, &["created_at", "createdAt"])
+            .unwrap_or_default()
+            .to_string(),
+        updated_at: read_trimmed_value(delivery, &["updated_at", "updatedAt"])
+            .unwrap_or_default()
+            .to_string(),
+        reported_at: read_trimmed_value(delivery, &["reported_at", "reportedAt"]).map(ToString::to_string),
+        acknowledged_at: read_trimmed_value(delivery, &["acknowledged_at", "acknowledgedAt"])
+            .map(ToString::to_string),
+    })
+    .map_err(storage_error)?;
+    let local = assignment_store::get_task_delivery(id)
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_error("同步本地任务投递失败"))?;
+    let (notification_type, severity) = match local.delivery_kind.trim().to_ascii_lowercase().as_str() {
+        "progress" => ("progress", "info"),
+        "anomaly" => ("anomaly", "error"),
+        "final" => {
+            if local
+                .summary_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+            {
+                ("summary", "success")
+            } else {
+                ("completed", "success")
+            }
+        }
+        _ => ("system", "info"),
+    };
+    let title_prefix = match notification_type {
+        "progress" => "任务进展",
+        "anomaly" => "任务异常",
+        "summary" => "任务总结",
+        "completed" => "任务完成",
+        _ => "任务通知",
+    };
+    let task_name = local.task_name.clone().unwrap_or_else(|| "未命名任务".to_string());
+    let mut detail_lines = Vec::new();
+    if let Some(agent_name) = local
+        .report_actor_agent_name
+        .clone()
+        .or_else(|| local.executor_agent_name.clone())
+    {
+        detail_lines.push(format!("发送智能体：{agent_name}"));
+    } else if !local.owner_agent_id.trim().is_empty() {
+        detail_lines.push(format!("发送智能体：{}", local.owner_agent_id.trim()));
+    }
+    detail_lines.push(format!("关联任务：{task_name}"));
+    if let Some(run_count) = local.run_count {
+        detail_lines.push(format!("执行轮次：第 {run_count} 次"));
+    }
+    if let Some(summary) = local.summary_text.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        detail_lines.push(summary.to_string());
+    }
+    if let Some(error_text) = local.error_text.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        detail_lines.push(error_text.to_string());
+    }
+    let source_domain = if local
+        .origin_chat_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "chat_task"
+    } else {
+        "manual_task"
+    };
+    assignment_store::upsert_notification(assignment_store::UpsertNotificationInput {
+        source_key: format!("task_delivery:{}", local.id),
+        source_domain: source_domain.to_string(),
+        source_record_id: local.id.clone(),
+        notification_type: notification_type.to_string(),
+        severity: severity.to_string(),
+        title: format!("{title_prefix}：{task_name}"),
+        summary: local
+            .summary_text
+            .clone()
+            .or_else(|| local.error_text.clone())
+            .or_else(|| Some(format!("{title_prefix}已更新"))),
+        detail: Some(detail_lines.join("\n")),
+        agent_id: local
+            .report_actor_agent_id
+            .clone()
+            .or_else(|| local.executor_agent_id.clone())
+            .or_else(|| Some(local.owner_agent_id.clone())),
+        agent_name: local
+            .report_actor_agent_name
+            .clone()
+            .or_else(|| local.executor_agent_name.clone()),
+        task_id: Some(local.task_id.clone()),
+        task_name: Some(task_name),
+        session_id: local.origin_chat_session_id.clone(),
+        source_run_id,
+        payload: local.payload.clone(),
+        delivery_status: json!({
+            "source_updated_at": local.updated_at,
+            "task_delivery_status": local.status,
+            "target_kind": read_trimmed_value(delivery, &["target_kind", "targetKind"]).unwrap_or_default(),
+        }),
+    })
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+fn sync_capability_job_notifications_from_store() -> Result<(), ApiError> {
+    let jobs = assignment_store::list_capability_jobs(None, None, Some(300)).map_err(storage_error)?;
+    for job in jobs {
+        let status = job.status.trim().to_ascii_lowercase();
+        let (notification_type, severity) = if matches!(status.as_str(), "failed" | "error" | "cancelled") {
+            ("failed", "error")
+        } else if matches!(status.as_str(), "completed" | "succeeded" | "done") {
+            if job.summary.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_some() {
+                ("summary", "success")
+            } else {
+                ("completed", "success")
+            }
+        } else {
+            ("progress", "info")
+        };
+        let source_domain = if job
+            .job_type
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().contains("video"))
+            .unwrap_or(false)
+        {
+            "video_job"
+        } else {
+            "agent_workflow"
+        };
+        let title = format!(
+            "{}：{}",
+            match notification_type {
+                "progress" => "异步任务进展",
+                "failed" => "异步任务失败",
+                "summary" => "异步任务总结",
+                "completed" => "异步任务完成",
+                _ => "异步任务通知",
+            },
+            job.title.clone().unwrap_or_else(|| job.job_id.clone())
+        );
+        let mut detail_lines = vec![
+            format!("发送智能体：{}", job.owner_agent_id),
+            format!("关联任务：{}", job.title.clone().unwrap_or_else(|| job.job_id.clone())),
+            format!("状态：{}", job.status),
+        ];
+        if let Some(stage) = job.stage.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            detail_lines.push(format!("阶段：{stage}"));
+        }
+        if let Some(progress) = job.progress_percent {
+            detail_lines.push(format!("进度：{}%", progress.round() as i64));
+        }
+        if let Some(summary) = job.summary.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            detail_lines.push(summary.to_string());
+        }
+        if let Some(error_message) = job.error_message.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            detail_lines.push(error_message.to_string());
+        }
+        assignment_store::upsert_notification(assignment_store::UpsertNotificationInput {
+            source_key: format!("capability_job:{}", job.job_id),
+            source_domain: source_domain.to_string(),
+            source_record_id: job.job_id.clone(),
+            notification_type: notification_type.to_string(),
+            severity: severity.to_string(),
+            title,
+            summary: job.summary.clone().or_else(|| job.error_message.clone()),
+            detail: Some(detail_lines.join("\n")),
+            agent_id: Some(job.owner_agent_id.clone()),
+            agent_name: None,
+            task_id: None,
+            task_name: job.title.clone(),
+            session_id: None,
+            source_run_id: None,
+            payload: job.result_payload.clone(),
+            delivery_status: json!({
+                "source_updated_at": job.updated_at,
+                "job_status": job.status,
+                "progress_percent": job.progress_percent,
+            }),
+        })
+        .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn notification_settings_target(settings: &Value, channel: &str) -> Option<String> {
+    settings
+        .get("targets")
+        .and_then(Value::as_object)
+        .and_then(|targets| targets.get(channel))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn notification_source_updated_at(record: &assignment_store::NotificationRecord) -> String {
+    read_trimmed_value(&record.delivery_status, &["source_updated_at"])
+        .map(ToString::to_string)
+        .unwrap_or_else(|| record.updated_at.clone())
+}
+
+fn notification_delivery_attempts(status: &Value) -> Vec<Value> {
+    status
+        .get("delivery_attempts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn notification_attempt_exists(
+    attempts: &[Value],
+    channel: &str,
+    source_updated_at: &str,
+) -> bool {
+    attempts.iter().any(|item| {
+        read_trimmed_value(item, &["channel"]) == Some(channel)
+            && read_trimmed_value(item, &["source_updated_at", "sourceUpdatedAt"])
+                == Some(source_updated_at)
+    })
+}
+
+fn notification_message_body(record: &assignment_store::NotificationRecord) -> String {
+    record
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            record
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| record.title.clone())
+}
+
+fn build_system_delivery_attempt(source_updated_at: &str) -> Value {
+    json!({
+        "channel": "system",
+        "status": "delegated",
+        "handler": "desktop_client",
+        "source_updated_at": source_updated_at,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+async fn deliver_notification_to_channel(
+    record: &assignment_store::NotificationRecord,
+    channel: &str,
+    target: Option<&str>,
+) -> Value {
+    let title = record.title.trim();
+    let message = notification_message_body(record);
+    let source_updated_at = notification_source_updated_at(record);
+    let resolved_channel = channel.trim().to_ascii_lowercase();
+    let rendered = notification_text(title, &message, Some(record.severity.as_str()));
+    let attempt_time = chrono::Utc::now().to_rfc3339();
+
+    let (binding, targets) = if resolved_channel == "whatsapp" {
+        (None, split_notification_targets(target))
+    } else {
+        let binding = match resolve_channel_binding_for_notification(
+            record.agent_id.as_deref(),
+            Some(resolved_channel.as_str()),
+        ) {
+            Ok(next) => next,
+            Err(error) => {
+                return json!({
+                    "channel": resolved_channel,
+                    "status": "failed",
+                    "reason": error.message,
+                    "created_at": attempt_time,
+                    "source_updated_at": source_updated_at,
+                });
+            }
+        };
+        let Some(binding) = binding else {
+            return json!({
+                "channel": resolved_channel,
+                "status": "failed",
+                "reason": "当前智能体未配置可用通知渠道",
+                "created_at": attempt_time,
+                "source_updated_at": source_updated_at,
+            });
+        };
+        let (missing, missing_env) = validate_channel_binding_requirements(&binding);
+        if !missing.is_empty() || !missing_env.is_empty() {
+            return json!({
+                "channel": resolved_channel,
+                "status": "failed",
+                "reason": if !missing.is_empty() {
+                    format!("渠道配置缺少字段: {}", missing.join(", "))
+                } else {
+                    format!("渠道缺少环境变量: {}", missing_env.join(", "))
+                },
+                "created_at": attempt_time,
+                "source_updated_at": source_updated_at,
+            });
+        }
+        let targets = resolve_notification_targets(&binding, target);
+        (Some(binding), targets)
+    };
+
+    if targets.is_empty() {
+        return json!({
+            "channel": resolved_channel,
+            "status": "failed",
+            "reason": "渠道已配置，但没有可用通知目标",
+            "created_at": attempt_time,
+            "source_updated_at": source_updated_at,
+        });
+    }
+
+    let result = match binding.as_ref() {
+        Some(binding) => dispatch_channel_notification(binding, &targets, &rendered).await,
+        None if resolved_channel == "whatsapp" => send_whatsapp_notification(&targets, &rendered).await,
+        None => Err(format!("暂不支持的渠道类型: {resolved_channel}")),
+    };
+
+    match result {
+        Ok(delivered_targets) => json!({
+            "channel": resolved_channel,
+            "status": "succeeded",
+            "delivered_targets": delivered_targets,
+            "created_at": attempt_time,
+            "source_updated_at": source_updated_at,
+        }),
+        Err(reason) => json!({
+            "channel": resolved_channel,
+            "status": "failed",
+            "resolved_target": targets.join(","),
+            "reason": reason,
+            "created_at": attempt_time,
+            "source_updated_at": source_updated_at,
+        }),
+    }
+}
+
+async fn dispatch_notifications_from_store() -> Result<(), ApiError> {
+    let settings = merge_notification_settings_with_defaults(
+        assignment_store::get_notification_settings().map_err(storage_error)?,
+    );
+    let enabled_channels = notification_settings_enabled_channels(&settings);
+    if enabled_channels.is_empty() {
+        return Ok(());
+    }
+    let include_system = enabled_channels.iter().any(|item| item == "system");
+    let fallback_to_system = settings
+        .get("fallback_to_system")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let notifications = assignment_store::list_notifications(&assignment_store::NotificationListQuery {
+        unread_only: false,
+        include_archived: false,
+        notification_type: None,
+        source_domain: None,
+        agent_id: None,
+        query: None,
+        created_from: None,
+        created_to: None,
+        limit: Some(200),
+    })
+    .map_err(storage_error)?;
+
+    for record in notifications {
+        let source_updated_at = notification_source_updated_at(&record);
+        let mut attempts = notification_delivery_attempts(&record.delivery_status);
+        let mut changed = false;
+        let mut fallback_needed = false;
+
+        for channel in enabled_channels.iter().filter(|item| item.as_str() != "system") {
+            if notification_attempt_exists(&attempts, channel, &source_updated_at) {
+                continue;
+            }
+            let target = notification_settings_target(&settings, channel);
+            let attempt = deliver_notification_to_channel(&record, channel, target.as_deref()).await;
+            if read_trimmed_value(&attempt, &["status"]) == Some("failed") {
+                fallback_needed = true;
+            }
+            attempts.push(attempt);
+            changed = true;
+        }
+
+        if (include_system || (fallback_to_system && fallback_needed))
+            && !notification_attempt_exists(&attempts, "system", &source_updated_at)
+        {
+            attempts.push(build_system_delivery_attempt(&source_updated_at));
+            changed = true;
+        }
+
+        if changed {
+            let mut next_status = match record.delivery_status.clone() {
+                Value::Object(map) => map,
+                _ => Map::new(),
+            };
+            next_status.insert(
+                "source_updated_at".to_string(),
+                Value::String(source_updated_at.clone()),
+            );
+            next_status.insert("delivery_attempts".to_string(), Value::Array(attempts));
+            assignment_store::replace_notification_delivery_status(
+                &record.id,
+                &Value::Object(next_status),
+            )
+            .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+async fn sync_notifications_from_runtime(state: &Arc<AppState>) -> Result<(), ApiError> {
+    ensure_online(state).await?;
+    for target_kind in ["pc_notice", "chat_message"] {
+        let payload = timeout(
+            Duration::from_secs(MANAGED_TASK_DELIVERY_UPSTREAM_TIMEOUT_SECS),
+            state
+                .openfang
+                .get_json_with_query("/api/tasks/deliveries/pending", &[(
+                    "target_kind".to_string(),
+                    target_kind.to_string(),
+                )]),
+        )
+        .await
+        .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "同步通知 pending deliveries 超时"))??;
+        if let Some(rows) = payload.as_array() {
+            for row in rows {
+                let _ = upsert_local_task_delivery_from_upstream(row);
+            }
+        }
+    }
+    sync_capability_job_notifications_from_store()?;
+    dispatch_notifications_from_store().await?;
+    Ok(())
+}
+
 async fn resolve_managed_task_remote_chat_binding(
     state: &Arc<AppState>,
     task_id: &str,
@@ -9941,6 +10865,19 @@ async fn resolve_managed_task_remote_chat_binding(
         return Ok((remote_session_id, owner_agent_id));
     }
     Err(ApiError::new(StatusCode::CONFLICT, "任务未绑定远端会话 ID"))
+}
+
+async fn fail_unrecoverable_chat_delivery(
+    state: &Arc<AppState>,
+    delivery_id: &str,
+    current_status: &str,
+) {
+    if current_status.eq_ignore_ascii_case("failed")
+        || current_status.eq_ignore_ascii_case("acknowledged")
+    {
+        return;
+    }
+    let _ = update_task_delivery_status_upstream(state, delivery_id, "failed").await;
 }
 
 async fn append_message_to_remote_chat_session(
@@ -10022,9 +10959,6 @@ pub async fn writeback_managed_task_delivery_to_chat_route(
         ));
     }
 
-    let (remote_session_id, remote_session_owner_agent_id) =
-        resolve_managed_task_remote_chat_binding(&state, task_id).await?;
-
     let deliveries_path = format!("/api/tasks/{task_id}/deliveries");
     let deliveries = state.openfang.get_json(&deliveries_path).await?;
     let delivery = deliveries
@@ -10049,29 +10983,52 @@ pub async fn writeback_managed_task_delivery_to_chat_route(
         ));
     }
 
-    let message_count = append_message_to_remote_chat_session(
-        &state,
-        &remote_session_owner_agent_id,
-        &remote_session_id,
-        message_text,
-    )
-    .await?;
-
     let current_status = delivery
         .get("status")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("pending");
-    let next_status = if current_status == "acknowledged" {
-        "acknowledged"
+
+    let (remote_session_id, remote_session_owner_agent_id) =
+        match resolve_managed_task_remote_chat_binding(&state, task_id).await {
+            Ok(binding) => binding,
+            Err(err) => {
+                if err.status == StatusCode::CONFLICT {
+                    fail_unrecoverable_chat_delivery(&state, &id, current_status).await;
+                }
+                return Err(err);
+            }
+        };
+
+    let message_count = match append_message_to_remote_chat_session(
+        &state,
+        &remote_session_owner_agent_id,
+        &remote_session_id,
+        message_text,
+    )
+    .await
+    {
+        Ok(count) => count,
+        Err(err) => {
+            if matches!(err.status, StatusCode::CONFLICT | StatusCode::NOT_FOUND) {
+                fail_unrecoverable_chat_delivery(&state, &id, current_status).await;
+            }
+            return Err(err);
+        }
+    };
+
+    let synced_delivery = if current_status == "acknowledged" {
+        delivery.clone()
     } else {
         let status_path = format!("/api/tasks/deliveries/{id}/status");
-        let _ = state
+        state
             .openfang
-            .post_json(&status_path, json!({ "status": "reported" }))
-            .await?;
-        "reported"
+            .post_json(&status_path, json!({ "status": "acknowledged" }))
+            .await?
     };
+    let synced_delivery =
+        enrich_delivery_owner_agent(&synced_delivery, &remote_session_owner_agent_id);
+    upsert_local_task_delivery_from_upstream(&synced_delivery)?;
 
     Ok(Json(json!({
         "ok": true,
@@ -10080,7 +11037,7 @@ pub async fn writeback_managed_task_delivery_to_chat_route(
         "remote_session_id": remote_session_id,
         "remote_session_owner_agent_id": remote_session_owner_agent_id,
         "message_count": message_count,
-        "delivery_status": next_status,
+        "delivery_status": "acknowledged",
     })))
 }
 
@@ -10090,6 +11047,21 @@ fn value_array(payload: &Value) -> Vec<Value> {
 
 fn read_delivery_field<'a>(delivery: &'a Value, keys: &[&str]) -> Option<&'a str> {
     read_trimmed_value(delivery, keys)
+}
+
+fn enrich_delivery_owner_agent(delivery: &Value, owner_agent_id: &str) -> Value {
+    let normalized_owner_agent_id = owner_agent_id.trim();
+    if normalized_owner_agent_id.is_empty() {
+        return delivery.clone();
+    }
+    let mut enriched = delivery.clone();
+    if let Value::Object(map) = &mut enriched {
+        map.entry("owner_agent_id".to_string())
+            .or_insert_with(|| Value::String(normalized_owner_agent_id.to_string()));
+        map.entry("ownerAgentId".to_string())
+            .or_insert_with(|| Value::String(normalized_owner_agent_id.to_string()));
+    }
+    enriched
 }
 
 fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -10258,7 +11230,9 @@ async fn dispatch_chat_message_delivery(
             )
             .await?;
             let updated =
-                update_task_delivery_status_upstream(state, delivery_id, "reported").await?;
+                update_task_delivery_status_upstream(state, delivery_id, "acknowledged").await?;
+            let updated = enrich_delivery_owner_agent(&updated, &owner_agent_id);
+            upsert_local_task_delivery_from_upstream(&updated)?;
             Ok(json!({
                 "ok": true,
                 "delivery": updated,
@@ -10428,6 +11402,8 @@ pub struct ChatMessageAttachmentRequest {
 #[derive(Deserialize)]
 pub struct ChatMessageRequest {
     pub message: String,
+    #[serde(default)]
+    pub raw_user_message: Option<String>,
     pub session_id: Option<String>,
     pub session_label: Option<String>,
     pub request_origin: Option<String>,
@@ -12854,20 +13830,12 @@ pub async fn chat_message(
     if let Some(task_draft_response) =
         maybe_resolve_inline_chat_task_draft(&state, &agent_id, &payload).await
     {
-        let session_id = payload
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let session_label = payload
-            .session_label
-            .as_deref()
-            .map(normalize_session_label)
-            .filter(|value| !value.is_empty());
+        let (bound_session_id, bound_session_label) =
+            resolve_inline_chat_task_draft_binding(&state, &agent_id, &payload).await;
         return Ok(Json(build_inline_chat_task_draft_json(
             &task_draft_response,
-            session_id,
-            session_label.as_deref(),
+            bound_session_id.as_deref(),
+            bound_session_label.as_deref(),
         )));
     }
 
@@ -13040,39 +14008,43 @@ pub async fn chat_message_stream(
 
     let ChatMessageRequest {
         message: user_message,
+        raw_user_message,
         session_id: requested_session_id,
         session_label: requested_session_label,
         request_origin: requested_request_origin,
         current_task_draft: requested_current_task_draft,
         attachments: requested_attachments,
     } = payload;
-    if let Some(task_draft_response) =
-        maybe_resolve_inline_chat_task_draft(
-            &state,
-            &agent_id,
-            &ChatMessageRequest {
-                message: user_message.clone(),
-                session_id: requested_session_id.clone(),
-                session_label: requested_session_label.clone(),
-                request_origin: requested_request_origin.clone(),
-                current_task_draft: requested_current_task_draft.clone(),
-                attachments: requested_attachments.clone(),
-            },
-        )
-        .await
+    if let Some(task_draft_response) = maybe_resolve_inline_chat_task_draft(
+        &state,
+        &agent_id,
+        &ChatMessageRequest {
+            message: user_message.clone(),
+            raw_user_message: raw_user_message.clone(),
+            session_id: requested_session_id.clone(),
+            session_label: requested_session_label.clone(),
+            request_origin: requested_request_origin.clone(),
+            current_task_draft: requested_current_task_draft.clone(),
+            attachments: requested_attachments.clone(),
+        },
+    )
+    .await
     {
-        let normalized_session_label = requested_session_label
-            .as_deref()
-            .map(normalize_session_label)
-            .filter(|value| !value.is_empty());
-        let session_id = requested_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+        let inline_payload = ChatMessageRequest {
+            message: user_message.clone(),
+            raw_user_message: raw_user_message.clone(),
+            session_id: requested_session_id.clone(),
+            session_label: requested_session_label.clone(),
+            request_origin: requested_request_origin.clone(),
+            current_task_draft: requested_current_task_draft.clone(),
+            attachments: requested_attachments.clone(),
+        };
+        let (bound_session_id, bound_session_label) =
+            resolve_inline_chat_task_draft_binding(&state, &agent_id, &inline_payload).await;
         let body = build_inline_chat_task_draft_json(
             &task_draft_response,
-            session_id,
-            normalized_session_label.as_deref(),
+            bound_session_id.as_deref(),
+            bound_session_label.as_deref(),
         );
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(8);
         tokio::spawn(async move {
@@ -13937,7 +14909,11 @@ async fn probe_model_via_chat_completion(
                 last_error = if body.is_empty() {
                     format!("HTTP {status}")
                 } else {
-                    format!("HTTP {status}: {}", &body[..body.len().min(200)])
+                    let snippet: String = body.chars().take(200).collect();
+                    format!(
+                        "HTTP {status}: {}",
+                        snippet
+                    )
                 };
             }
             Err(err) => {
@@ -15358,35 +16334,6 @@ pub async fn compose_task_full(
     Ok(Json(full))
 }
 
-pub async fn compose_task_notices_pending(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, ApiError> {
-    ensure_online(&state).await?;
-    let payload = state
-        .openfang
-        .get_json_with_query(
-            "/api/tasks/deliveries/pending",
-            &[("target_kind".to_string(), "pc_notice".to_string())],
-        )
-        .await?;
-    let mut notices = Vec::new();
-    for delivery in value_array(&payload) {
-        notices.push(json!({
-            "id": read_delivery_field(&delivery, &["id"]).unwrap_or_default(),
-            "task_id": read_delivery_field(&delivery, &["task_id", "taskId"]).unwrap_or_default(),
-            "run_id": read_delivery_field(&delivery, &["run_id", "runId"]),
-            "event_id": read_delivery_field(&delivery, &["event_id", "eventId"]),
-            "title": read_delivery_field(&delivery, &["title"]).unwrap_or_default(),
-            "body": read_delivery_field(&delivery, &["body"]).unwrap_or_default(),
-            "status": read_delivery_field(&delivery, &["status"]).unwrap_or("pending"),
-            "created_at": read_delivery_field(&delivery, &["created_at", "createdAt"]).unwrap_or_default(),
-            "updated_at": read_delivery_field(&delivery, &["updated_at", "updatedAt"]).unwrap_or_default(),
-            "payload": delivery.get("payload").cloned().unwrap_or(Value::Null),
-        }));
-    }
-    Ok(Json(json!({ "notices": notices })))
-}
-
 async fn sync_agent_skill_assignments(
     state: &Arc<AppState>,
     agent_id: &str,
@@ -16672,6 +17619,20 @@ fn resolve_notification_targets(
     let config = binding.config.as_object();
     match binding.channel_type.as_str() {
         "telegram" => read_string_list(config.and_then(|value| value.get("allowed_users"))),
+        "qqbot" | "whatsapp" => {
+            let mut targets = read_string_list(config.and_then(|value| value.get("default_targets")));
+            if targets.is_empty() {
+                if let Some(target) = read_string(config.and_then(|value| value.get("default_target"))) {
+                    targets = split_notification_targets(Some(target.as_str()));
+                }
+            }
+            if targets.is_empty() {
+                if let Some(target) = read_string(config.and_then(|value| value.get("to"))) {
+                    targets = split_notification_targets(Some(target.as_str()));
+                }
+            }
+            targets
+        }
         _ => Vec::new(),
     }
 }
@@ -16944,6 +17905,177 @@ async fn send_feishu_notification(
     Ok(delivered)
 }
 
+async fn fetch_qqbot_access_token(app_id: &str, client_secret: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("初始化 QQBot 客户端失败: {e}"))?;
+    let response = client
+        .post("https://bots.qq.com/app/getAppAccessToken")
+        .json(&json!({
+            "appId": app_id,
+            "clientSecret": client_secret,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("获取 QQBot access_token 失败: {e}"))?;
+    let status = response.status();
+    let payload = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("QQBot 鉴权失败: HTTP {status} {payload}"));
+    }
+    let data = serde_json::from_str::<Value>(&payload)
+        .map_err(|e| format!("解析 QQBot 鉴权结果失败: {e}; body={payload}"))?;
+    data.get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "QQBot 鉴权未返回 access_token".to_string())
+}
+
+fn parse_qqbot_target(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if let Some((target_type, target_id)) = trimmed.split_once(':') {
+        let normalized = match target_type.trim().to_ascii_lowercase().as_str() {
+            "group" | "group_openid" => "group".to_string(),
+            "guild" | "channel" => "channel".to_string(),
+            _ => "user".to_string(),
+        };
+        return (normalized, target_id.trim().to_string());
+    }
+    ("user".to_string(), trimmed.to_string())
+}
+
+async fn send_qqbot_notification(
+    binding: &ChannelBindingCandidate,
+    targets: &[String],
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let config = binding
+        .config
+        .as_object()
+        .ok_or_else(|| "QQBot 渠道配置格式异常".to_string())?;
+    let app_id = read_string(config.get("app_id"))
+        .or_else(|| read_string(config.get("appId")))
+        .ok_or_else(|| "QQBot 渠道缺少 app_id".to_string())?;
+    let client_secret = read_string(config.get("client_secret"))
+        .or_else(|| read_string(config.get("clientSecret")))
+        .ok_or_else(|| "QQBot 渠道缺少 client_secret".to_string())?;
+    let access_token = fetch_qqbot_access_token(&app_id, &client_secret).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("初始化 QQBot 消息客户端失败: {e}"))?;
+
+    let mut delivered = Vec::new();
+    let mut failures = Vec::new();
+    for target in targets {
+        let (target_type, target_id) = parse_qqbot_target(target);
+        if target_id.is_empty() {
+            failures.push("empty_target".to_string());
+            continue;
+        }
+        let path = match target_type.as_str() {
+            "group" => format!("https://api.sgroup.qq.com/v2/groups/{target_id}/messages"),
+            "channel" => format!("https://api.sgroup.qq.com/channels/{target_id}/messages"),
+            _ => format!("https://api.sgroup.qq.com/v2/users/{target_id}/messages"),
+        };
+        match client
+            .post(&path)
+            .header(AUTHORIZATION, format!("QQBot {access_token}"))
+            .json(&json!({
+                "content": text.chars().take(1900).collect::<String>(),
+                "msg_type": 0,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                delivered.push(target.clone());
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                failures.push(format!("{target}: HTTP {status} {}", body.trim()));
+            }
+            Err(error) => {
+                failures.push(format!("{target}: {error}"));
+            }
+        }
+    }
+
+    if delivered.is_empty() {
+        return Err(failures.join("；"));
+    }
+    if !failures.is_empty() {
+        tracing::warn!(
+            channel = "qqbot",
+            agent_id = %binding.agent_id,
+            failed_targets = %failures.join("；"),
+            "channel notify partially failed"
+        );
+    }
+    Ok(delivered)
+}
+
+async fn send_whatsapp_notification(
+    targets: &[String],
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let gateway_url = env::var("WHATSAPP_GATEWAY_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let port = env::var("WHATSAPP_GATEWAY_PORT")
+                .ok()
+                .and_then(|value| value.trim().parse::<u16>().ok())
+                .unwrap_or(3009);
+            format!("http://127.0.0.1:{port}")
+        });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("初始化 WhatsApp 网关客户端失败: {e}"))?;
+    let mut delivered = Vec::new();
+    let mut failures = Vec::new();
+    for target in targets {
+        match client
+            .post(format!("{gateway_url}/message/send"))
+            .json(&json!({
+                "to": target,
+                "text": text,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                delivered.push(target.clone());
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                failures.push(format!("{target}: HTTP {status} {}", body.trim()));
+            }
+            Err(error) => {
+                failures.push(format!("{target}: {error}"));
+            }
+        }
+    }
+    if delivered.is_empty() {
+        return Err(failures.join("；"));
+    }
+    if !failures.is_empty() {
+        tracing::warn!(
+            channel = "whatsapp",
+            failed_targets = %failures.join("；"),
+            "channel notify partially failed"
+        );
+    }
+    Ok(delivered)
+}
+
 async fn dispatch_channel_notification(
     binding: &ChannelBindingCandidate,
     targets: &[String],
@@ -16953,8 +18085,8 @@ async fn dispatch_channel_notification(
         "telegram" => send_telegram_notification(binding, targets, text).await,
         "discord" => send_discord_notification(binding, targets, text).await,
         "feishu" => send_feishu_notification(binding, targets, text).await,
+        "qqbot" => send_qqbot_notification(binding, targets, text).await,
         "email" => Err("Email 渠道暂未接入主动任务通知发送".to_string()),
-        "qqbot" => Err("QQBot 渠道暂未接入主动任务通知发送".to_string()),
         _ => Err(format!("暂不支持的渠道类型: {}", binding.channel_type)),
     }
 }
@@ -16971,64 +18103,117 @@ pub async fn send_channel_notification(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "message 不能为空"));
     }
 
-    let binding = resolve_channel_binding_for_notification(
-        payload.agent_id.as_deref(),
-        payload.preferred_channel.as_deref(),
-    )?;
-    let Some(binding) = binding else {
+    let preferred_channel = payload
+        .preferred_channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    let binding = if preferred_channel.as_deref() == Some("whatsapp") {
+        None
+    } else {
+        resolve_channel_binding_for_notification(
+            payload.agent_id.as_deref(),
+            preferred_channel.as_deref(),
+        )?
+    };
+    let resolved_channel = if let Some(channel) = preferred_channel.clone() {
+        channel
+    } else if let Some(binding) = binding.as_ref() {
+        binding.channel_type.clone()
+    } else {
         return Ok(Json(json!({
             "ok": false,
             "delivered": false,
             "fallback_recommended": true,
-            "reason": "当前智能体未配置可用通知渠道"
+            "reason": "当前智能体未配置可用通知渠道",
+            "delivery_attempts": []
         })));
     };
 
-    let (missing, missing_env) = validate_channel_binding_requirements(&binding);
-    if !missing.is_empty() || !missing_env.is_empty() {
-        return Ok(Json(json!({
-            "ok": false,
-            "delivered": false,
-            "resolved_channel": binding.channel_type,
-            "fallback_recommended": true,
-            "reason": if !missing.is_empty() {
-                format!("渠道配置缺少字段: {}", missing.join(", "))
-            } else {
-                format!("渠道缺少环境变量: {}", missing_env.join(", "))
-            }
-        })));
+    if let Some(binding) = binding.as_ref() {
+        let (missing, missing_env) = validate_channel_binding_requirements(binding);
+        if !missing.is_empty() || !missing_env.is_empty() {
+            return Ok(Json(json!({
+                "ok": false,
+                "delivered": false,
+                "resolved_channel": resolved_channel,
+                "fallback_recommended": true,
+                "reason": if !missing.is_empty() {
+                    format!("渠道配置缺少字段: {}", missing.join(", "))
+                } else {
+                    format!("渠道缺少环境变量: {}", missing_env.join(", "))
+                },
+                "delivery_attempts": [{
+                    "channel": resolved_channel,
+                    "status": "failed",
+                    "reason": if !missing.is_empty() {
+                        format!("渠道配置缺少字段: {}", missing.join(", "))
+                    } else {
+                        format!("渠道缺少环境变量: {}", missing_env.join(", "))
+                    }
+                }]
+            })));
+        }
     }
 
-    let targets = resolve_notification_targets(&binding, payload.target.as_deref());
+    let targets = if let Some(binding) = binding.as_ref() {
+        resolve_notification_targets(binding, payload.target.as_deref())
+    } else {
+        split_notification_targets(payload.target.as_deref())
+    };
     if targets.is_empty() {
         return Ok(Json(json!({
             "ok": false,
             "delivered": false,
-            "resolved_channel": binding.channel_type,
+            "resolved_channel": resolved_channel,
             "fallback_recommended": true,
-            "reason": "渠道已配置，但没有可用通知目标"
+            "reason": "渠道已配置，但没有可用通知目标",
+            "delivery_attempts": [{
+                "channel": resolved_channel,
+                "status": "failed",
+                "reason": "渠道已配置，但没有可用通知目标"
+            }]
         })));
     }
 
     let rendered = notification_text(title, message, payload.level.as_deref());
-    match dispatch_channel_notification(&binding, &targets, &rendered).await {
+    let delivery_result = match binding.as_ref() {
+        Some(binding) => dispatch_channel_notification(binding, &targets, &rendered).await,
+        None if resolved_channel == "whatsapp" => send_whatsapp_notification(&targets, &rendered).await,
+        None => Err(format!("暂不支持的渠道类型: {resolved_channel}")),
+    };
+    match delivery_result {
         Ok(delivered_targets) => Ok(Json(json!({
             "ok": true,
             "delivered": true,
-            "resolved_channel": binding.channel_type,
+            "resolved_channel": resolved_channel,
             "resolved_target": delivered_targets.join(","),
             "delivered_targets": delivered_targets,
             "tag": payload.tag,
-            "fallback_recommended": false
+            "fallback_recommended": false,
+            "delivery_attempts": [{
+                "channel": resolved_channel,
+                "status": "succeeded",
+                "delivered_targets": delivered_targets,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+            }]
         }))),
         Err(reason) => Ok(Json(json!({
             "ok": false,
             "delivered": false,
-            "resolved_channel": binding.channel_type,
+            "resolved_channel": resolved_channel,
             "resolved_target": targets.join(","),
             "fallback_recommended": true,
             "reason": reason,
-            "tag": payload.tag
+            "tag": payload.tag,
+            "delivery_attempts": [{
+                "channel": resolved_channel,
+                "status": "failed",
+                "reason": reason,
+                "resolved_target": targets.join(","),
+                "created_at": chrono::Utc::now().to_rfc3339(),
+            }]
         }))),
     }
 }

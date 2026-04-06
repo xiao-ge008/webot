@@ -274,8 +274,8 @@ export function TaskCenterPage() {
     }, [t]);
 
     const handleClearAllTasks = async () => {
-        const manualTasks = tasks.filter((task) => task.sourceType !== 'chat');
-        if (!selectedAgentId || manualTasks.length === 0) {
+        const visibleTasks = tasks.filter((task) => !task.isTemplate && task.sourceType !== 'chat');
+        if (!selectedAgentId || visibleTasks.length === 0) {
             return;
         }
 
@@ -292,14 +292,14 @@ export function TaskCenterPage() {
         try {
             let success = 0;
             let failed = 0;
-            const deletable = manualTasks.filter((task) => canDeleteTask(task));
+            const deletable = visibleTasks.filter((task) => canDeleteTask(task));
             for (const task of deletable) {
                 const result = await deleteTask(task.id);
                 if (result.success) success += 1;
                 else failed += 1;
             }
-            if (manualTasks.length > deletable.length) {
-                failed += manualTasks.length - deletable.length;
+            if (visibleTasks.length > deletable.length) {
+                failed += visibleTasks.length - deletable.length;
             }
             alert(t('tasks.list.clearAllResult', { success, failed }));
             await refreshTasks(selectedAgentId);
@@ -308,15 +308,17 @@ export function TaskCenterPage() {
         }
     };
 
-    const manualTasks = tasks.filter((task) => task.sourceType !== 'chat');
+    const nonTemplateTasks = tasks.filter((task) => !task.isTemplate && task.sourceType !== 'chat');
 
-    const filteredTasks = manualTasks.filter(task => {
+    const filteredTasks = (activeSourceTab === 'templates'
+        ? tasks.filter((task) => Boolean(task.isTemplate))
+        : nonTemplateTasks
+    ).filter(task => {
         const tab = activeSourceTab as string;
 
         // 分类过滤
         if (tab === 'templates') return !!task.isTemplate;
         if (task.isTemplate && tab !== 'templates') return false; // 模板仅在模板页展示
-        if (tab === 'custom' && task.sourceType !== 'custom') return false;
 
         // 搜索过滤
         if (searchQuery && !task.name.toLowerCase().includes(searchQuery.toLowerCase())) return false;
@@ -324,7 +326,7 @@ export function TaskCenterPage() {
         return true;
     });
 
-    const lifecycleStats = manualTasks.reduce(
+    const lifecycleStats = nonTemplateTasks.reduce(
         (acc, task) => {
             const state = resolveTaskLifecycle(task);
             acc[state] += 1;
@@ -333,7 +335,7 @@ export function TaskCenterPage() {
         { pending: 0, running: 0, success: 0, failed: 0 } as Record<TaskLifecycleState, number>,
     );
     const stats = {
-        total: manualTasks.length,
+        total: nonTemplateTasks.length,
         pending: lifecycleStats.pending,
         running: lifecycleStats.running,
         success: lifecycleStats.success,
@@ -386,7 +388,7 @@ export function TaskCenterPage() {
                         size="sm"
                         className="rounded-full gap-2 font-bold px-5 h-10 bg-card text-foreground hover:bg-muted/70 border-border/30"
                         onClick={() => { void handleClearAllTasks(); }}
-                        disabled={manualTasks.length === 0 || clearingAll}
+                        disabled={nonTemplateTasks.length === 0 || clearingAll}
                     >
                         <Trash2 className="w-4 h-4" />
                         {t('tasks.list.clearAll')}
@@ -809,6 +811,20 @@ function TaskCard({
 /** 任务表单弹窗 */
 const CRON_DEFAULT_EXPR = '*/5 * * * *';
 const DEFAULT_FINAL_SUMMARY_PROMPT = '请基于全部执行日志，输出最终总结报告：总体结论、关键变化、异常与建议。';
+type TaskNotificationScope = 'inherit' | 'override';
+type TaskNotificationChannel = 'system' | 'telegram' | 'feishu' | 'qqbot' | 'whatsapp';
+
+const TASK_NOTIFICATION_CHANNEL_OPTIONS: ReadonlyArray<{
+    value: TaskNotificationChannel;
+    label: string;
+    hint: string;
+}> = [
+    { value: 'system', label: '系统弹窗', hint: '桌面端右下角弹窗' },
+    { value: 'telegram', label: 'Telegram', hint: '发送到 Telegram 用户或群' },
+    { value: 'feishu', label: '飞书', hint: '发送到飞书会话或用户' },
+    { value: 'qqbot', label: 'QQ', hint: '发送到 QQ 私聊或群' },
+    { value: 'whatsapp', label: 'WhatsApp', hint: '发送到 WhatsApp 网关目标' },
+];
 const CRON_PRESETS: ReadonlyArray<{ label: string; expr: string }> = [
     { label: '每分钟', expr: '* * * * *' },
     { label: '每5分钟', expr: '*/5 * * * *' },
@@ -1015,6 +1031,10 @@ function TaskFormDialog({
     const [manualWeeklyDay, setManualWeeklyDay] = useState('1');
     const [manualWeeklyTime, setManualWeeklyTime] = useState('09:00');
     const [deliveryMode, setDeliveryMode] = useState<DeliveryMode>('none');
+    const [notificationScope, setNotificationScope] = useState<TaskNotificationScope>('inherit');
+    const [notificationChannel, setNotificationChannel] = useState<TaskNotificationChannel>('system');
+    const [notificationTarget, setNotificationTarget] = useState('');
+    const [notificationBestEffort, setNotificationBestEffort] = useState(true);
     const [finalSummaryPrompt, setFinalSummaryPrompt] = useState(DEFAULT_FINAL_SUMMARY_PROMPT);
     const [maxRuns, setMaxRuns] = useState<number>(0);
     const [targetAgentId, setTargetAgentId] = useState('');
@@ -1039,6 +1059,15 @@ function TaskFormDialog({
                 setManualWeeklyDay('1');
                 setManualWeeklyTime('09:00');
                 setDeliveryMode(task.delivery.mode);
+                setNotificationScope(
+                    task.delivery.mode === 'announce'
+                        && (Boolean(task.delivery.channel) || Boolean(task.delivery.to) || typeof task.delivery.bestEffort === 'boolean')
+                        ? 'override'
+                        : 'inherit',
+                );
+                setNotificationChannel((task.delivery.channel as TaskNotificationChannel) || 'system');
+                setNotificationTarget(task.delivery.to || '');
+                setNotificationBestEffort(task.delivery.bestEffort ?? true);
                 setFinalSummaryPrompt(task.delivery.finalSummaryPrompt || DEFAULT_FINAL_SUMMARY_PROMPT);
                 setMaxRuns(task.maxRuns || 0);
                 setTargetAgentId(task.teamId);
@@ -1056,6 +1085,10 @@ function TaskFormDialog({
                 setManualWeeklyDay('1');
                 setManualWeeklyTime('09:00');
                 setDeliveryMode('none');
+                setNotificationScope('inherit');
+                setNotificationChannel('system');
+                setNotificationTarget('');
+                setNotificationBestEffort(true);
                 setFinalSummaryPrompt(DEFAULT_FINAL_SUMMARY_PROMPT);
                 setMaxRuns(0);
                 setTargetAgentId(agentId);
@@ -1143,9 +1176,15 @@ function TaskFormDialog({
                 delivery: deliveryMode === 'announce'
                     ? {
                         mode: 'announce',
-                        channel: 'system',
                         finalSummaryPrompt: finalSummaryPrompt.trim() || DEFAULT_FINAL_SUMMARY_PROMPT,
                         notifyOnFinal: true,
+                        ...(notificationScope === 'override'
+                            ? {
+                                channel: notificationChannel,
+                                to: notificationTarget.trim() || undefined,
+                                bestEffort: notificationBestEffort,
+                            }
+                            : {}),
                     }
                     : { mode: 'none' },
                 maxRuns,
@@ -1192,8 +1231,8 @@ function TaskFormDialog({
         }
     };
 
-    // 任务中心列表里会混入 chat 触发的任务；表单里只允许基于“手动/自定义”任务做模板选择
-    const manualTasks = tasks.filter((taskItem) => taskItem.sourceType !== 'chat');
+    // 外层任务中心只处理手工/自定义任务；聊天定时任务只在聊天会话和右侧任务面板展示
+    const templateSourceTasks = tasks.filter((taskItem) => taskItem.sourceType !== 'chat');
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1218,6 +1257,15 @@ function TaskFormDialog({
                                     setPrompt(found.prompt || found.command || '');
                                     setCronExpr(cronFromSchedule(found.schedule));
                                     setDeliveryMode(found.delivery.mode);
+                                    setNotificationScope(
+                                        found.delivery.mode === 'announce'
+                                            && (Boolean(found.delivery.channel) || Boolean(found.delivery.to) || typeof found.delivery.bestEffort === 'boolean')
+                                            ? 'override'
+                                            : 'inherit',
+                                    );
+                                    setNotificationChannel((found.delivery.channel as TaskNotificationChannel) || 'system');
+                                    setNotificationTarget(found.delivery.to || '');
+                                    setNotificationBestEffort(found.delivery.bestEffort ?? true);
                                     setFinalSummaryPrompt(found.delivery.finalSummaryPrompt || DEFAULT_FINAL_SUMMARY_PROMPT);
                                     setSaveAsTemplate(Boolean(found.isTemplate));
                                 }
@@ -1227,7 +1275,7 @@ function TaskFormDialog({
                                 </SelectTrigger>
                                 <SelectContent className="rounded-xl border-none shadow-xl">
                                     <SelectItem value="none">{t('common.none')}</SelectItem>
-                                    {manualTasks.filter(t => t.isTemplate).map(t => (
+                                    {templateSourceTasks.filter(t => t.isTemplate).map(t => (
                                         <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>
                                     ))}
                                 </SelectContent>
@@ -1509,7 +1557,7 @@ function TaskFormDialog({
                             <div className="flex items-center justify-between p-4 bg-muted/20 rounded-2xl">
                                 <div className="space-y-0.5">
                                     <Label className="font-bold">{t('tasks.form.delivery')}</Label>
-                                    <p className="text-[10px] text-muted-foreground font-medium">任务完成后发送系统通知（右下角）。后续可扩展 WhatsApp/Message。</p>
+                                    <p className="text-[10px] text-muted-foreground font-medium">通知会先进入通知中心，再按全局或任务覆盖策略决定系统弹窗和外部渠道。</p>
                                 </div>
                                 <Switch
                                     checked={deliveryMode === 'announce'}
@@ -1519,13 +1567,89 @@ function TaskFormDialog({
                             {deliveryMode === 'announce' ? (
                                 <div className="space-y-3 rounded-2xl border border-primary/10 bg-primary/5 p-4">
                                     <div className="space-y-1">
-                                        <Label className="font-bold text-xs uppercase tracking-widest text-primary/70">通知通道</Label>
-                                        <Input
-                                            value="system (托盘通知)"
-                                            readOnly
-                                            className="rounded-xl h-10 bg-background border-none shadow-sm text-muted-foreground"
-                                        />
+                                        <Label className="font-bold text-xs uppercase tracking-widest text-primary/70">通知策略</Label>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                            <Button
+                                                type="button"
+                                                variant="outline"
+                                                className={cn(
+                                                    'justify-start rounded-2xl h-auto px-4 py-3 border-muted-foreground/15',
+                                                    notificationScope === 'inherit'
+                                                        ? 'border-primary/40 bg-primary/10 text-primary'
+                                                        : 'bg-background',
+                                                )}
+                                                onClick={() => setNotificationScope('inherit')}
+                                            >
+                                                <span className="text-left">
+                                                    <span className="block text-sm font-black">继承全局</span>
+                                                    <span className="block text-[11px] text-muted-foreground">默认使用通知中心全局设置，系统弹窗默认开启。</span>
+                                                </span>
+                                            </Button>
+                                            <Button
+                                                type="button"
+                                                variant="outline"
+                                                className={cn(
+                                                    'justify-start rounded-2xl h-auto px-4 py-3 border-muted-foreground/15',
+                                                    notificationScope === 'override'
+                                                        ? 'border-primary/40 bg-primary/10 text-primary'
+                                                        : 'bg-background',
+                                                )}
+                                                onClick={() => setNotificationScope('override')}
+                                            >
+                                                <span className="text-left">
+                                                    <span className="block text-sm font-black">覆盖全局</span>
+                                                    <span className="block text-[11px] text-muted-foreground">当前任务单独指定通道、接收目标和失败回退行为。</span>
+                                                </span>
+                                            </Button>
+                                        </div>
                                     </div>
+                                    {notificationScope === 'override' ? (
+                                        <>
+                                            <div className="space-y-1">
+                                                <Label className="font-bold text-xs uppercase tracking-widest text-primary/70">通知通道</Label>
+                                                <Select value={notificationChannel} onValueChange={(value: TaskNotificationChannel) => setNotificationChannel(value)}>
+                                                    <SelectTrigger className="rounded-xl h-10 bg-background border-none shadow-sm">
+                                                        <SelectValue />
+                                                    </SelectTrigger>
+                                                    <SelectContent className="rounded-xl border-none shadow-xl">
+                                                        {TASK_NOTIFICATION_CHANNEL_OPTIONS.map((option) => (
+                                                            <SelectItem key={option.value} value={option.value}>
+                                                                {option.label}
+                                                            </SelectItem>
+                                                        ))}
+                                                    </SelectContent>
+                                                </Select>
+                                                <p className="text-[10px] text-muted-foreground">
+                                                    {TASK_NOTIFICATION_CHANNEL_OPTIONS.find((option) => option.value === notificationChannel)?.hint}
+                                                </p>
+                                            </div>
+                                            {notificationChannel !== 'system' ? (
+                                                <div className="space-y-1">
+                                                    <Label className="font-bold text-xs uppercase tracking-widest text-primary/70">通知目标</Label>
+                                                    <Input
+                                                        value={notificationTarget}
+                                                        onChange={(e) => setNotificationTarget(e.target.value)}
+                                                        placeholder="支持多个目标，使用逗号、分号或换行分隔"
+                                                        className="rounded-xl h-10 bg-background border-none shadow-sm"
+                                                    />
+                                                </div>
+                                            ) : null}
+                                            <div className="flex items-center justify-between rounded-2xl bg-background/80 px-4 py-3">
+                                                <div className="space-y-0.5">
+                                                    <Label className="font-bold">失败回退系统弹窗</Label>
+                                                    <p className="text-[10px] text-muted-foreground font-medium">外部渠道发送失败时，仍保留桌面端右下角提醒。</p>
+                                                </div>
+                                                <Switch
+                                                    checked={notificationBestEffort}
+                                                    onCheckedChange={setNotificationBestEffort}
+                                                />
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <div className="rounded-2xl bg-background/80 px-4 py-3 text-[11px] leading-5 text-muted-foreground">
+                                            当前任务不单独指定渠道，通知中心会按全局设置决定是否额外发送飞书、QQ、Telegram 或 WhatsApp。
+                                        </div>
+                                    )}
                                     <div className="space-y-1">
                                         <Label className="font-bold text-xs uppercase tracking-widest text-primary/70">最终总结提示词</Label>
                                         <Textarea

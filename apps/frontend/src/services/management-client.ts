@@ -12,7 +12,7 @@ import type {
   EmbodimentAssetKind,
   EmbodimentAssetRef,
   EmbodimentVoiceRef,
-} from '@/main/types';
+} from '@/shared/desktop/types';
 
 interface JsonRecord {
   [key: string]: unknown;
@@ -1242,12 +1242,6 @@ export interface ManagementA2aAgentCard {
   skills: ManagementA2aAgentSkill[];
 }
 
-function withTimeoutSignal(timeoutMs: number): AbortSignal {
-  const controller = new AbortController();
-  window.setTimeout(() => controller.abort(), timeoutMs);
-  return controller.signal;
-}
-
 function mapManagementAgentSummaryRow(row: JsonRecord, baseUrl: string): ManagementAgentSummary {
   const model = isRecord(row.model) ? row.model : {};
   const identity = isRecord(row.identity) ? row.identity : {};
@@ -1295,7 +1289,7 @@ export async function listManagementAgents(): Promise<ManagementAgentSummary[]> 
   const baseUrl = await getApiBaseUrl();
   try {
     const payload = await requestJson<unknown>('/api/management/agents', {
-      signal: withTimeoutSignal(4_000),
+      timeoutMs: 4_000,
     });
     const rows = Array.isArray(payload) ? payload : [];
     return rows

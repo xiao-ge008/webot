@@ -4,9 +4,11 @@ import { pushSystemNotice } from '@/services/system-notifier';
 
 type PendingPcDelivery = {
   id?: string;
+  status?: string;
   title?: string;
   body?: string;
   created_at?: string;
+  updated_at?: string;
   payload?: Record<string, unknown> | null;
 };
 
@@ -14,6 +16,9 @@ const POLL_INTERVAL_MS = 8000;
 const NOTICE_POLL_TIMEOUT_MS = 3000;
 
 function unwrapPendingPcDeliveries(input: unknown): PendingPcDelivery[] {
+  if (Array.isArray(input)) {
+    return input.filter((item): item is PendingPcDelivery => typeof item === 'object' && item != null);
+  }
   if (typeof input !== 'object' || input == null) {
     return [];
   }
@@ -53,7 +58,7 @@ export function TaskNoticeBridge() {
       runningRef.current = true;
       try {
         const payload = await requestJson<unknown>(
-          '/api/compose/tasks/notices/pending',
+          '/api/management/tasks/deliveries/pending?target_kind=pc_notice',
           {
             timeoutMs: NOTICE_POLL_TIMEOUT_MS,
           },

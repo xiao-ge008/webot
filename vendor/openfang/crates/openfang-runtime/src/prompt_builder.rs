@@ -82,6 +82,9 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         sections.push(format!("## Current Date\nToday is {date}."));
     }
 
+    // Section 1.8 — Cognitive Workflow (always present)
+    sections.push(COGNITIVE_WORKFLOW.to_string());
+
     // Section 2 — Tool Call Behavior (skip for subagents)
     if !ctx.is_subagent {
         sections.push(TOOL_CALL_BEHAVIOR.to_string());
@@ -220,6 +223,9 @@ const TOOL_CALL_BEHAVIOR: &str = "\
 - If the user is asking about an uploaded/local image and no local image-analysis text is present in context, you MUST call `image_analyze` or `media_describe` before answering. Do not guess what is in the image.
 - Do not use `browser_navigate` for local files, `file://` images, `/api/uploads/...` images, screenshots, or other non-web image sources. Use `image_analyze` or `media_describe` instead.
 - For your own identity, long-term memories, prompt files, or self-photo workflows, prefer the dedicated self-management tools when they are available: `my_identity_patch`, `my_memory_patch`, `my_photo_generate`, and `my_photo_edit`.
+- For any self-upgrade that needs user confirmation, prepare the executable patch first, then call `my_upgrade_review`. Do NOT call `my_upgrade_review` with only descriptive `proposed_changes` text.
+- If the upgrade will rewrite `IDENTITY.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, `AGENTS.md`, `BOOTSTRAP.md`, or `HEARTBEAT.md`, place the full final file contents inside `identity_patch.files` before calling `my_upgrade_review`.
+- `proposed_changes` is only a human-readable review summary. It never replaces `identity_patch` or `memory_patch`.
 - For self video requests, use `video_generate` or `video_edit` instead of `my_photo_generate`. When the user wants a video of your current self and no explicit source image/video is provided, `video_generate` can automatically reuse your current default video source, portrait, or self photo.
 - For `video_generate`, choose one stable mode: `source_mode='self_default'` for a video of your current self, `source_mode='image_to_video'` when the user already gave you a source image, or `source_mode='text_to_video'` for prompt-only generation.
 - For a self video request such as “你的视频”“你来出镜”“用你的立绘生成视频”, call `video_generate` with the user's prompt and `source_mode='self_default'`. Do NOT manually pass `image_path`, `image_url`, `image_base64`, `source_image`, or `reference_image` unless the user explicitly supplied a different source asset.
@@ -256,6 +262,19 @@ without sharing what you found.
 - IMPORTANT: If your instructions or persona mention a shell command, script path, or code snippet, \
 execute it via the appropriate tool call (shell_exec, file_write, etc.). Never output commands as \
 code blocks — always call the tool instead.";
+
+const COGNITIVE_WORKFLOW: &str = "\
+## Cognitive Workflow
+- Think like a real operator, not a keyword router. First understand what is actually happening in the current turn, then decide what to do.
+- Before answering, internally organize your reasoning in this order:
+- 0. Situation bootstrap: identify the current request, execution environment, and whether there is already runtime, UI, task, or channel context provided.
+- 1. Identity and boundary check: determine who you are in this turn, what role or persona boundaries apply, and whether the interaction is roleplay, simulation, or real-world task handling.
+- 2. User intent understanding: infer the user's explicit goal, implicit expectations, emotional state, and what outcome would genuinely satisfy them.
+- 3. Memory integration: actively use recalled memory and prior context before asking the user to repeat themselves.
+- 4. Evidence and tools: decide whether tools are needed, call the right tools, and ground your answer in actual returned results instead of guesses.
+- 5. Presentation decision: choose the most suitable final output for the current client or channel, including whether structured UI, markdown, or plain text is the right delivery shape.
+- Do not expose this full chain-of-thought verbatim unless the product explicitly requires it, but make your actual decisions follow this structure.
+- Prefer coherent, human-like judgment: understand context first, then verify, then decide, then present.";
 
 /// Build the grouped tools section (Section 3).
 pub fn build_tools_section(granted_tools: &[String]) -> String {

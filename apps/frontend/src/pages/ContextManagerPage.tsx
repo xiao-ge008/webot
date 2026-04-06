@@ -12,7 +12,7 @@ import { deleteAgentSession, sendAgentChat, updateAgentSessionContent } from '@/
 import type { EditableAgentSessionMessage } from '@/services/agent-client';
 import { getChatGroup } from '@/services/group-client';
 import { getManagementAgentDetail, listManagementAgents } from '@/services/management-client';
-import { CHAT_CHANNELS, CHAT_RENDER_MODES } from '@/main/types';
+import { CHAT_CHANNELS, CHAT_RENDER_MODES } from '@/shared/desktop/types';
 import type { Message } from '@/data/mock-chats';
 import type { GroupMemoryDigest } from '@/types/group';
 import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';

@@ -1,9 +1,11 @@
 type JsonRecord = Record<string, unknown>;
 
-const DEFAULT_WEB_API_BASE_URL = 'http://127.0.0.1:4310';
+const DEFAULT_WEB_API_BASE_URLS = ['http://127.0.0.1:4310', 'http://127.0.0.2:4310'] as const;
 const API_BASE_ENV_KEYS = ['VITE_WEBOT_API_BASE_URL', 'VITE_API_BASE_URL'] as const;
+const DEFAULT_JSON_REQUEST_TIMEOUT_MS = 8_000;
 
 let apiBaseUrlPromise: Promise<string> | null = null;
+let preferredApiBaseUrl: string | null = null;
 
 function normalizeBaseUrl(input: string): string {
   return input.trim().replace(/\/+$/, '');
@@ -21,15 +23,36 @@ function isTauriRuntime(): boolean {
   return Boolean(globalWindow.__TAURI_INTERNALS__);
 }
 
-function resolveWebBaseUrl(): string {
+function uniqueBaseUrls(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = normalizeBaseUrl(value);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function resolveWebBaseUrls(): string[] {
+  const envUrls: string[] = [];
   for (const key of API_BASE_ENV_KEYS) {
     const value = (import.meta.env as Record<string, unknown>)[key];
     if (typeof value === 'string' && value.trim().length > 0) {
-      return normalizeBaseUrl(value);
+      envUrls.push(...value.split(',').map((item) => item.trim()).filter(Boolean));
     }
   }
+  return uniqueBaseUrls([...envUrls, ...DEFAULT_WEB_API_BASE_URLS]);
+}
 
-  return DEFAULT_WEB_API_BASE_URL;
+function rememberWorkingApiBaseUrl(baseUrl: string): string {
+  const normalized = normalizeBaseUrl(baseUrl);
+  preferredApiBaseUrl = normalized;
+  apiBaseUrlPromise = Promise.resolve(normalized);
+  return normalized;
 }
 
 async function resolveTauriBaseUrl(): Promise<string | null> {
@@ -69,6 +92,7 @@ async function resolveTauriOpenFangBaseUrl(): Promise<string | null> {
 export async function getApiBaseUrl(options?: { forceRefresh?: boolean }): Promise<string> {
   if (options?.forceRefresh) {
     apiBaseUrlPromise = null;
+    preferredApiBaseUrl = null;
   }
 
   if (isTauriRuntime()) {
@@ -80,7 +104,11 @@ export async function getApiBaseUrl(options?: { forceRefresh?: boolean }): Promi
   }
 
   if (!apiBaseUrlPromise) {
-    apiBaseUrlPromise = Promise.resolve(resolveWebBaseUrl());
+    const candidates = resolveWebBaseUrls();
+    const preferred = preferredApiBaseUrl && candidates.includes(preferredApiBaseUrl)
+      ? preferredApiBaseUrl
+      : candidates[0];
+    apiBaseUrlPromise = Promise.resolve(preferred);
   }
 
   return apiBaseUrlPromise;
@@ -92,6 +120,17 @@ function isFetchNetworkError(error: unknown): boolean {
   }
   const text = error.message.toLowerCase();
   return text.includes('failed to fetch') || text.includes('fetch failed') || text.includes('networkerror');
+}
+
+function isRetriableTransportError(error: unknown): boolean {
+  if (isFetchNetworkError(error)) {
+    return true;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const text = error.message.toLowerCase();
+  return text.includes('timed out') || text.includes('timeout') || text.includes('websocket 连接失败');
 }
 
 function buildApiUrl(baseUrl: string, path: string): string {
@@ -203,7 +242,11 @@ async function requestJsonWithBaseUrl<TResponse>(
     bodyText = JSON.stringify(options.body);
   }
 
-  const abortState = prepareAbortSignal(options?.signal, options?.timeoutMs);
+  const effectiveTimeoutMs =
+    typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? options.timeoutMs
+      : DEFAULT_JSON_REQUEST_TIMEOUT_MS;
+  const abortState = prepareAbortSignal(options?.signal, effectiveTimeoutMs);
   let response: Response;
   try {
     response = await fetch(url, {
@@ -215,7 +258,7 @@ async function requestJsonWithBaseUrl<TResponse>(
   } catch (error) {
     abortState.cleanup();
     if (abortState.didTimeout() && isAbortError(error)) {
-      throw new Error(`Request timed out after ${Math.round(options?.timeoutMs || 0)}ms`);
+      throw new Error(`Request timed out after ${Math.round(effectiveTimeoutMs)}ms`);
     }
     throw error;
   }
@@ -248,16 +291,22 @@ export async function requestJson<TResponse>(
   path: string,
   options?: RequestJsonOptions,
 ): Promise<TResponse> {
-  const firstBaseUrl = await getApiBaseUrl();
-  try {
-    return await requestJsonWithBaseUrl<TResponse>(firstBaseUrl, path, options);
-  } catch (error) {
-    if (!isFetchNetworkError(error)) {
-      throw error;
+  const primaryBaseUrl = await getApiBaseUrl();
+  const candidates = uniqueBaseUrls([primaryBaseUrl, ...resolveWebBaseUrls()]);
+  let lastError: unknown = null;
+  for (const baseUrl of candidates) {
+    try {
+      const response = await requestJsonWithBaseUrl<TResponse>(baseUrl, path, options);
+      rememberWorkingApiBaseUrl(baseUrl);
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (!isRetriableTransportError(error) || baseUrl === candidates[candidates.length - 1]) {
+        throw error;
+      }
     }
-    const retryBaseUrl = await getApiBaseUrl({ forceRefresh: true });
-    return requestJsonWithBaseUrl<TResponse>(retryBaseUrl, path, options);
   }
+  throw lastError instanceof Error ? lastError : new Error('请求失败');
 }
 
 export async function requestOpenFangJson<TResponse>(
@@ -325,80 +374,98 @@ export async function requestWebSocket(
   body?: unknown,
   options?: RequestWebSocketOptions,
 ): Promise<void> {
-  const preferredBaseUrl = (await resolveTauriOpenFangBaseUrl()) ?? (await getApiBaseUrl());
-  const wsBaseUrl = preferredBaseUrl.replace(/^http/i, 'ws');
-  const url = buildApiUrl(wsBaseUrl, path);
+  const tauriBaseUrl = await resolveTauriOpenFangBaseUrl();
+  const candidates = uniqueBaseUrls([
+    tauriBaseUrl ?? '',
+    await getApiBaseUrl(),
+    ...resolveWebBaseUrls(),
+  ]);
 
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const socket = new WebSocket(url, options?.protocols);
+  let lastError: unknown = null;
+  for (const preferredBaseUrl of candidates) {
+    const wsBaseUrl = preferredBaseUrl.replace(/^http/i, 'ws');
+    const url = buildApiUrl(wsBaseUrl, path);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const socket = new WebSocket(url, options?.protocols);
 
-    const cleanup = () => {
-      if (options?.signal) {
-        options.signal.removeEventListener('abort', handleAbort);
-      }
-    };
+        const cleanup = () => {
+          if (options?.signal) {
+            options.signal.removeEventListener('abort', handleAbort);
+          }
+        };
 
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) {
-        reject(error);
-      } else {
-        resolve();
-      }
-    };
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (error) {
+            reject(error);
+          } else {
+            resolve();
+          }
+        };
 
-    const handleAbort = () => {
-      try {
-        socket.close(1000, 'aborted');
-      } catch {
-        // ignore
-      }
-      finish(new Error('WebSocket 请求已取消'));
-    };
+        const handleAbort = () => {
+          try {
+            socket.close(1000, 'aborted');
+          } catch {
+            // ignore
+          }
+          finish(new Error('WebSocket 请求已取消'));
+        };
 
-    if (options?.signal) {
-      if (options.signal.aborted) {
-        handleAbort();
-        return;
-      }
-      options.signal.addEventListener('abort', handleAbort);
-    }
-
-    socket.onopen = () => {
-      if (body !== undefined) {
-        socket.send(JSON.stringify(body));
-      }
-    };
-
-    socket.onmessage = (event) => {
-      if (settled) return;
-      const shouldFinish = onMessage({ data: typeof event.data === 'string' ? event.data : '' });
-      if (shouldFinish) {
-        try {
-          socket.close(1000, 'completed');
-        } catch {
-          // ignore
+        if (options?.signal) {
+          if (options.signal.aborted) {
+            handleAbort();
+            return;
+          }
+          options.signal.addEventListener('abort', handleAbort);
         }
-        finish();
-      }
-    };
 
-    socket.onerror = () => {
-      finish(new Error('WebSocket 连接失败'));
-    };
+        socket.onopen = () => {
+          rememberWorkingApiBaseUrl(preferredBaseUrl);
+          if (body !== undefined) {
+            socket.send(JSON.stringify(body));
+          }
+        };
 
-    socket.onclose = (event) => {
-      if (settled) return;
-      if (event.code === 1000) {
-        finish();
-        return;
+        socket.onmessage = (event) => {
+          if (settled) return;
+          const shouldFinish = onMessage({ data: typeof event.data === 'string' ? event.data : '' });
+          if (shouldFinish) {
+            try {
+              socket.close(1000, 'completed');
+            } catch {
+              // ignore
+            }
+            finish();
+          }
+        };
+
+        socket.onerror = () => {
+          finish(new Error('WebSocket 连接失败'));
+        };
+
+        socket.onclose = (event) => {
+          if (settled) return;
+          if (event.code === 1000) {
+            finish();
+            return;
+          }
+          finish(new Error(event.reason || `WebSocket 已关闭 (${event.code})`));
+        };
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isRetriableTransportError(error) || preferredBaseUrl === candidates[candidates.length - 1]) {
+        throw error;
       }
-      finish(new Error(event.reason || `WebSocket 已关闭 (${event.code})`));
-    };
-  });
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('WebSocket 请求失败');
 }
 
 export async function requestSse(
@@ -406,69 +473,93 @@ export async function requestSse(
   onEvent: (frame: SseEventFrame) => void,
   options?: RequestSseOptions,
 ): Promise<void> {
-  const baseUrl = await getApiBaseUrl();
-  const url = buildApiUrl(baseUrl, path);
-  const method = options?.method ?? 'GET';
-  const headers: Record<string, string> = {
-    Accept: 'text/event-stream',
-    ...(options?.headers ?? {}),
-  };
-  let bodyText: string | undefined;
+  const candidates = uniqueBaseUrls([await getApiBaseUrl(), ...resolveWebBaseUrls()]);
+  let lastError: unknown = null;
 
-  if (options?.body !== undefined) {
-    headers['Content-Type'] = headers['Content-Type'] ?? 'application/json';
-    bodyText = JSON.stringify(options.body);
-  }
+  for (const baseUrl of candidates) {
+    const url = buildApiUrl(baseUrl, path);
+    const method = options?.method ?? 'GET';
+    const headers: Record<string, string> = {
+      Accept: 'text/event-stream',
+      ...(options?.headers ?? {}),
+    };
+    let bodyText: string | undefined;
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: bodyText,
-    signal: options?.signal,
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(makeErrorMessage(response.status, errorText));
-  }
-
-  if (!response.body) {
-    throw new Error('SSE 响应无可读数据流');
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+    if (options?.body !== undefined) {
+      headers['Content-Type'] = headers['Content-Type'] ?? 'application/json';
+      bodyText = JSON.stringify(options.body);
     }
 
-    buffer += decoder.decode(value, { stream: true });
+    try {
+      const response = await fetch(url, {
+        method,
+        headers,
+        body: bodyText,
+        signal: options?.signal,
+      });
 
-    while (true) {
-      const delimiterIndex = buffer.search(/\r?\n\r?\n/);
-      if (delimiterIndex < 0) {
-        break;
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(makeErrorMessage(response.status, errorText));
       }
 
-      const frameText = buffer.slice(0, delimiterIndex);
-      buffer = buffer.slice(delimiterIndex + (buffer[delimiterIndex] === '\r' ? 4 : 2));
+      rememberWorkingApiBaseUrl(baseUrl);
 
-      const frame = parseSseFrame(frameText);
-      if (frame) {
-        onEvent(frame);
+      if (!response.body) {
+        throw new Error('SSE 响应无可读数据流');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+
+        while (true) {
+          const delimiterIndex = buffer.search(/\r?\n\r?\n/);
+          if (delimiterIndex < 0) {
+            break;
+          }
+
+          const frameText = buffer.slice(0, delimiterIndex);
+          buffer = buffer.slice(delimiterIndex + (buffer[delimiterIndex] === '\r' ? 4 : 2));
+
+          const frame = parseSseFrame(frameText);
+          if (frame) {
+            onEvent(frame);
+          }
+        }
+      }
+
+      const tail = buffer.trim();
+      if (tail) {
+        const frame = parseSseFrame(tail);
+        if (frame) {
+          onEvent(frame);
+        }
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isRetriableTransportError(error) || baseUrl === candidates[candidates.length - 1]) {
+        throw error;
       }
     }
   }
 
-  const tail = buffer.trim();
-  if (tail) {
-    const frame = parseSseFrame(tail);
-    if (frame) {
-      onEvent(frame);
-    }
-  }
+  throw lastError instanceof Error ? lastError : new Error('SSE 请求失败');
+}
+
+export async function requestSseLegacy(
+  path: string,
+  onEvent: (frame: SseEventFrame) => void,
+  options?: RequestSseOptions,
+): Promise<void> {
+  return requestSse(path, onEvent, options);
 }

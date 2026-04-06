@@ -7,7 +7,6 @@ import { Badge } from '@/components/ui/badge';
 import { AgentAvatar } from '@/components/ui/agent-avatar';
 import { Plus, Edit2, Download, Users, ArrowRight, Clock } from 'lucide-react';
 import { useHomeTab } from '@/components/layout/Header';
-import { SuperToolsPanel } from '@/components/super-tools/SuperToolsPanel';
 import type { Agent } from '@/types';
 import { cn } from '@/lib/utils';
 import type { Task } from '@/types/tasks';
@@ -575,10 +574,6 @@ export function HomePage() {
             </div>
           )}
         </div>
-      )}
-
-      {activeTab === 'superTools' && (
-        <SuperToolsPanel />
       )}
     </div>
   );

@@ -1606,7 +1606,8 @@ fn build_component_presentable_result(
                 .get("poster_urls")
                 .and_then(Value::as_array)
                 .map(|items| {
-                    items.iter()
+                    items
+                        .iter()
                         .filter_map(Value::as_str)
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
@@ -4490,11 +4491,7 @@ fn normalize_component_management_asset_url(service_base: &str, source: &str) ->
         return None;
     }
     if trimmed.starts_with("/api/management/") {
-        return Some(format!(
-            "{}{}",
-            service_base.trim_end_matches('/'),
-            trimmed
-        ));
+        return Some(format!("{}{}", service_base.trim_end_matches('/'), trimmed));
     }
     if trimmed.starts_with("api/management/") {
         return Some(format!(
@@ -4516,7 +4513,8 @@ async fn resolve_component_management_image_path(
     state: &Arc<AppState>,
     source: &str,
 ) -> Result<Option<PathBuf>, ApiError> {
-    let Some((source_agent_id, kind, filename)) = parse_component_management_media_reference(source)
+    let Some((source_agent_id, kind, filename)) =
+        parse_component_management_media_reference(source)
     else {
         return Ok(None);
     };
@@ -7700,7 +7698,12 @@ mod tests {
     fn build_component_params_for_video_generate_keeps_prompt_text_out_of_image_aliases() {
         let item = test_component_with_mappings(vec![
             test_component_mapping("image", "image", "加载上传图片，要求图像的分辨率清晰", true),
-            test_component_mapping("text", "text", "图片生成视频提示词，要求描述详细 最好英文描述", true),
+            test_component_mapping(
+                "text",
+                "text",
+                "图片生成视频提示词，要求描述详细 最好英文描述",
+                true,
+            ),
         ]);
         let input = serde_json::json!({
             "image_url": "http://127.0.0.1:60466/api/management/agents/demo/portrait/test.png",
@@ -7763,11 +7766,7 @@ mod tests {
             parse_component_management_media_reference(
                 "http://127.0.0.1:60466/api/management/agents/demo-agent/portrait/test.png?x=1"
             ),
-            Some((
-                "demo-agent".to_string(),
-                "portrait",
-                "test.png".to_string()
-            ))
+            Some(("demo-agent".to_string(), "portrait", "test.png".to_string()))
         );
         assert_eq!(
             parse_component_management_media_reference(

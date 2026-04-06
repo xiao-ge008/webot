@@ -32,6 +32,7 @@ function lifecycleState(task: Task, runsCount?: number): TaskLifecycleState {
   );
   return resolveTaskLifecycle({
     enabled: task.enabled,
+    runtimeState: task.runtimeState,
     maxRuns: task.maxRuns,
     runInfo: {
       lastStatus: task.runInfo.lastStatus,
@@ -77,11 +78,14 @@ export function AgentTaskManagerPage() {
       setLoading(true);
     }
     try {
-      const rows = await listTasks(agentId);
+      const rows = (await listTasks(agentId)).filter((task) => task.sourceType === 'chat');
       setTasks(rows);
-      if (!selectedTaskId && rows.length > 0) {
-        setSelectedTaskId(rows[0].id);
-      }
+      setSelectedTaskId((prev) => {
+        if (prev && rows.some((task) => task.id === prev)) {
+          return prev;
+        }
+        return rows[0]?.id || null;
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       pushInAppNotice({
@@ -110,8 +114,10 @@ export function AgentTaskManagerPage() {
         listTaskRuns(normalized),
       ]);
       if (pollTokenRef.current !== token) return;
-      if (detail) {
+      if (detail?.sourceType === 'chat') {
         setSelectedTask(detail);
+      } else {
+        setSelectedTask(null);
       }
       setSelectedRuns(runs);
       setSelectedFinalSummary(getTaskFinalSummary(normalized));
@@ -331,7 +337,7 @@ export function AgentTaskManagerPage() {
             size="icon"
             variant="outline"
             className="h-8 w-8 rounded-lg"
-            title={deletable ? '删除' : '不可删除（已执行过的任务需先停止并保留历史）'}
+            title={deletable ? '删除' : '不可删除（任务执行中时请先停止）'}
             disabled={deleteDisabled}
             onClick={() => void handleDeleteTask(task)}
           >

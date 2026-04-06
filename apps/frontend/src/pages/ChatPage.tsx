@@ -21,11 +21,11 @@ import { TaskDetailsDialog } from '@/components/tasks/TaskDetailsDialog';
 import type { TaskDetailsTask } from '@/components/tasks/TaskDetailsDialog';
 import { A2AWorkDetailsDialog } from '@/components/tasks/A2AWorkDetailsDialog';
 import type { Agent } from '@/types';
-import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord } from '@/types/tasks';
+import type { Task, TaskConversationType, TaskRunRecord } from '@/types/tasks';
 import type { ChatTaskCardData, ChatTaskLifecycleItem } from '@/types/chat-task';
 import type { A2AWorkCardData, A2AWorkLogItem } from '@/types/a2a';
 import type { GroupQueueItem, GroupQueueReason, GroupQueueStatus, GroupSessionRuntime } from '@/types/group';
-import { CHAT_CHANNELS, CHAT_RENDER_MODES } from '@/main/types';
+import { CHAT_CHANNELS, CHAT_RENDER_MODES } from '@/shared/desktop/types';
 import { cancelAgentChat, compactAgentSession, deleteAgentSession, sendAgentChat, stopAgent, subscribeAgentChatStream, withChatRenderContext } from '@/services/agent-client';
 import type { StoredChatSession } from '@/services/chat-session-store';
 import { chatRuntimeStore, useChatRuntimeSelector } from '@/services/chat-runtime-store';
@@ -44,6 +44,7 @@ import {
     getManagementCapabilityJob,
     getManagementAgentDetail,
     listManagementAgents,
+    testManagementModelConnection,
     upsertManagementCapabilityJob,
     type ManagementCapabilityJobRecord,
 } from '@/services/management-client';
@@ -52,11 +53,11 @@ import { createChatGroup } from '@/services/group-client';
 import { requestJson } from '@/services/transport';
 import { analyzeAndCacheChatImageWithLocalVision } from '@/services/local-vision-service';
 import {
+    canDeleteTask,
     createTask,
     deleteTask,
     getTaskDetail,
     getTaskFinalSummary,
-    listPendingTaskReportDeliveries,
     listTaskRuns,
     markTaskFinalSummaryDelivered,
     pauseTask,
@@ -64,7 +65,6 @@ import {
     runTaskOnce,
     setTaskCenterAgentId,
     storeTaskFinalSummary,
-    updateTaskReportDeliveryStatus,
 } from '@/services/task-client';
 import {
     normalizeChatTaskDraftState,
@@ -72,6 +72,9 @@ import {
 } from '@/services/chat-task-draft-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import { useResolvedRuntimeAssetSrc } from '@/lib/runtime-asset-url';
+import {
+    analyzeSelfUpgradePayload,
+} from '@/components/chat/self-upgrade-guards';
 import {
     type AgentSelfAppearanceActionPayload,
     type ComponentInvokeActionPayload,
@@ -111,6 +114,7 @@ type StreamState = 'idle' | 'streaming' | 'waiting';
 
 const STREAM_VISUAL_FLUSH_MIN_INTERVAL_MS = 24;
 const WATCHDOG_WARNING_TEXT = '响应较慢，仍在等待。';
+const GROUP_AUTO_CHAT_TIMEOUT_MS = 45_000;
 type ChatSession = StoredChatSession;
 type IdleAutoScope = 'agent' | 'group';
 
@@ -645,6 +649,18 @@ function parseBackendMessageRole(value: unknown): Message['role'] {
 const CHAT_ATTACHMENT_PROMPT_BEGIN = '[WEBOT_CHAT_ATTACHMENTS_BEGIN]';
 const CHAT_ATTACHMENT_PROMPT_END = '[WEBOT_CHAT_ATTACHMENTS_END]';
 const TOOL_TRACE_ONLY_FALLBACK_TEXT = '本次请求只返回了工具/记忆日志，未生成正文回复，请重试。';
+const STREAM_NO_OUTPUT_WATCHDOG_MS = 20_000;
+const CHAT_TASK_RUNTIME_SESSION_PREFIX = '__task_runtime__::chat-task';
+const LEGACY_CHAT_TASK_RUNTIME_SESSION_PREFIX = 'chat-task::';
+
+function isInternalTaskSessionLabel(label: string): boolean {
+    const normalized = label.trim().toLowerCase();
+    if (!normalized) {
+        return false;
+    }
+    return normalized.startsWith(CHAT_TASK_RUNTIME_SESSION_PREFIX)
+        || normalized.startsWith(LEGACY_CHAT_TASK_RUNTIME_SESSION_PREFIX);
+}
 
 function stripTransientMessageMeta(meta?: string): string {
     if (!meta) {
@@ -1380,6 +1396,9 @@ function parseBackendSessionSummaries(payload: unknown): BackendSessionSummary[]
         const sessionLabel = typeof item.label === 'string'
             ? item.label.trim()
             : (typeof item.session_label === 'string' ? item.session_label.trim() : '');
+        if (isInternalTaskSessionLabel(sessionLabel)) {
+            continue;
+        }
         const rawTitle = pickSessionTitle(item);
         const normalizedTitle = normalizeSessionDisplayTitle(rawTitle, '');
         const messageCount = parseBackendMessageCount(item);
@@ -1824,6 +1843,9 @@ function mergeRemoteSessions(current: StoredChatSession[], incoming: StoredChatS
     let next = [...current];
 
     for (const remote of incoming) {
+        if (isInternalTaskSessionLabel((remote.sessionLabel || '').trim())) {
+            continue;
+        }
         const remoteSessionId = getRemoteSessionId(remote);
         if (!remoteSessionId) {
             continue;
@@ -2097,11 +2119,15 @@ function shouldMergeSessionEntries(left: StoredChatSession, right: StoredChatSes
 }
 
 function normalizeSessionCollection(sessions: StoredChatSession[], preferredSessionId = ''): StoredChatSession[] {
-    if (sessions.length <= 1) {
-        return sessions.slice().sort((left, right) => right.updatedAt - left.updatedAt);
+    const visibleSessions = sessions.filter((session) => !isInternalTaskSessionLabel((session.sessionLabel || '').trim()));
+    if (visibleSessions.length === 0) {
+        return sessions.length > 0 ? [createEmptySession(1)] : [];
+    }
+    if (visibleSessions.length <= 1) {
+        return visibleSessions.slice().sort((left, right) => right.updatedAt - left.updatedAt);
     }
 
-    const sorted = [...sessions].sort((left, right) => {
+    const sorted = [...visibleSessions].sort((left, right) => {
         if (right.updatedAt !== left.updatedAt) {
             return right.updatedAt - left.updatedAt;
         }
@@ -2546,6 +2572,7 @@ function mapManagedTaskTimelineKind(sourceKind?: string, status?: string): ChatT
     if (normalizedStatus.includes('failed') || normalizedStatus.includes('error')) return 'failed';
     if (normalizedStatus.includes('completed') || normalizedStatus.includes('succeeded') || normalizedStatus.includes('sent')) return 'final';
     if (normalizedStatus.includes('anomaly')) return 'anomaly';
+    if (normalizedStatus.includes('progress')) return 'progress';
     if (normalizedStatus.includes('started') || normalizedStatus.includes('running')) return 'started';
     if ((sourceKind || '').trim().toLowerCase() === 'delivery_attempt') return 'progress';
     return 'created';
@@ -2594,48 +2621,19 @@ function mergeTaskTimelineItems(...groups: Array<readonly ChatTaskLifecycleItem[
         .slice(-18);
 }
 
-function readTaskDeliveryProgressPercent(payload?: Record<string, unknown>): number | undefined {
-    if (!payload) return undefined;
-    const candidates = [
-        payload.progressPercent,
-        payload.progress_percent,
-        payload.progress,
-        payload.percent,
+function buildTaskAcceptanceContextText(card: ChatTaskCardData): string {
+    const lines = [
+        `已确认创建聊天任务：${card.taskName || '未命名任务'}`,
+        `任务内容：${card.objective || card.sourceMessageText || '待补充'}`,
+        `执行安排：${card.scheduleText || '待补充'}`,
     ];
-    for (const candidate of candidates) {
-        if (typeof candidate === 'number' && Number.isFinite(candidate)) {
-            return Math.max(0, Math.min(100, Math.floor(candidate)));
-        }
+    if ((card.reportCondition || '').trim()) {
+        lines.push(`汇报条件：${card.reportCondition?.trim()}`);
     }
-    return undefined;
+    lines.push('后续异常和最终汇报会自动回到当前会话。');
+    return lines.join('\n');
 }
 
-function readTaskDeliverySummary(delivery: TaskReportDelivery): string {
-    const direct = (delivery.summaryText || delivery.errorText || '').trim();
-    if (direct) {
-        return direct;
-    }
-    const payload = delivery.payload;
-    if (!payload) {
-        return '';
-    }
-    const candidates = [
-        payload.summaryText,
-        payload.summary_text,
-        payload.summary,
-        payload.title,
-        payload.message,
-        payload.error,
-        payload.errorText,
-        payload.error_text,
-    ];
-    for (const candidate of candidates) {
-        if (typeof candidate === 'string' && candidate.trim()) {
-            return candidate.trim();
-        }
-    }
-    return '';
-}
 
 function resolveTaskDetailsJobType(kind?: ChatTaskCardData['taskKind']): string {
     if (kind === 'chat_async') return '聊天长任务';
@@ -2722,6 +2720,16 @@ function appendTaskTimeline(
     };
 }
 
+function normalizeTaskCardForComparison(card: ChatTaskCardData): Omit<ChatTaskCardData, 'updatedAt'> {
+    const { updatedAt: _updatedAt, ...rest } = card;
+    return rest;
+}
+
+function areTaskCardsEquivalent(left: ChatTaskCardData, right: ChatTaskCardData): boolean {
+    return JSON.stringify(normalizeTaskCardForComparison(left))
+        === JSON.stringify(normalizeTaskCardForComparison(right));
+}
+
 function resolveTaskConversationScope(
     runtimeKey: string,
     sessionOwnerAgentId: string,
@@ -2788,6 +2796,42 @@ function buildAgentChatUnavailableMessage(meta?: AgentChatReadinessMeta): string
         `模型：${modelText || '-'}`,
         `请先在设置里修正模型提供商/模型名/API Key${keyHint}。`,
     ].join('\n');
+}
+
+function shouldBlockTaskCreationForModelProbeFailure(result: {
+    ok: boolean;
+    status: string;
+    message: string;
+}): boolean {
+    if (result.ok) {
+        return false;
+    }
+    const status = (result.status || '').trim().toLowerCase();
+    const message = (result.message || '').trim().toLowerCase();
+    if (status === 'missing_base_url' || status === 'missing_api_key') {
+        return true;
+    }
+    return [
+        'error sending request for url',
+        'actively refused',
+        '由于目标计算机积极拒绝',
+        'connection refused',
+        'connect error',
+        'dns error',
+        'timed out',
+        'timeout',
+        '127.0.0.1',
+        'localhost',
+        '无法连接',
+    ].some((keyword) => message.includes(keyword.toLowerCase()));
+}
+
+function buildGroupDispatchFailureMessage(error?: string): string {
+    const detail = (error || '').trim();
+    if (!detail) {
+        return '该成员当前不可用，已跳过。';
+    }
+    return `该成员当前不可用，已跳过。\n原因：${detail}`;
 }
 
 interface AgentDirectoryItem {
@@ -3365,7 +3409,6 @@ export function ChatPage({
 
     const messagesRef = useRef<Message[]>([]);
     const pendingChatTaskDraftsRef = useRef<Map<string, PendingChatTaskDraftState>>(new Map());
-    const handledTaskDeliveryIdsRef = useRef<Set<string>>(new Set());
     const isSendingRef = useRef(isSending);
     const silentDispatchingRef = useRef(silentDispatching);
     const multiReplyDispatchingRef = useRef(multiReplyDispatching);
@@ -3394,6 +3437,7 @@ export function ChatPage({
     const requestGroupQueueMapRef = useRef<Map<string, { sessionId: string; itemId: string; speakerId: string }>>(new Map());
     const agentDirectoryRef = useRef<Map<string, AgentDirectoryItem>>(new Map());
     const agentReadinessRef = useRef<Map<string, AgentChatReadinessMeta>>(new Map());
+    const agentReadinessRefreshRef = useRef<Map<string, Promise<AgentChatReadinessMeta | undefined>>>(new Map());
     const remoteHistorySyncedKeysRef = useRef<Set<string>>(new Set());
     const remoteSessionQueueRef = useRef<BackendSessionSummary[]>([]);
     const remoteSessionSummaryMapRef = useRef<Map<string, BackendSessionSummary>>(new Map());
@@ -3415,6 +3459,61 @@ export function ChatPage({
         return candidates.includes('nuwa') || candidates.includes('女娲');
     }, [agent.id, agent.name, chatAgentId]);
     const agentManagementPermissionScope = isNuwaManagementAgent ? 'manage_all' as const : 'self_only' as const;
+
+    const refreshAgentReadiness = useCallback(async (agentId: string): Promise<AgentChatReadinessMeta | undefined> => {
+        const normalizedAgentId = agentId.trim();
+        if (!normalizedAgentId) {
+            return undefined;
+        }
+        const inflight = agentReadinessRefreshRef.current.get(normalizedAgentId);
+        if (inflight) {
+            return inflight;
+        }
+
+        const request = (async () => {
+            try {
+                const detail = await getManagementAgentDetail(normalizedAgentId);
+                const readinessMeta = {
+                    authStatus: detail.authStatus,
+                    ready: detail.ready,
+                    modelProvider: detail.model.provider,
+                    modelName: detail.model.model,
+                    apiKeyEnv: detail.model.apiKeyEnv,
+                } satisfies AgentChatReadinessMeta;
+                for (const key of collectAgentLookupKeys(
+                    normalizedAgentId,
+                    detail.id,
+                    detail.nickname,
+                    detail.name,
+                    detail.english_name,
+                )) {
+                    agentReadinessRef.current.set(key, readinessMeta);
+                }
+                return readinessMeta;
+            } catch (error) {
+                console.warn('[ChatPage] 刷新智能体模型状态失败:', normalizedAgentId, error);
+                return undefined;
+            } finally {
+                agentReadinessRefreshRef.current.delete(normalizedAgentId);
+            }
+        })();
+
+        agentReadinessRefreshRef.current.set(normalizedAgentId, request);
+        return request;
+    }, []);
+
+    const resolveAgentReadiness = useCallback(async (agentId: string): Promise<AgentChatReadinessMeta | undefined> => {
+        const normalizedAgentId = agentId.trim();
+        if (!normalizedAgentId) {
+            return undefined;
+        }
+        const cached = agentReadinessRef.current.get(normalizedAgentId);
+        if (!isAgentChatUnavailable(cached)) {
+            return cached;
+        }
+        const refreshed = await refreshAgentReadiness(normalizedAgentId);
+        return refreshed ?? cached;
+    }, [refreshAgentReadiness]);
     const sessionOwnerAgentId = (sessionOwnerAgentIdProp ?? chatAgentId).trim() || chatAgentId;
     const runtimeAgentId = (runtimeKeyProp ?? chatAgentId).trim() || chatAgentId;
     const groupRuntimeEnabled = groupRuntimeEnabledProp ?? false;
@@ -3443,6 +3542,9 @@ export function ChatPage({
     }, []);
     const matchesRemoteSessionScope = useCallback((label: string) => {
         const normalized = label.trim();
+        if (isInternalTaskSessionLabel(normalized)) {
+            return false;
+        }
         const matcher = sessionLabelMatcherRef.current;
         if (matcher) {
             try {
@@ -3580,6 +3682,10 @@ export function ChatPage({
                 .map((card) => card.taskId as string),
         )]
     ), [messages]);
+    const activeTaskSyncKey = useMemo(
+        () => activeTaskSyncIds.slice().sort().join(','),
+        [activeTaskSyncIds],
+    );
     const sessionKeywordNormalized = useMemo(() => sessionKeyword.trim().toLocaleLowerCase(), [sessionKeyword]);
     const visibleSessions = useMemo(
         () => {
@@ -3991,7 +4097,10 @@ export function ChatPage({
         }
     };
 
-    const resolveRequestSessionTarget = useCallback((sessionId?: string): { sessionId?: string; sessionLabel?: string } => {
+    const resolveRequestSessionTarget = useCallback((
+        sessionId?: string,
+        ownerAgentId?: string,
+    ): { sessionId?: string; sessionLabel?: string } => {
         const sid = (sessionId || activeSessionIdRef.current || '').trim();
         if (!sid) return {};
         const label = resolveSessionLabel(sid);
@@ -4001,7 +4110,16 @@ export function ChatPage({
         }
         const targetSession = sessions.find((session) => session.id === sid) ?? null;
         const remoteSessionId = getRemoteSessionId(targetSession);
+        const remoteOwnerAgentId = getRemoteSessionOwnerAgentId(targetSession);
+        const normalizedOwnerAgentId = (ownerAgentId || '').trim();
         if (remoteSessionId) {
+            if (
+                normalizedOwnerAgentId
+                && remoteOwnerAgentId
+                && remoteOwnerAgentId !== normalizedOwnerAgentId
+            ) {
+                return { sessionLabel: label ? label : undefined };
+            }
             return {
                 sessionId: remoteSessionId,
                 sessionLabel: targetSession?.sessionLabel || undefined,
@@ -4009,6 +4127,51 @@ export function ChatPage({
         }
         return { sessionLabel: label ? label : undefined };
     }, [resolveSessionLabel, sessions]);
+
+    const resolveRemoteTaskSessionBinding = useCallback(async (
+        sessionId?: string,
+        ownerAgentId?: string,
+    ): Promise<{ sessionId?: string; sessionLabel?: string; ownerAgentId?: string }> => {
+        const normalizedOwnerAgentId = (ownerAgentId || sessionOwnerAgentId || '').trim();
+        const target = resolveRequestSessionTarget(sessionId, normalizedOwnerAgentId);
+        if (target.sessionId) {
+            return {
+                sessionId: target.sessionId,
+                sessionLabel: target.sessionLabel,
+                ownerAgentId: normalizedOwnerAgentId || undefined,
+            };
+        }
+        const targetSessionLabel = (target.sessionLabel || '').trim();
+        if (!normalizedOwnerAgentId || !targetSessionLabel) {
+            return {
+                sessionLabel: targetSessionLabel || undefined,
+                ownerAgentId: normalizedOwnerAgentId || undefined,
+            };
+        }
+        const payload = await requestJson<unknown>(
+            `/api/chat/${encodeURIComponent(normalizedOwnerAgentId)}/session?session_label=${encodeURIComponent(targetSessionLabel)}`,
+        );
+        const resolvedSession = buildSessionFromBackendPayload(payload, {
+            sessionLabel: targetSessionLabel,
+        }, normalizedOwnerAgentId);
+        const container = payload && typeof payload === 'object'
+            ? payload as Record<string, unknown>
+            : {};
+        const resolvedSessionId = getRemoteSessionId(resolvedSession)
+            || (typeof container.session_id === 'string'
+                ? container.session_id.trim()
+                : (typeof container.id === 'string' ? container.id.trim() : ''));
+        const resolvedSessionLabel = (resolvedSession?.sessionLabel || '').trim()
+            || (typeof container.label === 'string'
+                ? container.label.trim()
+                : (typeof container.session_label === 'string' ? container.session_label.trim() : ''))
+            || targetSessionLabel;
+        return {
+            sessionId: resolvedSessionId || undefined,
+            sessionLabel: resolvedSessionLabel || undefined,
+            ownerAgentId: normalizedOwnerAgentId || undefined,
+        };
+    }, [resolveRequestSessionTarget, sessionOwnerAgentId]);
 
     const refreshActiveSessionContextTokens = useCallback(async (
         sessionId?: string,
@@ -5986,7 +6149,7 @@ export function ChatPage({
             }
 
             const protocolOnly = looksLikeProtocolOnlyText(next.text || '');
-            const hasRenderable = Boolean(next.spec) || (!protocolOnly && Boolean(next.text));
+            const hasRenderable = Boolean(next.taskCard) || Boolean(next.spec) || (!protocolOnly && Boolean(next.text));
             if (chunk.kind === 'done' && !hasRenderable) {
                 const fallbackText = extractLatestToolReadableText(next.toolTrace);
                 const fallbackSpec = buildFallbackSpecFromToolTrace(next.toolTrace);
@@ -6101,7 +6264,7 @@ export function ChatPage({
             && !groupRuntimeEnabled;
         const currentTaskDraft = shouldForwardCurrentTaskDraft ? getPendingChatTaskDraft() : null;
         const userMsg = originalUserMsg;
-        const readiness = agentReadinessRef.current.get(dispatchAgentId);
+        const readiness = await resolveAgentReadiness(dispatchAgentId);
         if (isAgentChatUnavailable(readiness)) {
             const reasonText = buildAgentChatUnavailableMessage(readiness);
             const failed: Message = {
@@ -6326,7 +6489,7 @@ export function ChatPage({
                 setSessionStreamState(activeRequestSessionIdRef.current, 'waiting');
             }
             setStreamState('waiting');
-        }, 3000);
+        }, STREAM_NO_OUTPUT_WATCHDOG_MS);
 
         let keepWaiting = false;
         try {
@@ -6337,7 +6500,7 @@ export function ChatPage({
             await ensureSessionCompactedIfNeeded(requestSessionIdForRequest, compactionTargets);
 
             const sendCurrentRequest = async () => {
-                const requestSessionTarget = resolveRequestSessionTarget(requestSessionIdForRequest);
+                const requestSessionTarget = resolveRequestSessionTarget(requestSessionIdForRequest, dispatchAgentId);
                 return sendAgentChat(withChatRenderContext({
                     agentId: dispatchAgentId,
                     message: outgoingMessage,
@@ -6512,13 +6675,13 @@ export function ChatPage({
             finalDraft.streaming = false;
             finalDraft.debugWatchdogTriggered = false;
             finalDraft.tools = (finalDraft.tools ?? []).map((tool) => ({ ...tool, running: false }));
-            finalDraft.uiStreamState = finalDraft.spec != null || (finalDraft.uiRawText || '').trim()
+            finalDraft.uiStreamState = finalDraft.taskCard || finalDraft.spec != null || (finalDraft.uiRawText || '').trim()
                 ? 'ready'
                 : 'idle';
-            if (!finalDraft.text && !finalDraft.spec && !doneReceivedRef.current && finalDraft.cardPending) {
+            if (!finalDraft.text && !finalDraft.spec && !finalDraft.taskCard && !doneReceivedRef.current && finalDraft.cardPending) {
                 finalDraft.text = '卡片生成未完成，请重试。';
             }
-            if (!finalDraft.text && !finalDraft.spec && (finalDraft.toolTrace?.length ?? 0) > 0) {
+            if (!finalDraft.text && !finalDraft.spec && !finalDraft.taskCard && (finalDraft.toolTrace?.length ?? 0) > 0) {
                 const fallbackText = extractLatestToolReadableText(finalDraft.toolTrace);
                 if (fallbackText && !looksLikeProtocolOnlyText(fallbackText)) {
                     finalDraft.text = fallbackText;
@@ -6554,7 +6717,7 @@ export function ChatPage({
             if (autoAppearanceAction) {
                 finalDraft.spec = autoAppearanceAction.strippedSpec;
                 finalDraft.uiRawText = '';
-                finalDraft.uiStreamState = finalDraft.spec != null ? 'ready' : 'idle';
+                finalDraft.uiStreamState = finalDraft.taskCard || finalDraft.spec != null ? 'ready' : 'idle';
             }
             const autoComponentInvokeAction = result.success
                 ? extractComponentInvokeActionFromSpec(finalDraft.spec)
@@ -6563,7 +6726,10 @@ export function ChatPage({
                 finalDraft = prepareMessageForComponentInvokeAction(finalDraft, autoComponentInvokeAction.payload);
             }
             const protocolOnly = looksLikeProtocolOnlyText(finalDraft.text || '');
-            const hasRenderable = Boolean(autoAppearanceAction) || Boolean(finalDraft.spec) || (!protocolOnly && Boolean(finalDraft.text));
+            const hasRenderable = Boolean(autoAppearanceAction)
+                || Boolean(finalDraft.taskCard)
+                || Boolean(finalDraft.spec)
+                || (!protocolOnly && Boolean(finalDraft.text));
             if (!hasRenderable && doneReceivedRef.current) {
                 const fallbackSpec = buildFallbackSpecFromToolTrace(finalDraft.toolTrace);
                 if (finalDraft.spec == null && fallbackSpec != null) {
@@ -6786,126 +6952,43 @@ export function ChatPage({
     };
 
     const updateTaskCardMessage = (messageId: string, updater: (card: ChatTaskCardData) => ChatTaskCardData) => {
-        commitMessages((prev) => prev.map((message) => {
-            if (message.id !== messageId || !message.taskCard) return message;
-            return {
-                ...message,
-                taskCard: updater(message.taskCard),
-            };
-        }));
+        commitMessages((prev) => {
+            let changed = false;
+            const next = prev.map((message) => {
+                if (message.id !== messageId || !message.taskCard) return message;
+                const nextCard = updater(message.taskCard);
+                if (nextCard === message.taskCard || areTaskCardsEquivalent(message.taskCard, nextCard)) {
+                    return message;
+                }
+                changed = true;
+                return {
+                    ...message,
+                    taskCard: nextCard,
+                };
+            });
+            return changed ? next : prev;
+        });
     };
 
     const updateTaskCardByTaskId = (taskId: string, updater: (card: ChatTaskCardData) => ChatTaskCardData) => {
-        commitMessages((prev) => prev.map((message) => {
-            if (!message.taskCard || message.taskCard.taskId !== taskId) return message;
-            return {
-                ...message,
-                taskCard: updater(message.taskCard),
-            };
-        }));
+        commitMessages((prev) => {
+            let changed = false;
+            const next = prev.map((message) => {
+                if (!message.taskCard || message.taskCard.taskId !== taskId) return message;
+                const nextCard = updater(message.taskCard);
+                if (nextCard === message.taskCard || areTaskCardsEquivalent(message.taskCard, nextCard)) {
+                    return message;
+                }
+                changed = true;
+                return {
+                    ...message,
+                    taskCard: nextCard,
+                };
+            });
+            return changed ? next : prev;
+        });
     };
 
-    const consumePendingTaskReportDeliveries = useCallback(async (sessionId: string) => {
-        const deliveries = await listPendingTaskReportDeliveries({ chatSessionId: sessionId });
-        if (deliveries.length === 0) {
-            return;
-        }
-        const ordered = deliveries
-            .slice()
-            .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
-        for (const delivery of ordered) {
-            const deliveryId = delivery.id.trim();
-            const taskId = delivery.taskId.trim();
-            if (!deliveryId || !taskId) {
-                continue;
-            }
-            if (handledTaskDeliveryIdsRef.current.has(deliveryId)) {
-                continue;
-            }
-            const reportAt = delivery.reportedAt || delivery.updatedAt || delivery.createdAt;
-            const summary = readTaskDeliverySummary(delivery);
-            const progressPercent = readTaskDeliveryProgressPercent(delivery.payload);
-            if (!summary && delivery.deliveryKind !== 'progress') {
-                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
-                handledTaskDeliveryIdsRef.current.add(deliveryId);
-                continue;
-            }
-
-            if (delivery.deliveryKind === 'progress') {
-                updateTaskCardByTaskId(taskId, (card) => appendTaskTimeline({
-                    ...card,
-                    stage: card.stage === 'completed' || card.stage === 'cancelled' ? card.stage : 'running',
-                    reportStatus: 'acknowledged',
-                    latestReportAt: reportAt,
-                    latestReportKind: 'progress',
-                    updatedAt: reportAt,
-                    progressPercent: typeof progressPercent === 'number'
-                        ? Math.max(card.progressPercent ?? 0, progressPercent)
-                        : card.progressPercent,
-                }, buildTaskTimelineEntry({
-                    idSeed: deliveryId,
-                    kind: 'progress',
-                    title: summary || '收到进度汇报',
-                    detail: summary || undefined,
-                    at: reportAt,
-                    runCount: delivery.runCount,
-                    level: 'info',
-                })));
-                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
-                handledTaskDeliveryIdsRef.current.add(deliveryId);
-                continue;
-            }
-
-            if (delivery.deliveryKind === 'anomaly') {
-                updateTaskCardByTaskId(taskId, (card) => appendTaskTimeline({
-                    ...card,
-                    reportStatus: 'acknowledged',
-                    errorSummary: summary,
-                    errorCount: Math.max(1, card.errorCount ?? 0),
-                    latestReportAt: reportAt,
-                    latestReportKind: 'anomaly',
-                    updatedAt: reportAt,
-                }, buildTaskTimelineEntry({
-                    idSeed: deliveryId,
-                    kind: 'anomaly',
-                    title: '收到异常汇报',
-                    detail: summary,
-                    at: reportAt,
-                    runCount: delivery.runCount,
-                    level: 'error',
-                })));
-                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
-                handledTaskDeliveryIdsRef.current.add(deliveryId);
-                continue;
-            }
-
-            if (delivery.deliveryKind === 'final') {
-                const runCount = Math.max(0, Math.floor(delivery.runCount ?? 0));
-                storeTaskFinalSummary(taskId, runCount, summary);
-                markTaskFinalSummaryDelivered(taskId, runCount || 1);
-                updateTaskCardByTaskId(taskId, (card) => appendTaskTimeline({
-                    ...card,
-                    stage: 'completed',
-                    finalSummaryReady: true,
-                    finalSummaryText: summary,
-                    reportStatus: 'acknowledged',
-                    latestReportAt: reportAt,
-                    latestReportKind: 'final',
-                    updatedAt: reportAt,
-                }, buildTaskTimelineEntry({
-                    idSeed: deliveryId,
-                    kind: 'final',
-                    title: '收到最终总结',
-                    detail: summary,
-                    at: reportAt,
-                    runCount: delivery.runCount,
-                    level: 'success',
-                })));
-                await updateTaskReportDeliveryStatus(deliveryId, 'acknowledged');
-                handledTaskDeliveryIdsRef.current.add(deliveryId);
-            }
-        }
-    }, [agent.name]);
 
     type AutoDispatchMeta = {
         chainId: string;
@@ -7164,7 +7247,7 @@ export function ChatPage({
                         if (!targetId) continue;
                         const queueItemId = mentionQueueItems.find((item) => item.agentId === targetId)?.id;
 
-                        const readiness = agentReadinessRef.current.get(targetId);
+                        const readiness = await resolveAgentReadiness(targetId);
                         if (isAgentChatUnavailable(readiness)) {
                             const fallbackText = buildAgentChatUnavailableMessage(readiness);
                             commitMessages((prev) => [...prev, {
@@ -7234,12 +7317,13 @@ export function ChatPage({
                         const requestId = generateId();
                         await ensureSessionCompactedIfNeeded(activeSessionIdRef.current, [targetId, senderId, groupLeaderAgentId]);
                         const sendCurrentMentionRequest = async () => {
-                            const requestSessionTarget = resolveRequestSessionTarget();
+                            const requestSessionTarget = resolveRequestSessionTarget(undefined, targetId);
                             return sendAgentChat(withChatRenderContext({
                                 agentId: targetId,
                                 message: buildGroupDispatchHandoffMessage(msg),
                                 history,
-                                stream: false,
+                                stream: true,
+                                timeoutMs: GROUP_AUTO_CHAT_TIMEOUT_MS,
                                 requestId,
                                 sessionId: requestSessionTarget.sessionId,
                                 sessionLabel: requestSessionTarget.sessionLabel,
@@ -7306,9 +7390,7 @@ export function ChatPage({
                             : (raw ? extractUiRawText(raw) : '');
                         const fallbackText = result.success
                             ? ''
-                            : (result.error?.trim()
-                                ? '该成员当前不可用，已跳过。'
-                                : '该成员当前不可用，已跳过。');
+                            : buildGroupDispatchFailureMessage(result.error);
                         const autoComponentInvokeAction = result.success
                             ? extractComponentInvokeActionFromSpec(renderSpec)
                             : null;
@@ -7507,7 +7589,7 @@ export function ChatPage({
                 if (!extraId) continue;
                 const queueItemId = extraQueueItems.find((item) => item.agentId === extraId)?.id;
 
-                const readiness = agentReadinessRef.current.get(extraId);
+                const readiness = await resolveAgentReadiness(extraId);
                 if (isAgentChatUnavailable(readiness)) {
                     const fallbackText = buildAgentChatUnavailableMessage(readiness);
                     commitMessages((prev) => [...prev, {
@@ -7577,12 +7659,13 @@ export function ChatPage({
                 const requestId = generateId();
                 await ensureSessionCompactedIfNeeded(activeSessionIdRef.current, [extraId, primaryReplyAgentId, groupLeaderAgentId]);
                 const sendCurrentExtraRequest = async () => {
-                    const requestSessionTarget = resolveRequestSessionTarget();
+                    const requestSessionTarget = resolveRequestSessionTarget(undefined, extraId);
                     return sendAgentChat(withChatRenderContext({
                         agentId: extraId,
                         message: transformed.trim(),
                         history,
-                        stream: false,
+                        stream: true,
+                        timeoutMs: GROUP_AUTO_CHAT_TIMEOUT_MS,
                         requestId,
                         sessionId: requestSessionTarget.sessionId,
                         sessionLabel: requestSessionTarget.sessionLabel,
@@ -7649,9 +7732,7 @@ export function ChatPage({
                     : (raw ? extractUiRawText(raw) : '');
                 const fallbackText = result.success
                     ? ''
-                    : (result.error?.trim()
-                        ? '该成员当前不可用，已跳过。'
-                        : '该成员当前不可用，已跳过。');
+                    : buildGroupDispatchFailureMessage(result.error);
                 const autoComponentInvokeAction = result.success
                     ? extractComponentInvokeActionFromSpec(renderSpec)
                     : null;
@@ -7904,6 +7985,7 @@ export function ChatPage({
             at: nowIso,
             level: 'info',
         }));
+        const acceptedTaskContextText = buildTaskAcceptanceContextText(placeholderCard);
         if (isRetryingDraftCreation) {
             updateTaskCardMessage(placeholderMessageId, () => placeholderCard);
             commitMessages((prev) => prev.map((message) => (
@@ -7925,7 +8007,7 @@ export function ChatPage({
                         ...message,
                         taskCard: undefined,
                         spec: undefined,
-                        text: `${(message.text || '').trim()}\n已确认创建任务，运行占位符已生成。`.trim(),
+                        text: (message.text || '').trim(),
                         uiRawText: '',
                         uiStreamState: 'idle',
                         tools: [],
@@ -7946,7 +8028,7 @@ export function ChatPage({
                         agentAvatarUrl: agent.avatarUrl,
                         agentColor: agent.color,
                         agentPortraitUrl: agent.portraitUrl,
-                        text: `任务已受理：${sourceCard.taskName}`,
+                        text: acceptedTaskContextText,
                         taskCard: placeholderCard,
                         timestamp: nowIso,
                     },
@@ -7967,13 +8049,109 @@ export function ChatPage({
         const bindingSessionId = activeSessionIdRef.current.trim();
         const remoteChatSessionId = getRemoteSessionId(activeSession);
         const remoteChatSessionOwnerAgentId = getRemoteSessionOwnerAgentId(activeSession) || sessionOwnerAgentId;
+        const taskSessionTarget = [
+            CHAT_TASK_RUNTIME_SESSION_PREFIX,
+            chatAgentId,
+            bindingSessionId || 'local',
+            originMessageId,
+        ]
+            .map((value) => value.trim())
+            .filter(Boolean)
+            .join('::');
+        const markTaskCreationFailed = (detail: string) => {
+            const message = detail.trim() || '未知错误';
+            pushInAppNotice({
+                title: '任务创建失败',
+                message,
+                level: 'error',
+            });
+            updateTaskCardMessage(placeholderMessageId, (card) => appendTaskTimeline({
+                ...card,
+                stage: 'failed',
+                canCreate: true,
+                canCancel: false,
+                bindingSessionId: card.bindingSessionId || bindingSessionId || undefined,
+                bindingSourceMessageId: card.bindingSourceMessageId || originMessageId,
+                updatedAt: new Date().toISOString(),
+            }, buildTaskTimelineEntry({
+                kind: 'failed',
+                title: '任务创建失败',
+                detail: message,
+                level: 'error',
+            })));
+        };
 
         setTaskActionBusy(true);
         try {
+            const executorDetail = await getManagementAgentDetail(chatAgentId);
+            const executorMeta: AgentChatReadinessMeta = {
+                authStatus: executorDetail.authStatus,
+                ready: executorDetail.ready,
+                modelProvider: executorDetail.model.provider,
+                modelName: executorDetail.model.model,
+                apiKeyEnv: executorDetail.model.apiKeyEnv,
+            };
+            if (isAgentChatUnavailable(executorMeta)) {
+                markTaskCreationFailed(buildAgentChatUnavailableMessage(executorMeta));
+                return;
+            }
+            const executorProvider = (executorDetail.model.provider || '').trim();
+            const executorModel = (executorDetail.model.model || '').trim();
+            if (executorProvider && executorModel) {
+                const modelProbe = await testManagementModelConnection({
+                    provider: executorProvider,
+                    model: executorModel,
+                    modelId: `${executorProvider}::${executorModel}`,
+                });
+                if (!modelProbe.ok && shouldBlockTaskCreationForModelProbeFailure(modelProbe)) {
+                    markTaskCreationFailed([
+                        '当前执行智能体模型连通性不可用，已阻止创建任务进入调度。',
+                        `模型：${executorProvider}/${executorModel}`,
+                        `原因：${modelProbe.message || modelProbe.status || '未知错误'}`,
+                    ].join('\n'));
+                    return;
+                }
+                if (!modelProbe.ok) {
+                    pushInAppNotice({
+                        title: '模型预检未通过，已继续创建任务',
+                        message: [
+                            `模型：${executorProvider}/${executorModel}`,
+                            `原因：${modelProbe.message || modelProbe.status || '未知错误'}`,
+                        ].join('\n'),
+                        level: 'warning',
+                    });
+                }
+            }
+            const resolvedRemoteBinding = remoteChatSessionId
+                ? {
+                    sessionId: remoteChatSessionId,
+                    sessionLabel: (activeSession?.sessionLabel || '').trim() || undefined,
+                    ownerAgentId: remoteChatSessionOwnerAgentId || undefined,
+                }
+                : await resolveRemoteTaskSessionBinding(bindingSessionId, remoteChatSessionOwnerAgentId);
+            const resolvedRemoteSessionId = (resolvedRemoteBinding.sessionId || '').trim();
+            const resolvedRemoteSessionOwnerAgentId = (
+                resolvedRemoteBinding.ownerAgentId
+                || remoteChatSessionOwnerAgentId
+                || sessionOwnerAgentId
+                || ''
+            ).trim();
+            if (bindingSessionId && (resolvedRemoteSessionId || resolvedRemoteBinding.sessionLabel)) {
+                bindSessionRemoteTarget(bindingSessionId, {
+                    sessionId: resolvedRemoteSessionId || undefined,
+                    sessionLabel: resolvedRemoteBinding.sessionLabel,
+                    ownerAgentId: resolvedRemoteSessionOwnerAgentId || undefined,
+                });
+            }
+            if (!resolvedRemoteSessionId) {
+                const detail = '当前聊天会话还没有稳定绑定到远端线程，已阻止创建任务，避免后续异常和最终汇报丢失。请先在当前会话继续对话一次后重试。';
+                markTaskCreationFailed(detail);
+                return;
+            }
             const created = await createTask({
                 teamId: chatAgentId,
-                remoteChatSessionId: remoteChatSessionId || undefined,
-                remoteChatSessionOwnerAgentId: remoteChatSessionOwnerAgentId || undefined,
+                remoteChatSessionId: resolvedRemoteSessionId || undefined,
+                remoteChatSessionOwnerAgentId: resolvedRemoteSessionOwnerAgentId || undefined,
                 sourceType: 'chat',
                 sourceRef: encodeChatTaskSourceRef(activeSessionIdRef.current, originMessageId),
                 reportCondition: sourceCard.reportCondition,
@@ -7994,30 +8172,16 @@ export function ChatPage({
                 },
                 jobType: 'agent',
                 prompt: sourceCard.executionPrompt,
-                delivery: { mode: 'none' },
+                sessionTarget: taskSessionTarget,
+                delivery: {
+                    mode: 'announce',
+                    notifyOnFinal: true,
+                },
                 maxRuns: sourceCard.maxRuns,
             });
 
             if (!created.success || !created.data) {
-                pushInAppNotice({
-                    title: '任务创建失败',
-                    message: created.message || '未知错误',
-                    level: 'error',
-                });
-                updateTaskCardMessage(placeholderMessageId, (card) => appendTaskTimeline({
-                    ...card,
-                    stage: 'failed',
-                    canCreate: true,
-                    canCancel: false,
-                    bindingSessionId: card.bindingSessionId || bindingSessionId || undefined,
-                    bindingSourceMessageId: card.bindingSourceMessageId || originMessageId,
-                    updatedAt: new Date().toISOString(),
-                }, buildTaskTimelineEntry({
-                    kind: 'failed',
-                    title: '任务创建失败',
-                    detail: created.message || '未知错误',
-                    level: 'error',
-                })));
+                markTaskCreationFailed(created.message || '未知错误');
                 return;
             }
 
@@ -8335,6 +8499,11 @@ export function ChatPage({
         payload: Record<string, unknown>,
         _ctx?: { messageId?: string },
     ) => {
+        const upgradeGuard = analyzeSelfUpgradePayload(payload);
+        if (!upgradeGuard.canConfirm) {
+            appendLocalAgentMessage(upgradeGuard.reason || '当前升级审查缺少可执行补丁内容，无法继续确认。');
+            return;
+        }
         const reviewId = typeof payload.reviewId === 'string'
             ? payload.reviewId.trim()
             : typeof payload.review_id === 'string'
@@ -8354,7 +8523,7 @@ export function ChatPage({
             '请立即调用 my_upgrade_apply 执行升级，不要再重复审查。',
             `工具参数：${JSON.stringify(nextPayload)}`,
         ].join('\n'));
-    }, [handleSendSilentMessage]);
+    }, [appendLocalAgentMessage, handleSendSilentMessage]);
 
     const handleCancelSelfUpgrade = useCallback((
         payload: Record<string, unknown>,
@@ -8412,8 +8581,8 @@ export function ChatPage({
             }
             const latest = await getTaskDetail(taskId);
             const canDeleteAfterCancel = latest
-                ? latest.runInfo.runCount === 0 && !latest.runInfo.lastRun
-                : card.runCount === 0 && !card.lastRun;
+                ? canDeleteTask(latest)
+                : card.canDelete === true;
             const shouldRecoverAgent =
                 Boolean(latest?.runInfo.lastRun)
                 || latest?.runInfo.lastStatus === 'running'
@@ -8455,7 +8624,7 @@ export function ChatPage({
                         currentSessionId,
                         recoveredSessionLabel,
                         undefined,
-                        '已停止异常任务占用，并切换到新的恢复会话。你现在可以继续输入，不会再复用旧任务链路。',
+                        '已释放任务执行占用，后续普通对话会继续留在当前聊天中处理。',
                     );
                 }
             }
@@ -8599,57 +8768,16 @@ export function ChatPage({
         setA2aDetailsCard(latest);
     }, [a2aDetailsOpen, a2aDetailsTarget, messages]);
 
-    useEffect(() => {
-        let cancelled = false;
-        let timer: number | null = null;
-
-        const poll = async () => {
-            const sessionId = activeSessionIdRef.current.trim();
-            if (
-                !sessionId
-                || isDocumentHidden()
-                || streamStateRef.current !== 'idle'
-                || isSendingRef.current
-                || silentDispatchingRef.current
-                || multiReplyDispatchingRef.current
-            ) {
-                if (!cancelled) {
-                    timer = window.setTimeout(() => {
-                        void poll();
-                    }, 3_000);
-                }
-                return;
-            }
-            try {
-                await consumePendingTaskReportDeliveries(sessionId);
-            } catch {
-                // 下一轮轮询继续处理。
-            } finally {
-                if (!cancelled) {
-                    timer = window.setTimeout(() => {
-                        void poll();
-                    }, 3_000);
-                }
-            }
-        };
-
-        void poll();
-        return () => {
-            cancelled = true;
-            if (timer != null) {
-                window.clearTimeout(timer);
-            }
-        };
-    }, [activeSessionId, consumePendingTaskReportDeliveries]);
 
     useEffect(() => {
-        if (activeTaskSyncIds.length === 0) {
+        if (!activeTaskSyncKey) {
             return;
         }
 
         let cancelled = false;
         let timer: number | null = null;
         let syncing = false;
+        const taskIds = activeTaskSyncIds;
 
         const syncTaskCards = async () => {
             if (cancelled || syncing || isDocumentHidden()) {
@@ -8657,7 +8785,7 @@ export function ChatPage({
             }
             syncing = true;
             try {
-                await Promise.all(activeTaskSyncIds.map(async (taskId) => {
+                await Promise.all(taskIds.map(async (taskId) => {
                     const [detail, runs] = await Promise.all([
                         getTaskDetail(taskId),
                         listTaskRuns(taskId),
@@ -8699,7 +8827,7 @@ export function ChatPage({
                             progressPercent: calculateTaskProgressPercent(runCount, card.maxRuns) ?? card.progressPercent,
                             errorSummary: errorCount > 0 ? (runs.find((run) => run.status === 'error')?.output || card.errorSummary) : card.errorSummary,
                             timeline: mergedTimeline,
-                            updatedAt: new Date().toISOString(),
+                            updatedAt: card.updatedAt,
                         };
                         if (finalSummary?.content?.trim() && !next.timeline?.some((item) => item.kind === 'final')) {
                             next = appendTaskTimeline(next, buildTaskTimelineEntry({
@@ -8733,7 +8861,13 @@ export function ChatPage({
                                 level: 'success',
                             });
                         }
-                        return next;
+                        if (areTaskCardsEquivalent(card, next)) {
+                            return card;
+                        }
+                        return {
+                            ...next,
+                            updatedAt: new Date().toISOString(),
+                        };
                     });
                 }));
             } finally {
@@ -8754,7 +8888,7 @@ export function ChatPage({
                 window.clearTimeout(timer);
             }
         };
-    }, [activeTaskSyncIds]);
+    }, [activeTaskSyncKey, agent.name]);
 
     useEffect(() => {
         if (isSending || silentDispatching) return;

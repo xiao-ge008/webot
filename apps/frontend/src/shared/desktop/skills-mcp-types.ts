@@ -9,11 +9,11 @@ export interface SkillMetadata {
 
 /** Skill 文件信息 */
 export interface SkillItem {
-  id: string;          // 技能标识（可能包含来源前缀）
+  id: string; // 技能标识（可能包含来源前缀）
   metadata: SkillMetadata;
-  path: string;         // 完整路径
-  isSystem: boolean;    // 是否为系统技能
-  isNew: boolean;       // 是否为新导入
+  path: string; // 完整路径
+  isSystem: boolean; // 是否为系统技能
+  isNew: boolean; // 是否为新导入
 }
 
 /** Skill 导入输入 */
@@ -41,19 +41,19 @@ export interface SkillImportResult {
 
 /** MCP 服务器配置 */
 export interface McpServerConfig {
-  id: string;           // 服务器 ID
-  name: string;         // 显示名称
+  id: string; // 服务器 ID
+  name: string; // 显示名称
   description?: string; // 描述
   type: 'stdio' | 'sse' | 'streamableHttp' | string; // 类型
-  enabled: boolean;     // 是否启用
-  path?: string;        // 本地路径（如果是本地旧版）
-  command?: string;     // 启动命令 (stdio)
-  args?: string[];      // 启动参数 (stdio)
+  enabled: boolean; // 是否启用
+  path?: string; // 本地路径（如果是本地旧版）
+  command?: string; // 启动命令 (stdio)
+  args?: string[]; // 启动参数 (stdio)
   env?: Record<string, string>; // 环境变量 (stdio)
-  url?: string;         // URL (sse/streamableHttp)
+  url?: string; // URL (sse/streamableHttp)
   headers?: Record<string, string>; // 请求头 (streamableHttp)
   longRunning?: boolean; // 长时间运行模式
-  timeout?: number;      // 超时时间（秒）
+  timeout?: number; // 超时时间（秒）
 }
 
 /** MCP 创建输入 */
@@ -112,24 +112,3 @@ export interface McpServerDeleteResult {
   success: boolean;
   message?: string;
 }
-
-// ==================== Schemas ====================
-// (Unused)
-
-// ==================== IPC Channels ====================
-
-export const SKILLS_MCP_CHANNELS = {
-  // Skills
-  SKILLS_LIST: 'skills-mcp:list-skills',
-  SKILLS_DELETE: 'skills-mcp:delete-skill',
-  SKILLS_REFRESH: 'skills-mcp:refresh-skills',
-  SKILLS_IMPORT: 'skills-mcp:import-skill',
-
-  // MCP
-  MCP_LIST: 'skills-mcp:list-mcp',
-  MCP_CREATE: 'skills-mcp:create-mcp',
-  MCP_IMPORT: 'skills-mcp:import-mcp',
-  MCP_DELETE: 'skills-mcp:delete-mcp',
-  MCP_UPDATE: 'skills-mcp:update-mcp',
-  MCP_REFRESH: 'skills-mcp:refresh-mcp',
-} as const;

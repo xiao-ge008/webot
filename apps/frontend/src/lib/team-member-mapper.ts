@@ -1,4 +1,4 @@
-import type { AgentTeamMember } from '@/main/types';
+import type { AgentTeamMember } from '@/shared/desktop/types';
 import type { TeamMember } from '@/components/settings/TeamMemberConfig';
 import { createTeamMemberTools } from '@/components/settings/TeamMemberConfig';
 

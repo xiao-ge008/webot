@@ -38,6 +38,7 @@ import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+import { useGlobalAlert } from '@/providers/GlobalAlertProvider';
 import { formatCurrentModelLabel, formatModelLabel } from '@/lib/model-label';
 import { pushInAppNotice } from '@/services/in-app-notifier';
 import {
@@ -85,7 +86,7 @@ import {
   uploadManagementAgentPortrait,
 } from '@/services/management-client';
 import { getTtsConfig } from '@/services/tts-client';
-import type { AgentEmbodimentConfig, EmbodimentAssetRef, EmbodimentVoiceRef } from '@/main/types';
+import type { AgentEmbodimentConfig, EmbodimentAssetRef, EmbodimentVoiceRef } from '@/shared/desktop/types';
 
 interface ModelOption {
   modelId: string;
@@ -1159,6 +1160,7 @@ export function EditAgentPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { t } = useTranslation();
+  const { showConfirm } = useGlobalAlert();
 
   const [activeTab, setActiveTab] = useState('basic');
   const [editorTab, setEditorTab] = useState<EditorTab>('identity');
@@ -1800,7 +1802,12 @@ export function EditAgentPage() {
     if (!id || !semanticSupported) {
       return;
     }
-    if (!window.confirm(t('edit.memory.semanticDeleteConfirm'))) {
+    if (!await showConfirm(t('edit.memory.semanticDeleteConfirm'), {
+      title: '删除记忆',
+      confirmText: '删除',
+      cancelText: '取消',
+      variant: 'destructive',
+    })) {
       return;
     }
     const key = `${memoryId}:delete`;
@@ -4318,3 +4325,4 @@ export function EditAgentPage() {
     </div>
   );
 }
+

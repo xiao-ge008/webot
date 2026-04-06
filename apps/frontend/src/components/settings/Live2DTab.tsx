@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { UploadCloud, RefreshCw, Save, Copy, FileJson, Check, ExternalLink, Github, Play } from 'lucide-react';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
-import type { Live2dModelConfig, Live2dMotion, Live2dExpression } from '@/main/types';
+import type { Live2dModelConfig, Live2dMotion, Live2dExpression } from '@/shared/desktop/types';
 import { Live2DViewer } from './Live2DViewer';
 
 export function Live2DTab() {

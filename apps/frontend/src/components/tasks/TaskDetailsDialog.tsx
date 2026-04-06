@@ -233,6 +233,7 @@ function resolveTaskDetailsModel(
     const runCount = Math.max(runCountFromTask, runs.length);
     const lifecycle = resolveTaskLifecycle({
         enabled: resolvedTask.enabled,
+        runtimeState: resolvedTask.runtimeState,
         maxRuns: resolvedTask.maxRuns,
         runInfo: {
             lastStatus: resolvedTask.runInfo.lastStatus,

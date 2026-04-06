@@ -1,35 +1,33 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
-use crate::assignment_store;
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatTaskDraftPayload {
     #[serde(default)]
     pub objective: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "reportCondition")]
     pub report_condition: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "everyMs")]
     pub every_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "maxRuns")]
     pub max_runs: Option<u32>,
-    #[serde(default)]
+    #[serde(default, alias = "durationMs")]
     pub duration_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "scheduleText")]
     pub schedule_text: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "sourceMessageText")]
     pub source_message_text: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "createdAt")]
     pub created_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "missingSlots")]
     pub missing_slots: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "readyToConfirm")]
     pub ready_to_confirm: bool,
 }
 
@@ -38,6 +36,14 @@ pub struct AnalyzeChatTaskDraftRequest {
     pub message: String,
     #[serde(default)]
     pub current_draft: Option<ChatTaskDraftPayload>,
+    #[serde(default)]
+    pub session_messages: Vec<ChatTaskContextMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTaskContextMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,11 +119,6 @@ pub struct ChatTaskCardResponse {
     pub progress_percent: u32,
     pub timeline: Vec<ChatTaskTimelineItemResponse>,
 }
-
-const TASK_DRAFT_PARSER_AGENT_NAME: &str = "webot-task-draft-parser";
-const TASK_DRAFT_PARSER_AGENT_DESCRIPTION: &str =
-    "Webot 内部任务草稿解析智能体，只负责结构化理解聊天任务意图。";
-static TASK_DRAFT_PARSER_AGENT_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn build_task_name(objective: &str, fallback: &str) -> String {
     let seed = if objective.trim().is_empty() {
@@ -205,17 +206,18 @@ fn build_execution_prompt(
     lines.extend([
         "要求：".to_string(),
         "0) 这是已经创建好的任务的一次实际执行轮次，不是在创建任务。".to_string(),
-        "1) 必须返回可读的结论。".to_string(),
-        "2) 若失败，返回失败原因。".to_string(),
-        "3) 不要输出额外格式包装。".to_string(),
-        "4) 禁止输出“是否创建任务/请确认/确认后执行”等二次确认语句。".to_string(),
-        "5) 禁止复述调度信息（如每几分钟执行一次），仅输出本次查询结果。".to_string(),
-        "6) 监控/阈值类任务必须说明关键数值、阈值比较和是否触发告警。".to_string(),
-        "7) 严禁再次创建、修改、发布、暂停、删除、查询任何任务或调度，不要调用 cron_create、cron_list、cron_delete、schedule_create、schedule_list、schedule_delete、任务中心或调度类工具。".to_string(),
-        "8) 回复最后必须单独追加一行机器结果，格式严格如下：".to_string(),
+        "1) 先像真实执行者一样理解这次轮次的任务身份、监控目标、异常标准、用户要的结果，再决定是否调用工具。".to_string(),
+        "2) 必须返回可读的结论。".to_string(),
+        "3) 若失败，返回失败原因。".to_string(),
+        "4) 不要输出额外格式包装。".to_string(),
+        "5) 禁止输出“是否创建任务/请确认/确认后执行”等二次确认语句。".to_string(),
+        "6) 禁止复述调度信息（如每几分钟执行一次），仅输出本次查询结果。".to_string(),
+        "7) 监控/阈值类任务必须说明关键数值、阈值比较、与上一轮相比是否有变化、变化方向或幅度、是否命中汇报条件，以及为什么触发或未触发告警。".to_string(),
+        "8) 严禁再次创建、修改、发布、暂停、删除、查询任何任务或调度，不要调用 cron_create、cron_list、cron_delete、schedule_create、schedule_list、schedule_delete、任务中心或调度类工具。".to_string(),
+        "9) 回复最后必须单独追加一行机器结果，格式严格如下：".to_string(),
         "<task-result>{\"status\":\"ok\",\"alert\":false,\"summary\":\"一句话总结\",\"details\":\"补充说明，可为空\"}</task-result>".to_string(),
-        "9) 如果任务执行失败，把 status 改为 error，并在 summary/details 中写明失败原因。".to_string(),
-        "10) 如果命中异常或阈值，把 alert 改为 true；未命中则为 false。".to_string(),
+        "10) 如果任务执行失败，把 status 改为 error，并在 summary/details 中写明失败原因。".to_string(),
+        "11) 如果命中异常或阈值，把 alert 改为 true；未命中则为 false。".to_string(),
     ]);
     lines.join("\n")
 }
@@ -234,10 +236,10 @@ fn default_unmatched_response() -> AnalyzeChatTaskDraftResponse {
     }
 }
 
-fn build_parser_unavailable_response(
-    current_draft: Option<ChatTaskDraftPayload>,
+fn build_analysis_unavailable_response(
+    draft: Option<ChatTaskDraftPayload>,
 ) -> AnalyzeChatTaskDraftResponse {
-    let Some(draft) = current_draft else {
+    let Some(draft) = draft else {
         return default_unmatched_response();
     };
     AnalyzeChatTaskDraftResponse {
@@ -246,7 +248,8 @@ fn build_parser_unavailable_response(
         ready_to_confirm: false,
         draft: Some(draft),
         prompt_text: Some(
-            "任务草稿解析暂时不可用，请稍后重试，或重新补充一次频率和汇报条件。".to_string(),
+            "当前智能体的任务草案分析暂时不可用，本次没有生成任务卡。请稍后重试，或重新补充一次任务要求。"
+                .to_string(),
         ),
         task_name: None,
         schedule_text: None,
@@ -329,206 +332,147 @@ fn parse_model_task_draft_analysis(raw: &str) -> Option<ModelTaskDraftAnalysis> 
     })
 }
 
-fn build_model_system_prompt() -> &'static str {
-    r#"你是“任务草稿解析器”。
-你的职责是判断一条聊天消息，是否应该被识别为“创建任务/补充任务草稿”的输入，并提取结构化字段。
-
-严格规则：
-1. 只能输出一个 JSON 对象，禁止 Markdown、禁止代码块、禁止任何解释。
-2. 如果当前没有任务草稿，只有当用户明显在表达“定时执行、周期监控、条件提醒、持续跟踪、自动汇报”这类任务意图时，matched 才能为 true。
-3. 如果当前已经有任务草稿，也不能无脑拦截。像“ai”“你好”“在吗”“继续聊”“随便”这类与补充任务参数无关的话，必须返回 matched=false。
-4. 如果用户明确表示取消当前任务草稿，例如“取消任务”“不建了”“先别建”，返回 matched=true、cancelled=true。
-5. 如果 matched=true，请尽量提取：
-   - objective: 任务要做什么
-   - every_ms: 执行频率，单位毫秒
-   - report_condition: 何时通知/汇报
-   - duration_ms: 持续时长，单位毫秒
-   - max_runs: 总执行次数上限；只有用户明确说了次数，或者语义非常明确时才填写
-   - task_name: 简短任务名，可留空
-   - prompt_text: 给用户展示的简短中文回复。若信息缺失，最多追问 1 到 2 个关键缺口；若已足够创建任务，可留空或只保留一句极简确认，不要套模板话。
-6. ready_to_confirm 由服务端自行计算，你不用输出它。
-7. 不要捏造字段；无法确定时用 null。
-
-输出字段固定为：
-{
-  "matched": true,
-  "cancelled": false,
-  "objective": "字符串或 null",
-  "report_condition": "字符串或 null",
-  "every_ms": 300000,
-  "duration_ms": null,
-  "max_runs": null,
-  "task_name": "字符串或 null",
-  "prompt_text": "字符串或 null"
-}"#
+async fn current_task_draft_analysis_session_id(
+    state: &Arc<AppState>,
+    agent_id: &str,
+) -> Option<String> {
+    state
+        .openfang
+        .get_json(&format!("/api/agents/{agent_id}/session"))
+        .await
+        .ok()?
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
-fn escape_toml_string(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+async fn create_task_draft_analysis_request_session(
+    state: &Arc<AppState>,
+    agent_id: &str,
+) -> Result<(Option<String>, String), String> {
+    let original_session_id = current_task_draft_analysis_session_id(state, agent_id).await;
+    let request_session_id = state
+        .openfang
+        .post_json(&format!("/api/agents/{agent_id}/sessions"), json!({}))
+        .await
+        .map_err(|err| format!("create analysis session failed: {}", err.message))?
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "create analysis session returned empty session_id".to_string())?;
+    state
+        .openfang
+        .post_json(
+            &format!("/api/agents/{agent_id}/sessions/{request_session_id}/switch"),
+            json!({}),
+        )
+        .await
+        .map_err(|err| format!("switch analysis session failed: {}", err.message))?;
+    Ok((original_session_id, request_session_id))
 }
 
-fn resolve_default_model_tuple() -> Option<(String, String)> {
-    let models_value = assignment_store::list_model_assignments().ok()?;
-    let default_id = assignment_store::get_default_model().ok().flatten()?;
-    let hit = models_value
-        .into_iter()
-        .find(|item| item.model_id == default_id)?;
-    Some((hit.provider_id, hit.model_name))
-}
-
-fn build_task_draft_parser_manifest_toml(provider: &str, model: &str) -> String {
-    [
-        format!(
-            "name = \"{}\"",
-            escape_toml_string(TASK_DRAFT_PARSER_AGENT_NAME)
-        ),
-        format!(
-            "description = \"{}\"",
-            escape_toml_string(TASK_DRAFT_PARSER_AGENT_DESCRIPTION)
-        ),
-        "profile = \"full\"".to_string(),
-        String::new(),
-        "[model]".to_string(),
-        format!("provider = \"{}\"", escape_toml_string(provider)),
-        format!("model = \"{}\"", escape_toml_string(model)),
-        format!(
-            "system_prompt = \"{}\"",
-            escape_toml_string(build_model_system_prompt())
-        ),
-    ]
-    .join("\n")
-}
-
-async fn ensure_task_draft_parser_agent(state: &Arc<AppState>) -> Option<String> {
-    let cache = TASK_DRAFT_PARSER_AGENT_CACHE.get_or_init(|| Mutex::new(None));
-    if let Some(cached) = cache.lock().await.clone() {
-        return Some(cached);
-    }
-
-    let mut guard = cache.lock().await;
-    if let Some(cached) = guard.clone() {
-        return Some(cached);
-    }
-
-    let agents_payload = state.openfang.get_json("/api/agents").await.ok()?;
-    let rows = agents_payload.as_array().cloned().unwrap_or_default();
-    let existing_id = rows.iter().find_map(|row| {
-        let name = row.get("name").and_then(Value::as_str)?.trim();
-        if name != TASK_DRAFT_PARSER_AGENT_NAME {
-            return None;
-        }
-        row.get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-    });
-
-    let agent_id = if let Some(agent_id) = existing_id {
+async fn cleanup_task_draft_analysis_request_session(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    original_session_id: Option<&str>,
+    request_session_id: &str,
+) {
+    if let Some(original_session_id) = original_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != request_session_id)
+    {
         let _ = state
             .openfang
-            .patch_json(
-                &format!("/api/agents/{agent_id}/config"),
-                json!({
-                    "system_prompt": build_model_system_prompt(),
-                    "description": TASK_DRAFT_PARSER_AGENT_DESCRIPTION,
-                }),
+            .post_json(
+                &format!("/api/agents/{agent_id}/sessions/{original_session_id}/switch"),
+                json!({}),
             )
             .await;
-        agent_id
-    } else {
-        let (provider, model) = resolve_default_model_tuple()?;
-        let created = state
-            .openfang
-            .post_json(
-                "/api/agents",
-                json!({
-                    "manifest_toml": build_task_draft_parser_manifest_toml(&provider, &model)
-                }),
-            )
-            .await
-            .ok()?;
-        created
-            .get("agent_id")
-            .or_else(|| created.get("id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)?
-    };
-
-    let _ = assignment_store::set_agent_hidden(&agent_id, true);
-    *guard = Some(agent_id.clone());
-    Some(agent_id)
+    }
+    let _ = state
+        .openfang
+        .delete_json(&format!("/api/sessions/{request_session_id}"))
+        .await;
 }
 
-pub async fn warm_task_draft_parser_agent(state: &Arc<AppState>) {
-    let Some(agent_id) = ensure_task_draft_parser_agent(state).await else {
-        return;
-    };
-    let _ = analyze_chat_task_draft_via_model(
-        state,
-        &agent_id,
-        &AnalyzeChatTaskDraftRequest {
-            message: "这不是任务请求，请返回 matched=false。".to_string(),
-            current_draft: None,
-        },
-    )
-    .await;
-}
-
-fn build_model_user_prompt(message: &str, current_draft: &Option<ChatTaskDraftPayload>) -> String {
+fn build_model_user_prompt_with_context(
+    message: &str,
+    current_draft: &Option<ChatTaskDraftPayload>,
+    session_messages: &[ChatTaskContextMessage],
+) -> String {
     let current_json = serde_json::to_string(current_draft).unwrap_or_else(|_| "null".to_string());
+    let session_json =
+        serde_json::to_string(session_messages).unwrap_or_else(|_| "[]".to_string());
+    let transcript = session_messages
+        .iter()
+        .map(|item| {
+            format!(
+                "{}: {}",
+                item.role.trim(),
+                item.content.split_whitespace().collect::<Vec<_>>().join(" ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "请分析最新用户消息，并仅返回 JSON。\n\n当前任务草稿：{}\n\n最新用户消息：{}",
+        "你正在作为当前聊天智能体本人，分析这条消息是否是在创建或补充聊天任务草案。你只能返回一个 JSON 对象，禁止 Markdown、禁止代码块、禁止解释。\n\n规则：\n1. 必须优先做语义理解，不能只看关键词。\n2. 如果当前没有任务草稿，只有当用户真的在表达定时执行、周期监控、条件提醒、持续跟踪、自动汇报这类任务意图时，matched 才能为 true。\n3. 如果当前已经有任务草稿，也不能无脑拦截。像“ai”“你好”“在吗”“继续聊”“随便”这类与补充任务参数无关的话，必须返回 matched=false。\n4. 如果最近会话已经明确了监控对象或目标，而最新消息只是在补充频率、持续时间、汇报方式、取消等信息，你应当结合上下文补全 objective，而不是返回 unmatched。\n5. 如果最近会话已经明确说过频率、持续时间、总次数、汇报方式，而最新消息只是“开始”“就按这个来”“照刚才那个执行”“开始盯 BTC 价格”这类触发语，你必须复用上下文里已经明确过的参数。\n6. 如果用户明确表示取消当前任务草稿，例如“取消任务”“不建了”“先别建”，返回 matched=true、cancelled=true。\n7. 普通问答、寒暄、追问看法，即使上下文里刚聊过任务，也必须返回 matched=false，除非这条最新消息本身明确是在补充任务参数或确认执行。\n8. 如果 matched=true，请尽量提取 objective、every_ms、report_condition、duration_ms、max_runs、task_name、prompt_text。\n9. 若信息缺失，prompt_text 必须由你自己用自然中文追问 1 到 2 个关键缺口，不要套模板话。\n10. ready_to_confirm 由服务端自行计算，你不用输出。\n11. 不要捏造字段；无法确定时用 null。\n\n输出字段固定为：\n{{\"matched\":true,\"cancelled\":false,\"objective\":\"字符串或 null\",\"report_condition\":\"字符串或 null\",\"every_ms\":300000,\"duration_ms\":null,\"max_runs\":null,\"task_name\":\"字符串或 null\",\"prompt_text\":\"字符串或 null\"}}\n\n当前任务草稿：{}\n\n最近会话上下文(JSON)：{}\n\n最近会话上下文(按时间顺序转写)：\n{}\n\n最新用户消息：{}\n\n注意：如果最新消息本身没有频率或时长，但最近上下文已经明确过，请直接复用上下文参数，不要重复追问。",
         current_json,
+        session_json,
+        transcript,
         serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string())
     )
 }
 
 async fn analyze_chat_task_draft_via_model(
     state: &Arc<AppState>,
-    model_ref: &str,
+    agent_id: &str,
     request: &AnalyzeChatTaskDraftRequest,
-) -> Option<ModelTaskDraftAnalysis> {
-    let model_ref = model_ref.trim();
-    if model_ref.is_empty() {
-        return None;
+) -> Result<ModelTaskDraftAnalysis, String> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return Err("empty agent_id".to_string());
     }
-
+    let (original_session_id, request_session_id) =
+        create_task_draft_analysis_request_session(state, agent_id).await?;
     let upstream_payload = json!({
-        "model": model_ref,
-        "messages": [
-            {
-                "role": "user",
-                "content": build_model_user_prompt(&request.message, &request.current_draft),
-            }
-        ],
-        "temperature": 0.1,
-        "stream": false
+        "message": build_model_user_prompt_with_context(
+            &request.message,
+            &request.current_draft,
+            &request.session_messages,
+        )
     });
     let response = timeout(
         Duration::from_secs(20),
         state
             .openfang
-            .post_json("/v1/chat/completions", upstream_payload),
+            .post_json(&format!("/api/agents/{agent_id}/message"), upstream_payload),
     )
     .await
-    .ok()?
-    .ok()?;
+    .map_err(|_| "analysis request timed out".to_string())?;
+    cleanup_task_draft_analysis_request_session(
+        state,
+        agent_id,
+        original_session_id.as_deref(),
+        &request_session_id,
+    )
+    .await;
+    let response =
+        response.map_err(|err| format!("analysis request failed: {}", err.message))?;
     let content = response
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|rows| rows.first())
-        .and_then(|row| row.get("message"))
-        .and_then(|message| message.get("content"))
+        .get("response")
+        .or_else(|| response.get("content"))
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    parse_model_task_draft_analysis(content)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "analysis response content is empty".to_string())?;
+    parse_model_task_draft_analysis(content).ok_or_else(|| {
+        let snippet = content.chars().take(240).collect::<String>();
+        format!("analysis response is not valid task draft JSON: {}", snippet)
+    })
 }
 
 fn build_response_from_analysis(
@@ -557,42 +501,44 @@ fn build_response_from_analysis(
         return default_unmatched_response();
     }
 
-    let parsed_objective = trim_optional_string(analysis.objective)
+    let parsed_objective = trim_optional_string(analysis.objective).or_else(|| {
+        current
+            .as_ref()
+            .and_then(|draft| trim_optional_string(draft.objective.clone()))
+    });
+    let report_condition = trim_optional_string(analysis.report_condition)
         .or_else(|| {
             current
                 .as_ref()
-                .and_then(|draft| trim_optional_string(draft.objective.clone()))
-        })
-        .or_else(|| {
-            if current.is_none() {
-                trim_optional_string(Some(trimmed.clone()))
-            } else {
-                None
-            }
+                .and_then(|draft| trim_optional_string(draft.report_condition.clone()))
         });
-    let report_condition = trim_optional_string(analysis.report_condition).or_else(|| {
-        current
-            .as_ref()
-            .and_then(|draft| trim_optional_string(draft.report_condition.clone()))
-    });
-    let every_ms = analysis.every_ms.filter(|value| *value > 0).or_else(|| {
-        current
-            .as_ref()
-            .and_then(|draft| draft.every_ms)
-            .filter(|value| *value > 0)
-    });
-    let duration_ms = analysis.duration_ms.filter(|value| *value > 0).or_else(|| {
-        current
-            .as_ref()
-            .and_then(|draft| draft.duration_ms)
-            .filter(|value| *value > 0)
-    });
-    let explicit_max_runs = analysis.max_runs.filter(|value| *value > 0).or_else(|| {
-        current
-            .as_ref()
-            .and_then(|draft| draft.max_runs)
-            .filter(|value| *value > 0)
-    });
+    let every_ms = analysis
+        .every_ms
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            current
+                .as_ref()
+                .and_then(|draft| draft.every_ms)
+                .filter(|value| *value > 0)
+        });
+    let duration_ms = analysis
+        .duration_ms
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            current
+                .as_ref()
+                .and_then(|draft| draft.duration_ms)
+                .filter(|value| *value > 0)
+        });
+    let explicit_max_runs = analysis
+        .max_runs
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            current
+                .as_ref()
+                .and_then(|draft| draft.max_runs)
+                .filter(|value| *value > 0)
+        });
     let max_runs = explicit_max_runs.or_else(|| {
         if let (Some(duration_ms), Some(every_ms)) = (duration_ms, every_ms) {
             Some(((duration_ms + every_ms - 1) / every_ms).max(1) as u32)
@@ -666,6 +612,9 @@ fn build_response_from_analysis(
     } else {
         None
     };
+    if !ready_to_confirm && prompt_text.is_none() {
+        return build_analysis_unavailable_response(Some(draft));
+    }
 
     AnalyzeChatTaskDraftResponse {
         matched: true,
@@ -682,29 +631,37 @@ fn build_response_from_analysis(
 
 pub async fn analyze_chat_task_draft(
     state: &Arc<AppState>,
-    _model_ref: &str,
+    agent_id: &str,
     request: AnalyzeChatTaskDraftRequest,
 ) -> AnalyzeChatTaskDraftResponse {
     let trimmed = request.message.trim();
     if trimmed.is_empty() {
         return default_unmatched_response();
     }
-    let parser_agent_id = ensure_task_draft_parser_agent(state).await;
-    let model_result = if let Some(agent_id) = parser_agent_id {
-        timeout(
-            Duration::from_secs(24),
-            analyze_chat_task_draft_via_model(state, &agent_id, &request),
-        )
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
-    if let Some(analysis) = model_result {
-        return build_response_from_analysis(request, analysis);
+    let current_draft = request.current_draft.clone();
+    let model_result = timeout(
+        Duration::from_secs(24),
+        analyze_chat_task_draft_via_model(state, agent_id, &request),
+    )
+    .await;
+    match model_result {
+        Ok(Ok(analysis)) => build_response_from_analysis(request, analysis),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %error,
+                "chat task draft analysis failed"
+            );
+            build_analysis_unavailable_response(current_draft)
+        }
+        Err(_) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "chat task draft analysis timed out"
+            );
+            build_analysis_unavailable_response(current_draft)
+        }
     }
-    build_parser_unavailable_response(request.current_draft)
 }
 
 fn build_task_card_schedule_segments(draft: &ChatTaskDraftPayload) -> Vec<String> {
@@ -827,5 +784,71 @@ fn build_task_card_response(
         report_status: "pending".to_string(),
         progress_percent: 0,
         timeline,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_current_draft() -> ChatTaskDraftPayload {
+        ChatTaskDraftPayload {
+            objective: Some("监控比特币价格".to_string()),
+            report_condition: Some("执行后立刻汇报".to_string()),
+            every_ms: Some(60_000),
+            max_runs: Some(5),
+            duration_ms: None,
+            schedule_text: Some("每 1 分钟，共 5 次".to_string()),
+            source_message_text: Some("帮我盯下比特币价格".to_string()),
+            created_at: Some("2026-04-06T00:00:00Z".to_string()),
+            missing_slots: Vec::new(),
+            ready_to_confirm: true,
+        }
+    }
+
+    #[test]
+    fn matched_false_no_longer_force_uses_existing_draft() {
+        let request = AnalyzeChatTaskDraftRequest {
+            message: "我觉得现在行情怎么看".to_string(),
+            current_draft: Some(sample_current_draft()),
+            session_messages: Vec::new(),
+        };
+        let response = build_response_from_analysis(
+            request,
+            ModelTaskDraftAnalysis {
+                matched: false,
+                ..ModelTaskDraftAnalysis::default()
+            },
+        );
+
+        assert!(!response.matched);
+        assert!(response.draft.is_none());
+        assert!(response.task_card.is_none());
+    }
+
+    #[test]
+    fn missing_prompt_text_falls_back_to_analysis_unavailable_notice() {
+        let request = AnalyzeChatTaskDraftRequest {
+            message: "帮我盯下比特币价格".to_string(),
+            current_draft: None,
+            session_messages: Vec::new(),
+        };
+        let response = build_response_from_analysis(
+            request,
+            ModelTaskDraftAnalysis {
+                matched: true,
+                objective: Some("监控比特币价格".to_string()),
+                report_condition: Some("执行后立刻汇报".to_string()),
+                ..ModelTaskDraftAnalysis::default()
+            },
+        );
+
+        assert!(response.matched);
+        assert!(!response.ready_to_confirm);
+        assert!(response.task_card.is_none());
+        assert_eq!(
+            response.prompt_text.as_deref(),
+            Some("当前智能体的任务草案分析暂时不可用，本次没有生成任务卡。请稍后重试，或重新补充一次任务要求。")
+        );
     }
 }

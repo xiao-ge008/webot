@@ -8,9 +8,10 @@ import { ThemeLangSwitcher } from '@/components/ThemeLangSwitcher';
 import { SettingsDialog } from '@/components/SettingsDialog';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { getServicePowerState, startServicePower, stopServicePower, type ServicePowerState } from '@/services/service-power-client';
-import { AlertTriangle, ChevronLeft, Loader2, Power, Sparkles, User, Users, Clock, Wand2, Boxes } from 'lucide-react';
+import { getUnreadNotificationCount, subscribeNotificationState } from '@/services/notification-client';
+import { AlertTriangle, Bell, ChevronLeft, Loader2, Power, Sparkles, User, Users, Clock, Boxes } from 'lucide-react';
 
-export type HomeTab = 'agents' | 'groups' | 'tasks' | 'components' | 'superTools';
+export type HomeTab = 'agents' | 'groups' | 'tasks' | 'components' | 'notifications';
 
 interface HomeTabContextType {
   activeTab: HomeTab;
@@ -46,12 +47,14 @@ export function Header() {
   const isHome = location.pathname === '/' || location.pathname === '/home';
   const isTaskLanding = location.pathname.startsWith('/tasks');
   const isComponentLanding = location.pathname.startsWith('/components');
+  const isNotificationLanding = location.pathname.startsWith('/notifications');
   const [serviceState, setServiceState] = useState<ServicePowerState>({
     status: 'offline',
     online: false,
   });
   const [toggling, setToggling] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
 
   const refreshServiceState = async () => {
     try {
@@ -71,6 +74,34 @@ export function Header() {
       void refreshServiceState();
     }, 10_000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshUnread = async () => {
+      try {
+        const count = await getUnreadNotificationCount();
+        if (!cancelled) {
+          setUnreadNotificationCount(count);
+        }
+      } catch {
+        if (!cancelled) {
+          setUnreadNotificationCount(0);
+        }
+      }
+    };
+    void refreshUnread();
+    const timer = window.setInterval(() => {
+      void refreshUnread();
+    }, 8000);
+    const unsubscribe = subscribeNotificationState(() => {
+      void refreshUnread();
+    });
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      unsubscribe();
+    };
   }, []);
 
   const handleToggleService = async () => {
@@ -93,12 +124,13 @@ export function Header() {
     { id: 'agents' as HomeTab, icon: User, label: t('home.tabs.agents'), path: '/home' },
     { id: 'groups' as HomeTab, icon: Users, label: t('home.tabs.groups'), path: '/home' },
     { id: 'tasks' as HomeTab, icon: Clock, label: t('home.tabs.tasks'), path: '/tasks' },
+    { id: 'notifications' as HomeTab, icon: Bell, label: '通知中心', path: '/notifications' },
     { id: 'components' as HomeTab, icon: Boxes, label: t('home.tabs.components'), path: '/components' },
-    { id: 'superTools' as HomeTab, icon: Wand2, label: t('home.tabs.superTools'), path: '/home' },
   ];
 
   const activeTopTab: HomeTab | null = (() => {
     if (isTaskLanding) return 'tasks';
+    if (location.pathname.startsWith('/notifications')) return 'notifications';
     if (isComponentLanding) return 'components';
     if (location.pathname.startsWith('/agents')) return 'agents';
     if (isHome) return activeTab;
@@ -110,7 +142,7 @@ export function Header() {
       <div className="h-full flex items-center px-4 md:px-6">
         {/* 左侧：Logo 或 返回按钮 */}
         <div className="flex items-center gap-3 shrink-0">
-          {isHome || isTaskLanding ? (
+          {isHome || isTaskLanding || isNotificationLanding ? (
             <Link to="/home" className="flex items-center gap-2">
               <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
                 <Sparkles className="w-5 h-5 text-primary-foreground" />
@@ -128,7 +160,7 @@ export function Header() {
         </div>
 
         {/* 中间：主功能导航 Tab */}
-        {(isHome || isTaskLanding || isComponentLanding || location.pathname.startsWith('/agents')) && (
+        {(isHome || isTaskLanding || isComponentLanding || isNotificationLanding || location.pathname.startsWith('/agents')) && (
           <nav className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center gap-1">
             {navTabs.map((tab) => (
               <Button
@@ -146,8 +178,16 @@ export function Header() {
                     }
                   }}
                 >
-                  <tab.icon className="h-4 w-4" />
-                  <span>{tab.label}</span>
+                  <span className="relative inline-flex items-center gap-2">
+                    <tab.icon className="h-4 w-4" />
+                    <span>{tab.label}</span>
+                    {tab.id === 'notifications' && unreadNotificationCount > 0 ? (
+                      <span className="relative ml-1 inline-flex min-w-5 justify-center rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] font-black leading-none text-white">
+                        {unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}
+                        <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border border-background bg-red-500" />
+                      </span>
+                    ) : null}
+                  </span>
                 </Link>
               </Button>
             ))}

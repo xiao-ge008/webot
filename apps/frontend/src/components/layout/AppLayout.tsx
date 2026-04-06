@@ -4,6 +4,8 @@ import { Footer } from './Footer';
 import { InAppNotificationCenter } from '@/components/ui/in-app-notification-center';
 import { ChatKeepAliveLayer } from './ChatKeepAliveLayer';
 import { TaskNoticeBridge } from '@/components/tasks/TaskNoticeBridge';
+import { TaskChatDeliveryBridge } from '@/components/tasks/TaskChatDeliveryBridge';
+import { NotificationRealtimeBridge } from '@/components/notifications/NotificationRealtimeBridge';
 
 /** 全局布局：顶部导航栏 + 内容区 */
 export function AppLayout() {
@@ -18,13 +20,15 @@ export function AppLayout() {
         {/* 顶部导航栏 */}
         <Header />
         <InAppNotificationCenter />
+        <NotificationRealtimeBridge />
         <TaskNoticeBridge />
+        <TaskChatDeliveryBridge />
 
-      {/* 主内容区 */}
-      <main className="flex-1 min-h-0 pt-14 flex flex-col items-stretch">
-        {isPrivateChatConversationPage ? <ChatKeepAliveLayer /> : null}
-        {!isPrivateChatConversationPage ? <Outlet /> : null}
-      </main>
+        {/* 主内容区 */}
+        <main className="flex-1 min-h-0 pt-14 flex flex-col items-stretch">
+          {isPrivateChatConversationPage ? <ChatKeepAliveLayer /> : null}
+          {!isPrivateChatConversationPage ? <Outlet /> : null}
+        </main>
 
         {/* 仅在非聊天页面显示底部信息栏 */}
         {!isChatPage && <Footer />}

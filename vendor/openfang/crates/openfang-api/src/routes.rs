@@ -324,7 +324,7 @@ pub async fn send_message(
     let quota_scope = resolve_scheduler_quota_scope(req.request_origin.as_deref());
     match state
         .kernel
-        .send_message_with_handle_and_quota_scope_and_blocked_tools(
+        .collect_streaming_message_with_quota_scope_and_blocked_tools(
             agent_id,
             &req.message,
             Some(kernel_handle),

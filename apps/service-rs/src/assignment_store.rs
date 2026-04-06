@@ -14,6 +14,7 @@ use crate::path_resolver;
 
 const APP_PREF_KEY_PROVIDER_MODEL_STATE_NORMALIZED_V1: &str = "provider_model_state_normalized_v2";
 const APP_PREF_KEY_TTS_CONFIG: &str = "tts_config";
+const APP_PREF_KEY_NOTIFICATION_SETTINGS: &str = "notification_settings";
 static PROVIDER_MODEL_STATE_MIGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PROVIDER_MODEL_STATE_MIGRATED_IN_PROCESS: OnceLock<()> = OnceLock::new();
 
@@ -199,6 +200,64 @@ pub struct TaskDeliveryRecord {
     pub updated_at: String,
     pub reported_at: Option<String>,
     pub acknowledged_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRecord {
+    pub id: String,
+    pub source_key: String,
+    pub source_domain: String,
+    pub source_record_id: String,
+    pub notification_type: String,
+    pub severity: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub detail: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub task_id: Option<String>,
+    pub task_name: Option<String>,
+    pub session_id: Option<String>,
+    pub source_run_id: Option<String>,
+    pub payload: Value,
+    pub delivery_status: Value,
+    pub read_at: Option<String>,
+    pub archived_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NotificationListQuery {
+    pub unread_only: bool,
+    pub include_archived: bool,
+    pub notification_type: Option<String>,
+    pub source_domain: Option<String>,
+    pub agent_id: Option<String>,
+    pub query: Option<String>,
+    pub created_from: Option<String>,
+    pub created_to: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertNotificationInput {
+    pub source_key: String,
+    pub source_domain: String,
+    pub source_record_id: String,
+    pub notification_type: String,
+    pub severity: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub detail: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub task_id: Option<String>,
+    pub task_name: Option<String>,
+    pub session_id: Option<String>,
+    pub source_run_id: Option<String>,
+    pub payload: Value,
+    pub delivery_status: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,6 +822,36 @@ pub fn ensure_db() -> Result<PathBuf, String> {
 
         CREATE INDEX IF NOT EXISTS idx_task_deliveries_session_status
             ON task_deliveries(origin_chat_session_id, status, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS notifications (
+            id TEXT PRIMARY KEY,
+            source_key TEXT NOT NULL UNIQUE,
+            source_domain TEXT NOT NULL,
+            source_record_id TEXT NOT NULL,
+            notification_type TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'info',
+            title TEXT NOT NULL,
+            summary TEXT NULL,
+            detail TEXT NULL,
+            agent_id TEXT NULL,
+            agent_name TEXT NULL,
+            task_id TEXT NULL,
+            task_name TEXT NULL,
+            session_id TEXT NULL,
+            source_run_id TEXT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            delivery_status_json TEXT NOT NULL DEFAULT '{}',
+            read_at TEXT NULL,
+            archived_at TEXT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notifications_unread_updated
+            ON notifications(read_at, archived_at, updated_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_notifications_source_type_updated
+            ON notifications(source_domain, notification_type, updated_at DESC);
 
         DROP TABLE IF EXISTS task_runtime_bindings;
         "#,
@@ -1911,6 +2000,42 @@ pub fn get_memory_enhancement_config() -> Result<Option<Value>, String> {
         .map_err(|e| format!("解析记忆增强配置失败: {e}"))?;
     let config = serde_json::from_str::<Value>(&value)
         .map_err(|e| format!("反序列化记忆增强配置失败: {e}"))?;
+    Ok(Some(config))
+}
+
+pub fn set_notification_settings(config: &Value) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        INSERT INTO app_prefs(key, value, updated_at)
+        VALUES (?1, ?2, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![APP_PREF_KEY_NOTIFICATION_SETTINGS, config.to_string()],
+    )
+    .map_err(|e| format!("写入通知设置失败: {e}"))?;
+    Ok(())
+}
+
+pub fn get_notification_settings() -> Result<Option<Value>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM app_prefs WHERE key = ?1")
+        .map_err(|e| format!("查询通知设置失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![APP_PREF_KEY_NOTIFICATION_SETTINGS])
+        .map_err(|e| format!("读取通知设置失败: {e}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| format!("读取通知设置行失败: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let value: String = row.get(0).map_err(|e| format!("解析通知设置失败: {e}"))?;
+    let config = serde_json::from_str::<Value>(&value)
+        .map_err(|e| format!("反序列化通知设置失败: {e}"))?;
     Ok(Some(config))
 }
 
@@ -3330,6 +3455,347 @@ pub fn mark_task_delivery_status(delivery_id: &str, status: &str) -> Result<(), 
     )
     .map_err(|e| format!("更新任务投递状态失败: {e}"))?;
     Ok(())
+}
+
+pub fn upsert_notification(input: UpsertNotificationInput) -> Result<NotificationRecord, String> {
+    let normalized = normalize_notification_input(input)?;
+    let existing = get_notification_by_source_key(&normalized.source_key)?;
+    let merged_delivery_status = existing
+        .as_ref()
+        .map(|item| merge_json_object_values(&item.delivery_status, &normalized.delivery_status))
+        .unwrap_or_else(|| normalized.delivery_status.clone());
+    let id = existing
+        .as_ref()
+        .map(|item| item.id.clone())
+        .unwrap_or_else(|| format!("notif-{}", Uuid::new_v4().simple()));
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        INSERT INTO notifications(
+            id,
+            source_key,
+            source_domain,
+            source_record_id,
+            notification_type,
+            severity,
+            title,
+            summary,
+            detail,
+            agent_id,
+            agent_name,
+            task_id,
+            task_name,
+            session_id,
+            source_run_id,
+            payload_json,
+            delivery_status_json,
+            read_at,
+            archived_at,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, NULL, NULL,
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(source_key) DO UPDATE SET
+            source_domain = excluded.source_domain,
+            source_record_id = excluded.source_record_id,
+            notification_type = excluded.notification_type,
+            severity = excluded.severity,
+            title = excluded.title,
+            summary = excluded.summary,
+            detail = excluded.detail,
+            agent_id = excluded.agent_id,
+            agent_name = excluded.agent_name,
+            task_id = excluded.task_id,
+            task_name = excluded.task_name,
+            session_id = excluded.session_id,
+            source_run_id = excluded.source_run_id,
+            payload_json = excluded.payload_json,
+            delivery_status_json = excluded.delivery_status_json,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            id,
+            normalized.source_key,
+            normalized.source_domain,
+            normalized.source_record_id,
+            normalized.notification_type,
+            normalized.severity,
+            normalized.title,
+            normalized.summary,
+            normalized.detail,
+            normalized.agent_id,
+            normalized.agent_name,
+            normalized.task_id,
+            normalized.task_name,
+            normalized.session_id,
+            normalized.source_run_id,
+            serde_json::to_string(&normalized.payload)
+                .map_err(|e| format!("序列化通知 payload 失败: {e}"))?,
+            serde_json::to_string(&merged_delivery_status)
+                .map_err(|e| format!("序列化通知投递状态失败: {e}"))?,
+        ],
+    )
+    .map_err(|e| format!("写入通知失败: {e}"))?;
+    get_notification_by_id(&id)?
+        .ok_or_else(|| "通知写入成功但读取失败".to_string())
+}
+
+pub fn replace_notification_delivery_status(
+    notification_id: &str,
+    delivery_status: &Value,
+) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        UPDATE notifications
+        SET
+            delivery_status_json = ?2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?1
+        "#,
+        params![
+            notification_id.trim(),
+            serde_json::to_string(&normalize_json_object_like(delivery_status.clone()))
+                .map_err(|e| format!("序列化通知投递状态失败: {e}"))?,
+        ],
+    )
+    .map_err(|e| format!("更新通知投递状态失败: {e}"))?;
+    Ok(())
+}
+
+pub fn list_notifications(query: &NotificationListQuery) -> Result<Vec<NotificationRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                id,
+                source_key,
+                source_domain,
+                source_record_id,
+                notification_type,
+                severity,
+                title,
+                summary,
+                detail,
+                agent_id,
+                agent_name,
+                task_id,
+                task_name,
+                session_id,
+                source_run_id,
+                payload_json,
+                delivery_status_json,
+                read_at,
+                archived_at,
+                created_at,
+                updated_at
+            FROM notifications
+            WHERE (?1 = 1 OR archived_at IS NULL)
+              AND (?2 = 0 OR read_at IS NULL)
+              AND (?3 IS NULL OR notification_type = ?3)
+              AND (?4 IS NULL OR source_domain = ?4)
+              AND (?5 IS NULL OR lower(agent_id) = lower(?5))
+              AND (
+                ?6 IS NULL
+                OR lower(title) LIKE lower('%' || ?6 || '%')
+                OR lower(COALESCE(summary, '')) LIKE lower('%' || ?6 || '%')
+                OR lower(COALESCE(detail, '')) LIKE lower('%' || ?6 || '%')
+                OR lower(COALESCE(task_name, '')) LIKE lower('%' || ?6 || '%')
+                OR lower(COALESCE(agent_name, '')) LIKE lower('%' || ?6 || '%')
+              )
+              AND (?7 IS NULL OR date(created_at) >= date(?7))
+              AND (?8 IS NULL OR date(created_at) <= date(?8))
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT ?9
+            "#,
+        )
+        .map_err(|e| format!("准备通知列表查询失败: {e}"))?;
+    let rows = stmt
+        .query_map(
+            params![
+                if query.include_archived { 1 } else { 0 },
+                if query.unread_only { 1 } else { 0 },
+                query.notification_type.as_deref(),
+                query.source_domain.as_deref(),
+                query.agent_id.as_deref(),
+                query.query.as_deref(),
+                query.created_from.as_deref(),
+                query.created_to.as_deref(),
+                i64::from(query.limit.unwrap_or(200).clamp(1, 500)),
+            ],
+            parse_notification_row,
+        )
+        .map_err(|e| format!("执行通知列表查询失败: {e}"))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|e| format!("解析通知记录失败: {e}"))?);
+    }
+    Ok(output)
+}
+
+pub fn get_notification_by_id(notification_id: &str) -> Result<Option<NotificationRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                id,
+                source_key,
+                source_domain,
+                source_record_id,
+                notification_type,
+                severity,
+                title,
+                summary,
+                detail,
+                agent_id,
+                agent_name,
+                task_id,
+                task_name,
+                session_id,
+                source_run_id,
+                payload_json,
+                delivery_status_json,
+                read_at,
+                archived_at,
+                created_at,
+                updated_at
+            FROM notifications
+            WHERE id = ?1
+            "#,
+        )
+        .map_err(|e| format!("准备通知详情查询失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![notification_id.trim()])
+        .map_err(|e| format!("执行通知详情查询失败: {e}"))?;
+    let Some(row) = rows.next().map_err(|e| format!("读取通知详情失败: {e}"))? else {
+        return Ok(None);
+    };
+    parse_notification_row(row)
+        .map(Some)
+        .map_err(|e| format!("解析通知详情失败: {e}"))
+}
+
+pub fn get_notification_by_source_key(source_key: &str) -> Result<Option<NotificationRecord>, String> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                id,
+                source_key,
+                source_domain,
+                source_record_id,
+                notification_type,
+                severity,
+                title,
+                summary,
+                detail,
+                agent_id,
+                agent_name,
+                task_id,
+                task_name,
+                session_id,
+                source_run_id,
+                payload_json,
+                delivery_status_json,
+                read_at,
+                archived_at,
+                created_at,
+                updated_at
+            FROM notifications
+            WHERE source_key = ?1
+            "#,
+        )
+        .map_err(|e| format!("准备通知 source_key 查询失败: {e}"))?;
+    let mut rows = stmt
+        .query(params![source_key.trim()])
+        .map_err(|e| format!("执行通知 source_key 查询失败: {e}"))?;
+    let Some(row) = rows.next().map_err(|e| format!("读取通知 source_key 失败: {e}"))? else {
+        return Ok(None);
+    };
+    parse_notification_row(row)
+        .map(Some)
+        .map_err(|e| format!("解析通知 source_key 结果失败: {e}"))
+}
+
+pub fn mark_notification_read(notification_id: &str) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        UPDATE notifications
+        SET
+            read_at = COALESCE(read_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?1
+        "#,
+        params![notification_id.trim()],
+    )
+    .map_err(|e| format!("标记通知已读失败: {e}"))?;
+    Ok(())
+}
+
+pub fn mark_all_notifications_read() -> Result<usize, String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        UPDATE notifications
+        SET
+            read_at = COALESCE(read_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE read_at IS NULL
+          AND archived_at IS NULL
+        "#,
+        [],
+    )
+    .map_err(|e| format!("批量标记通知已读失败: {e}"))
+}
+
+pub fn archive_notification(notification_id: &str) -> Result<(), String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        UPDATE notifications
+        SET
+            archived_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?1
+        "#,
+        params![notification_id.trim()],
+    )
+    .map_err(|e| format!("归档通知失败: {e}"))?;
+    Ok(())
+}
+
+pub fn delete_notification(notification_id: &str) -> Result<usize, String> {
+    let conn = open_conn()?;
+    conn.execute(
+        r#"
+        DELETE FROM notifications
+        WHERE id = ?1
+        "#,
+        params![notification_id.trim()],
+    )
+    .map_err(|e| format!("删除通知失败: {e}"))
+}
+
+pub fn count_unread_notifications() -> Result<i64, String> {
+    let conn = open_conn()?;
+    conn.query_row(
+        r#"
+        SELECT COUNT(1)
+        FROM notifications
+        WHERE read_at IS NULL
+          AND archived_at IS NULL
+        "#,
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| format!("统计未读通知失败: {e}"))
 }
 
 fn map_task_delivery_row(row: &rusqlite::Row<'_>) -> Result<TaskDeliveryRecord, rusqlite::Error> {
@@ -4886,6 +5352,55 @@ fn normalize_capability_scope(value: &str) -> String {
     }
 }
 
+fn normalize_notification_input(
+    input: UpsertNotificationInput,
+) -> Result<UpsertNotificationInput, String> {
+    Ok(UpsertNotificationInput {
+        source_key: normalize_required_text(&input.source_key, "source_key")?,
+        source_domain: normalize_required_text(&input.source_domain, "source_domain")?
+            .to_ascii_lowercase(),
+        source_record_id: normalize_required_text(&input.source_record_id, "source_record_id")?,
+        notification_type: normalize_required_text(&input.notification_type, "notification_type")?
+            .to_ascii_lowercase(),
+        severity: normalize_required_text(&input.severity, "severity")?.to_ascii_lowercase(),
+        title: normalize_required_text(&input.title, "title")?,
+        summary: input.summary.and_then(normalize_nullable_text),
+        detail: input.detail.and_then(normalize_nullable_text),
+        agent_id: input.agent_id.and_then(normalize_nullable_text),
+        agent_name: input.agent_name.and_then(normalize_nullable_text),
+        task_id: input.task_id.and_then(normalize_nullable_text),
+        task_name: input.task_name.and_then(normalize_nullable_text),
+        session_id: input.session_id.and_then(normalize_nullable_text),
+        source_run_id: input.source_run_id.and_then(normalize_nullable_text),
+        payload: normalize_json_object_like(input.payload),
+        delivery_status: normalize_json_object_like(input.delivery_status),
+    })
+}
+
+fn merge_json_object_values(base: &Value, overlay: &Value) -> Value {
+    let mut merged = match normalize_json_object_like(base.clone()) {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let Value::Object(overlay_map) = normalize_json_object_like(overlay.clone()) {
+        for (key, value) in overlay_map {
+            match (merged.get(&key), value) {
+                (Some(Value::Object(existing)), Value::Object(next)) => {
+                    let nested = merge_json_object_values(
+                        &Value::Object(existing.clone()),
+                        &Value::Object(next),
+                    );
+                    merged.insert(key, nested);
+                }
+                (_, next) => {
+                    merged.insert(key, next);
+                }
+            }
+        }
+    }
+    Value::Object(merged)
+}
+
 fn normalize_binding_type(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "provider" => "provider".to_string(),
@@ -4972,6 +5487,39 @@ fn parse_capability_job_row(
         started_at: row.get(19)?,
         finished_at: row.get(20)?,
         last_heartbeat_at: row.get(21)?,
+    })
+}
+
+fn parse_notification_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<NotificationRecord, rusqlite::Error> {
+    let payload_json: String = row.get(15)?;
+    let delivery_status_json: String = row.get(16)?;
+    Ok(NotificationRecord {
+        id: row.get(0)?,
+        source_key: row.get(1)?,
+        source_domain: row.get(2)?,
+        source_record_id: row.get(3)?,
+        notification_type: row.get(4)?,
+        severity: row.get(5)?,
+        title: row.get(6)?,
+        summary: row.get(7)?,
+        detail: row.get(8)?,
+        agent_id: row.get(9)?,
+        agent_name: row.get(10)?,
+        task_id: row.get(11)?,
+        task_name: row.get(12)?,
+        session_id: row.get(13)?,
+        source_run_id: row.get(14)?,
+        payload: parse_json_value_or_default(&payload_json, Value::Object(Default::default())),
+        delivery_status: parse_json_value_or_default(
+            &delivery_status_json,
+            Value::Object(Default::default()),
+        ),
+        read_at: row.get(17)?,
+        archived_at: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 

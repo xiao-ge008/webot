@@ -1,14 +1,7 @@
-﻿import { AGENT_IPC_CHANNELS } from "@/main/ipc-contract";
 import { compileSpecStream } from "@json-render/core";
 import type {
   AgentProfile,
   AgentRuntimeStatus,
-  AgentLogTail,
-  AgentCollaborationEvent,
-  GetAgentCollaborationEventsInput,
-  GetAgentLogTailInput,
-  SaveAgentInput,
-  SaveAgentResult,
   StartAgentInput,
   StartAgentResult,
   StopAgentInput,
@@ -34,8 +27,8 @@ import type {
   AgentNotificationMarkReadInput,
   AgentNotificationMarkReadResult,
   AgentTask,
-} from "@/main/types";
-import { CHAT_CHANNELS, CHAT_RENDER_MODES } from "@/main/types";
+} from "@/shared/desktop/types";
+import { CHAT_CHANNELS, CHAT_RENDER_MODES } from "@/shared/desktop/types";
 import { primeManifestSchemaCache } from "@/components/chat/chat-page-helpers";
 import {
   requestJson,
@@ -50,26 +43,33 @@ import {
   listManagementAgents,
 } from "@/services/management-client";
 
-interface SettingsApiResult<T> {
-  ok: boolean;
-  data?: T;
-  error?: { message: string };
+function isTauriRuntime(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const globalWindow = window as Window & {
+    __TAURI_INTERNALS__?: unknown;
+  };
+  return Boolean(globalWindow.__TAURI_INTERNALS__);
 }
 
-interface IpcInvoker {
-  invoke: (channel: string, payload?: unknown) => Promise<unknown>;
-}
+async function invokeDesktopCommand<TResponse>(
+  command: string,
+  payload?: Record<string, unknown>,
+): Promise<TResponse> {
+  if (!isTauriRuntime()) {
+    throw new Error("Desktop command unavailable");
+  }
 
-interface IpcEmitter {
-  on: (
-    channel: string,
-    listener: (payload: unknown) => void,
-  ) => void | (() => void);
-  off: (channel: string, listener: (payload: unknown) => void) => void;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<TResponse>(command, payload);
 }
 
 interface OpenFangAgentSummary {
   id?: string;
+  resolved_agent_id?: string;
+  resolvedAgentId?: string;
   name?: string;
   english_name?: string;
   nickname?: string;
@@ -854,6 +854,26 @@ function buildOutgoingAttachmentRefs(
     }));
 }
 
+function normalizeOutgoingCurrentTaskDraft(
+  draft: AgentChatInput["currentTaskDraft"] | undefined,
+): Record<string, unknown> | undefined {
+  if (!draft) {
+    return undefined;
+  }
+  return {
+    objective: draft.objective,
+    report_condition: draft.reportCondition,
+    every_ms: draft.everyMs,
+    max_runs: draft.maxRuns,
+    duration_ms: draft.durationMs,
+    schedule_text: draft.scheduleText,
+    source_message_text: draft.sourceMessageText,
+    created_at: draft.createdAt,
+    missing_slots: draft.missingSlots,
+    ready_to_confirm: draft.readyToConfirm,
+  };
+}
+
 function normalizeSessionLabelComponent(raw: string, maxLen: number): string {
   const trimmed = raw.trim();
   if (!trimmed) return "";
@@ -1366,6 +1386,17 @@ async function buildUiEnvironmentSystemPrompt(
     "[system:ui-environment]",
     `Current UI environment: channel=${channel}, renderMode=${renderMode}, A2UI rendering is available.`,
     "You are replying in chat mode for a json-render capable client, not a pure generation-only mode.",
+    "[system:reasoning-flow]",
+    "Before producing the final answer, internally organize your work in this order and keep the chain coherent across the whole turn.",
+    "Step 0. Connection/bootstrap: recognize the current chat request has started, note any frontend-provided UI/runtime context, and treat it as part of the execution environment.",
+    "Step 1. Identity check: first determine who you are in this turn, your current identity boundary, and whether the interaction is roleplay, simulation, or real-world task handling.",
+    "Step 2. User intent understanding: deeply understand the user's semantics, emotional state, hidden expectations, and the concrete outcome they actually want.",
+    "Step 3. Memory recall: proactively recall relevant memory, summarize what memory returned, and integrate it into the next action instead of ignoring it.",
+    "Step 4. Tool reasoning: when tools are needed, decide which tools to call, inspect what they returned, and ground the answer in those returned results.",
+    "Step 5. Render/output decision: before finalizing, decide what client you are in, what output format is most suitable, whether A2UI/json-render should be used, and what the final visible output should look like.",
+    "Do not expose this full internal chain verbatim unless the product explicitly asks for it, but make your reasoning and tool choices actually follow this structure.",
+    "If the model supports hidden reasoning text or `<think>` blocks, keep the chain observable with compact private checkpoints in this exact style when you reach each stage: `[stage:identity] ...`, `[stage:intent] ...`, `[stage:memory] ...`, `[stage:tools] ...`, `[stage:render] ...`.",
+    "Each private checkpoint should be 1-2 short lines, concrete, and consistent with the actual next action. Do not leak these stage markers into the final visible answer outside hidden reasoning or tool logs.",
     components.length > 0
       ? `Available custom dynamic components right now: ${components.join(", ")}.`
       : "No custom dynamic component is currently available.",
@@ -1406,6 +1437,15 @@ async function buildUiEnvironmentSystemPrompt(
       : "",
     supportsSelfManagementAgent
       ? "selfManagement.upgradeFlow=review_then_confirm_then_apply"
+      : "",
+    supportsSelfManagementAgent
+      ? "selfManagement.reviewRequiresExecutablePatch=true"
+      : "",
+    supportsSelfManagementAgent
+      ? "selfManagement.identityFileUpgradeFormat=identity_patch.files[IDENTITY.md|SOUL.md|USER.md|MEMORY.md|AGENTS.md|BOOTSTRAP.md|HEARTBEAT.md]=full_final_markdown"
+      : "",
+    supportsSelfManagementAgent
+      ? "selfManagement.proposedChangesIsDisplayOnly=true"
       : "",
     supportsSelfManagementAgent
       ? "identityWrites.requireConfirmCard=true"
@@ -1529,12 +1569,13 @@ async function loadSkillPromptContext(
   }
 
   try {
-    const invoke = resolveIpcInvoker();
-    if (!invoke) return "";
-    const payload = (await invoke.invoke("load_skill_prompt_context", {
+    const payload = await invokeDesktopCommand<{ content?: unknown }>(
+      "load_skill_prompt_context",
+      {
       componentName: normalized,
       agentId: agentId ?? null,
-    })) as { content?: unknown };
+      },
+    );
     const content =
       typeof payload?.content === "string" ? payload.content.trim() : "";
     skillPromptContextCache.set(cacheKey, content);
@@ -1558,12 +1599,13 @@ async function listAvailableSkillComponents(
   if (cached) return cached;
 
   try {
-    const invoke = resolveIpcInvoker();
-    if (!invoke) return [];
-    const payload = (await invoke.invoke("list_available_skill_components", {
+    const payload = await invokeDesktopCommand<{ components?: unknown }>(
+      "list_available_skill_components",
+      {
       skillNames: normalizedSkills,
       agentId,
-    })) as { components?: unknown };
+      },
+    );
     const components = Array.isArray(payload?.components)
       ? payload.components.filter(
           (item): item is string =>
@@ -1594,19 +1636,17 @@ async function loadSkillComponentManifest(
   if (cached) return cached;
 
   try {
-    const invoke = resolveIpcInvoker();
-    if (!invoke) return null;
-    const payload = (await invoke.invoke("load_skill_component_manifest", {
-      componentName: normalized,
-      agentId: agentId ?? null,
-    })) as {
+    const payload = await invokeDesktopCommand<{
       description?: unknown;
       props_schema?: unknown;
       propsSchema?: unknown;
       example?: unknown;
       invoke_example?: unknown;
       invokeExample?: unknown;
-    };
+    }>("load_skill_component_manifest", {
+      componentName: normalized,
+      agentId: agentId ?? null,
+    });
     const manifest = {
       description:
         typeof payload?.description === "string"
@@ -1783,6 +1823,10 @@ function mapAgentToProfile(
   return {
     version: "1.0",
     agentId: toStringValue(agent.id),
+    resolvedAgentId: toStringValue(
+      (agent as { resolved_agent_id?: unknown }).resolved_agent_id,
+      toStringValue((agent as { resolvedAgentId?: unknown }).resolvedAgentId),
+    ) || undefined,
     name: toStringValue(
       agent.nickname,
       toStringValue(
@@ -1886,77 +1930,6 @@ function mapOpenFangCronJobToAgentTask(job: OpenFangCronJob): AgentTask {
   };
 }
 
-function resolveIpcInvoker(): IpcInvoker | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  const globalWindow = window as unknown as {
-    webotIpc?: IpcInvoker;
-    electron?: { ipcRenderer?: IpcInvoker };
-  };
-
-  if (globalWindow.webotIpc?.invoke) {
-    return globalWindow.webotIpc;
-  }
-
-  if (globalWindow.electron?.ipcRenderer?.invoke) {
-    return globalWindow.electron.ipcRenderer;
-  }
-
-  return null;
-}
-
-function resolveIpcEmitter(): IpcEmitter | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  const globalWindow = window as unknown as {
-    webotIpc?: IpcInvoker & IpcEmitter;
-    electron?: { ipcRenderer?: IpcInvoker & IpcEmitter };
-  };
-
-  if (globalWindow.webotIpc?.on) {
-    return globalWindow.webotIpc;
-  }
-
-  if (globalWindow.electron?.ipcRenderer?.on) {
-    return globalWindow.electron.ipcRenderer;
-  }
-
-  return null;
-}
-
-async function invokeIpc<TResponse>(
-  channel: string,
-  payload?: unknown,
-): Promise<TResponse> {
-  const ipc = resolveIpcInvoker();
-  if (!ipc) {
-    throw new Error("IPC unavailable");
-  }
-
-  const result = (await ipc.invoke(channel, payload)) as
-    | SettingsApiResult<TResponse>
-    | TResponse;
-
-  if (result && typeof result === "object" && "ok" in result) {
-    if (result.ok) {
-      return result.data as TResponse;
-    }
-    throw new Error(result.error?.message ?? "鏈煡閿欒");
-  }
-
-  return result as TResponse;
-}
-
-export async function saveAgent(
-  input: SaveAgentInput,
-): Promise<SaveAgentResult> {
-  return invokeIpc<SaveAgentResult>(AGENT_IPC_CHANNELS.saveAgent, input);
-}
-
 export async function getAgent(agentId: string): Promise<AgentProfile> {
   const data = await requestJson<unknown>(
     `/api/management/agents/${encodeURIComponent(agentId)}`,
@@ -2016,36 +1989,6 @@ export async function getAgentStatus(
     status: toRuntimeStatus(state),
     message: state,
   };
-}
-
-export async function getAgentLogTail(
-  input: GetAgentLogTailInput,
-): Promise<AgentLogTail> {
-  try {
-    return await invokeIpc<AgentLogTail>(
-      AGENT_IPC_CHANNELS.agentLogTail,
-      input,
-    );
-  } catch {
-    return {
-      agentId: input.agentId,
-      content: "",
-      updatedAt: new Date().toISOString(),
-    };
-  }
-}
-
-export async function getAgentCollaborationEvents(
-  input: GetAgentCollaborationEventsInput,
-): Promise<readonly AgentCollaborationEvent[]> {
-  try {
-    return await invokeIpc<readonly AgentCollaborationEvent[]>(
-      AGENT_IPC_CHANNELS.agentCollaborationEvents,
-      input,
-    );
-  } catch {
-    return [];
-  }
 }
 
 async function sendAgentChatStreamOnce(
@@ -2198,6 +2141,9 @@ async function sendAgentChatStreamOnce(
       typeof input.sessionLabel === "string" ? input.sessionLabel.trim() : "";
     const requestOrigin = input.requestOrigin;
     const currentTaskDraft = input.currentTaskDraft;
+    const outgoingCurrentTaskDraft = normalizeOutgoingCurrentTaskDraft(
+      currentTaskDraft,
+    );
     let taskDraftMeta: ReturnType<typeof parseTaskDraftMetaFromPayload> = {};
 
     // 聊天统一走 service-rs SSE 代理，避免桌面端直连 OpenFang WS 时绕过
@@ -2395,11 +2341,12 @@ async function sendAgentChatStreamOnce(
             method: "POST",
               body: {
                 message: outgoingMessage,
+                raw_user_message: input.message,
                 attachments: attachmentRefs.length > 0 ? attachmentRefs : undefined,
                 session_id: sessionId || undefined,
                 session_label: sessionLabel || undefined,
                 request_origin: requestOrigin,
-                current_task_draft: currentTaskDraft ?? undefined,
+                current_task_draft: outgoingCurrentTaskDraft,
               },
               signal: controller.signal,
             },
@@ -2662,9 +2609,10 @@ async function sendAgentChatStreamOnce(
               method: "POST",
               body: {
                 message: outgoingMessage,
+                raw_user_message: input.message,
                 attachments:
                   attachmentRefs.length > 0 ? attachmentRefs : undefined,
-                current_task_draft: currentTaskDraft ?? undefined,
+                current_task_draft: outgoingCurrentTaskDraft,
               },
               signal: controller.signal,
             },
@@ -2762,7 +2710,8 @@ async function sendAgentChatStreamOnce(
               method: "POST",
               body: {
                 message: outgoingMessage,
-                current_task_draft: currentTaskDraft ?? undefined,
+                raw_user_message: input.message,
+                current_task_draft: outgoingCurrentTaskDraft,
               },
               signal: controller.signal,
             },
@@ -2953,6 +2902,15 @@ export async function sendAgentChat(
           ? requestInput.sessionLabel.trim()
           : "";
       const requestOrigin = requestInput.requestOrigin;
+      const outgoingCurrentTaskDraft = normalizeOutgoingCurrentTaskDraft(
+        requestInput.currentTaskDraft,
+      );
+      const timeoutMs =
+        typeof requestInput.timeoutMs === "number" &&
+        Number.isFinite(requestInput.timeoutMs) &&
+        requestInput.timeoutMs > 0
+          ? requestInput.timeoutMs
+          : undefined;
       const result = await requestJson<unknown>(
         `/api/chat/${encodeURIComponent(requestInput.agentId)}/message`,
         {
@@ -2963,9 +2921,10 @@ export async function sendAgentChat(
             session_id: nextSessionId || undefined,
             session_label: nextSessionLabel || undefined,
             request_origin: requestOrigin,
-            current_task_draft: requestInput.currentTaskDraft ?? undefined,
+            current_task_draft: outgoingCurrentTaskDraft,
           },
           signal: controller.signal,
+          timeoutMs,
         },
       );
       const body = isRecord(result) ? result : {};
@@ -3646,20 +3605,7 @@ export function subscribeAgentChatStream(
 ): () => void {
   streamSubscribers.add(handler);
 
-  const emitter = resolveIpcEmitter();
-  const listener = (payload: unknown) =>
-    handler(payload as AgentChatStreamChunk);
-  const unsubscribe = emitter?.on?.(
-    AGENT_IPC_CHANNELS.agentChatStream,
-    listener,
-  );
-
   return () => {
     streamSubscribers.delete(handler);
-    if (typeof unsubscribe === "function") {
-      unsubscribe();
-      return;
-    }
-    emitter?.off?.(AGENT_IPC_CHANNELS.agentChatStream, listener);
   };
 }

@@ -1,11 +1,11 @@
 {
   "name": "@webot/frontend",
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.8",
   "packageManager": "npm@10",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --force",
     "dev:tauri": "tauri dev",
     "build:tauri": "tauri build",
     "build": "tsc -b && vite build",
@@ -73,3 +73,4 @@
     "vite": "^7.3.1"
   }
 }
+

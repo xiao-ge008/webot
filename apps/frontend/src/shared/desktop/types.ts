@@ -274,6 +274,7 @@ export interface AgentTeamMember {
 export interface AgentProfile {
   version: '1.0';
   agentId: string;
+  resolvedAgentId?: string;
   name: string;
   title?: string;
   tags: readonly string[];
@@ -462,6 +463,7 @@ export interface AgentChatInput {
   systemPreamble?: string;
   homeDirOverride?: string;
   currentTaskDraft?: unknown;
+  timeoutMs?: number;
 }
 
 export interface AgentAppearanceUpdated {

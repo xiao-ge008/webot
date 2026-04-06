@@ -1117,6 +1117,10 @@ impl OpenFangKernel {
             self_handle: OnceLock::new(),
         };
 
+        if let Err(error) = kernel.recover_interrupted_managed_tasks() {
+            warn!("Failed to recover interrupted managed tasks: {error}");
+        }
+
         // Restore persisted agents from SQLite
         match kernel.memory.load_all_agents() {
             Ok(agents) => {
@@ -1487,6 +1491,73 @@ impl OpenFangKernel {
         Ok(signed.manifest)
     }
 
+    pub async fn collect_streaming_message_with_quota_scope_and_blocked_tools(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        quota_scope: SchedulerQuotaScope,
+        blocked_tools: Vec<String>,
+    ) -> KernelResult<AgentLoopResult> {
+        let (mut rx, join_handle) = self.send_message_streaming_with_quota_scope_and_blocked_tools(
+            agent_id,
+            message,
+            kernel_handle,
+            quota_scope,
+            blocked_tools,
+        )?;
+        let mut streamed_text = String::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::TextDelta { text } = event {
+                streamed_text.push_str(&text);
+            }
+        }
+        let mut result = join_handle.await.map_err(|e| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Streaming task join error: {e}"
+            )))
+        })??;
+        if result.response.trim().is_empty() && !streamed_text.trim().is_empty() {
+            result.response = streamed_text;
+        }
+        Ok(result)
+    }
+
+    pub async fn collect_streaming_message_with_memory_context_and_quota_scope_and_blocked_tools(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        memory_turn_context: Option<MemoryTurnContext>,
+        quota_scope: SchedulerQuotaScope,
+        blocked_tools: Vec<String>,
+    ) -> KernelResult<AgentLoopResult> {
+        let (mut rx, join_handle) = self
+            .send_message_streaming_with_memory_context_and_quota_scope_and_blocked_tools(
+                agent_id,
+                message,
+                kernel_handle,
+                memory_turn_context,
+                quota_scope,
+                blocked_tools,
+            )?;
+        let mut streamed_text = String::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::TextDelta { text } = event {
+                streamed_text.push_str(&text);
+            }
+        }
+        let mut result = join_handle.await.map_err(|e| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Streaming task join error: {e}"
+            )))
+        })??;
+        if result.response.trim().is_empty() && !streamed_text.trim().is_empty() {
+            result.response = streamed_text;
+        }
+        Ok(result)
+    }
+
     /// Send a message to an agent and get a response.
     ///
     /// Automatically upgrades the kernel handle from `self_handle` so that
@@ -1497,15 +1568,22 @@ impl OpenFangKernel {
         agent_id: AgentId,
         message: &str,
     ) -> KernelResult<AgentLoopResult> {
-        let handle: Option<Arc<dyn KernelHandle>> = self
-            .self_handle
-            .get()
-            .and_then(|w| w.upgrade())
-            .map(|arc| arc as Arc<dyn KernelHandle>);
+        if let Some(kernel_arc) = self.self_handle.get().and_then(|w| w.upgrade()) {
+            let handle: Arc<dyn KernelHandle> = kernel_arc.clone();
+            return kernel_arc
+                .collect_streaming_message_with_quota_scope_and_blocked_tools(
+                    agent_id,
+                    message,
+                    Some(handle),
+                    SchedulerQuotaScope::Ignore,
+                    Vec::new(),
+                )
+                .await;
+        }
         self.send_message_with_handle_and_memory_context(
             agent_id,
             message,
-            handle,
+            None,
             None,
             SchedulerQuotaScope::Ignore,
             &[],
@@ -1523,15 +1601,23 @@ impl OpenFangKernel {
         message: &str,
         memory_turn_context: Option<MemoryTurnContext>,
     ) -> KernelResult<AgentLoopResult> {
-        let handle: Option<Arc<dyn KernelHandle>> = self
-            .self_handle
-            .get()
-            .and_then(|w| w.upgrade())
-            .map(|arc| arc as Arc<dyn KernelHandle>);
+        if let Some(kernel_arc) = self.self_handle.get().and_then(|w| w.upgrade()) {
+            let handle: Arc<dyn KernelHandle> = kernel_arc.clone();
+            return kernel_arc
+                .collect_streaming_message_with_memory_context_and_quota_scope_and_blocked_tools(
+                    agent_id,
+                    message,
+                    Some(handle),
+                    memory_turn_context,
+                    SchedulerQuotaScope::Ignore,
+                    Vec::new(),
+                )
+                .await;
+        }
         self.send_message_with_handle_and_memory_context(
             agent_id,
             message,
-            handle,
+            None,
             memory_turn_context,
             SchedulerQuotaScope::Ignore,
             &[],
@@ -1702,20 +1788,22 @@ impl OpenFangKernel {
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
-        self.send_message_streaming_with_quota_scope_and_blocked_tools(
+        self.send_message_streaming_with_memory_context_and_quota_scope_and_blocked_tools(
             agent_id,
             message,
             kernel_handle,
+            None,
             quota_scope,
             Vec::new(),
         )
     }
 
-    pub fn send_message_streaming_with_quota_scope_and_blocked_tools(
+    pub fn send_message_streaming_with_memory_context_and_quota_scope_and_blocked_tools(
         self: &Arc<Self>,
         agent_id: AgentId,
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
+        memory_turn_context: Option<MemoryTurnContext>,
         quota_scope: SchedulerQuotaScope,
         blocked_tools: Vec<String>,
     ) -> KernelResult<(
@@ -1840,6 +1928,15 @@ impl OpenFangKernel {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
+        if let Some(ctx) = memory_turn_context {
+            if let Ok(v) = serde_json::to_value(ctx) {
+                manifest
+                    .metadata
+                    .insert("memory_turn_context".to_string(), v);
+            }
+        } else {
+            manifest.metadata.remove("memory_turn_context");
+        }
 
         // Lazy backfill: create workspace for existing agents spawned before workspaces
         if manifest.workspace.is_none() {
@@ -2135,6 +2232,27 @@ impl OpenFangKernel {
         self.running_tasks.insert(agent_id, handle.abort_handle());
 
         Ok((rx, handle))
+    }
+
+    pub fn send_message_streaming_with_quota_scope_and_blocked_tools(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        quota_scope: SchedulerQuotaScope,
+        blocked_tools: Vec<String>,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
+        self.send_message_streaming_with_memory_context_and_quota_scope_and_blocked_tools(
+            agent_id,
+            message,
+            kernel_handle,
+            None,
+            quota_scope,
+            blocked_tools,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -4290,7 +4408,9 @@ impl OpenFangKernel {
                     .and_then(|env| std::env::var(env).ok())
             } else if agent_provider == default_provider {
                 // Same provider  ?use default key
-                std::env::var(&self.config.default_model.api_key_env).ok()
+                std::env::var(&self.config.default_model.api_key_env)
+                    .ok()
+                    .or_else(|| provider_cfg.and_then(|p| p.api_key.clone()))
             } else {
                 // Different provider  ?check auth profiles first, then let
                 // create_driver() look up the correct env var automatically.
@@ -6445,27 +6565,239 @@ impl OpenFangKernel {
             .and_then(|meta| meta.job.next_run.map(|value| value.to_rfc3339()))
     }
 
-    fn build_managed_task_agent_prompt(prompt: &str) -> String {
+    fn managed_task_context_role_label(role: openfang_types::message::Role) -> Option<&'static str> {
+        match role {
+            openfang_types::message::Role::User => Some("用户"),
+            openfang_types::message::Role::Assistant => Some("智能体"),
+            openfang_types::message::Role::System => None,
+        }
+    }
+
+    fn build_managed_task_context_excerpt(
+        messages: &[openfang_types::message::Message],
+        max_messages: usize,
+    ) -> String {
+        let mut lines = Vec::new();
+        for message in messages.iter().rev() {
+            if lines.len() >= max_messages {
+                break;
+            }
+            let Some(role_label) = Self::managed_task_context_role_label(message.role) else {
+                continue;
+            };
+            let text = message
+                .content
+                .text_content()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() {
+                continue;
+            }
+            let excerpt = openfang_types::truncate_str(&text, 280);
+            lines.push(format!("{role_label}: {excerpt}"));
+        }
+        lines.reverse();
+        lines.join("\n")
+    }
+
+    fn load_managed_task_origin_context(
+        &self,
+        detail: &openfang_types::tasks::ManagedTaskDetail,
+        fallback_session_id: openfang_types::agent::SessionId,
+    ) -> Option<String> {
+        let mut candidate_session_ids = Vec::new();
+        if let Some(session_id) = detail
+            .spec
+            .binding
+            .remote_chat_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .map(openfang_types::agent::SessionId)
+        {
+            candidate_session_ids.push(session_id);
+        }
+        if !candidate_session_ids
+            .iter()
+            .any(|item| item.0 == fallback_session_id.0)
+        {
+            candidate_session_ids.push(fallback_session_id);
+        }
+
+        let binding_owner_agent_id = detail
+            .spec
+            .binding
+            .remote_chat_session_owner_agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .map(openfang_types::agent::AgentId);
+
+        for session_id in candidate_session_ids {
+            let Ok(Some(session)) = self.memory.get_session(session_id) else {
+                continue;
+            };
+            if let Some(owner_agent_id) = binding_owner_agent_id {
+                if session.agent_id != owner_agent_id && session.id.0 != fallback_session_id.0 {
+                    continue;
+                }
+            }
+            let excerpt = Self::build_managed_task_context_excerpt(&session.messages, 10);
+            if !excerpt.is_empty() {
+                return Some(excerpt);
+            }
+        }
+
+        None
+    }
+
+    fn build_managed_task_memory_context(
+        detail: &openfang_types::tasks::ManagedTaskDetail,
+        runs: &[openfang_types::tasks::ManagedTaskRun],
+    ) -> Option<String> {
+        let mut lines: Vec<String> = Vec::new();
+
+        if detail.runtime.run_count > 0 {
+            lines.push(format!("历史运行次数：{} 次", detail.runtime.run_count));
+        }
+
+        if let Some(last_run) = detail.runtime.last_run.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            lines.push(format!("上次运行时间：{last_run}"));
+        }
+
+        if let Some(latest_summary) = detail
+            .runtime
+            .latest_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!(
+                "上次运行结果摘要：{}",
+                openfang_types::truncate_str(latest_summary, 220)
+            ));
+        }
+
+        let recent_error = detail
+            .runtime
+            .last_error
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .or_else(|| {
+                runs.iter()
+                    .find(|run| run.status == openfang_types::tasks::ManagedTaskStatus::Error)
+                    .and_then(|run| {
+                        run.error
+                            .as_deref()
+                            .or(run.summary.as_deref())
+                            .or(run.output.as_deref())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(|value| value.to_string())
+                    })
+            });
+        if let Some(error_text) = recent_error {
+            lines.push(format!(
+                "最近异常：{}",
+                openfang_types::truncate_str(&error_text, 220)
+            ));
+        }
+
+        let latest_success = runs
+            .iter()
+            .find(|run| run.status == openfang_types::tasks::ManagedTaskStatus::Ok)
+            .and_then(|run| {
+                run.summary
+                    .as_deref()
+                    .or(run.output.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+            })
+            .or_else(|| {
+                detail
+                    .runtime
+                    .last_output
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+            });
+        if let Some(success_text) = latest_success {
+            lines.push(format!(
+                "最近一次成功值：{}",
+                openfang_types::truncate_str(&success_text, 220)
+            ));
+        }
+
+        if detail.runtime.consecutive_errors > 0 {
+            lines.push(format!("当前连续异常次数：{}", detail.runtime.consecutive_errors));
+        }
+
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    fn build_managed_task_agent_prompt(
+        prompt: &str,
+        context_excerpt: Option<&str>,
+        task_memory_context: Option<&str>,
+    ) -> String {
         let trimmed = prompt.trim();
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(context) = context_excerpt.map(str::trim).filter(|value| !value.is_empty()) {
+            lines.push("你正在执行一个从聊天中确认下来的任务。先理解下面的原始聊天上下文，再决定如何调用工具和如何执行。".to_string());
+            lines.push("不要只看关键词，必须结合上下文语义完成任务。".to_string());
+            lines.push("【原聊天上下文】".to_string());
+            lines.push(context.to_string());
+            lines.push(String::new());
+        }
+        if let Some(task_memory) = task_memory_context.map(str::trim).filter(|value| !value.is_empty()) {
+            lines.push("【任务态记忆】".to_string());
+            lines.push("下面是这个任务最近几轮的连续观察状态。先吸收这些状态，再决定本轮是否发生变化。".to_string());
+            lines.push(task_memory.to_string());
+            lines.push(String::new());
+        }
+        lines.extend([
+            "执行本轮任务前，请先在内部按下面顺序判断：".to_string(),
+            "0) 先确认这是“已创建任务的一次执行轮次”，不是和用户闲聊，也不是创建任务。".to_string(),
+            "1) 判断本轮你的执行身份：你现在是任务执行者、监控者或汇报者，而不是自由聊天助手。".to_string(),
+            "2) 结合原聊天上下文与任务目标，理解本轮真正要检查的对象、条件、阈值、异常定义和用户期待的结果。".to_string(),
+            "3) 先结合任务态记忆比较“本轮结果 vs 上轮结果/最近一次成功值/最近异常”，判断是否有变化、变化方向、变化幅度，以及是否属于持续异常。".to_string(),
+            "4) 如果需要历史上下文、记忆或工具结果，先获取证据，再下结论；不要凭空猜测任务状态。".to_string(),
+            "5) 如果是监控或定时任务，必须先判断“本轮是否真的命中汇报条件”，再决定输出是正常记录还是异常告警。".to_string(),
+            "6) 输出中要明确说明：本轮核心结论、与上一轮相比有没有变化、为什么触发或未触发汇报。".to_string(),
+            "7) 输出时先给人类可读结论，再附加机器可读 task-result，不要把过程写成闲聊或自言自语。".to_string(),
+            String::new(),
+        ]);
         if trimmed.is_empty() {
-            return [
-                "请执行任务并返回简洁结论。",
-                "最后必须单独追加一行机器结果，格式严格如下：",
-                "<task-result>{\"status\":\"ok\",\"alert\":false,\"summary\":\"一句话总结\",\"details\":\"补充说明，可为空\"}</task-result>",
-            ]
-            .join("\n");
+            lines.extend([
+                "请执行任务并返回简洁结论。".to_string(),
+                "最后必须单独追加一行机器结果，格式严格如下：".to_string(),
+                "<task-result>{\"status\":\"ok\",\"alert\":false,\"summary\":\"一句话总结\",\"details\":\"补充说明，可为空\"}</task-result>".to_string(),
+            ]);
+            return lines.join("\n");
         }
         if trimmed.contains("<task-result>") {
-            return trimmed.to_string();
+            lines.push(trimmed.to_string());
+            return lines.join("\n");
         }
-        [
-            trimmed,
-            "",
-            "最后必须单独追加一行机器结果，格式严格如下：",
-            "<task-result>{\"status\":\"ok\",\"alert\":false,\"summary\":\"一句话总结\",\"details\":\"补充说明，可为空\"}</task-result>",
-            "如果任务执行失败，把 status 改为 error；如果命中异常或阈值，把 alert 改为 true。",
-        ]
-        .join("\n")
+        lines.extend([
+            trimmed.to_string(),
+            String::new(),
+            "最后必须单独追加一行机器结果，格式严格如下：".to_string(),
+            "<task-result>{\"status\":\"ok\",\"alert\":false,\"summary\":\"一句话总结\",\"details\":\"补充说明，可为空\"}</task-result>".to_string(),
+            "如果任务执行失败，把 status 改为 error；如果命中异常或阈值，把 alert 改为 true。".to_string(),
+        ]);
+        lines.join("\n")
     }
 
     fn extract_task_result(output: &str) -> (String, Option<serde_json::Value>) {
@@ -6517,6 +6849,57 @@ impl OpenFangKernel {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
+    }
+
+    fn task_result_alert(task_result: Option<&serde_json::Value>) -> Option<bool> {
+        task_result
+            .and_then(|value| value.get("alert"))
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    fn normalize_task_observation_text(value: &str, limit: usize) -> Option<String> {
+        let normalized = value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace('|', "/");
+        let trimmed = normalized.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(openfang_types::truncate_str(trimmed, limit).to_string())
+        }
+    }
+
+    fn build_task_observation_snapshot(
+        output: &str,
+        fallback: &str,
+        task_result: Option<&serde_json::Value>,
+    ) -> String {
+        let status = Self::task_result_status(task_result)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "ok".to_string());
+        let alert = Self::task_result_alert(task_result).unwrap_or(false);
+        let summary = Self::task_result_summary(task_result)
+            .or_else(|| Self::normalize_task_observation_text(output, 220))
+            .unwrap_or_else(|| fallback.to_string());
+        let details = Self::task_result_details(task_result)
+            .or_else(|| {
+                let normalized_output = Self::normalize_task_observation_text(output, 320)?;
+                if normalized_output == summary {
+                    None
+                } else {
+                    Some(normalized_output)
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
+        format!(
+            "status={} | alert={} | summary={} | details={}",
+            status,
+            alert,
+            summary,
+            details
+        )
     }
 
     fn extract_report_condition_threshold(report_condition: &str) -> Vec<String> {
@@ -6631,7 +7014,6 @@ impl OpenFangKernel {
         use openfang_types::tasks::ManagedTaskState;
 
         let state = &detail.runtime.state;
-        let has_run = detail.runtime.run_count > 0;
         openfang_types::tasks::ManagedTaskCapabilities {
             publish: matches!(
                 state,
@@ -6645,7 +7027,7 @@ impl OpenFangKernel {
                 state,
                 ManagedTaskState::Draft | ManagedTaskState::Paused | ManagedTaskState::Scheduled
             ),
-            delete: !has_run && !matches!(state, ManagedTaskState::Running),
+            delete: !matches!(state, ManagedTaskState::Running),
         }
     }
 
@@ -6819,6 +7201,58 @@ impl OpenFangKernel {
         detail.timeline =
             Self::build_managed_task_timeline(&task_id, &events, &deliveries, &attempts);
         Ok(detail)
+    }
+
+    fn recover_interrupted_managed_tasks(&self) -> Result<(), String> {
+        let tasks = self
+            .memory
+            .task_list_managed(None)
+            .map_err(|e| format!("Managed task list failed during recovery: {e}"))?;
+
+        for mut detail in tasks {
+            if detail.runtime.state != openfang_types::tasks::ManagedTaskState::Running {
+                continue;
+            }
+
+            detail.runtime.state = if detail.spec.enabled {
+                openfang_types::tasks::ManagedTaskState::Scheduled
+            } else {
+                openfang_types::tasks::ManagedTaskState::Paused
+            };
+            detail.runtime.next_run = if detail.spec.enabled {
+                self.derive_next_run_from_cron_job(detail.spec.cron_job_id.as_deref())
+            } else {
+                None
+            };
+            detail.runtime.last_status = if detail.runtime.run_count > 0 {
+                detail.runtime.last_status.clone()
+            } else {
+                openfang_types::tasks::ManagedTaskStatus::Idle
+            };
+            detail.runtime.last_error = None;
+            detail.runtime.disabled_reason = None;
+            detail.runtime.latest_summary = Some("检测到运行时重启，上次执行被中断，任务已恢复调度。".to_string());
+            detail.spec.updated_at = Self::managed_task_now();
+
+            self.memory
+                .task_update(&detail.spec, &detail.runtime)
+                .map_err(|e| format!("Managed task recovery update failed: {e}"))?;
+
+            let event = Self::build_managed_task_event(
+                &detail.spec.id,
+                None,
+                openfang_types::tasks::ManagedTaskEventType::Progress,
+                "检测到运行时重启，任务已恢复调度",
+                serde_json::json!({
+                    "task_id": detail.spec.id,
+                    "recovered_after_restart": true,
+                    "enabled": detail.spec.enabled,
+                }),
+            );
+            let _ = self.memory.task_append_event(&event);
+        }
+
+        Ok(())
     }
 
     fn append_managed_task_delivery(
@@ -7212,7 +7646,7 @@ impl OpenFangKernel {
             .map_err(|e| format!("Managed task load failed: {e}"))?;
         if let Some(detail) = detail {
             if !Self::build_managed_task_capabilities(&detail).delete {
-                return Err("任务已开始执行，当前不允许删除".to_string());
+                return Err("任务正在执行，请先停止后再删除".to_string());
             }
             if let Some(cron_job_id) = detail.spec.cron_job_id {
                 if let Ok(parsed) = uuid::Uuid::parse_str(&cron_job_id) {
@@ -7258,6 +7692,50 @@ impl OpenFangKernel {
             return self.hydrate_managed_task_detail(detail);
         }
 
+        let agent_id = openfang_types::agent::AgentId(
+            uuid::Uuid::parse_str(&detail.spec.agent_id)
+                .map_err(|e| format!("Invalid agent ID: {e}"))?,
+        );
+        let original_session_id = self
+            .registry
+            .get(agent_id)
+            .map(|entry| entry.session_id)
+            .ok_or_else(|| format!("Agent not found for managed task: {}", detail.spec.agent_id))?;
+        let mut restore_session_id: Option<openfang_types::agent::SessionId> = None;
+        if let Some(session_target) = detail
+            .spec
+            .action
+            .session_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let target_session = self
+                .memory
+                .find_session_by_label(agent_id, session_target)
+                .map_err(|e| format!("Managed task target session load failed: {e}"))?
+                .unwrap_or_else(|| {
+                    self.memory
+                        .create_session_with_label(agent_id, Some(session_target))
+                        .expect("managed task target session should be creatable")
+                });
+            if target_session.id != original_session_id {
+                self.registry
+                    .update_session_id(agent_id, target_session.id)
+                    .map_err(|e| format!("Managed task target session switch failed: {e}"))?;
+                restore_session_id = Some(original_session_id);
+            }
+        }
+
+        let origin_context_excerpt =
+            self.load_managed_task_origin_context(&detail, original_session_id);
+        let recent_runs = self
+            .memory
+            .task_list_runs_managed(task_id)
+            .unwrap_or_default();
+        let task_memory_context =
+            Self::build_managed_task_memory_context(&detail, &recent_runs);
+
         let run_id = uuid::Uuid::new_v4().to_string();
         let start_time = Self::managed_task_now();
         detail.runtime.state = openfang_types::tasks::ManagedTaskState::Running;
@@ -7301,10 +7779,7 @@ impl OpenFangKernel {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(180),
                 self.send_message_with_handle(
-                    openfang_types::agent::AgentId(
-                        uuid::Uuid::parse_str(&detail.spec.agent_id)
-                            .map_err(|e| format!("Invalid agent ID: {e}"))?,
-                    ),
+                    agent_id,
                     &Self::build_managed_task_agent_prompt(
                         detail
                             .spec
@@ -7313,6 +7788,8 @@ impl OpenFangKernel {
                             .as_deref()
                             .or(detail.spec.action.command.as_deref())
                             .unwrap_or(&detail.spec.name),
+                        origin_context_excerpt.as_deref(),
+                        task_memory_context.as_deref(),
                     ),
                     kernel_handle,
                 ),
@@ -7324,6 +7801,9 @@ impl OpenFangKernel {
                 Err(_) => Err("timed out after 180s".to_string()),
             }
         };
+        if let Some(session_id) = restore_session_id {
+            let _ = self.registry.update_session_id(agent_id, session_id);
+        }
 
         let end_time = Self::managed_task_now();
         let next_run = self.derive_next_run_from_cron_job(detail.spec.cron_job_id.as_deref());
@@ -7343,6 +7823,11 @@ impl OpenFangKernel {
                             (!trimmed.is_empty()).then(|| trimmed.to_string())
                         })
                         .unwrap_or_else(|| "任务执行失败".to_string());
+                    let observation_snapshot = Self::build_task_observation_snapshot(
+                        &clean_output,
+                        &logical_error,
+                        task_result,
+                    );
                     if let Some(job_id) = cron_job_id {
                         self.cron_scheduler.record_failure(job_id, &logical_error);
                         detail.runtime.consecutive_errors = self
@@ -7358,7 +7843,7 @@ impl OpenFangKernel {
                     detail.runtime.last_run = Some(end_time.clone());
                     detail.runtime.last_status = openfang_types::tasks::ManagedTaskStatus::Error;
                     detail.runtime.last_error = Some(logical_error.clone());
-                    detail.runtime.latest_summary = Some(logical_error.clone());
+                    detail.runtime.latest_summary = Some(observation_snapshot.clone());
                     let disabled = detail.runtime.consecutive_errors >= 5;
                     detail.runtime.state = if disabled {
                         openfang_types::tasks::ManagedTaskState::Disabled
@@ -7389,7 +7874,7 @@ impl OpenFangKernel {
                             Some(clean_output.clone())
                         },
                         error: Some(logical_error.clone()),
-                        summary: Some(logical_error.clone()),
+                        summary: Some(observation_snapshot.clone()),
                         start_time,
                         end_time: Some(end_time.clone()),
                     };
@@ -7421,21 +7906,22 @@ impl OpenFangKernel {
                                 "run_count": current_run_no,
                             }),
                         );
+                    } else {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&failed_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                            format!("任务异常：{}", detail.spec.name),
+                            logical_error,
+                            serde_json::json!({
+                                "delivery_kind": "anomaly",
+                                "status": "failed",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                            }),
+                        );
                     }
-                    let _ = self.append_managed_task_delivery(
-                        &detail,
-                        Some(&run_id),
-                        Some(&failed_event.id),
-                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
-                        format!("任务异常：{}", detail.spec.name),
-                        logical_error,
-                        serde_json::json!({
-                            "delivery_kind": "anomaly",
-                            "status": "failed",
-                            "task_name": detail.spec.name,
-                            "run_count": current_run_no,
-                        }),
-                    );
                     self.memory
                         .task_update(&detail.spec, &detail.runtime)
                         .map_err(|e| format!("Managed task final update failed: {e}"))?;
@@ -7447,12 +7933,17 @@ impl OpenFangKernel {
                 }
                 let summary =
                     Self::summarize_task_output(&clean_output, "任务执行成功", task_result);
+                let observation_snapshot = Self::build_task_observation_snapshot(
+                    &clean_output,
+                    &summary,
+                    task_result,
+                );
                 detail.runtime.run_count = current_run_no;
                 detail.runtime.consecutive_errors = 0;
                 detail.runtime.last_run = Some(end_time.clone());
                 detail.runtime.last_status = openfang_types::tasks::ManagedTaskStatus::Ok;
                 detail.runtime.last_output = Some(summary.clone());
-                detail.runtime.latest_summary = Some(summary.clone());
+                detail.runtime.latest_summary = Some(observation_snapshot.clone());
                 let reached_max = detail
                     .spec
                     .max_runs
@@ -7492,7 +7983,7 @@ impl OpenFangKernel {
                     status: openfang_types::tasks::ManagedTaskStatus::Ok,
                     output: Some(clean_output.clone()),
                     error: None,
-                    summary: Some(summary.clone()),
+                    summary: Some(observation_snapshot.clone()),
                     start_time,
                     end_time: Some(end_time.clone()),
                 };
@@ -7542,40 +8033,75 @@ impl OpenFangKernel {
                                 "run_count": current_run_no,
                             }),
                         );
+                    } else {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&anomaly_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                            format!("任务异常：{}", detail.spec.name),
+                            summary.clone(),
+                            serde_json::json!({
+                                "delivery_kind": "anomaly",
+                                "status": "anomaly",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                            }),
+                        );
                     }
-                    let _ = self.append_managed_task_delivery(
-                        &detail,
-                        Some(&run_id),
-                        Some(&anomaly_event.id),
-                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
-                        format!("任务异常：{}", detail.spec.name),
-                        summary.clone(),
-                        serde_json::json!({
-                            "delivery_kind": "anomaly",
-                            "status": "anomaly",
-                            "task_name": detail.spec.name,
-                            "run_count": current_run_no,
-                        }),
-                    );
                 }
-                if !completed
-                    && !emit_anomaly_notice
-                    && detail.spec.binding.origin_chat_session_id.is_none()
-                {
-                    let _ = self.append_managed_task_delivery(
-                        &detail,
+                if !completed && !emit_anomaly_notice {
+                    let progress_percent = detail
+                        .spec
+                        .max_runs
+                        .filter(|max_runs| *max_runs > 0)
+                        .map(|max_runs| ((current_run_no * 100) / max_runs).min(100) as u64);
+                    let progress_event = Self::build_managed_task_event(
+                        task_id,
                         Some(&run_id),
-                        Some(&succeeded_event.id),
-                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
-                        format!("任务汇报：{}", detail.spec.name),
+                        openfang_types::tasks::ManagedTaskEventType::Progress,
                         summary.clone(),
                         serde_json::json!({
-                            "delivery_kind": "progress",
-                            "status": "reported",
+                            "run_no": current_run_no,
                             "task_name": detail.spec.name,
-                            "run_count": current_run_no,
+                            "progress_percent": progress_percent,
+                            "structured_result": structured_result.clone(),
                         }),
                     );
+                    let _ = self.memory.task_append_event(&progress_event);
+                    if detail.spec.binding.origin_chat_session_id.is_some() {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&progress_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::ChatMessage,
+                            format!("任务进展：{}", detail.spec.name),
+                            summary.clone(),
+                            serde_json::json!({
+                                "delivery_kind": "progress",
+                                "status": "reported",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                                "progress_percent": progress_percent,
+                            }),
+                        );
+                    } else {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&progress_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                            format!("任务汇报：{}", detail.spec.name),
+                            summary.clone(),
+                            serde_json::json!({
+                                "delivery_kind": "progress",
+                                "status": "reported",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                                "progress_percent": progress_percent,
+                            }),
+                        );
+                    }
                 }
                 if completed {
                     let final_summary = summary.clone();
@@ -7605,21 +8131,22 @@ impl OpenFangKernel {
                                 "run_count": current_run_no,
                             }),
                         );
+                    } else {
+                        let _ = self.append_managed_task_delivery(
+                            &detail,
+                            Some(&run_id),
+                            Some(&completed_event.id),
+                            openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                            format!("任务完成：{}", detail.spec.name),
+                            final_summary,
+                            serde_json::json!({
+                                "delivery_kind": "final",
+                                "status": "completed",
+                                "task_name": detail.spec.name,
+                                "run_count": current_run_no,
+                            }),
+                        );
                     }
-                    let _ = self.append_managed_task_delivery(
-                        &detail,
-                        Some(&run_id),
-                        Some(&completed_event.id),
-                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
-                        format!("任务完成：{}", detail.spec.name),
-                        final_summary,
-                        serde_json::json!({
-                            "delivery_kind": "final",
-                            "status": "completed",
-                            "task_name": detail.spec.name,
-                            "run_count": current_run_no,
-                        }),
-                    );
                 }
             }
             Err(error) => {
@@ -7695,20 +8222,21 @@ impl OpenFangKernel {
                             "run_count": current_run_no,
                         }),
                     );
+                } else {
+                    let _ = self.append_managed_task_delivery(
+                        &detail,
+                        Some(&run_id),
+                        Some(&failed_event.id),
+                        openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
+                        format!("任务异常：{}", detail.spec.name),
+                        error,
+                        serde_json::json!({
+                            "delivery_kind": "anomaly",
+                            "task_name": detail.spec.name,
+                            "run_count": current_run_no,
+                        }),
+                    );
                 }
-                let _ = self.append_managed_task_delivery(
-                    &detail,
-                    Some(&run_id),
-                    Some(&failed_event.id),
-                    openfang_types::tasks::ManagedTaskDeliveryTargetKind::PcNotice,
-                    format!("任务异常：{}", detail.spec.name),
-                    error,
-                    serde_json::json!({
-                        "delivery_kind": "anomaly",
-                        "task_name": detail.spec.name,
-                        "run_count": current_run_no,
-                    }),
-                );
             }
         }
 
@@ -7750,6 +8278,30 @@ impl KernelHandle for OpenFangKernel {
                 .map(|e| e.id)
                 .ok_or_else(|| format!("Agent not found: {agent_id}"))?,
         };
+        if let Some(kernel_arc) = self.self_handle.get().and_then(|w| w.upgrade()) {
+            let handle: Arc<dyn KernelHandle> = kernel_arc.clone();
+            let (mut rx, join_handle) = kernel_arc
+                .send_message_streaming(id, message, Some(handle))
+                .map_err(|e| format!("Send failed: {e}"))?;
+            let mut streamed_text = String::new();
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::TextDelta { text } = event {
+                    streamed_text.push_str(&text);
+                }
+            }
+            let result = join_handle
+                .await
+                .map_err(|e| format!("Send failed: streaming task join error: {e}"))?
+                .map_err(|e| format!("Send failed: {e}"))?;
+            if !result.response.trim().is_empty() {
+                return Ok(result.response);
+            }
+            if !streamed_text.trim().is_empty() {
+                return Ok(streamed_text);
+            }
+            return Ok(result.response);
+        }
+
         let result = self
             .send_message(id, message)
             .await
@@ -9218,6 +9770,11 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openfang_types::tasks::{
+        ManagedTaskAction, ManagedTaskCapabilities, ManagedTaskDeliveryConfig,
+        ManagedTaskDetail, ManagedTaskRuntime, ManagedTaskSchedule, ManagedTaskSourceType,
+        ManagedTaskSpec, ManagedTaskState, ManagedTaskStatus,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -9320,6 +9877,87 @@ mod tests {
         // UUID lookup should also work
         let found_by_id = registry.get(agent_id);
         assert!(found_by_id.is_some());
+    }
+
+    fn build_test_managed_task_detail(
+        state: ManagedTaskState,
+        run_count: u64,
+    ) -> ManagedTaskDetail {
+        ManagedTaskDetail {
+            spec: ManagedTaskSpec {
+                id: "task-test".to_string(),
+                agent_id: "agent-test".to_string(),
+                name: "task-test".to_string(),
+                source_type: ManagedTaskSourceType::Chat,
+                source_ref: None,
+                report_condition: None,
+                summary_style: None,
+                enabled: !matches!(state, ManagedTaskState::Paused | ManagedTaskState::Disabled),
+                schedule: ManagedTaskSchedule {
+                    kind: "every".to_string(),
+                    expr: None,
+                    tz: None,
+                    at: None,
+                    every_secs: Some(60),
+                },
+                action: ManagedTaskAction {
+                    job_type: "agent".to_string(),
+                    prompt: Some("test".to_string()),
+                    command: None,
+                    session_target: None,
+                },
+                delivery: ManagedTaskDeliveryConfig::default(),
+                max_runs: None,
+                binding: Default::default(),
+                cron_job_id: None,
+                created_at: "2026-04-06T00:00:00+08:00".to_string(),
+                updated_at: "2026-04-06T00:00:00+08:00".to_string(),
+            },
+            runtime: ManagedTaskRuntime {
+                state,
+                next_run: None,
+                last_run: None,
+                last_status: if run_count > 0 {
+                    ManagedTaskStatus::Ok
+                } else {
+                    ManagedTaskStatus::Idle
+                },
+                last_output: None,
+                run_count,
+                consecutive_errors: 0,
+                latest_summary: None,
+                last_error: None,
+                completed_at: None,
+                disabled_reason: None,
+            },
+            final_summary: None,
+            delivery_stats: Default::default(),
+            capabilities: ManagedTaskCapabilities::default(),
+            timeline: vec![],
+        }
+    }
+
+    #[test]
+    fn test_managed_task_delete_allowed_after_stop_or_finish() {
+        for state in [
+            ManagedTaskState::Draft,
+            ManagedTaskState::Scheduled,
+            ManagedTaskState::Paused,
+            ManagedTaskState::Completed,
+            ManagedTaskState::Failed,
+            ManagedTaskState::Disabled,
+        ] {
+            let detail = build_test_managed_task_detail(state, 3);
+            let caps = OpenFangKernel::build_managed_task_capabilities(&detail);
+            assert!(caps.delete, "state should be deletable after execution");
+        }
+    }
+
+    #[test]
+    fn test_managed_task_delete_blocked_while_running() {
+        let detail = build_test_managed_task_detail(ManagedTaskState::Running, 3);
+        let caps = OpenFangKernel::build_managed_task_capabilities(&detail);
+        assert!(!caps.delete);
     }
 
     #[test]

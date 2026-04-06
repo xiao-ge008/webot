@@ -5075,7 +5075,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "my_upgrade_review".to_string(),
-            description: "Create a structured self-upgrade review for the current agent only. Use this before any risky self identity/memory/system upgrade. The tool stores a review snapshot with a review_id when possible and returns review_result plus an optional confirm_result so the desktop UI can ask for explicit confirmation.".to_string(),
+            description: "Create a structured self-upgrade review for the current agent only. Use this before any risky self identity/memory/system upgrade. IMPORTANT: this review must carry an executable `identity_patch` or `memory_patch` payload. Text-only proposed_changes are not enough. If you want to replace IDENTITY.md / SOUL.md / USER.md or similar files, put the full final file contents into `identity_patch.files`. The tool stores a review snapshot with a review_id when possible and returns review_result plus an optional confirm_result so the desktop UI can ask for explicit confirmation.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -5086,11 +5086,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "requires_confirmation": { "type": "boolean", "description": "Override whether the upgrade must be confirmed by the user before apply." },
                     "proposed_changes": {
                         "type": "array",
-                        "description": "Structured proposed changes. Each item can include kind, target, summary, and payload.",
+                        "description": "Structured proposed changes. Each item can include kind, target, summary, and payload. This list is for UI display and audit; it does NOT replace the executable `identity_patch` / `memory_patch` payload.",
                         "items": { "type": "object" }
                     },
-                    "identity_patch": { "type": "object", "description": "Optional my_identity_patch-compatible payload to apply after review." },
-                    "memory_patch": { "type": "object", "description": "Optional my_memory_patch-compatible payload to apply after review." },
+                    "identity_patch": { "type": "object", "description": "Optional my_identity_patch-compatible payload to apply after review. Required in practice for identity/file upgrades. For file rewrites, include full final file contents under `files`, for example `{\"files\":{\"IDENTITY.md\":\"# IDENTITY.md\\n...\"}}`." },
+                    "memory_patch": { "type": "object", "description": "Optional my_memory_patch-compatible payload to apply after review. Required in practice for memory-only upgrades and must include executable fields such as `content`." },
                     "confirmed_by_user": { "type": "boolean", "description": "Usually false during review; only set true when creating a review after the user has already explicitly approved it." }
                 }
             }),
@@ -6776,6 +6776,60 @@ fn extract_upgrade_review_record(value: &serde_json::Value) -> Option<serde_json
     None
 }
 
+fn has_nonempty_string_field(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|item| !item.is_empty())
+}
+
+fn identity_patch_has_effective_changes(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let has_files = object
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|files| {
+            files
+                .values()
+                .any(|item| item.as_str().map(str::trim).is_some_and(|v| !v.is_empty()))
+        });
+    has_files
+        || has_nonempty_string_field(object.get("system_prompt"))
+        || object.get("avatar_url").is_some()
+        || object.get("color").is_some()
+}
+
+fn memory_patch_has_effective_changes(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    has_nonempty_string_field(object.get("content"))
+}
+
+fn extract_upgrade_patch_from_proposed_changes(
+    proposed_changes: Option<&serde_json::Value>,
+    kind: &str,
+) -> Option<serde_json::Value> {
+    proposed_changes
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                let object = item.as_object()?;
+                let item_kind = object
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                if item_kind != kind {
+                    return None;
+                }
+                object.get("payload").cloned()
+            })
+        })
+}
+
 fn infer_upgrade_target_scope(
     explicit_scope: Option<&str>,
     identity_patch: Option<&serde_json::Value>,
@@ -7556,10 +7610,15 @@ async fn tool_my_upgrade_review(
     let (kh, agent_id) = require_self_tool_context(kernel, caller_agent_id)?;
     let _ = workspace_root;
     let self_ctx = kh.get_agent_self_context(agent_id)?;
-    let identity_patch = input.get("identity_patch").cloned();
-    let memory_patch = input.get("memory_patch").cloned();
+    let proposed_changes_input = input.get("proposed_changes");
+    let identity_patch = input.get("identity_patch").cloned().or_else(|| {
+        extract_upgrade_patch_from_proposed_changes(proposed_changes_input, "identity_patch")
+    });
+    let memory_patch = input.get("memory_patch").cloned().or_else(|| {
+        extract_upgrade_patch_from_proposed_changes(proposed_changes_input, "memory_patch")
+    });
     let proposed_changes = build_upgrade_proposed_changes(
-        input.get("proposed_changes"),
+        proposed_changes_input,
         identity_patch.as_ref(),
         memory_patch.as_ref(),
     );
@@ -7592,6 +7651,18 @@ async fn tool_my_upgrade_review(
         .get("requires_confirmation")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or_else(|| risk_level != "low");
+    let has_applicable_patch = identity_patch
+        .as_ref()
+        .is_some_and(identity_patch_has_effective_changes)
+        || memory_patch
+            .as_ref()
+            .is_some_and(memory_patch_has_effective_changes);
+    if !has_applicable_patch {
+        return Err(
+            "my_upgrade_review requires an executable identity_patch or memory_patch payload; proposed_changes text alone cannot be applied."
+                .to_string(),
+        );
+    }
     let review_id = pick_string_field(input, "review_id")
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("upgrade-review-{}", uuid::Uuid::new_v4()));
@@ -7721,10 +7792,15 @@ async fn tool_my_upgrade_apply(
 
     let mut applied_changes = Vec::new();
     let mut identity_result = None;
-    if let Some(identity_patch) = review_object
-        .get("identity_patch")
-        .and_then(serde_json::Value::as_object)
-        .cloned()
+    let identity_patch_value = review_object.get("identity_patch").cloned().or_else(|| {
+        extract_upgrade_patch_from_proposed_changes(
+            review_object.get("proposed_changes"),
+            "identity_patch",
+        )
+    });
+    if let Some(identity_patch) = identity_patch_value
+        .filter(identity_patch_has_effective_changes)
+        .and_then(|value| value.as_object().cloned())
     {
         let mut delegated = identity_patch;
         delegated.insert(
@@ -7756,10 +7832,15 @@ async fn tool_my_upgrade_apply(
     }
 
     let mut memory_result = None;
-    if let Some(memory_patch) = review_object
-        .get("memory_patch")
-        .and_then(serde_json::Value::as_object)
-        .cloned()
+    let memory_patch_value = review_object.get("memory_patch").cloned().or_else(|| {
+        extract_upgrade_patch_from_proposed_changes(
+            review_object.get("proposed_changes"),
+            "memory_patch",
+        )
+    });
+    if let Some(memory_patch) = memory_patch_value
+        .filter(memory_patch_has_effective_changes)
+        .and_then(|value| value.as_object().cloned())
     {
         let mut delegated = memory_patch;
         if !delegated.contains_key("reason") {
@@ -11870,6 +11951,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_my_upgrade_review_rejects_non_executable_review() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let err = tool_my_upgrade_review(
+            &serde_json::json!({
+                "summary": "只有审查描述，没有实际补丁",
+                "proposed_changes": [
+                    {
+                        "kind": "identity_patch",
+                        "summary": "更新外形气质描述"
+                    }
+                ]
+            }),
+            None,
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect_err("review without executable patch should fail");
+        assert!(err.contains("requires an executable identity_patch or memory_patch"));
+    }
+
+    #[tokio::test]
+    async fn test_my_upgrade_review_recovers_patch_from_proposed_changes_payload() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = tool_my_upgrade_review(
+            &serde_json::json!({
+                "summary": "从 proposed_changes 恢复身份补丁",
+                "proposed_changes": [
+                    {
+                        "kind": "identity_patch",
+                        "summary": "更新 IDENTITY.md",
+                        "payload": {
+                            "files": {
+                                "IDENTITY.md": "# IDENTITY.md\n- vibe: 冷艳\n"
+                            }
+                        }
+                    }
+                ]
+            }),
+            None,
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect("review should recover executable patch");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&result).expect("parse review payload");
+        assert_eq!(
+            payload["review"]["identity_patch"]["files"]["IDENTITY.md"],
+            "# IDENTITY.md\n- vibe: 冷艳\n"
+        );
+    }
+
+    #[tokio::test]
     async fn test_my_upgrade_apply_requires_confirmation_when_review_demands_it() {
         let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
             mode: MediaDescribeTestKernelMode::Immediate,
@@ -11927,6 +12066,51 @@ mod tests {
         .await
         .expect("my_upgrade_apply should succeed");
         let _ = std::fs::remove_dir_all(&workspace);
+        let payload = serde_json::from_str::<serde_json::Value>(&result)
+            .expect("parse apply success payload");
+        assert_eq!(payload["presentable_result"]["kind"], "patch_result");
+    }
+
+    #[tokio::test]
+    async fn test_my_upgrade_apply_recovers_patch_from_proposed_changes_payload() {
+        let workspace = std::env::temp_dir().join(format!(
+            "openfang_my_upgrade_workspace_recover_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let kernel: Arc<dyn KernelHandle> = Arc::new(MediaDescribeTestKernel {
+            mode: MediaDescribeTestKernelMode::Immediate,
+        });
+        let result = tool_my_upgrade_apply(
+            &serde_json::json!({
+                "confirmed_by_user": true,
+                "review": {
+                    "review_id": "review-3",
+                    "summary": "从 proposed_changes 应用身份补丁",
+                    "requires_confirmation": true,
+                    "proposed_changes": [
+                        {
+                            "kind": "identity_patch",
+                            "summary": "更新 IDENTITY.md",
+                            "payload": {
+                                "files": {
+                                    "IDENTITY.md": "# IDENTITY.md\n- vibe: 妩媚冷静\n"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }),
+            Some(workspace.as_path()),
+            Some(&kernel),
+            Some("agent-1"),
+        )
+        .await
+        .expect("my_upgrade_apply should recover and apply identity patch");
+        let identity_path = workspace.join("IDENTITY.md");
+        let identity_content = std::fs::read_to_string(&identity_path).unwrap();
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert!(identity_content.contains("妩媚冷静"));
         let payload = serde_json::from_str::<serde_json::Value>(&result)
             .expect("parse apply success payload");
         assert_eq!(payload["presentable_result"]["kind"], "patch_result");

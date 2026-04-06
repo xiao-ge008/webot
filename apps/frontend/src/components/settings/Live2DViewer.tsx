@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as PIXI from 'pixi.js';
-import type { Live2dModelConfig } from '@/main/types';
+import type { Live2dModelConfig } from '@/shared/desktop/types';
 
 // Important for pixi-live2d-display
 (window as any).PIXI = PIXI;

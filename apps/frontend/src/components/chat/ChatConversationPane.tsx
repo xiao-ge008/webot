@@ -24,6 +24,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 import {
   cleanupAssistantText,
   containsUiJsonTag,
@@ -50,6 +51,7 @@ import type { AgentTtsSynthesisResult } from '@/types/tts';
 import { DynamicUIRenderer } from '@/components/chat/DynamicUIRenderer';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { uploadManagementAgentChatAsset } from '@/services/management-client';
 import { getTtsStatus, synthesizeAgentTts } from '@/services/tts-client';
@@ -249,6 +251,138 @@ function summarizeThinkingDetail(detail?: string): string | undefined {
   return clampLogText(detail);
 }
 
+type SyntheticThinkingStage = 'identity' | 'semantic' | 'render';
+
+const SYNTHETIC_THINKING_STAGE_MARKERS: Record<SyntheticThinkingStage, RegExp[]> = {
+  identity: [
+    /\[stage:(?:identity|role|persona)\]\s*(.+)/gi,
+    /(?:^|\n)\s*step\s*1\b[^\n]*(?:identity|role|persona)[^\n]*[:：-]?\s*(.+)/gi,
+    /(?:^|\n)\s*步骤?\s*1\b[^\n]*(?:身份|角色|边界)[^\n]*[:：-]?\s*(.+)/gi,
+  ],
+  semantic: [
+    /\[stage:(?:intent|semantic|user)\]\s*(.+)/gi,
+    /(?:^|\n)\s*step\s*2\b[^\n]*(?:intent|semantic|user)[^\n]*[:：-]?\s*(.+)/gi,
+    /(?:^|\n)\s*步骤?\s*2\b[^\n]*(?:意图|语义|用户)[^\n]*[:：-]?\s*(.+)/gi,
+  ],
+  render: [
+    /\[stage:(?:render|output)\]\s*(.+)/gi,
+    /(?:^|\n)\s*step\s*5\b[^\n]*(?:render|output|format)[^\n]*[:：-]?\s*(.+)/gi,
+    /(?:^|\n)\s*步骤?\s*5\b[^\n]*(?:渲染|输出|格式)[^\n]*[:：-]?\s*(.+)/gi,
+  ],
+};
+
+const SYNTHETIC_THINKING_STAGE_KEYWORDS: Record<SyntheticThinkingStage, RegExp> = {
+  identity: /身份|角色|persona|identity|边界|扮演|真实世界|当前我是|当前应以/i,
+  semantic: /意图|语义|诉求|目标|情绪|期望|用户想要|隐藏期待/i,
+  render: /渲染|输出|格式|markdown|json|ui|卡片|呈现|最终回答/i,
+};
+
+function normalizeSyntheticThinkingSnippet(value: string): string | undefined {
+  const normalized = value
+    .replace(/^\[(?:stage:[^\]]+)\]\s*/i, '')
+    .replace(/^\s*step\s*\d+\b[^:：-]*[:：-]?\s*/i, '')
+    .replace(/^\s*步骤?\s*\d+\b[^:：-]*[:：-]?\s*/i, '')
+    .trim();
+  if (!normalized) {
+    return undefined;
+  }
+  return clampLogText(normalized, 120);
+}
+
+function splitThinkingEvidenceSegments(detail: string): string[] {
+  return detail
+    .split(/\r?\n+/)
+    .map((segment) => normalizeSyntheticThinkingSnippet(segment))
+    .filter((segment): segment is string => Boolean(segment))
+    .filter((segment) => !isHiddenSystemPromptText(segment));
+}
+
+function extractSyntheticThinkingEvidence(
+  rows: MessageTrace[],
+  stage: SyntheticThinkingStage,
+): string | undefined {
+  const hits: string[] = [];
+  const markerPatterns = SYNTHETIC_THINKING_STAGE_MARKERS[stage];
+  const keywordPattern = SYNTHETIC_THINKING_STAGE_KEYWORDS[stage];
+
+  for (const row of rows) {
+    const detail = (row.detail || '').trim();
+    if (!detail) {
+      continue;
+    }
+
+    for (const pattern of markerPatterns) {
+      const matches = Array.from(detail.matchAll(pattern));
+      for (const match of matches) {
+        const snippet = normalizeSyntheticThinkingSnippet(match[1] || match[0] || '');
+        if (snippet) {
+          hits.push(snippet);
+        }
+      }
+    }
+
+    if (hits.length > 0) {
+      continue;
+    }
+
+    const segments = splitThinkingEvidenceSegments(detail);
+    for (const segment of segments) {
+      if (keywordPattern.test(segment)) {
+        hits.push(segment);
+      }
+    }
+  }
+
+  const unique = Array.from(new Set(hits)).slice(0, 3);
+  return unique.length > 0 ? unique.join('\n') : undefined;
+}
+
+function buildSyntheticThinkingRows(
+  sourceRows: MessageTrace[],
+  stage: SyntheticThinkingStage,
+  title: string,
+  id: string,
+): MessageTrace[] {
+  const detail = extractSyntheticThinkingEvidence(sourceRows, stage);
+  if (!detail) {
+    return [];
+  }
+  return [{
+    id,
+    title,
+    detail,
+    at: sourceRows[0]?.at || new Date().toISOString(),
+  }];
+}
+
+function inferIdentityStageRows(
+  msg: Message,
+  agent: Agent,
+  id: string,
+): MessageTrace[] {
+  const identityName = (msg.agentName || agent.name || agent.title || agent.id).trim();
+  const channel = (msg.debugPromptChannel || 'app').trim();
+  const renderMode = (msg.debugRenderMode || 'json-render').trim();
+  const expertise = agent.expertise.filter(Boolean).slice(0, 2).join('、');
+  const description = agent.description.trim();
+  const summaryParts = [
+    identityName ? `当前以 ${identityName} 的身份处理本轮请求。` : '当前以已选智能体身份处理本轮请求。',
+    `执行环境为 ${channel} 聊天通道，渲染模式 ${renderMode}。`,
+    '按真实任务处理边界响应，不把本轮对话视为纯角色扮演。',
+  ];
+  if (expertise) {
+    summaryParts.push(`当前优先使用的能力侧重：${expertise}。`);
+  } else if (description) {
+    summaryParts.push(clampLogText(`当前身份职责：${description}`, 120));
+  }
+  return [{
+    id,
+    title: '身份判断',
+    detail: summaryParts.join('\n'),
+    at: msg.timestamp || new Date().toISOString(),
+  }];
+}
+
 function summarizeFinalOutput(msg: Message): string | undefined {
   const text = cleanupAssistantText(msg.text || '', msg.spec).trim();
   if (text && !looksLikeProtocolOnlyText(text)) {
@@ -266,6 +400,289 @@ function summarizeFinalOutput(msg: Message): string | undefined {
     return '已生成结果卡片。';
   }
   return undefined;
+}
+
+function isMemoryTraceRow(row: MessageTrace): boolean {
+  const haystack = `${row.title}\n${row.detail || ''}`.toLowerCase();
+  return /记忆|memory|semantic_memory|unified_memory/.test(haystack);
+}
+
+function isIdentityThinkingRow(row: MessageTrace): boolean {
+  const haystack = `${row.title}\n${row.detail || ''}`.toLowerCase();
+  return /身份|角色|roleplay|persona|identity|真实世界|互动边界|边界/.test(haystack);
+}
+
+function isRenderDecisionThinkingRow(row: MessageTrace): boolean {
+  const haystack = `${row.title}\n${row.detail || ''}`.toLowerCase();
+  return /a2ui|json-render|render|渲染|客户端|格式|markdown|ui_json|卡片|输出/.test(haystack);
+}
+
+function isConnectionToolRow(row: MessageTrace): boolean {
+  const title = row.title.trim().toLowerCase();
+  return /会话准备|会话就绪|连接模型|模型连接已建立|upstream|session/i.test(title);
+}
+
+function isGenericProgressThinkingRow(row: MessageTrace): boolean {
+  const title = row.title.trim().toLowerCase();
+  const detail = (row.detail || '').trim().toLowerCase();
+  if (/开始生成|整理输出|生成完成|阶段:/.test(row.title.trim())) {
+    return true;
+  }
+  return (
+    detail.includes('模型已开始处理本轮请求')
+    || detail.includes('正在等待首个内容块')
+    || detail.includes('模型正在思考并组织回复')
+    || detail.includes('模型正在整理输出内容')
+    || detail.includes('本轮流式输出已结束')
+  );
+}
+
+function hasSubstantiveThinkingDetail(row: MessageTrace): boolean {
+  return Boolean(summarizeThinkingDetail(row.detail)) && !isGenericProgressThinkingRow(row);
+}
+
+function summarizeTraceDetails(
+  rows: MessageTrace[],
+  summarize: (row: MessageTrace) => string | undefined,
+  fallback: string,
+  maxItems = 3,
+): string {
+  const picked = Array.from(new Set(
+    rows
+      .map((row) => summarize(row)?.trim())
+      .filter((item): item is string => Boolean(item)),
+  )).slice(0, maxItems);
+  if (picked.length === 0) {
+    return fallback;
+  }
+  return picked.join('\n');
+}
+
+function summarizeTraceRowsWithLead(
+  lead: string,
+  rows: MessageTrace[],
+  summarize: (row: MessageTrace) => string | undefined,
+  maxItems = 3,
+): string {
+  const detail = summarizeTraceDetails(rows, summarize, '', maxItems).trim();
+  if (!detail) {
+    return lead;
+  }
+  return `${lead}\n${detail}`;
+}
+
+function summarizeThinkingStageEvidence(
+  primaryRows: MessageTrace[],
+): string {
+  return summarizeTraceDetails(primaryRows, (row) => summarizeThinkingDetail(row.detail), '', 3);
+}
+
+function extractToolNames(rows: MessageTrace[]): string[] {
+  return Array.from(new Set(
+    rows
+      .map((row) => row.title
+        .replace(/^工具调用\s*[·:：-]?\s*/i, '')
+        .replace(/\s+(开始|完成|运行中)$/u, '')
+        .trim())
+      .filter(Boolean),
+  ));
+}
+
+function summarizeMemoryStageEvidence(rows: MessageTrace[]): string {
+  if (rows.length === 0) {
+    return '当前未显式命中长期记忆，继续依赖本轮上下文与短期会话状态。';
+  }
+  const hits = rows.length;
+  const details = summarizeTraceDetails(
+    rows,
+    (row) => summarizeToolDetail(row.title, row.detail),
+    '',
+    3,
+  );
+  return [
+    `本轮已触发记忆召回，共返回 ${hits} 段记忆线索。`,
+    details,
+  ].filter(Boolean).join('\n');
+}
+
+function summarizeToolStageEvidence(rows: MessageTrace[]): string {
+  if (rows.length === 0) {
+    return '本轮未触发额外工具，答案主要基于现有上下文直接生成。';
+  }
+  const toolNames = extractToolNames(rows);
+  const head = toolNames.length > 0
+    ? `本轮已调用 ${toolNames.length} 个工具：${toolNames.join('、')}。`
+    : `本轮已产生 ${rows.length} 条工具调用记录。`;
+  const details = summarizeTraceDetails(
+    rows,
+    (row) => summarizeToolDetail(row.title, row.detail) || row.title,
+    '',
+    4,
+  );
+  return [head, details].filter(Boolean).join('\n');
+}
+
+function summarizeConnectionEvidence(msg: Message, rows: MessageTrace[]): string {
+  const channel = (msg.debugPromptChannel || 'app').trim();
+  const renderMode = (msg.debugRenderMode || 'json-render').trim();
+  const streamState = (msg.uiStreamState || 'idle').trim();
+  const connectionLines = summarizeTraceDetails(
+    rows,
+    (row) => summarizeToolDetail(row.title, row.detail) || clampLogText(row.detail || row.title, 96),
+    '',
+    4,
+  );
+  const header = `channel=${channel} · render=${renderMode}${streamState ? ` · ${streamState}` : ''}`;
+  return [header, connectionLines].filter(Boolean).join('\n');
+}
+
+function summarizeConnectionStage(msg: Message): string {
+  const channel = (msg.debugPromptChannel || 'app').trim();
+  const renderMode = (msg.debugRenderMode || 'json-render').trim();
+  const streamState = (msg.uiStreamState || 'idle').trim();
+  const extra: string[] = [
+    `已开始连接本轮请求，前端按 channel=${channel}、renderMode=${renderMode} 建立聊天上下文。`,
+  ];
+  if (msg.generationStartedAt) {
+    extra.push('已创建流式消息草稿并开始接收模型事件。');
+  }
+  if (msg.debugHasUiJson) {
+    extra.push(`检测到结构化 UI 数据流，当前 UI 状态：${streamState}。`);
+  }
+  return extra.join('\n');
+}
+
+function summarizeRenderDecisionStage(msg: Message, renderThinkingRows: MessageTrace[]): string {
+  const channel = (msg.debugPromptChannel || 'app').trim();
+  const renderMode = (msg.debugRenderMode || 'json-render').trim();
+  const outputFormat = msg.spec
+    ? '结构化卡片/A2UI'
+    : (cleanupAssistantText(msg.text || '', msg.spec).trim() ? 'Markdown 文本' : '空白/等待结果');
+  const a2uiAvailable = renderMode === 'json-render' || renderMode === 'gui'
+    || channel === 'app' || channel === 'desktop' || channel === 'web' || channel === 'gui';
+  const finalOutput = summarizeFinalOutput(msg);
+  const thoughtSummary = summarizeTraceDetails(
+    renderThinkingRows,
+    (row) => summarizeThinkingDetail(row.detail),
+    '',
+    2,
+  );
+  return [
+    `当前客户端：${channel}，渲染模式：${renderMode}，A2UI ${a2uiAvailable ? '可用' : '不可用'}。`,
+    thoughtSummary,
+    `最终决定输出格式：${outputFormat}。`,
+    finalOutput ? `最终输出：${finalOutput}` : '最终输出：本轮暂未形成可展示结果。',
+  ].filter(Boolean).join('\n');
+}
+
+function getRuntimeStageLabel(title: string): string {
+  return title.trim().replace(/^\d+\s*[：:]\s*/u, '');
+}
+
+function getRuntimeStageIndex(trace: Pick<MessageTrace, 'title'>): number {
+  const normalized = getRuntimeStageLabel(trace.title);
+  const stageMap: Record<string, number> = {
+    '开始连接': 0,
+    '身份判断': 1,
+    '理解用户': 2,
+    '召回记忆': 3,
+    '调用工具': 4,
+    '渲染与输出': 5,
+  };
+  return stageMap[normalized] ?? Number.MAX_SAFE_INTEGER;
+}
+
+function summarizeStagePreview(title: string, detail: string): string {
+  const normalizedTitle = getRuntimeStageLabel(title);
+  const firstLine = detail
+    .split('\n')
+    .map((line) => line.trim())
+    .find(Boolean) || '';
+  if (!firstLine) {
+    return '点击展开查看';
+  }
+  if (normalizedTitle === '开始连接') {
+    return '已连接上下文';
+  }
+  if (normalizedTitle === '身份判断') {
+    return clampLogText(firstLine.replace(/^已进入本轮执行身份判断，?/, '').replace(/^当前判断如下[:：]?/, ''), 28) || '已完成身份判断';
+  }
+  if (normalizedTitle === '理解用户') {
+    return clampLogText(firstLine.replace(/^正在持续理解用户语义与意图，?/, '').replace(/^当前收敛结果如下[:：]?/, ''), 32) || '已理解用户意图';
+  }
+  if (normalizedTitle === '召回记忆') {
+    const hitMatch = detail.match(/共返回\s*(\d+)\s*段/u);
+    return hitMatch ? `命中 ${hitMatch[1]} 段记忆` : '已召回记忆';
+  }
+  if (normalizedTitle === '调用工具') {
+    const toolMatch = detail.match(/已调用\s*(\d+)\s*个工具[:：]\s*([^\n。]+)/u);
+    if (toolMatch) {
+      return clampLogText(`${toolMatch[1]} 个工具 · ${toolMatch[2]}`, 38);
+    }
+    return '已调用工具';
+  }
+  if (normalizedTitle === '渲染与输出') {
+    const outputMatch = detail.match(/最终输出[:：]\s*([^\n]+)/u);
+    if (outputMatch) {
+      return clampLogText(outputMatch[1], 38);
+    }
+    const formatMatch = detail.match(/最终决定输出格式[:：]\s*([^\n。]+)/u);
+    if (formatMatch) {
+      return clampLogText(formatMatch[1], 24);
+    }
+    return '已生成输出';
+  }
+  return clampLogText(firstLine, 40) || '点击展开查看';
+}
+
+function formatRuntimeStageTickerLabel(trace: MessageTrace): string {
+  const stageTitle = getRuntimeStageLabel(trace.title);
+  const preview = summarizeStagePreview(trace.title, trace.detail || '');
+  return preview && preview !== '点击展开查看'
+    ? `${stageTitle} ${preview}`.trim()
+    : stageTitle;
+}
+
+function getTraceTimeMs(trace: Pick<MessageTrace, 'at'>): number {
+  const value = new Date(trace.at).getTime();
+  return Number.isFinite(value) ? value : Date.now();
+}
+
+function createStageTrace(
+  id: string,
+  title: string,
+  detail: string,
+  sourceRows: MessageTrace[],
+  fallbackTimeMs: number,
+): MessageTrace {
+  const stageTimeMs = sourceRows.length > 0
+    ? Math.max(...sourceRows.map((row) => getTraceTimeMs(row)))
+    : fallbackTimeMs;
+  return {
+    id,
+    title,
+    detail,
+    at: new Date(stageTimeMs).toISOString(),
+  };
+}
+
+function formatTraceDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return '0ms';
+  }
+  if (ms < 1_000) {
+    return `${Math.round(ms)}ms`;
+  }
+  const seconds = ms / 1_000;
+  if (seconds < 10) {
+    return `${seconds.toFixed(1)}s`;
+  }
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainSeconds = Math.round(seconds % 60);
+  return `${minutes}m ${remainSeconds}s`;
 }
 
 function hasVisibleToolDetail(tool: MessageToolCall): boolean {
@@ -857,6 +1274,8 @@ export function ChatConversationPane({
   const { showAlert } = useGlobalAlert();
   const [inputValue, setInputValue] = useState('');
   const [traceOpen, setTraceOpen] = useState<Record<string, boolean>>({});
+  const [traceNodeOpen, setTraceNodeOpen] = useState<Record<string, boolean>>({});
+  const [taskCardTabState, setTaskCardTabState] = useState<Record<string, 'overview' | 'process' | 'summary'>>({});
   const [copiedTraceKey, setCopiedTraceKey] = useState('');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachmentDraft[]>([]);
@@ -1620,44 +2039,16 @@ export function ChatConversationPane({
   }, []);
 
   const renderLoadingCard = useCallback((msg: Message) => {
-    const stageText = msg.debugWatchdogTriggered
-      ? '响应较慢'
-      : msg.thinking
-        ? '思考中'
-        : msg.streaming
-          ? '等待回复'
-          : msg.uiStreamState === 'streaming'
-            ? '生成卡片中'
-            : msg.uiStreamState === 'ready'
-              ? '渲染中'
-              : msg.uiRawText
-                ? '解析中'
-                : '处理中';
-    const helperText = msg.debugWatchdogTriggered
-      ? '仍在等待返回'
-      : '请稍候';
-    const elapsedMs = msg.generationStartedAt != null ? Math.max(0, nowMs - msg.generationStartedAt) : 0;
     return (
-      <Card className="mt-2 border-border/60 shadow-none bg-muted/10">
-        <CardContent className="py-3 px-4">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              <span>{stageText}</span>
-            </div>
-            {elapsedMs > 0 ? (
-              <span className="text-xs text-muted-foreground">
-                {formatElapsed(elapsedMs)}
-              </span>
-            ) : null}
-          </div>
-          <div className="mt-1 pl-[1.35rem] text-xs text-muted-foreground/80">
-            {helperText}
-          </div>
-        </CardContent>
-      </Card>
+      <div className="chat-inputing-inline mt-2" aria-label={msg.debugWatchdogTriggered ? '等待中' : '输入中'}>
+        <span className="chat-inputing-dots" aria-hidden="true">
+          <span className="chat-inputing-dot" />
+          <span className="chat-inputing-dot" />
+          <span className="chat-inputing-dot" />
+        </span>
+      </div>
     );
-  }, [formatElapsed, nowMs]);
+  }, []);
 
   const taskStageLabel = useCallback((stage: ChatTaskCardData['stage']): string => {
     if (stage === 'proposal') return '待确认';
@@ -1715,15 +2106,18 @@ export function ChatConversationPane({
     const logCount = taskCard.logCount ?? taskCard.runCount;
     const errorCount = taskCard.errorCount ?? 0;
     const hasFinalSummary = taskCard.finalSummaryReady === true;
-    const canViewDetails = Boolean(
-      taskCard.taskId
-      || taskCard.timeline?.length
-      || taskCard.finalSummaryText
-      || taskCard.errorSummary
-      || taskCard.bindingSourceMessageId,
-    );
-    const latestTimelineEntries = (taskCard.timeline ?? []).slice(-3).reverse();
+    const allTimelineEntries = (taskCard.timeline ?? [])
+      .slice()
+      .sort((left, right) => Date.parse(right.at) - Date.parse(left.at));
+    const processTimelineEntries = allTimelineEntries.filter((entry) => entry.kind !== 'final');
+    const anomalyTimelineEntries = allTimelineEntries.filter((entry) => entry.kind === 'anomaly' || entry.kind === 'failed');
     const finalSummaryPreview = (taskCard.finalSummaryText || '').trim();
+    const activeTab = taskCardTabState[msg.id]
+      || (finalSummaryPreview || stage === 'completed'
+        ? 'summary'
+        : processTimelineEntries.length > 0
+          ? 'process'
+          : 'overview');
     const canCreate = (stage === 'proposal' || stage === 'failed') && taskCard.canCreate === true;
     const canCancelProposal = stage === 'proposal' && taskCard.canCancel === true;
     const canCancelRunning = (stage === 'scheduled' || stage === 'running') && taskCard.canCancel === true;
@@ -1735,7 +2129,7 @@ export function ChatConversationPane({
       ? '任务尚未创建，无需删除'
       : stage === 'running'
       ? '执行中任务不能删除'
-      : '任务已开跑，当前仅支持取消，不可删除';
+      : '任务执行中，请先停止后再删除';
     let deliveryStatus = '等待确认创建';
     let deliveryClass = 'text-muted-foreground';
     if (stage === 'scheduled') {
@@ -1750,10 +2144,10 @@ export function ChatConversationPane({
       deliveryClass = 'text-primary';
     } else if (stage === 'completed') {
       if (hasFinalSummary) {
-        deliveryStatus = '已完成（最终汇报已生成，点击查看明细）';
+        deliveryStatus = '已完成（最终汇报已归档到卡片）';
         deliveryClass = 'text-success';
       } else {
-        deliveryStatus = '已完成（最终汇报生成中，点击查看明细）';
+        deliveryStatus = '已完成（最终汇报生成中）';
         deliveryClass = 'text-warning';
       }
     } else if (stage === 'cancelled') {
@@ -1763,71 +2157,148 @@ export function ChatConversationPane({
       deliveryClass = 'text-destructive';
     }
     return (
-      <Card className="mt-2 border-border/60 shadow-none bg-card/70">
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between gap-2">
-            <CardTitle className="text-sm flex items-center gap-2">
-              <Zap className="w-4 h-4 text-warning" />
-              {taskCard.taskName || '任务定时器'}
-            </CardTitle>
-            <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-bold text-white', taskStageClass(taskCard.stage))}>
+      <Card className="mt-2 rounded-2xl border-border/50 bg-background shadow-none">
+        <CardHeader className="pb-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 space-y-2">
+              <CardTitle className="flex items-center gap-2 text-[15px] font-semibold text-foreground">
+                <Zap className="h-4 w-4 shrink-0 text-warning" />
+                <span className="truncate">{taskCard.taskName || '任务定时器'}</span>
+              </CardTitle>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                <span>{taskKindLabel(taskCard.taskKind)}</span>
+                <span>已执行 {taskCard.maxRuns > 0 ? `${taskCard.runCount}/${taskCard.maxRuns}` : `${taskCard.runCount} 次`}</span>
+                <span>{allTimelineEntries.length} 条记录</span>
+                {errorCount > 0 ? <span className="text-destructive">异常 {errorCount} 次</span> : null}
+              </div>
+            </div>
+            <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-semibold text-white', taskStageClass(taskCard.stage))}>
               {taskStageLabel(taskCard.stage)}
             </span>
           </div>
-        </CardHeader>
-        <CardContent className="pt-0 space-y-3">
-          <div className="text-xs leading-6 text-foreground/85">
-            <div><span className="font-semibold">任务内容：</span>{taskCard.objective || '-'}</div>
-            <div className="flex items-center gap-1.5">
-              <Clock3 className="w-3.5 h-3.5 text-muted-foreground" />
-              <span>{taskCard.scheduleText || '-'}</span>
-            </div>
-            <div>
-              <span className="font-semibold">执行进度：</span>
-              {taskCard.maxRuns > 0
-                ? `${taskCard.runCount}/${taskCard.maxRuns}${typeof taskCard.progressPercent === 'number' ? `（${taskCard.progressPercent}%）` : ''}`
-                : `${taskCard.runCount} 次`}
-            </div>
-            <div><span className="font-semibold">任务类型：</span>{taskKindLabel(taskCard.taskKind)}</div>
-            <div><span className="font-semibold">执行人：</span>{taskCard.executorAgentName || '-'}</div>
-            <div><span className="font-semibold">汇报人：</span>{taskCard.reportActorName || taskCard.executorAgentName || '-'}</div>
-            <div><span className="font-semibold">汇报状态：</span>{taskReportStatusLabel(taskCard.reportStatus)}</div>
-            <div>
-              <span className="font-semibold">聊天回执：</span>
-              <span className={deliveryClass}>{deliveryStatus}</span>
-            </div>
-            {taskCard.errorSummary ? <div><span className="font-semibold">异常摘要：</span>{taskCard.errorSummary}</div> : null}
-            {finalSummaryPreview ? (
-              <div><span className="font-semibold">最终总结：</span>{finalSummaryPreview.length > 160 ? `${finalSummaryPreview.slice(0, 160)}...` : finalSummaryPreview}</div>
-            ) : null}
-            {taskCard.nextRun ? <div><span className="font-semibold">下次执行：</span>{new Date(taskCard.nextRun).toLocaleString()}</div> : null}
-            {taskCard.lastRun ? <div><span className="font-semibold">上次执行：</span>{new Date(taskCard.lastRun).toLocaleString()}</div> : null}
+          <div className="border-t border-border/50 pt-3 text-sm leading-7 text-foreground/88">
+            {taskCard.objective || '-'}
           </div>
-          {latestTimelineEntries.length > 0 ? (
-            <div className="rounded-xl border border-border/60 bg-muted/10 p-2.5 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/80">任务时间线</span>
-                <span className="text-[10px] text-muted-foreground">{taskCard.timeline?.length || 0} 条</span>
-              </div>
-              <div className="space-y-2">
-                {latestTimelineEntries.map((entry) => (
-                  <div key={entry.id} className="rounded-lg border border-border/50 bg-background/80 px-2.5 py-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className={cn('text-[11px] font-semibold', taskTimelineClass(entry))}>
-                        {taskTimelineLabel(entry.kind)} · {entry.title}
-                      </span>
-                      <span className="text-[10px] text-muted-foreground">{formatTaskTimelineTime(entry.at)}</span>
-                    </div>
-                    {entry.detail ? (
-                      <div className="mt-1 text-[11px] leading-5 text-foreground/80 whitespace-pre-wrap break-words">
-                        {entry.detail}
-                      </div>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
+          {taskCard.reportCondition ? (
+            <div className="text-xs leading-6 text-muted-foreground">
+              <span className="font-medium text-foreground/80">汇报条件：</span>
+              {taskCard.reportCondition}
             </div>
           ) : null}
+        </CardHeader>
+        <CardContent className="space-y-3 pt-0">
+          <Tabs
+            value={activeTab}
+            onValueChange={(value) => setTaskCardTabState((prev) => ({
+              ...prev,
+              [msg.id]: value as 'overview' | 'process' | 'summary',
+            }))}
+            className="space-y-3"
+          >
+            <TabsList className="grid h-auto grid-cols-3 rounded-none border-b border-border/50 bg-transparent p-0 text-muted-foreground">
+              <TabsTrigger value="overview" className="rounded-none border-b-2 border-transparent px-0 py-2 text-xs font-medium data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none">
+                概览
+              </TabsTrigger>
+              <TabsTrigger value="process" className="rounded-none border-b-2 border-transparent px-0 py-2 text-xs font-medium data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none">
+                过程
+              </TabsTrigger>
+              <TabsTrigger value="summary" className="rounded-none border-b-2 border-transparent px-0 py-2 text-xs font-medium data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none">
+                总结
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="overview" className="mt-0 space-y-3">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3 text-xs">
+                  <div className="flex items-center gap-1.5 text-muted-foreground">
+                    <Gauge className="h-3.5 w-3.5" />
+                    <span>执行进度</span>
+                  </div>
+                  <span className="font-medium text-foreground">
+                    {taskCard.maxRuns > 0
+                      ? `${taskCard.runCount}/${taskCard.maxRuns}${typeof taskCard.progressPercent === 'number' ? `（${taskCard.progressPercent}%）` : ''}`
+                      : `${taskCard.runCount} 次`}
+                  </span>
+                </div>
+                <Progress value={taskCard.progressPercent ?? 0} className="h-1.5" />
+              </div>
+              <div className="grid gap-x-6 gap-y-2 text-xs leading-6 text-foreground/85 sm:grid-cols-2">
+                <div><span className="text-muted-foreground">执行安排：</span>{taskCard.scheduleText || '-'}</div>
+                <div><span className="text-muted-foreground">聊天回执：</span><span className={deliveryClass}>{deliveryStatus}</span></div>
+                <div><span className="text-muted-foreground">执行人：</span>{taskCard.executorAgentName || '-'}</div>
+                <div><span className="text-muted-foreground">汇报人：</span>{taskCard.reportActorName || taskCard.executorAgentName || '-'}</div>
+                <div><span className="text-muted-foreground">汇报状态：</span>{taskReportStatusLabel(taskCard.reportStatus)}</div>
+                <div><span className="text-muted-foreground">上次执行：</span>{taskCard.lastRun ? new Date(taskCard.lastRun).toLocaleString() : '-'}</div>
+                <div><span className="text-muted-foreground">下次执行：</span>{taskCard.nextRun ? new Date(taskCard.nextRun).toLocaleString() : '-'}</div>
+              </div>
+              {taskCard.errorSummary ? (
+                <div className="border-l-2 border-destructive/60 pl-3 text-xs leading-6 text-destructive">
+                  <span className="font-medium">异常摘要：</span>
+                  {taskCard.errorSummary}
+                </div>
+              ) : null}
+            </TabsContent>
+            <TabsContent value="process" className="mt-0 space-y-3">
+              {anomalyTimelineEntries.length > 0 ? (
+                <div className="border-l-2 border-destructive/60 pl-3">
+                  <div className="text-[11px] font-medium text-destructive/80">异常概览</div>
+                  <div className="mt-1 text-xs leading-6 text-destructive">
+                    {anomalyTimelineEntries[0]?.detail || anomalyTimelineEntries[0]?.title || '存在异常，请查看过程明细。'}
+                  </div>
+                </div>
+              ) : null}
+              {allTimelineEntries.length > 0 ? (
+                <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+                  {allTimelineEntries.map((entry) => (
+                    <div key={entry.id} className="space-y-1 border-b border-border/40 pb-3 last:border-b-0 last:pb-0">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className={cn('text-[11px] font-medium', taskTimelineClass(entry))}>
+                            {taskTimelineLabel(entry.kind)} · {entry.title}
+                          </div>
+                          {typeof entry.runCount === 'number' ? (
+                            <div className="mt-0.5 text-[10px] text-muted-foreground">第 {entry.runCount} 轮</div>
+                          ) : null}
+                        </div>
+                        <div className="shrink-0 text-[10px] text-muted-foreground">{formatTaskTimelineTime(entry.at)}</div>
+                      </div>
+                      {entry.detail ? (
+                        <div className="text-xs leading-6 text-foreground/78 whitespace-pre-wrap break-words">
+                          {entry.detail}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="py-4 text-center text-xs text-muted-foreground">
+                  暂时还没有执行过程，首次执行后会直接沉淀在这里。
+                </div>
+              )}
+            </TabsContent>
+            <TabsContent value="summary" className="mt-0 space-y-3">
+              {finalSummaryPreview ? (
+                <div className="space-y-2">
+                  <div className="text-[11px] font-medium text-success/80">最终总结</div>
+                  <div className="text-sm leading-7 text-foreground/90 whitespace-pre-wrap break-words">
+                    {finalSummaryPreview}
+                  </div>
+                </div>
+              ) : taskCard.errorSummary ? (
+                <div className="space-y-2">
+                  <div className="text-[11px] font-medium text-destructive/80">失败总结</div>
+                  <div className="text-sm leading-7 text-foreground/90 whitespace-pre-wrap break-words">
+                    {taskCard.errorSummary}
+                  </div>
+                </div>
+              ) : (
+                <div className="py-4 text-center text-xs text-muted-foreground">
+                  {stage === 'completed'
+                    ? '任务已完成，正在等待最终总结写回。'
+                    : '任务还未结束，最终总结会在完成后显示在这里。'}
+                </div>
+              )}
+            </TabsContent>
+          </Tabs>
           <div className="flex flex-wrap items-center gap-2">
             {(stage === 'proposal' || stage === 'failed') ? (
               <Button
@@ -1882,18 +2353,6 @@ export function ChatConversationPane({
                 删除
               </Button>
             ) : null}
-            {canViewDetails ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                className="h-7 rounded-md px-3 text-[11px] font-semibold gap-1.5"
-                onClick={() => onOpenTaskCardDetails({ taskId: taskCard.taskId, messageId: msg.id })}
-              >
-                <ListChecks className="w-3 h-3" />
-                查看详情
-              </Button>
-            ) : null}
           </div>
         </CardContent>
       </Card>
@@ -1903,7 +2362,7 @@ export function ChatConversationPane({
     onCancelTaskCard,
     onCreateTaskCard,
     onDeleteTaskCard,
-    onOpenTaskCardDetails,
+    taskCardTabState,
     taskKindLabel,
     taskReportStatusLabel,
     taskStageClass,
@@ -2003,29 +2462,65 @@ export function ChatConversationPane({
     );
   }, [a2aStatusText, onOpenA2aCardDetails]);
 
-  const renderTraceItems = useCallback((rows: MessageTrace[]) => (
-    <div className="space-y-3 min-w-0">
-      {rows.map((trace) => (
-        <div
-          key={trace.id}
-          className="min-w-0 [contain:layout] border-t border-zinc-200/70 pt-3 first:border-t-0 first:pt-0 dark:border-white/6"
-        >
-          <div className="flex items-center gap-2 text-[10px] leading-4 text-zinc-500 dark:text-zinc-500/80">
-            <span className="font-semibold tracking-[0.02em] text-zinc-700 dark:text-zinc-100/90">{trace.title}</span>
-            <span className="inline-flex h-1 w-1 rounded-full bg-zinc-300 dark:bg-zinc-500/80" />
-            <span className="tabular-nums">
-              {new Date(trace.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-            </span>
+  const toggleTraceNodePanel = useCallback((parentKey: string, key: string) => {
+    setTraceNodeOpen((prev) => {
+      const next = { ...prev };
+      const prefix = `${parentKey}:`;
+      Object.keys(next).forEach((itemKey) => {
+        if (itemKey.startsWith(prefix)) {
+          delete next[itemKey];
+        }
+      });
+      if (!prev[key]) {
+        next[key] = true;
+      }
+      return next;
+    });
+  }, []);
+
+  const renderTraceItems = useCallback((parentKey: string, rows: MessageTrace[], live = false) => (
+    <div className="chat-trace-list min-w-0">
+      {rows.map((trace, index) => {
+        const previousAt = index > 0 ? getTraceTimeMs(rows[index - 1]) : getTraceTimeMs(trace);
+        const currentAt = getTraceTimeMs(trace);
+        const durationLabel = formatTraceDuration(Math.max(0, currentAt - previousAt));
+        const nodeKey = `${parentKey}:${trace.id}`;
+        const opened = traceNodeOpen[nodeKey] ?? (live && index === rows.length - 1);
+        return (
+          <div
+            key={trace.id}
+            className="chat-trace-node min-w-0 [contain:layout]"
+          >
+            <button
+              type="button"
+              className="chat-trace-node-trigger"
+              onClick={() => toggleTraceNodePanel(parentKey, nodeKey)}
+            >
+              <div className="chat-trace-node-head">
+                <span className="chat-trace-node-dot" />
+                <span className="chat-trace-node-title">{getRuntimeStageLabel(trace.title)}</span>
+                <span className="chat-trace-node-inline-meta">
+                  <span className="chat-trace-node-duration">{durationLabel}</span>
+                  <ChevronDown className={cn('chat-trace-node-chevron', opened && 'rotate-90')} />
+                </span>
+              </div>
+            </button>
+            {trace.detail ? (
+              <div
+                className={cn(
+                  'chat-trace-node-detail-wrap',
+                  opened ? 'chat-trace-node-detail-wrap-open' : 'chat-trace-node-detail-wrap-closed',
+                )}
+              >
+                <div className="chat-trace-node-detail whitespace-pre-wrap break-all overflow-x-auto">
+                  {trace.detail}
+                </div>
+              </div>
+            ) : null}
           </div>
-          {trace.detail ? (
-            <div className="mt-1.5 px-0.5 text-[12px] leading-6 text-zinc-800 whitespace-pre-wrap break-all overflow-x-auto dark:text-zinc-200/90">
-              {trace.detail}
-            </div>
-          ) : null}
-        </div>
-      ))}
+      )})}
     </div>
-  ), []);
+  ), [toggleTraceNodePanel, traceNodeOpen]);
 
   const toggleTracePanel = useCallback((key: string) => {
     setTraceOpen((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -2056,34 +2551,33 @@ export function ChatConversationPane({
     }
   }, []);
 
-  const renderTraceBlock = useCallback((key: string, label: string, rows: MessageTrace[] | undefined) => {
+  const renderTraceBlock = useCallback((key: string, label: string, rows: MessageTrace[] | undefined, live = false) => {
     const count = rows?.length ?? 0;
     if (count <= 0) return null;
-    const opened = Boolean(traceOpen[key]);
+    const opened = traceOpen[key] ?? live;
     const latestAt = rows?.[count - 1]?.at;
-    const timeLabel = latestAt
-      ? new Date(latestAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      : '';
+    const totalDuration = count > 1
+      ? formatTraceDuration(Math.max(0, getTraceTimeMs(rows![count - 1]) - getTraceTimeMs(rows![0])))
+      : formatTraceDuration(0);
     return (
-      <div className="mt-2 w-full">
+      <div className="chat-runtime-card mt-1.5 w-full">
         <div className="group/trace-trigger flex items-center gap-2">
           <button
             type="button"
             onClick={() => toggleTracePanel(key)}
-            className="min-w-0 flex-1 inline-flex items-center justify-start gap-2 rounded-lg px-1 py-1 text-muted-foreground transition-colors hover:text-foreground dark:text-zinc-400/85 dark:hover:text-zinc-100"
+            className="chat-runtime-card-trigger"
           >
-            <span className="inline-flex min-w-0 items-center gap-2 text-[11px] leading-5">
-              <span className="truncate font-medium tracking-[0.01em]">{label}</span>
-              {timeLabel ? (
-                <span className="inline-flex shrink-0 items-center gap-1 text-[10px] tabular-nums text-muted-foreground/80 dark:text-zinc-500/80">
-                  <Clock3 className="h-3 w-3" />
-                  {timeLabel}
-                </span>
-              ) : null}
-              <ChevronDown className={cn(
-                'h-3.5 w-3.5 shrink-0 transition-all duration-150',
-                opened ? 'rotate-180 opacity-100' : 'rotate-0 opacity-0 group-hover/trace-trigger:opacity-100',
-              )} />
+            <span className="chat-runtime-card-trigger-inner">
+              <span className="chat-runtime-card-title">
+                <span className="truncate">{label}</span>
+              </span>
+              <span className="chat-runtime-card-inline-meta">
+                <span className="chat-runtime-card-meta">{count}步 · {totalDuration}</span>
+                <ChevronDown className={cn(
+                  'chat-runtime-card-chevron',
+                  opened ? 'rotate-180 opacity-100' : 'rotate-0 opacity-70',
+                )} />
+              </span>
             </span>
           </button>
         </div>
@@ -2094,18 +2588,18 @@ export function ChatConversationPane({
           )}
         >
           <div className="min-h-0 overflow-hidden">
-            <div className="group/trace-panel relative max-h-80 overflow-y-auto overflow-x-hidden rounded-2xl border border-zinc-200/80 bg-zinc-50/92 px-3 pb-3 pt-3 min-w-0 shadow-[0_14px_30px_rgba(15,23,42,0.08)] overscroll-contain [scrollbar-gutter:stable] dark:border-white/6 dark:bg-zinc-950/62 dark:shadow-[0_16px_30px_rgba(0,0,0,0.26)]">
+            <div className="chat-runtime-card-body group/trace-panel relative max-h-80 overflow-y-auto overflow-x-hidden min-w-0 overscroll-contain [scrollbar-gutter:stable]">
               <Button
                 type="button"
                 variant="ghost"
                 size="icon"
-                className="absolute right-2 top-2 h-7 w-7 shrink-0 rounded-lg text-zinc-500 opacity-0 transition-all hover:bg-white/80 hover:text-zinc-900 group-hover/trace-panel:opacity-100 focus-visible:opacity-100 dark:text-zinc-500/90 dark:hover:bg-white/8 dark:hover:text-zinc-50"
+                className="absolute right-0 top-0 h-6 w-6 shrink-0 rounded-md text-zinc-500 opacity-0 transition-all hover:bg-white/80 hover:text-zinc-900 group-hover/trace-panel:opacity-100 focus-visible:opacity-100 dark:text-zinc-500/90 dark:hover:bg-white/8 dark:hover:text-zinc-50"
                 onClick={() => copyTraceBlock(key, label, rows)}
                 title={`复制${label}`}
               >
                 {copiedTraceKey === key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
               </Button>
-              {renderTraceItems(rows ?? [])}
+              {renderTraceItems(key, rows ?? [], live)}
             </div>
           </div>
         </div>
@@ -2113,8 +2607,8 @@ export function ChatConversationPane({
     );
   }, [copiedTraceKey, copyTraceBlock, renderTraceItems, toggleTracePanel, traceOpen]);
 
-  const buildRuntimeLogRows = useCallback((msg: Message): MessageTrace[] => {
-    const rows: MessageTrace[] = [];
+  const buildRuntimeLogRows = useCallback((msg: Message, includeAllStages = false): MessageTrace[] => {
+    const rawToolRows: MessageTrace[] = [];
     const baseAt = Number.isFinite(new Date(msg.timestamp).getTime()) ? new Date(msg.timestamp).getTime() : Date.now();
     let autoIndex = 0;
 
@@ -2123,7 +2617,7 @@ export function ChatConversationPane({
       if (!normalizedDetail) {
         return;
       }
-      rows.push({
+      rawToolRows.push({
         id: `${msg.id}-runtime-${autoIndex}`,
         title,
         detail: normalizedDetail,
@@ -2140,51 +2634,154 @@ export function ChatConversationPane({
       });
     }
 
-    (msg.thinkingTrace ?? []).forEach((row) => {
-      const detail = summarizeThinkingDetail(row.detail);
-      if (!detail) return;
-      rows.push({
+    const normalizedThinkingRows = (msg.thinkingTrace ?? [])
+      .map((row) => ({
         ...row,
-        title: row.title?.trim() ? `思考过程 · ${row.title}` : '思考过程',
-        detail,
-      });
-    });
+        detail: summarizeThinkingDetail(row.detail),
+      }))
+      .filter((row): row is MessageTrace & { detail: string } => Boolean(row.detail));
 
-    (msg.toolTrace ?? []).forEach((row) => {
-      const detail = summarizeToolDetail(row.title, row.detail);
-      if (!detail) return;
-      rows.push({
-        ...row,
-        title: row.title?.trim() ? `工具调用 · ${row.title}` : '工具调用',
-        detail,
-      });
-    });
+    const normalizedToolRows = [
+      ...rawToolRows,
+      ...(msg.toolTrace ?? [])
+        .map((row) => ({
+          ...row,
+          detail: summarizeToolDetail(row.title, row.detail),
+        }))
+        .filter((row): row is MessageTrace & { detail: string } => Boolean(row.detail)),
+    ].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
 
-    const sortedRows = rows
-      .filter((row) => row.detail && row.detail.trim().length > 0)
-      .sort((a, b) => {
-        const aTime = new Date(a.at).getTime();
-        const bTime = new Date(b.at).getTime();
-        return aTime - bTime;
-      });
-    if (sortedRows.length > 0) {
-      const finalOutput = summarizeFinalOutput(msg);
-      if (finalOutput) {
-        sortedRows.push({
-          id: `${msg.id}-runtime-final`,
-          title: '最终输出',
-          detail: finalOutput,
-          at: new Date(baseAt + 60_000 + autoIndex).toISOString(),
-        });
-      }
+    const connectionRows = normalizedToolRows.filter(isConnectionToolRow);
+    const identityRows = normalizedThinkingRows.filter((row) => isIdentityThinkingRow(row) && hasSubstantiveThinkingDetail(row));
+    const renderDecisionRows = normalizedThinkingRows.filter((row) => isRenderDecisionThinkingRow(row) && hasSubstantiveThinkingDetail(row));
+    const semanticRows = normalizedThinkingRows.filter((row) => (
+      !isIdentityThinkingRow(row)
+      && !isRenderDecisionThinkingRow(row)
+      && !isGenericProgressThinkingRow(row)
+      && hasSubstantiveThinkingDetail(row)
+    ));
+    const identityStageRows = identityRows.length > 0
+      ? identityRows
+      : (() => {
+        const syntheticRows = buildSyntheticThinkingRows(
+          normalizedThinkingRows,
+          'identity',
+          '身份判断',
+          `${msg.id}-runtime-stage-1-synthetic`,
+        );
+        return syntheticRows.length > 0
+          ? syntheticRows
+          : inferIdentityStageRows(msg, agent, `${msg.id}-runtime-stage-1-inferred`);
+      })();
+    const semanticStageRows = semanticRows.length > 0
+      ? semanticRows
+      : buildSyntheticThinkingRows(normalizedThinkingRows, 'semantic', '理解用户', `${msg.id}-runtime-stage-2-synthetic`);
+    const renderStageRows = renderDecisionRows.length > 0
+      ? renderDecisionRows
+      : buildSyntheticThinkingRows(normalizedThinkingRows, 'render', '渲染与输出', `${msg.id}-runtime-stage-5-synthetic`);
+    const memoryRows = normalizedToolRows.filter(isMemoryTraceRow);
+    const toolRows = normalizedToolRows.filter((row) => !isMemoryTraceRow(row) && !isConnectionToolRow(row));
+
+    const hasAnyMemory = memoryRows.length > 0;
+    const hasAnyTool = toolRows.length > 0;
+    const hasFinalOutput = Boolean(
+      renderDecisionRows.length > 0
+      || msg.spec != null
+      || msg.taskCard
+      || cleanupAssistantText(msg.text || '', msg.spec).trim(),
+    );
+    const hasConnectionEvidence = connectionRows.length > 0 || Boolean(msg.generationStartedAt);
+
+    const stageRows: MessageTrace[] = [];
+    if (hasConnectionEvidence || includeAllStages) {
+      stageRows.push(createStageTrace(
+        `${msg.id}-runtime-stage-0`,
+        '开始连接',
+        hasConnectionEvidence
+          ? summarizeConnectionEvidence(msg, connectionRows)
+          : summarizeConnectionStage(msg),
+        connectionRows,
+        msg.generationStartedAt ?? baseAt,
+      ));
     }
-    return sortedRows;
+
+    if (identityStageRows.length > 0 || includeAllStages) {
+      stageRows.push(createStageTrace(
+        `${msg.id}-runtime-stage-1`,
+        '身份判断',
+        identityStageRows.length > 0
+          ? `${identityRows.length > 0 ? '已进入本轮执行身份判断，当前判断如下：' : '当前未单独输出身份节点，已从统一思考流提取如下：'}\n${summarizeThinkingStageEvidence(identityStageRows)}`
+          : '本轮未显式输出身份判断内容。',
+        identityStageRows,
+        (msg.generationStartedAt ?? baseAt) + 100,
+      ));
+    }
+
+    if (semanticStageRows.length > 0 || includeAllStages) {
+      stageRows.push(createStageTrace(
+        `${msg.id}-runtime-stage-2`,
+        '理解用户',
+        semanticStageRows.length > 0
+          ? `${semanticRows.length > 0 ? '已进入本轮用户语义理解，当前收敛如下：' : '当前未单独输出语义节点，已从统一思考流提取如下：'}\n${summarizeThinkingStageEvidence(semanticStageRows)}`
+          : '本轮未显式输出语义理解内容。',
+        semanticStageRows,
+        (msg.generationStartedAt ?? baseAt) + 200,
+      ));
+    }
+
+    if (hasAnyMemory || hasAnyTool || hasFinalOutput || includeAllStages) {
+      stageRows.push(createStageTrace(
+        `${msg.id}-runtime-stage-3`,
+        '召回记忆',
+        hasAnyMemory
+          ? summarizeMemoryStageEvidence(memoryRows)
+          : '本轮未触发记忆召回。',
+        memoryRows,
+        (msg.generationStartedAt ?? baseAt) + 300,
+      ));
+    }
+
+    if (hasAnyTool || hasFinalOutput || includeAllStages) {
+      stageRows.push(createStageTrace(
+        `${msg.id}-runtime-stage-4`,
+        '调用工具',
+        hasAnyTool
+          ? summarizeToolStageEvidence(toolRows)
+          : '本轮未显式调用外部工具。',
+        toolRows,
+        (msg.generationStartedAt ?? baseAt) + 400,
+      ));
+    }
+
+    if (hasFinalOutput || renderStageRows.length > 0 || includeAllStages) {
+      stageRows.push(createStageTrace(
+        `${msg.id}-runtime-stage-5`,
+        '渲染与输出',
+        hasFinalOutput
+          ? summarizeRenderDecisionStage(msg, renderStageRows)
+          : renderStageRows.length > 0
+            ? `当前未单独输出渲染决策节点，已从统一思考流提取如下：\n${summarizeThinkingStageEvidence(renderStageRows)}`
+          : '本轮暂未形成最终输出内容。',
+        renderStageRows,
+        msg.generationStartedAt && typeof msg.generationElapsedMs === 'number'
+          ? msg.generationStartedAt + msg.generationElapsedMs
+          : baseAt + 500,
+      ));
+    }
+
+    return stageRows.filter((row) => row.detail.trim().length > 0);
   }, []);
 
-  const buildRuntimeLogRowsForMessages = useCallback((items: Message[]): MessageTrace[] =>
+  const buildRuntimeLogRowsForMessages = useCallback((items: Message[], includeAllStages = false): MessageTrace[] =>
     items
-      .flatMap((item) => buildRuntimeLogRows(item))
-      .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime()), [buildRuntimeLogRows]);
+      .flatMap((item) => buildRuntimeLogRows(item, includeAllStages))
+      .sort((a, b) => {
+        const stageDelta = getRuntimeStageIndex(a) - getRuntimeStageIndex(b);
+        if (stageDelta !== 0) {
+          return stageDelta;
+        }
+        return new Date(a.at).getTime() - new Date(b.at).getTime();
+      }), [buildRuntimeLogRows]);
 
   const ttsTriggerTag = normalizeMessageTtsTag(agent.ttsConfig?.messageTag);
   const agentTtsAvailable = globalTtsEnabled && Boolean(agent.ttsConfig?.enabled);
@@ -2196,12 +2793,33 @@ export function ChatConversationPane({
     if (!items.some((item) => hasRuntimeLogData(item))) {
       return null;
     }
-    const rows = buildRuntimeLogRowsForMessages(items);
+    const rows = buildRuntimeLogRowsForMessages(items, true);
     if (rows.length === 0) {
       return null;
     }
-    return renderTraceBlock(`${key}-runtime-log`, '运行日志', rows);
+    const live = items.some((item) => item.streaming || item.thinking || item.uiStreamState === 'streaming');
+    return renderTraceBlock(`${key}-runtime-log`, '执行过程', rows, live);
   }, [buildRuntimeLogRowsForMessages, renderTraceBlock]);
+
+  const renderLiveTraceTicker = useCallback((msg: Message) => {
+    const rows = buildRuntimeLogRows(msg);
+    if (rows.length === 0) {
+      return null;
+    }
+    const current = rows[rows.length - 1];
+    return (
+      <div className="chat-live-trace-ticker" aria-label="执行步骤">
+        <span className="chat-live-trace-ticker-dots" aria-hidden="true">
+          <span className="chat-live-trace-ticker-dot" />
+          <span className="chat-live-trace-ticker-dot" />
+          <span className="chat-live-trace-ticker-dot" />
+        </span>
+        <span key={current.id} className="chat-live-trace-ticker-current">
+          {formatRuntimeStageTickerLabel(current)}
+        </span>
+      </div>
+    );
+  }, [buildRuntimeLogRows]);
 
   const hasMeaningfulMarkdownText = useCallback((msg: Message): boolean => {
     const text = getMessageTtsTrigger(msg).cleanText;
@@ -2910,13 +3528,14 @@ export function ChatConversationPane({
                 : '...'}
             </span>
           </div>
+          {renderLiveTraceTicker(activeStreaming)}
           <div className="chat-bubble-container flex w-full justify-start mt-1">
-            <div className="chat-bubble chat-bubble-agent">{renderMessageBody(activeStreaming, false, { deferHeavyUi: false })}</div>
+            <div className="chat-bubble chat-bubble-agent">{renderMessageBody(activeStreaming, false, { deferHeavyUi: false, includeProcessPanel: false })}</div>
           </div>
         </div>
       </div>
     );
-  }, [activeStreaming, agent.avatarUrl, agent.color, agent.name, nowMs, renderMessageBody]);
+  }, [activeStreaming, agent.avatarUrl, agent.color, agent.name, nowMs, renderLiveTraceTicker, renderMessageBody]);
 
   const readyAttachmentCount = composerAttachments.filter((item) => item.status === 'ready').length;
   const uploadingAttachmentCount = composerAttachments.filter((item) => item.status === 'uploading').length;

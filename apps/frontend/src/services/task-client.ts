@@ -1,6 +1,7 @@
-import type { AgentTask, AgentTaskLogItem } from '@/main/types';
+import type { AgentTask, AgentTaskLogItem } from '@/shared/desktop/types';
 import { requestJson } from '@/services/transport';
 import {
+  getAgent,
   getAgentSession,
   listAgentTasks,
   listAgents,
@@ -10,7 +11,8 @@ import type { Task, TaskConversationType, TaskReportDelivery, TaskRunRecord, Tas
 
 const TASK_CLIENT_AGENT_ID_KEY = 'webot-task-center-agent-id';
 const TASK_LOCAL_META_KEY = 'webot-task-local-meta-v1';
-const TASK_LIST_TIMEOUT_MS = 4_500;
+const TASK_AGENT_ALIAS_MAP_KEY = 'webot-task-agent-alias-map-v1';
+const TASK_LIST_TIMEOUT_MS = 8_000;
 const TASK_DELIVERY_TIMEOUT_MS = 3_500;
 
 const taskAgentIndex = new Map<string, string>();
@@ -436,9 +438,7 @@ function mapManagedTaskDetail(input: unknown): Task | null {
     prompt: trimToUndefined(typeof action.prompt === 'string' ? action.prompt : undefined),
     command: trimToUndefined(typeof action.command === 'string' ? action.command : undefined),
     sessionTarget:
-      trimToUndefined(typeof action.session_target === 'string' ? action.session_target : undefined) === 'main'
-        ? 'main'
-        : 'isolated',
+      trimToUndefined(typeof action.session_target === 'string' ? action.session_target : undefined) || 'isolated',
     delivery: {
       mode:
         trimToUndefined(typeof delivery.mode === 'string' ? delivery.mode : undefined) === 'announce'
@@ -531,6 +531,41 @@ function writeTaskMetaMap(next: Record<string, TaskLocalMeta>): void {
   window.localStorage.setItem(TASK_LOCAL_META_KEY, JSON.stringify(next));
 }
 
+function readTaskAliasMap(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  const raw = window.localStorage.getItem(TASK_AGENT_ALIAS_MAP_KEY);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return {};
+    return parsed as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function writeTaskAliasMap(next: Record<string, string>): void {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(TASK_AGENT_ALIAS_MAP_KEY, JSON.stringify(next));
+}
+
+function rememberTaskAgentAlias(alias: string | undefined, agentId: string | undefined): void {
+  const normalizedAlias = trimToUndefined(alias)?.toLowerCase();
+  const normalizedAgentId = trimToUndefined(agentId);
+  if (!normalizedAlias || !normalizedAgentId) return;
+  if (normalizedAlias === normalizedAgentId.toLowerCase()) return;
+  const map = readTaskAliasMap();
+  if (map[normalizedAlias] === normalizedAgentId) return;
+  map[normalizedAlias] = normalizedAgentId;
+  writeTaskAliasMap(map);
+}
+
+function readRememberedTaskAgentAlias(alias?: string): string | undefined {
+  const normalizedAlias = trimToUndefined(alias)?.toLowerCase();
+  if (!normalizedAlias) return undefined;
+  return trimToUndefined(readTaskAliasMap()[normalizedAlias]);
+}
+
 function getTaskMeta(taskId: string): TaskLocalMeta | undefined {
   const map = readTaskMetaMap();
   return map[taskId];
@@ -572,6 +607,28 @@ function removeTaskMeta(taskId: string): void {
   if (!map[taskId]) return;
   delete map[taskId];
   writeTaskMetaMap(map);
+}
+
+function listKnownTaskIdsForAgents(agentIds: readonly string[]): string[] {
+  if (agentIds.length === 0) return [];
+  const owned = new Set(agentIds.map((item) => item.trim()).filter(Boolean));
+  return Object.values(readTaskMetaMap())
+    .filter((item) => owned.has((item.agentId || '').trim()))
+    .map((item) => item.taskId.trim())
+    .filter(Boolean);
+}
+
+async function loadTasksByKnownIds(taskIds: readonly string[]): Promise<Task[]> {
+  if (taskIds.length === 0) return [];
+  const rows = await Promise.allSettled(
+    [...new Set(taskIds)]
+      .filter(Boolean)
+      .map(async (taskId) => getTaskDetail(taskId)),
+  );
+  return rows
+    .filter((result): result is PromiseFulfilledResult<Task | undefined> => result.status === 'fulfilled')
+    .map((result) => result.value)
+    .filter((item): item is Task => item != null);
 }
 
 export function isHttp404Message(message?: string): boolean {
@@ -627,11 +684,48 @@ export function mapAgentTaskToTask(
 
 async function resolveAgentIds(scope?: string): Promise<string[]> {
   const all = await listAgents();
-  const ids = all.map((item) => item.agentId).filter(Boolean);
+  const ids = all.map((item) => item.resolvedAgentId || item.agentId).filter(Boolean);
   if (ids.length === 0) return [];
 
   if (scope && scope !== 'team-001' && scope !== 'all') {
-    return ids.includes(scope) ? [scope] : [];
+    if (ids.includes(scope)) {
+      return [scope];
+    }
+    const normalizedScope = scope.trim().toLowerCase();
+    const resolved = await resolveTaskAgentRef(scope);
+    if (resolved && ids.includes(resolved)) {
+      return [resolved];
+    }
+    const rememberedAliasId = readRememberedTaskAgentAlias(scope);
+    if (rememberedAliasId && ids.includes(rememberedAliasId)) {
+      return [rememberedAliasId];
+    }
+    const scopeDetail = await (async () => {
+      try {
+        return await getAgent(scope);
+      } catch {
+        return null;
+      }
+    })();
+    const matched = all.find((item) => {
+      const candidates = [
+        item.agentId,
+        item.resolvedAgentId,
+        item.name,
+        scopeDetail?.name,
+      ]
+        .map((value) => value?.trim().toLowerCase())
+        .filter(Boolean);
+      return candidates.includes(normalizedScope)
+        || (scopeDetail?.name?.trim()
+          && item.name?.trim().toLowerCase() === scopeDetail.name.trim().toLowerCase());
+    });
+    if (matched?.agentId && ids.includes(matched.agentId)) {
+      return [matched.agentId];
+    }
+    const remembered =
+      (typeof window !== 'undefined' ? window.localStorage.getItem(TASK_CLIENT_AGENT_ID_KEY) : '') || '';
+    return remembered && ids.includes(remembered) ? [remembered] : [];
   }
   if (scope === 'all') {
     return ids;
@@ -643,6 +737,35 @@ async function resolveAgentIds(scope?: string): Promise<string[]> {
     return [remembered];
   }
   return [ids[0]];
+}
+
+async function resolveTaskAgentRef(agentId?: string): Promise<string | undefined> {
+  const trimmed = agentId?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const detail = await requestJson<Record<string, unknown>>(
+      `/api/management/agents/${encodeURIComponent(trimmed)}`,
+    );
+    const resolved = trimToUndefined(
+      typeof detail.resolved_agent_id === 'string'
+        ? detail.resolved_agent_id
+        : (typeof detail.resolvedAgentId === 'string' ? detail.resolvedAgentId : undefined),
+    );
+    if (resolved) {
+      rememberTaskAgentAlias(trimmed, resolved);
+      return resolved;
+    }
+    const profile = await getAgent(trimmed);
+    const resolvedProfileId = profile.resolvedAgentId?.trim() || profile.agentId?.trim() || trimmed;
+    rememberTaskAgentAlias(trimmed, resolvedProfileId);
+    rememberTaskAgentAlias(profile.name, resolvedProfileId);
+    return resolvedProfileId;
+  } catch {
+    const rememberedAliasId = readRememberedTaskAgentAlias(trimmed);
+    return rememberedAliasId || trimmed;
+  }
 }
 
 async function findTaskAgentId(taskId: string): Promise<string | null> {
@@ -1015,13 +1138,8 @@ export function canDeleteTask(task: Task): boolean {
   if (typeof task.capabilities?.delete === 'boolean') {
     return task.capabilities.delete;
   }
-  if (task.runInfo.lastStatus === 'running') return false;
-  const hasLimit = Boolean(task.maxRuns && task.maxRuns > 0);
-  const reachedFinal = hasLimit && task.runInfo.runCount >= (task.maxRuns || 0);
-  if (reachedFinal && (task.runInfo.lastStatus === 'ok' || task.runInfo.lastStatus === 'error')) {
-    return true;
-  }
-  return !task.enabled;
+  const runtimeState = (task.runtimeState || '').trim().toLowerCase();
+  return runtimeState !== 'running' && task.runInfo.lastStatus !== 'running';
 }
 
 async function updateTaskEnabledByApi(taskId: string, enabled: boolean): Promise<{ success: boolean; message?: string }> {
@@ -1079,15 +1197,26 @@ export async function listTasks(scope: string): Promise<Task[]> {
       console.warn('[TaskClient] listTasks partial failure:', result.reason);
     });
 
-  const tasks = fulfilledBuckets
+  const mergedTasks = new Map<string, Task>();
+  fulfilledBuckets
     .flat()
+    .forEach((task) => {
+      mergedTasks.set(task.id, task);
+    });
+
+  const knownTaskIds = listKnownTaskIdsForAgents(agentIds);
+  const missingKnownTaskIds = knownTaskIds.filter((taskId) => !mergedTasks.has(taskId));
+  const fallbackTasks = await loadTasksByKnownIds(missingKnownTaskIds);
+  fallbackTasks.forEach((task) => {
+    mergedTasks.set(task.id, task);
+  });
+
+  return [...mergedTasks.values()]
     .sort((a, b) => {
       const ta = Date.parse(a.runInfo.nextRun || a.runInfo.lastRun || a.updatedAt);
       const tb = Date.parse(b.runInfo.nextRun || b.runInfo.lastRun || b.updatedAt);
       return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
     });
-
-  return tasks;
 }
 
 export async function createTask(
@@ -1108,10 +1237,16 @@ export async function createTask(
     reportActorAgentName?: string;
   },
 ): Promise<{ success: boolean; data?: Task; message?: string }> {
-  const agentId = task.teamId || (await resolveAgentIds(undefined))[0];
+  const agentId =
+    (await resolveTaskAgentRef(task.teamId)) || (await resolveAgentIds(undefined))[0];
   if (!agentId) {
     return { success: false, message: '没有可用智能体。' };
   }
+  const remoteChatSessionOwnerAgentId = await resolveTaskAgentRef(
+    task.remoteChatSessionOwnerAgentId,
+  );
+  const executorAgentId = await resolveTaskAgentRef(task.executorAgentId);
+  const reportActorAgentId = await resolveTaskAgentRef(task.reportActorAgentId);
 
   const scheduleKind = task.schedule?.kind || 'cron';
   const sourceType: Task['sourceType'] = task.sourceType || 'custom';
@@ -1162,12 +1297,12 @@ export async function createTask(
           origin_chat_session_id: trimToUndefined(task.originChatSessionId),
           origin_message_id: trimToUndefined(task.originMessageId),
           remote_chat_session_id: trimToUndefined(task.remoteChatSessionId),
-          remote_chat_session_owner_agent_id: trimToUndefined(task.remoteChatSessionOwnerAgentId),
+          remote_chat_session_owner_agent_id: trimToUndefined(remoteChatSessionOwnerAgentId),
           creator_participant_id: trimToUndefined(task.creatorParticipantId),
           creator_participant_name: trimToUndefined(task.creatorParticipantName),
-          executor_agent_id: trimToUndefined(task.executorAgentId),
+          executor_agent_id: trimToUndefined(executorAgentId),
           executor_agent_name: trimToUndefined(task.executorAgentName),
-          report_actor_agent_id: trimToUndefined(task.reportActorAgentId),
+          report_actor_agent_id: trimToUndefined(reportActorAgentId),
           report_actor_agent_name: trimToUndefined(task.reportActorAgentName),
         },
         enabled: false,
@@ -1183,6 +1318,7 @@ export async function createTask(
   if (!createdTask) {
     return { success: false, message: '创建任务失败。' };
   }
+  rememberTaskAgentAlias(task.teamId, createdTask.teamId);
 
   const localMeta = upsertTaskMeta(createdTask.id, {
     agentId,
@@ -1245,7 +1381,7 @@ export async function updateTask(
 export async function deleteTask(taskId: string): Promise<{ success: boolean; message?: string }> {
   const detail = await getTaskDetail(taskId);
   if (detail && !canDeleteTask(detail)) {
-    return { success: false, message: '任务已运行过，不能删除。' };
+    return { success: false, message: '任务正在执行，请先停止后再删除。' };
   }
   try {
     await requestJson<unknown>(`/api/management/tasks/${encodeURIComponent(taskId)}`, {
@@ -1298,37 +1434,6 @@ export async function resumeTask(taskId: string): Promise<{ success: boolean; me
   return updateTask(taskId, { enabled: true });
 }
 
-export async function writeTaskDeliveryToChatSession(input: {
-  deliveryId: string;
-  taskId: string;
-  messageText: string;
-}): Promise<{ success: boolean; message?: string }> {
-  const deliveryId = input.deliveryId.trim();
-  const taskId = input.taskId.trim();
-  const messageText = input.messageText.trim();
-  if (!deliveryId || !taskId || !messageText) {
-    return { success: false, message: '任务回写参数不完整。' };
-  }
-  try {
-    await requestJson<unknown>(
-      `/api/management/tasks/deliveries/${encodeURIComponent(deliveryId)}/chat-writeback`,
-      {
-        method: 'POST',
-        body: {
-          task_id: taskId,
-          message_text: messageText,
-        },
-      },
-    );
-    return { success: true };
-  } catch (error) {
-    return {
-      success: false,
-      message: error instanceof Error ? error.message : '任务回写失败。',
-    };
-  }
-}
-
 export async function listTaskRuns(taskId: string): Promise<TaskRunRecord[]> {
   try {
     const full = await requestJson<{ runs?: unknown[] }>(
@@ -1347,7 +1452,13 @@ export async function getTaskDetail(taskId: string): Promise<Task | undefined> {
     const full = await requestJson<{ task?: unknown }>(
       `/api/compose/tasks/${encodeURIComponent(taskId)}/full`,
     );
-    return mapManagedTaskDetail(full?.task) || undefined;
+    const mapped = mapManagedTaskDetail(full?.task) || undefined;
+    if (mapped?.teamId) {
+      const remembered =
+        (typeof window !== 'undefined' ? window.localStorage.getItem(TASK_CLIENT_AGENT_ID_KEY) : '') || '';
+      rememberTaskAgentAlias(remembered, mapped.teamId);
+    }
+    return mapped;
   } catch {
     return undefined;
   }
@@ -1387,6 +1498,51 @@ export async function updateTaskReportDeliveryStatus(
     },
   );
   return mapTaskDelivery(unwrapTaskDeliveryItem(result));
+}
+
+export async function writebackTaskReportDeliveryToChat(
+  deliveryId: string,
+  input: {
+    taskId: string;
+    messageText: string;
+  },
+): Promise<{
+  ok: boolean;
+  taskId: string;
+  deliveryId: string;
+  remoteSessionId?: string;
+  remoteSessionOwnerAgentId?: string;
+  messageCount?: number;
+  deliveryStatus?: string;
+}> {
+  const id = deliveryId.trim();
+  const taskId = trimToUndefined(input.taskId);
+  const messageText = trimToUndefined(input.messageText);
+  if (!id) {
+    throw new Error('deliveryId 不能为空。');
+  }
+  if (!taskId) {
+    throw new Error('taskId 不能为空。');
+  }
+  if (!messageText) {
+    throw new Error('messageText 不能为空。');
+  }
+  return requestJson<{
+    ok: boolean;
+    taskId: string;
+    deliveryId: string;
+    remoteSessionId?: string;
+    remoteSessionOwnerAgentId?: string;
+    messageCount?: number;
+    deliveryStatus?: string;
+  }>(`/api/management/tasks/deliveries/${encodeURIComponent(id)}/chat-writeback`, {
+    method: 'POST',
+    body: {
+      task_id: taskId,
+      message_text: messageText,
+    },
+    timeoutMs: TASK_DELIVERY_TIMEOUT_MS,
+  });
 }
 
 export function hasTaskFinalSummaryDelivered(taskId: string, runCount: number): boolean {

@@ -14,6 +14,7 @@ pub mod tts_management;
 pub mod vision_analysis;
 
 use std::fs;
+use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -28,6 +29,7 @@ use config::ServiceConfig;
 use openfang::OpenFangClient;
 use serde_json::json;
 use serde_json::Value;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio::time::sleep;
@@ -38,6 +40,7 @@ use tracing::{error, info, warn};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const LEGACY_CHAT_TASK_STARTUP_RECONCILE_ATTEMPTS: usize = 16;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -211,15 +214,36 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
     root.insert("providers".to_string(), toml::Value::Array(toml_providers));
     if let Some(default_id) = default_model {
         if let Some((provider_id, model_name)) = default_id.split_once("::") {
+            let normalized_provider_id = assignment_store::normalize_provider_id(provider_id);
+            let provider_config =
+                assignment_store::get_provider_config(&normalized_provider_id).ok().flatten();
             let mut default_table = TomlTable::new();
             default_table.insert(
                 "provider".to_string(),
-                toml::Value::String(assignment_store::normalize_provider_id(provider_id)),
+                toml::Value::String(normalized_provider_id.clone()),
             );
             default_table.insert(
                 "model".to_string(),
                 toml::Value::String(assignment_store::normalize_model_name(model_name)),
             );
+            let api_key_env = provider_config
+                .as_ref()
+                .and_then(resolve_provider_api_key_env)
+                .unwrap_or_else(|| default_provider_api_key_env(&normalized_provider_id));
+            if !api_key_env.is_empty() {
+                default_table.insert("api_key_env".to_string(), toml::Value::String(api_key_env));
+            }
+            if let Some(base_url) = provider_config
+                .as_ref()
+                .and_then(|cfg| cfg.base_url.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                default_table.insert(
+                    "base_url".to_string(),
+                    toml::Value::String(base_url.trim_end_matches('/').to_string()),
+                );
+            }
             root.insert(
                 "default_model".to_string(),
                 toml::Value::Table(default_table),
@@ -235,6 +259,74 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
         toml::to_string_pretty(&root).map_err(|e| format!("序列化 OpenFang 配置失败: {e}"))?;
     fs::write(&config_path, output).map_err(|e| format!("写入 OpenFang 配置失败: {e}"))?;
     Ok(())
+}
+
+fn resolve_provider_api_key_env(
+    provider: &assignment_store::ProviderConfigRecord,
+) -> Option<String> {
+    let normalized_provider_id = assignment_store::normalize_provider_id(&provider.provider_id);
+    if normalized_provider_id.is_empty() {
+        return None;
+    }
+
+    if provider
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return Some(default_provider_api_key_env(&normalized_provider_id));
+    }
+
+    None
+}
+
+fn default_provider_api_key_env(provider_id: &str) -> String {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "groq" => "GROQ_API_KEY".to_string(),
+        "anthropic" => "ANTHROPIC_API_KEY".to_string(),
+        "openai" => "OPENAI_API_KEY".to_string(),
+        "gemini" => "GEMINI_API_KEY".to_string(),
+        "google" => "GOOGLE_API_KEY".to_string(),
+        "deepseek" => "DEEPSEEK_API_KEY".to_string(),
+        "openrouter" => "OPENROUTER_API_KEY".to_string(),
+        "together" => "TOGETHER_API_KEY".to_string(),
+        "mistral" => "MISTRAL_API_KEY".to_string(),
+        "fireworks" => "FIREWORKS_API_KEY".to_string(),
+        "perplexity" => "PERPLEXITY_API_KEY".to_string(),
+        "cohere" => "COHERE_API_KEY".to_string(),
+        "ai21" => "AI21_API_KEY".to_string(),
+        "cerebras" => "CEREBRAS_API_KEY".to_string(),
+        "sambanova" => "SAMBANOVA_API_KEY".to_string(),
+        "huggingface" => "HF_API_KEY".to_string(),
+        "xai" => "XAI_API_KEY".to_string(),
+        "replicate" => "REPLICATE_API_TOKEN".to_string(),
+        "github-copilot" | "copilot" => "GITHUB_TOKEN".to_string(),
+        "codex" | "openai-codex" => "OPENAI_API_KEY".to_string(),
+        "claude-code" => String::new(),
+        "moonshot" | "kimi" => "MOONSHOT_API_KEY".to_string(),
+        "qwen" | "dashscope" => "DASHSCOPE_API_KEY".to_string(),
+        "minimax" => "MINIMAX_API_KEY".to_string(),
+        "zhipu" | "glm" | "zhipu_coding" | "codegeex" | "zai" | "zai_coding" => {
+            "ZHIPU_API_KEY".to_string()
+        }
+        "qianfan" | "baidu" => "QIANFAN_API_KEY".to_string(),
+        "volcengine" | "doubao" | "volcengine_coding" => "VOLCENGINE_API_KEY".to_string(),
+        "nvidia" | "nvidia-nim" => "NVIDIA_API_KEY".to_string(),
+        other => {
+            let mut env_key = String::with_capacity(other.len() + "_API_KEY".len());
+            for ch in other.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    env_key.push(ch.to_ascii_uppercase());
+                } else {
+                    env_key.push('_');
+                }
+            }
+            env_key.push_str("_API_KEY");
+            env_key
+        }
+    }
 }
 
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
@@ -263,7 +355,9 @@ pub async fn run_with_config(config: ServiceConfig) -> Result<(), Box<dyn std::e
     spawn_auto_power_on(state.clone());
     spawn_task_delivery_dispatcher(state.clone());
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let std_listener = create_reusable_listener(listen_addr)?;
+    std_listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
     write_service_url_file(listen_addr);
     info!("webot-service-rs listening on http://{listen_addr}");
@@ -274,7 +368,7 @@ pub async fn run_with_config(config: ServiceConfig) -> Result<(), Box<dyn std::e
 pub fn start_embedded(
     mut config: ServiceConfig,
 ) -> Result<EmbeddedServerHandle, Box<dyn std::error::Error>> {
-    let std_listener = TcpListener::bind(config.listen_addr)?;
+    let std_listener = create_reusable_listener(config.listen_addr)?;
     let listen_addr = std_listener.local_addr()?;
     config.listen_addr = listen_addr;
 
@@ -306,6 +400,19 @@ pub fn start_embedded(
         shutdown_tx,
         server_thread: Some(server_thread),
     })
+}
+
+fn create_reusable_listener(listen_addr: SocketAddr) -> io::Result<TcpListener> {
+    let domain = if listen_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&listen_addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
 }
 
 async fn serve_with_shutdown(
@@ -394,12 +501,150 @@ fn spawn_auto_power_on(state: Arc<AppState>) {
                 } else {
                     info!("auto power-on succeeded (OpenFang already reachable)");
                 }
+                if let Err(err) = quarantine_legacy_chat_tasks_on_startup(state.clone()).await {
+                    warn!(error = %err, "legacy chat task startup quarantine failed");
+                }
             }
             Err(err) => {
                 warn!("auto power-on failed: {err}");
             }
         }
     });
+}
+
+async fn quarantine_legacy_chat_tasks_on_startup(state: Arc<AppState>) -> Result<(), String> {
+    wait_for_openfang_health(&state).await?;
+
+    let payload = state
+        .openfang
+        .get_json("/api/tasks")
+        .await
+        .map_err(|error| error.message)?;
+    let rows = payload
+        .as_array()
+        .ok_or_else(|| "OpenFang /api/tasks 返回格式异常".to_string())?;
+
+    let mut candidates: Vec<LegacyChatTaskCandidate> = Vec::new();
+    for row in rows {
+        if let Some(candidate) = extract_legacy_chat_task_candidate(row) {
+            candidates.push(candidate);
+        }
+    }
+
+    if candidates.is_empty() {
+        info!("startup legacy chat task quarantine skipped: no legacy chat tasks");
+        return Ok(());
+    }
+
+    let mut paused_ids: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut already_inactive = 0usize;
+
+    for candidate in candidates {
+        if !candidate.enabled {
+            already_inactive += 1;
+            continue;
+        }
+        let path = format!("/api/tasks/{}/pause", candidate.task_id);
+        match state.openfang.post_json(&path, json!({})).await {
+            Ok(_) => paused_ids.push(format!("{}({})", candidate.task_id, candidate.reason)),
+            Err(error) => failed.push(format!(
+                "{}({}): {}",
+                candidate.task_id, candidate.reason, error.message
+            )),
+        }
+    }
+
+    if !paused_ids.is_empty() {
+        info!(
+            paused = %paused_ids.join(", "),
+            already_inactive,
+            "startup legacy chat tasks quarantined"
+        );
+    }
+    if !failed.is_empty() {
+        warn!(
+            failed = %failed.join(" | "),
+            already_inactive,
+            "startup legacy chat tasks quarantine partially failed"
+        );
+    }
+
+    Ok(())
+}
+
+async fn wait_for_openfang_health(state: &Arc<AppState>) -> Result<(), String> {
+    for attempt in 1..=LEGACY_CHAT_TASK_STARTUP_RECONCILE_ATTEMPTS {
+        match state.openfang.get_json("/api/health").await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if attempt == LEGACY_CHAT_TASK_STARTUP_RECONCILE_ATTEMPTS {
+                    return Err(error.message);
+                }
+                sleep(Duration::from_millis(750)).await;
+            }
+        }
+    }
+    Err("等待 OpenFang 就绪超时".to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyChatTaskCandidate {
+    task_id: String,
+    enabled: bool,
+    reason: &'static str,
+}
+
+fn extract_legacy_chat_task_candidate(row: &Value) -> Option<LegacyChatTaskCandidate> {
+    let task_id = row
+        .pointer("/spec/id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let source_type = row
+        .pointer("/spec/source_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !source_type.eq_ignore_ascii_case("chat") {
+        return None;
+    }
+
+    let session_target = row
+        .pointer("/spec/action/session_target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let origin_chat_session_id = row
+        .pointer("/spec/binding/origin_chat_session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let origin_message_id = row
+        .pointer("/spec/binding/origin_message_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let reason = if session_target.is_none() {
+        "missing_session_target"
+    } else if origin_chat_session_id.is_none() {
+        "missing_origin_chat_session_id"
+    } else if origin_message_id.is_none() {
+        "missing_origin_message_id"
+    } else {
+        return None;
+    };
+
+    Some(LegacyChatTaskCandidate {
+        task_id,
+        enabled: row
+            .pointer("/spec/enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        reason,
+    })
 }
 
 fn spawn_task_delivery_dispatcher(state: Arc<AppState>) {
@@ -411,6 +656,56 @@ fn spawn_task_delivery_dispatcher(state: Arc<AppState>) {
             sleep(Duration::from_secs(5)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::extract_legacy_chat_task_candidate;
+
+    #[test]
+    fn identifies_legacy_chat_task_without_session_target() {
+        let payload = json!({
+            "spec": {
+                "id": "task-1",
+                "source_type": "chat",
+                "enabled": true,
+                "action": {
+                    "session_target": null
+                },
+                "binding": {
+                    "origin_chat_session_id": "session-1",
+                    "origin_message_id": "message-1"
+                }
+            }
+        });
+
+        let candidate = extract_legacy_chat_task_candidate(&payload).expect("candidate");
+        assert_eq!(candidate.task_id, "task-1");
+        assert_eq!(candidate.reason, "missing_session_target");
+        assert!(candidate.enabled);
+    }
+
+    #[test]
+    fn ignores_new_chat_task_with_complete_binding() {
+        let payload = json!({
+            "spec": {
+                "id": "task-2",
+                "source_type": "chat",
+                "enabled": true,
+                "action": {
+                    "session_target": "chat-task::nuwa::session::message"
+                },
+                "binding": {
+                    "origin_chat_session_id": "session-1",
+                    "origin_message_id": "message-1"
+                }
+            }
+        });
+
+        assert!(extract_legacy_chat_task_candidate(&payload).is_none());
+    }
 }
 
 impl AppState {
@@ -723,10 +1018,6 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/api/compose/tasks/{id}/full",
             get(routes::compose_task_full),
-        )
-        .route(
-            "/api/compose/tasks/notices/pending",
-            get(routes::compose_task_notices_pending),
         )
         .route(
             "/internal/task-deliveries/send",

@@ -4,6 +4,7 @@ import { CheckCircle2, ClipboardCheck, FilePenLine, ShieldAlert, Sparkles } from
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
+import { analyzeSelfUpgradePayload } from '@/components/chat/self-upgrade-guards';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -101,6 +102,11 @@ export function GenUIReviewResultCard(ctx: unknown) {
     () => normalizeArray(props.proposedChanges).map(buildChangeSummary),
     [props.proposedChanges],
   );
+  const upgradeGuard = useMemo(
+    () => analyzeSelfUpgradePayload(props.payload),
+    [props.payload],
+  );
+  const confirmDisabled = status !== 'idle' || !upgradeGuard.canConfirm;
 
   return (
     <Card className="mt-2 overflow-hidden border-border/60 bg-card/80 shadow-none">
@@ -141,12 +147,17 @@ export function GenUIReviewResultCard(ctx: unknown) {
             ))}
           </div>
         ) : null}
+        {!upgradeGuard.canConfirm ? (
+          <div className="rounded-2xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs leading-5 text-destructive">
+            {upgradeGuard.reason}
+          </div>
+        ) : null}
       </CardContent>
       {requiresConfirmation && onAction ? (
         <CardFooter className="flex items-center gap-2 pt-0">
           <Button
             size="sm"
-            disabled={status !== 'idle'}
+            disabled={confirmDisabled}
             onClick={() => {
               setStatus('confirmed');
               onAction(props.confirmAction || 'confirm_self_upgrade', props.payload ?? props);
@@ -178,6 +189,11 @@ export function GenUIConfirmResultCard(ctx: unknown) {
   const onAction = typeof props.__onAction === 'function' ? props.__onAction : undefined;
   const [status, setStatus] = useState<'idle' | 'confirmed' | 'cancelled'>('idle');
   const riskLevel = normalizeText(props.riskLevel) || 'medium';
+  const upgradeGuard = useMemo(
+    () => analyzeSelfUpgradePayload(props.payload),
+    [props.payload],
+  );
+  const confirmDisabled = status !== 'idle' || !upgradeGuard.canConfirm;
 
   return (
     <Card className="mt-2 overflow-hidden border-border/60 bg-card/78 shadow-none">
@@ -197,16 +213,25 @@ export function GenUIConfirmResultCard(ctx: unknown) {
           <ReviewBadge riskLevel={riskLevel} />
         </div>
       </CardHeader>
-      {normalizeText(props.description) ? (
-        <CardContent className="pt-0 text-xs leading-5 text-foreground-secondary">
-          {normalizeText(props.description)}
+      {(normalizeText(props.description) || !upgradeGuard.canConfirm) ? (
+        <CardContent className="space-y-3 pt-0">
+          {normalizeText(props.description) ? (
+            <div className="text-xs leading-5 text-foreground-secondary">
+              {normalizeText(props.description)}
+            </div>
+          ) : null}
+          {!upgradeGuard.canConfirm ? (
+            <div className="rounded-2xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs leading-5 text-destructive">
+              {upgradeGuard.reason}
+            </div>
+          ) : null}
         </CardContent>
       ) : null}
       {onAction ? (
         <CardFooter className="flex items-center gap-2 pt-0">
           <Button
             size="sm"
-            disabled={status !== 'idle'}
+            disabled={confirmDisabled}
             onClick={() => {
               setStatus('confirmed');
               onAction(props.confirmAction || 'confirm_self_upgrade', props.payload ?? props);
