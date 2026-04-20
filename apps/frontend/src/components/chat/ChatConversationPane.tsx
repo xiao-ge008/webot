@@ -24,7 +24,6 @@ import {
   Volume2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { isHiddenSystemPromptText } from '@/lib/chat-message-filter';
 import {
   cleanupAssistantText,
   containsUiJsonTag,
@@ -275,11 +274,6 @@ function isMemoryTraceRow(row: MessageTrace): boolean {
   return /记忆|memory|semantic_memory|unified_memory/.test(haystack);
 }
 
-function isIdentityThinkingRow(row: MessageTrace): boolean {
-  const haystack = `${row.title}\n${row.detail || ''}`.toLowerCase();
-  return /身份|角色|roleplay|persona|identity|真实世界|互动边界|边界/.test(haystack);
-}
-
 function isRenderDecisionThinkingRow(row: MessageTrace): boolean {
   const haystack = `${row.title}\n${row.detail || ''}`.toLowerCase();
   return /a2ui|json-render|render|渲染|客户端|格式|markdown|ui_json|卡片|输出/.test(haystack);
@@ -404,25 +398,6 @@ function summarizeConnectionStage(msg: Message): string {
     extra.push(`检测到结构化 UI 数据流，当前 UI 状态：${streamState}。`);
   }
   return extra.join('\n');
-}
-
-function summarizePromptDebugSlotEvidence(msg: Message): string | undefined {
-  const slots = msg.promptDebug?.promptSlots ?? [];
-  const promptSources = msg.promptDebug?.promptSources ?? [];
-  const host = msg.promptDebug?.hostPolicyLoaded;
-  const parts: string[] = [];
-  if (slots.length > 0) {
-    parts.push(`结构化上下文已装配：${slots.join(' -> ')}。`);
-  }
-  if (host === true) {
-    parts.push('宿主级 AGENTS 已优先加载。');
-  } else if (host === false) {
-    parts.push('宿主级 AGENTS 未加载或内容为空。');
-  }
-  if (promptSources.length > 0) {
-    parts.push(`来源：${promptSources.slice(0, 6).join('、')}。`);
-  }
-  return parts.length > 0 ? parts.join('\n') : undefined;
 }
 
 function summarizePromptDebugCapabilityEvidence(msg: Message): string | undefined {
