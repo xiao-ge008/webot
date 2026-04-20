@@ -2034,8 +2034,8 @@ pub fn get_notification_settings() -> Result<Option<Value>, String> {
         return Ok(None);
     };
     let value: String = row.get(0).map_err(|e| format!("解析通知设置失败: {e}"))?;
-    let config = serde_json::from_str::<Value>(&value)
-        .map_err(|e| format!("反序列化通知设置失败: {e}"))?;
+    let config =
+        serde_json::from_str::<Value>(&value).map_err(|e| format!("反序列化通知设置失败: {e}"))?;
     Ok(Some(config))
 }
 
@@ -3539,8 +3539,7 @@ pub fn upsert_notification(input: UpsertNotificationInput) -> Result<Notificatio
         ],
     )
     .map_err(|e| format!("写入通知失败: {e}"))?;
-    get_notification_by_id(&id)?
-        .ok_or_else(|| "通知写入成功但读取失败".to_string())
+    get_notification_by_id(&id)?.ok_or_else(|| "通知写入成功但读取失败".to_string())
 }
 
 pub fn replace_notification_delivery_status(
@@ -3566,7 +3565,9 @@ pub fn replace_notification_delivery_status(
     Ok(())
 }
 
-pub fn list_notifications(query: &NotificationListQuery) -> Result<Vec<NotificationRecord>, String> {
+pub fn list_notifications(
+    query: &NotificationListQuery,
+) -> Result<Vec<NotificationRecord>, String> {
     let conn = open_conn()?;
     let mut stmt = conn
         .prepare(
@@ -3680,7 +3681,9 @@ pub fn get_notification_by_id(notification_id: &str) -> Result<Option<Notificati
         .map_err(|e| format!("解析通知详情失败: {e}"))
 }
 
-pub fn get_notification_by_source_key(source_key: &str) -> Result<Option<NotificationRecord>, String> {
+pub fn get_notification_by_source_key(
+    source_key: &str,
+) -> Result<Option<NotificationRecord>, String> {
     let conn = open_conn()?;
     let mut stmt = conn
         .prepare(
@@ -3715,7 +3718,10 @@ pub fn get_notification_by_source_key(source_key: &str) -> Result<Option<Notific
     let mut rows = stmt
         .query(params![source_key.trim()])
         .map_err(|e| format!("执行通知 source_key 查询失败: {e}"))?;
-    let Some(row) = rows.next().map_err(|e| format!("读取通知 source_key 失败: {e}"))? else {
+    let Some(row) = rows
+        .next()
+        .map_err(|e| format!("读取通知 source_key 失败: {e}"))?
+    else {
         return Ok(None);
     };
     parse_notification_row(row)
@@ -5490,9 +5496,7 @@ fn parse_capability_job_row(
     })
 }
 
-fn parse_notification_row(
-    row: &rusqlite::Row<'_>,
-) -> Result<NotificationRecord, rusqlite::Error> {
+fn parse_notification_row(row: &rusqlite::Row<'_>) -> Result<NotificationRecord, rusqlite::Error> {
     let payload_json: String = row.get(15)?;
     let delivery_status_json: String = row.get(16)?;
     Ok(NotificationRecord {

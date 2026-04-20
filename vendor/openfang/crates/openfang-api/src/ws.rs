@@ -322,14 +322,14 @@ async fn handle_agent_ws(
             Message::Text(text) => {
                 last_activity = std::time::Instant::now();
 
-                // SECURITY: Reject oversized WebSocket messages (64KB max)
-                const MAX_WS_MSG_SIZE: usize = 64 * 1024;
+                // SECURITY: Reject oversized WebSocket messages (100KB max)
+                const MAX_WS_MSG_SIZE: usize = 100 * 1024;
                 if text.len() > MAX_WS_MSG_SIZE {
                     let _ = send_json(
                         &sender,
                         &serde_json::json!({
                             "type": "error",
-                            "content": "Message too large (max 64KB)",
+                            "content": "Message too large (max 100KB)",
                         }),
                     )
                     .await;

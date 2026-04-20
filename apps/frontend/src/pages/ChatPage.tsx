@@ -66,7 +66,6 @@ import {
     storeTaskFinalSummary,
 } from '@/services/task-client';
 import {
-    normalizeChatTaskDraftState,
     normalizeChatTaskDraftTaskCard,
 } from '@/services/chat-task-draft-client';
 import { pushInAppNotice } from '@/services/in-app-notifier';
@@ -126,19 +125,6 @@ interface IdleAutoConfig {
     maxPerDay?: number;
     cooldownMs?: number;
     agentOverride?: Agent;
-}
-
-interface PendingChatTaskDraftState {
-    objective?: string;
-    reportCondition?: string;
-    everyMs?: number;
-    maxRuns?: number;
-    durationMs?: number;
-    scheduleText?: string;
-    taskName?: string;
-    executionPrompt?: string;
-    sourceMessageText: string;
-    createdAt: string;
 }
 
 const GROUP_UPGRADE_SYSTEM_PREAMBLE = [
@@ -3414,7 +3400,6 @@ export function ChatPage({
     const [activeSessionContextUpdatedAt, setActiveSessionContextUpdatedAt] = useState<number | null>(null);
 
     const messagesRef = useRef<Message[]>([]);
-    const pendingChatTaskDraftsRef = useRef<Map<string, PendingChatTaskDraftState>>(new Map());
     const isSendingRef = useRef(isSending);
     const silentDispatchingRef = useRef(silentDispatching);
     const multiReplyDispatchingRef = useRef(multiReplyDispatching);
@@ -4757,80 +4742,6 @@ export function ChatPage({
         }]);
     };
 
-    const getPendingChatTaskDraftKey = (): string => {
-        const sessionId = activeSessionIdRef.current.trim();
-        return sessionId || '__default__';
-    };
-
-    const getPendingChatTaskDraft = (): PendingChatTaskDraftState | null => {
-        return pendingChatTaskDraftsRef.current.get(getPendingChatTaskDraftKey()) ?? null;
-    };
-
-    const setPendingChatTaskDraft = (draft: PendingChatTaskDraftState | null): void => {
-        const key = getPendingChatTaskDraftKey();
-        if (!draft) {
-            pendingChatTaskDraftsRef.current.delete(key);
-            return;
-        }
-        pendingChatTaskDraftsRef.current.set(key, draft);
-    };
-
-    const normalizePendingChatTaskDraft = (
-        draft: Partial<PendingChatTaskDraftState> | null | undefined,
-        fallbackText: string,
-        previous?: PendingChatTaskDraftState | null,
-    ): PendingChatTaskDraftState | null => {
-        if (!draft) {
-            return null;
-        }
-        const sourceMessageText = (draft.sourceMessageText || previous?.sourceMessageText || fallbackText).trim();
-        if (!sourceMessageText) {
-            return null;
-        }
-        return {
-            objective: draft.objective?.trim() || previous?.objective,
-            reportCondition: draft.reportCondition?.trim() || previous?.reportCondition,
-            everyMs: typeof draft.everyMs === 'number' && draft.everyMs > 0 ? draft.everyMs : previous?.everyMs,
-            maxRuns: typeof draft.maxRuns === 'number' && draft.maxRuns >= 0 ? draft.maxRuns : previous?.maxRuns,
-            durationMs: typeof draft.durationMs === 'number' && draft.durationMs > 0 ? draft.durationMs : previous?.durationMs,
-            scheduleText: draft.scheduleText?.trim() || previous?.scheduleText,
-            taskName: draft.taskName?.trim() || previous?.taskName,
-            executionPrompt: draft.executionPrompt?.trim() || previous?.executionPrompt,
-            sourceMessageText,
-            createdAt: draft.createdAt?.trim() || previous?.createdAt || new Date().toISOString(),
-        };
-    };
-
-    const applyPendingChatTaskDraftState = useCallback((
-        messageText: string,
-        payload: {
-            matched?: boolean;
-            cancelled?: boolean;
-            readyToConfirm?: boolean;
-            draft?: unknown;
-        },
-    ) => {
-        if (payload.matched !== true) {
-            return;
-        }
-        if (payload.cancelled) {
-            setPendingChatTaskDraft(null);
-            return;
-        }
-        const currentDraft = getPendingChatTaskDraft();
-        const normalizedDraft = normalizeChatTaskDraftState(payload.draft);
-        const nextDraft = normalizePendingChatTaskDraft(
-            normalizedDraft ?? currentDraft,
-            messageText,
-            currentDraft,
-        );
-        if (payload.readyToConfirm) {
-            setPendingChatTaskDraft(null);
-            return;
-        }
-        setPendingChatTaskDraft(nextDraft);
-    }, []);
-
     const buildSessionContextDigest = (session: ChatSession | null | undefined): ChatSession['contextDigest'] => {
         if (!session) return undefined;
         const offset = typeof session.remoteContextOffset === 'number' && Number.isFinite(session.remoteContextOffset)
@@ -5681,6 +5592,16 @@ export function ChatPage({
                     debugLastEvent: chunk.event || '',
                     debugNativeFrames: base.debugNativeFrames || '',
                     debugDonePayload: base.debugDonePayload || '',
+                    promptDebug: base.promptDebug ? {
+                        promptSlots: [...(base.promptDebug.promptSlots ?? [])],
+                        promptSources: [...(base.promptDebug.promptSources ?? [])],
+                        hostPolicyLoaded: base.promptDebug.hostPolicyLoaded,
+                        capabilitySources: [...(base.promptDebug.capabilitySources ?? [])],
+                        availableSkills: [...(base.promptDebug.availableSkills ?? [])],
+                        availableMcpServers: [...(base.promptDebug.availableMcpServers ?? [])],
+                        availableCapabilities: [...(base.promptDebug.availableCapabilities ?? [])],
+                        blockedTools: [...(base.promptDebug.blockedTools ?? [])],
+                    } : undefined,
                 };
             next.generationElapsedMs = Math.max(0, Date.now() - (next.generationStartedAt || Date.now()));
 
@@ -5811,6 +5732,42 @@ export function ChatPage({
                     }
                 }
                 const lowerEvent = (chunk.event || '').trim().toLowerCase();
+                if (lowerEvent === 'prompt_debug') {
+                    const payload = parseJsonSafely<Record<string, unknown>>(raw);
+                    next.promptDebug = {
+                        promptSlots: Array.isArray(payload?.debugPromptSlots) ? payload.debugPromptSlots.filter((value): value is string => typeof value === 'string') : [],
+                        promptSources: Array.isArray(payload?.debugPromptSources) ? payload.debugPromptSources.filter((value): value is string => typeof value === 'string') : [],
+                        hostPolicyLoaded: typeof payload?.debugHostPolicyLoaded === 'boolean' ? payload.debugHostPolicyLoaded : undefined,
+                        capabilitySources: Array.isArray(payload?.debugCapabilitySources) ? payload.debugCapabilitySources.filter((value): value is string => typeof value === 'string') : [],
+                        availableSkills: Array.isArray(payload?.debugAvailableSkills) ? payload.debugAvailableSkills.filter((value): value is string => typeof value === 'string') : [],
+                        availableMcpServers: Array.isArray(payload?.debugAvailableMcpServers) ? payload.debugAvailableMcpServers.filter((value): value is string => typeof value === 'string') : [],
+                        availableCapabilities: Array.isArray(payload?.debugAvailableCapabilities) ? payload.debugAvailableCapabilities.filter((value): value is string => typeof value === 'string') : [],
+                        blockedTools: Array.isArray(payload?.debugBlockedTools) ? payload.debugBlockedTools.filter((value): value is string => typeof value === 'string') : [],
+                    };
+                    next.toolTrace = pushTrace(next.toolTrace, {
+                        id: generateId(),
+                        title: '上下文装配',
+                        detail: [
+                            Array.isArray(next.promptDebug.promptSlots) && next.promptDebug.promptSlots.length > 0
+                                ? `槽位：${next.promptDebug.promptSlots.join(' -> ')}`
+                                : '',
+                            Array.isArray(next.promptDebug.promptSlots) && next.promptDebug.promptSlots.includes('temporal_context')
+                                ? '已注入 temporal_context（本地时间/时区/今日首聊判定）。'
+                                : '',
+                            Array.isArray(next.promptDebug.promptSlots) && next.promptDebug.promptSlots.includes('opening_context')
+                                ? '已注入 opening_context（首聊问安与近期连续性回顾）。'
+                                : '',
+                            next.promptDebug.hostPolicyLoaded === true ? '宿主级 AGENTS 已加载。' : '宿主级 AGENTS 未加载或为空。',
+                            Array.isArray(next.promptDebug.availableSkills) && next.promptDebug.availableSkills.length > 0
+                                ? `skills：${next.promptDebug.availableSkills.join('、')}`
+                                : '',
+                            Array.isArray(next.promptDebug.availableCapabilities) && next.promptDebug.availableCapabilities.length > 0
+                                ? `capabilities：${next.promptDebug.availableCapabilities.join('；')}`
+                                : '',
+                        ].filter(Boolean).join('\n'),
+                        at: new Date().toISOString(),
+                    });
+                }
                 if (lowerEvent === 'tool_use') {
                     const parsedTool = parseJsonSafely<Record<string, unknown>>(raw);
                     const toolName = typeof parsedTool?.tool === 'string' ? parsedTool.tool : raw.trim() || 'tool';
@@ -6041,12 +5998,6 @@ export function ChatPage({
                     chunk.meta?.appearanceUpdated,
                 );
                 const taskCard = normalizeChatTaskDraftTaskCard(chunk.meta?.taskCard);
-                applyPendingChatTaskDraftState(rawAssistantStreamRef.current || next.text || '', {
-                    matched: chunk.meta?.taskDraftMatched === true,
-                    cancelled: chunk.meta?.taskDraftCancelled === true,
-                    readyToConfirm: chunk.meta?.taskDraftReadyToConfirm === true,
-                    draft: chunk.meta?.taskDraftState,
-                });
                 if (taskCard) {
                     next.taskCard = taskCard;
                     next.spec = undefined;
@@ -6265,10 +6216,6 @@ export function ChatPage({
                 timestamp: new Date().toISOString(),
             }
             : null;
-        const shouldForwardCurrentTaskDraft = appendUser
-            && !options?.requestOrigin
-            && !groupRuntimeEnabled;
-        const currentTaskDraft = shouldForwardCurrentTaskDraft ? getPendingChatTaskDraft() : null;
         const userMsg = originalUserMsg;
         const readiness = await resolveAgentReadiness(dispatchAgentId);
         if (isAgentChatUnavailable(readiness)) {
@@ -6517,7 +6464,6 @@ export function ChatPage({
                     sessionId: requestSessionTarget.sessionId,
                     sessionLabel: requestSessionTarget.sessionLabel,
                     requestOrigin,
-                    currentTaskDraft,
                     systemPreamble: getSystemPreambleForRequest(dispatchAgentId, text, 'primary'),
                 }, {
                     channel: CHAT_CHANNELS.app,
@@ -6587,6 +6533,16 @@ export function ChatPage({
                 };
             finalDraft.generationStartedAt = finalDraft.generationStartedAt ?? startedAt;
             finalDraft.generationElapsedMs = Math.max(0, Date.now() - finalDraft.generationStartedAt);
+            finalDraft.promptDebug = {
+                promptSlots: result.debugPromptSlots ?? finalDraft.promptDebug?.promptSlots ?? [],
+                promptSources: result.debugPromptSources ?? finalDraft.promptDebug?.promptSources ?? [],
+                hostPolicyLoaded: result.debugHostPolicyLoaded ?? finalDraft.promptDebug?.hostPolicyLoaded,
+                capabilitySources: result.debugCapabilitySources ?? finalDraft.promptDebug?.capabilitySources ?? [],
+                availableSkills: result.debugAvailableSkills ?? finalDraft.promptDebug?.availableSkills ?? [],
+                availableMcpServers: result.debugAvailableMcpServers ?? finalDraft.promptDebug?.availableMcpServers ?? [],
+                availableCapabilities: result.debugAvailableCapabilities ?? finalDraft.promptDebug?.availableCapabilities ?? [],
+                blockedTools: result.debugBlockedTools ?? finalDraft.promptDebug?.blockedTools ?? [],
+            };
 
             if (!finalDraft.text) {
                 finalDraft.text = result.text || result.content || '';
@@ -6599,12 +6555,6 @@ export function ChatPage({
                 runtimeAgentIdRef.current,
             );
             const taskCardFromResult = normalizeChatTaskDraftTaskCard(result.taskCard);
-            applyPendingChatTaskDraftState(result.text || result.content || '', {
-                matched: result.taskDraftMatched,
-                cancelled: result.taskDraftCancelled,
-                readyToConfirm: result.taskDraftReadyToConfirm,
-                draft: result.taskDraftState,
-            });
             finalDraft.debugNormalizedUiRawText = finalDraft.uiRawText || '';
             finalDraft.debugRepairedUiRawText = finalDraft.uiRawText ? repairUiJsonString(finalDraft.uiRawText) : '';
             finalDraft.debugUiContractWarnings = (() => {

@@ -405,15 +405,17 @@ fn build_model_user_prompt_with_context(
     session_messages: &[ChatTaskContextMessage],
 ) -> String {
     let current_json = serde_json::to_string(current_draft).unwrap_or_else(|_| "null".to_string());
-    let session_json =
-        serde_json::to_string(session_messages).unwrap_or_else(|_| "[]".to_string());
+    let session_json = serde_json::to_string(session_messages).unwrap_or_else(|_| "[]".to_string());
     let transcript = session_messages
         .iter()
         .map(|item| {
             format!(
                 "{}: {}",
                 item.role.trim(),
-                item.content.split_whitespace().collect::<Vec<_>>().join(" ")
+                item.content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
             )
         })
         .collect::<Vec<_>>()
@@ -460,8 +462,7 @@ async fn analyze_chat_task_draft_via_model(
         &request_session_id,
     )
     .await;
-    let response =
-        response.map_err(|err| format!("analysis request failed: {}", err.message))?;
+    let response = response.map_err(|err| format!("analysis request failed: {}", err.message))?;
     let content = response
         .get("response")
         .or_else(|| response.get("content"))
@@ -471,7 +472,10 @@ async fn analyze_chat_task_draft_via_model(
         .ok_or_else(|| "analysis response content is empty".to_string())?;
     parse_model_task_draft_analysis(content).ok_or_else(|| {
         let snippet = content.chars().take(240).collect::<String>();
-        format!("analysis response is not valid task draft JSON: {}", snippet)
+        format!(
+            "analysis response is not valid task draft JSON: {}",
+            snippet
+        )
     })
 }
 
@@ -506,39 +510,29 @@ fn build_response_from_analysis(
             .as_ref()
             .and_then(|draft| trim_optional_string(draft.objective.clone()))
     });
-    let report_condition = trim_optional_string(analysis.report_condition)
-        .or_else(|| {
-            current
-                .as_ref()
-                .and_then(|draft| trim_optional_string(draft.report_condition.clone()))
-        });
-    let every_ms = analysis
-        .every_ms
-        .filter(|value| *value > 0)
-        .or_else(|| {
-            current
-                .as_ref()
-                .and_then(|draft| draft.every_ms)
-                .filter(|value| *value > 0)
-        });
-    let duration_ms = analysis
-        .duration_ms
-        .filter(|value| *value > 0)
-        .or_else(|| {
-            current
-                .as_ref()
-                .and_then(|draft| draft.duration_ms)
-                .filter(|value| *value > 0)
-        });
-    let explicit_max_runs = analysis
-        .max_runs
-        .filter(|value| *value > 0)
-        .or_else(|| {
-            current
-                .as_ref()
-                .and_then(|draft| draft.max_runs)
-                .filter(|value| *value > 0)
-        });
+    let report_condition = trim_optional_string(analysis.report_condition).or_else(|| {
+        current
+            .as_ref()
+            .and_then(|draft| trim_optional_string(draft.report_condition.clone()))
+    });
+    let every_ms = analysis.every_ms.filter(|value| *value > 0).or_else(|| {
+        current
+            .as_ref()
+            .and_then(|draft| draft.every_ms)
+            .filter(|value| *value > 0)
+    });
+    let duration_ms = analysis.duration_ms.filter(|value| *value > 0).or_else(|| {
+        current
+            .as_ref()
+            .and_then(|draft| draft.duration_ms)
+            .filter(|value| *value > 0)
+    });
+    let explicit_max_runs = analysis.max_runs.filter(|value| *value > 0).or_else(|| {
+        current
+            .as_ref()
+            .and_then(|draft| draft.max_runs)
+            .filter(|value| *value > 0)
+    });
     let max_runs = explicit_max_runs.or_else(|| {
         if let (Some(duration_ms), Some(every_ms)) = (duration_ms, every_ms) {
             Some(((duration_ms + every_ms - 1) / every_ms).max(1) as u32)

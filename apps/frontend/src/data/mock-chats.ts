@@ -8,6 +8,17 @@ export interface MessageTrace {
     at: string;
 }
 
+export interface MessagePromptDebug {
+    promptSlots?: string[];
+    promptSources?: string[];
+    hostPolicyLoaded?: boolean;
+    capabilitySources?: string[];
+    availableSkills?: string[];
+    availableMcpServers?: string[];
+    availableCapabilities?: string[];
+    blockedTools?: string[];
+}
+
 export interface MessageToolCall {
     id: string;
     name: string;
@@ -73,6 +84,7 @@ export interface Message {
     debugWatchdogTriggered?: boolean;
     debugLastChunkKind?: string;
     debugLastEvent?: string;
+    promptDebug?: MessagePromptDebug;
     thinkingTrace?: MessageTrace[];
     toolTrace?: MessageTrace[];
     generationStartedAt?: number;

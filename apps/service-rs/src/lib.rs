@@ -1,6 +1,5 @@
 pub mod assignment_store;
 pub mod capability_registry;
-pub mod chat_task_draft;
 pub mod component_center;
 pub mod config;
 pub mod error;
@@ -215,8 +214,9 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
     if let Some(default_id) = default_model {
         if let Some((provider_id, model_name)) = default_id.split_once("::") {
             let normalized_provider_id = assignment_store::normalize_provider_id(provider_id);
-            let provider_config =
-                assignment_store::get_provider_config(&normalized_provider_id).ok().flatten();
+            let provider_config = assignment_store::get_provider_config(&normalized_provider_id)
+                .ok()
+                .flatten();
             let mut default_table = TomlTable::new();
             default_table.insert(
                 "provider".to_string(),

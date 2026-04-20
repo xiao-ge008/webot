@@ -230,6 +230,7 @@
     "connectNow": "Connect Now",
     "powerOn": "Power On",
     "powerOff": "Power Off",
+    "recentUsed": "Last used {{time}}",
     "recentOutput": "Latest output {{time}}",
     "tabs": {
       "agents": "Agents",

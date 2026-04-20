@@ -462,7 +462,6 @@ export interface AgentChatInput {
   requestOrigin?: 'group_auto';
   systemPreamble?: string;
   homeDirOverride?: string;
-  currentTaskDraft?: unknown;
   timeoutMs?: number;
 }
 
@@ -482,10 +481,6 @@ export interface AgentChatResult {
   uiRawText?: string;
   spec?: unknown;
   taskCard?: unknown;
-  taskDraftState?: unknown;
-  taskDraftMatched?: boolean;
-  taskDraftCancelled?: boolean;
-  taskDraftReadyToConfirm?: boolean;
   appearanceUpdated?: AgentAppearanceUpdated;
   error?: string;
   usedFallback?: boolean;
@@ -494,6 +489,14 @@ export interface AgentChatResult {
   recoveredSessionLabel?: string;
   recoveredRemoteSessionId?: string;
   recoveryReason?: 'session_conflict' | 'context_overflow' | 'quota_exceeded';
+  debugPromptSlots?: string[];
+  debugPromptSources?: string[];
+  debugHostPolicyLoaded?: boolean;
+  debugCapabilitySources?: string[];
+  debugAvailableSkills?: string[];
+  debugAvailableMcpServers?: string[];
+  debugAvailableCapabilities?: string[];
+  debugBlockedTools?: string[];
 }
 
 export interface AgentChatStreamChunk {
@@ -506,10 +509,6 @@ export interface AgentChatStreamChunk {
   meta?: (Record<string, unknown> & {
     appearanceUpdated?: AgentAppearanceUpdated;
     taskCard?: unknown;
-    taskDraftState?: unknown;
-    taskDraftMatched?: boolean;
-    taskDraftCancelled?: boolean;
-    taskDraftReadyToConfirm?: boolean;
   });
 }
 

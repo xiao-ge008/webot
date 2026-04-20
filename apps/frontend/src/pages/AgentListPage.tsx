@@ -17,6 +17,7 @@ import {
   listManagementAgents,
   type ManagementAgentSummary,
 } from '@/services/management-client';
+import { buildAgentLastUsedMap, sortAgentsByLastUsed } from '@/services/agent-recency';
 
 const HIDDEN_COLLAB_TAGS = new Set(['webot:collab_discoverable', 'webot:collab_dispatcher']);
 
@@ -89,7 +90,9 @@ export function AgentListPage() {
     const loadAgents = async () => {
       try {
         const profiles = await listManagementAgents();
-        setAgents(profiles.map(mapSummaryToAgent));
+        const mappedAgents = profiles.map(mapSummaryToAgent);
+        const lastUsedAtMap = buildAgentLastUsedMap(mappedAgents.map((agent) => agent.id));
+        setAgents(sortAgentsByLastUsed(mappedAgents, lastUsedAtMap));
       } catch (error) {
         console.error('[AgentList] 加载智能体失败:', error);
       }

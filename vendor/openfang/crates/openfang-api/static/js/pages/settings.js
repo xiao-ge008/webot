@@ -104,7 +104,7 @@ function settingsPage() {
       {
         name: 'WebSocket Connection Limits', key: 'websocket_limits',
         description: 'Per-IP connection cap prevents connection exhaustion. Idle timeout closes abandoned connections. Message rate limiting prevents flooding.',
-        configHint: 'Hard-coded: 5 connections/IP, 30min idle timeout, 64KB max message. Edit ws.rs to tune.',
+        configHint: 'Hard-coded: 5 connections/IP, 30min idle timeout, 100KB max message. Edit ws.rs to tune.',
         valueKey: 'websocket_limits'
       },
       {

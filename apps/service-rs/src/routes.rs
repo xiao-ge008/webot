@@ -20,14 +20,13 @@ use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::{future::join_all, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant, MissedTickBehavior};
 
 use crate::assignment_store;
 use crate::capability_registry;
-use crate::chat_task_draft;
 use crate::component_center;
 use crate::error::ApiError;
 use crate::image_generation;
@@ -39,6 +38,75 @@ use crate::AppState;
 
 const DEFAULT_UI_SKILL_NAME: &str = "ui-skill";
 const MANAGED_TASK_DELIVERY_UPSTREAM_TIMEOUT_SECS: u64 = 4;
+const STREAM_PROXY_HEARTBEAT_INTERVAL_SECS: u64 = 15;
+const HOST_POLICY_AGENTS_PATH: &str = r"C:\Users\Administrator\.webot\AGENTS.md";
+const CONTEXT_SLOT_OPEN_PREFIX: &str = "[[CONTEXT_SLOT:";
+const CONTEXT_SLOT_CLOSE: &str = "[[/CONTEXT_SLOT]]";
+const OPENFANG_PROMPT_WARN_THRESHOLD_BYTES: usize = 48 * 1024;
+const OPENFANG_PROMPT_MAX_BYTES: usize = 92 * 1024;
+const PROMPT_TRUNCATION_NOTICE: &str = "\n[内容过长，已自动截断]\n";
+
+#[derive(Debug, Clone)]
+struct PromptContextSlot {
+    slot: String,
+    source: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct PromptContextEnvelope {
+    version: String,
+    slots: Vec<PromptContextSlot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptSlotSizeDebug {
+    slot: String,
+    source: String,
+    content_bytes: usize,
+    rendered_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RenderedPromptContext {
+    message: String,
+    bytes: usize,
+    slot_sizes: Vec<PromptSlotSizeDebug>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct AgentCapabilitySnapshot {
+    agent_id: String,
+    enabled_skills: Vec<String>,
+    enabled_mcp_servers: Vec<String>,
+    enabled_capabilities: Vec<String>,
+    blocked_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PromptAssemblyDebug {
+    prompt_slots: Vec<String>,
+    prompt_sources: Vec<String>,
+    prompt_total_bytes: usize,
+    prompt_slot_sizes: Vec<PromptSlotSizeDebug>,
+    host_policy_loaded: bool,
+    capability_sources: Vec<String>,
+    available_skills: Vec<String>,
+    available_mcp_servers: Vec<String>,
+    available_capabilities: Vec<String>,
+    blocked_tools: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ParsedFrontendPromptSlots {
+    global_policy: Option<String>,
+    execution_protocol: Option<String>,
+    capability_context: Option<String>,
+    session_context: Option<String>,
+    task_input: Option<String>,
+    slot_sources: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 struct RuntimeSkillListEntry {
@@ -478,6 +546,7 @@ struct DefaultAgentInitState {
 
 static DEFAULT_AGENT_INIT: OnceLock<Mutex<DefaultAgentInitState>> = OnceLock::new();
 static NUWA_AGENT_ID_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static AGENT_DAILY_CHAT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub fn management_router() -> Router<Arc<AppState>> {
     Router::new()
@@ -742,8 +811,14 @@ pub fn management_router() -> Router<Arc<AppState>> {
         .route("/channels/test", post(test_channel_connection))
         .route("/channels/notify", post(send_channel_notification))
         .route("/notifications", get(list_notifications_route))
-        .route("/notifications/unread-count", get(get_notifications_unread_count_route))
-        .route("/notifications/read-all", post(mark_all_notifications_read_route))
+        .route(
+            "/notifications/unread-count",
+            get(get_notifications_unread_count_route),
+        )
+        .route(
+            "/notifications/read-all",
+            post(mark_all_notifications_read_route),
+        )
         .route(
             "/notifications/settings",
             get(get_notification_settings_route).put(update_notification_settings_route),
@@ -752,8 +827,14 @@ pub fn management_router() -> Router<Arc<AppState>> {
             "/notifications/{id}",
             get(get_notification_route).delete(delete_notification_route),
         )
-        .route("/notifications/{id}/read", post(mark_notification_read_route))
-        .route("/notifications/{id}/archive", post(archive_notification_route))
+        .route(
+            "/notifications/{id}/read",
+            post(mark_notification_read_route),
+        )
+        .route(
+            "/notifications/{id}/archive",
+            post(archive_notification_route),
+        )
         .route("/models", get(list_models))
         .route("/models/test", post(test_model_connection))
         .route(
@@ -1187,270 +1268,8 @@ pub fn chat_router() -> Router<Arc<AppState>> {
         )
         .route("/{id}/session/content", put(update_chat_session_content))
         .route("/{id}/session/compact", post(chat_session_compact))
-        .route("/{id}/task-draft", post(analyze_chat_task_draft_route))
         .route("/{id}/message", post(chat_message))
         .route("/{id}/message/stream", post(chat_message_stream))
-}
-
-pub async fn analyze_chat_task_draft_route(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<chat_task_draft::AnalyzeChatTaskDraftRequest>,
-) -> Result<Json<Value>, ApiError> {
-    validate_agent_path_segment(&id)?;
-    let response = chat_task_draft::analyze_chat_task_draft(&state, &id, payload).await;
-    Ok(Json(serde_json::to_value(response).unwrap_or_else(|_| {
-        json!({
-            "matched": false,
-            "cancelled": false,
-            "ready_to_confirm": false
-        })
-    })))
-}
-
-fn should_try_inline_chat_task_draft(payload: &ChatMessageRequest) -> bool {
-    if payload
-        .request_origin
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| value.eq_ignore_ascii_case("group_auto"))
-    {
-        return false;
-    }
-    if !payload.attachments.is_empty() {
-        return false;
-    }
-    let inline_task_draft_message = payload
-        .raw_user_message
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(payload.message.as_str());
-    !inline_task_draft_message.trim().is_empty()
-}
-
-fn extract_inline_task_draft_context_messages(
-    session: &Value,
-) -> Vec<chat_task_draft::ChatTaskContextMessage> {
-    let Some(rows) = session.get("messages").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-
-    let mut messages = Vec::new();
-    for row in rows {
-        let role = row
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if role != "user" && role != "assistant" && role != "agent" {
-            continue;
-        }
-
-        let text = row
-            .get("content")
-            .and_then(extract_text_from_json)
-            .or_else(|| row.get("message").and_then(extract_text_from_json));
-        let Some(text) = text else {
-            continue;
-        };
-        let Some(text) = sanitize_inline_task_draft_context_text(&role, &text) else {
-            continue;
-        };
-        if looks_like_protocol_only_text(&text) {
-            continue;
-        }
-
-        messages.push(chat_task_draft::ChatTaskContextMessage {
-            role,
-            content: text,
-        });
-    }
-
-    const MAX_CONTEXT_MESSAGES: usize = 8;
-    if messages.len() > MAX_CONTEXT_MESSAGES {
-        messages = messages.split_off(messages.len() - MAX_CONTEXT_MESSAGES);
-    }
-    messages
-}
-
-fn sanitize_inline_task_draft_context_text(role: &str, text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if !trimmed.contains("[system:") && !trimmed.contains("[AGENT_IDENTITY_PROFILE]") {
-        return Some(trimmed.to_string());
-    }
-
-    let lines: Vec<&str> = trimmed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    let mut tail_lines = Vec::new();
-    for line in lines.iter().rev() {
-        if line.starts_with('[') && line.ends_with(']') {
-            if tail_lines.is_empty() {
-                continue;
-            }
-            break;
-        }
-        tail_lines.push(*line);
-        if role == "user" && tail_lines.len() >= 3 {
-            break;
-        }
-    }
-    tail_lines.reverse();
-    let candidate = tail_lines.join("\n").trim().to_string();
-    if candidate.is_empty() || candidate.starts_with("[system:") {
-        None
-    } else {
-        Some(candidate)
-    }
-}
-
-async fn load_inline_chat_task_draft_context_messages(
-    state: &Arc<AppState>,
-    agent_id: &str,
-    payload: &ChatMessageRequest,
-) -> Vec<chat_task_draft::ChatTaskContextMessage> {
-    let session_path = format!("/api/agents/{agent_id}/session");
-    if payload
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-        && payload
-            .session_label
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none()
-    {
-        return state
-            .openfang
-            .get_json(&session_path)
-            .await
-            .map(|session| extract_inline_task_draft_context_messages(&session))
-            .unwrap_or_default();
-    }
-
-    let session_ctx = match ensure_switched_to_session_target(
-        state,
-        agent_id,
-        payload.session_id.as_deref(),
-        payload.session_label.as_deref(),
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(_) => return Vec::new(),
-    };
-
-    let session_payload = state.openfang.get_json(&session_path).await.ok();
-    restore_and_cleanup_switched_session(&state.openfang, agent_id, &session_ctx).await;
-    session_payload
-        .map(|session| extract_inline_task_draft_context_messages(&session))
-        .unwrap_or_default()
-}
-
-async fn maybe_resolve_inline_chat_task_draft(
-    state: &Arc<AppState>,
-    agent_id: &str,
-    payload: &ChatMessageRequest,
-) -> Option<chat_task_draft::AnalyzeChatTaskDraftResponse> {
-    if !should_try_inline_chat_task_draft(payload) {
-        return None;
-    }
-    let inline_task_draft_message = payload
-        .raw_user_message
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(payload.message.as_str());
-    let session_messages = load_inline_chat_task_draft_context_messages(state, agent_id, payload).await;
-    let response = chat_task_draft::analyze_chat_task_draft(
-        state,
-        agent_id,
-        chat_task_draft::AnalyzeChatTaskDraftRequest {
-            message: inline_task_draft_message.to_string(),
-            current_draft: payload.current_task_draft.clone(),
-            session_messages,
-        },
-    )
-    .await;
-    response.matched.then_some(response)
-}
-
-async fn resolve_inline_chat_task_draft_binding(
-    state: &Arc<AppState>,
-    agent_id: &str,
-    payload: &ChatMessageRequest,
-) -> (Option<String>, Option<String>) {
-    let session_id = payload
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let session_label = payload
-        .session_label
-        .as_deref()
-        .map(normalize_session_label)
-        .filter(|value| !value.is_empty());
-
-    if session_id.is_some() {
-        return (session_id, session_label);
-    }
-
-    if let Some(label) = session_label.clone() {
-        if let Ok(session_ctx) = ensure_switched_to_session_label(state, agent_id, &label).await {
-            if session_ctx.switched {
-                restore_openfang_session_with_client(
-                    &state.openfang,
-                    agent_id,
-                    &session_ctx.original_session_id,
-                )
-                .await;
-            }
-            return (Some(session_ctx.target_session_id), Some(label));
-        }
-        return (None, Some(label));
-    }
-
-    (get_openfang_agent_session_id(state, agent_id).await.ok(), None)
-}
-
-fn build_inline_chat_task_draft_json(
-    response: &chat_task_draft::AnalyzeChatTaskDraftResponse,
-    session_id: Option<&str>,
-    session_label: Option<&str>,
-) -> Value {
-    let content = response
-        .prompt_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default()
-        .to_string();
-    json!({
-        "response": content,
-        "content": content,
-        "task_draft_matched": response.matched,
-        "task_draft_cancelled": response.cancelled,
-        "task_draft_ready_to_confirm": response.ready_to_confirm,
-        "task_draft": response.draft.clone(),
-        "task_card": response.task_card.clone(),
-        "session_id": session_id,
-        "session_label": session_label,
-    })
 }
 
 pub fn groups_router() -> Router<Arc<AppState>> {
@@ -10117,9 +9936,7 @@ pub async fn get_notification_route(
     Ok(Json(json!({ "notification": record })))
 }
 
-pub async fn mark_notification_read_route(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+pub async fn mark_notification_read_route(Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     assignment_store::mark_notification_read(id.trim()).map_err(storage_error)?;
     let record = assignment_store::get_notification_by_id(id.trim()).map_err(storage_error)?;
     Ok(Json(json!({ "notification": record })))
@@ -10130,17 +9947,13 @@ pub async fn mark_all_notifications_read_route() -> Result<Json<Value>, ApiError
     Ok(Json(json!({ "updated_count": updated })))
 }
 
-pub async fn archive_notification_route(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+pub async fn archive_notification_route(Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     assignment_store::archive_notification(id.trim()).map_err(storage_error)?;
     let record = assignment_store::get_notification_by_id(id.trim()).map_err(storage_error)?;
     Ok(Json(json!({ "notification": record })))
 }
 
-pub async fn delete_notification_route(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+pub async fn delete_notification_route(Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     let deleted = assignment_store::delete_notification(id.trim()).map_err(storage_error)?;
     if deleted == 0 {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "通知不存在"));
@@ -10394,7 +10207,8 @@ fn upsert_local_task_delivery_from_upstream(delivery: &Value) -> Result<(), ApiE
         run_count,
         summary_text: read_trimmed_value(delivery, &["summary_text", "summaryText", "body"])
             .map(ToString::to_string),
-        error_text: read_trimmed_value(delivery, &["error_text", "errorText"]).map(ToString::to_string),
+        error_text: read_trimmed_value(delivery, &["error_text", "errorText"])
+            .map(ToString::to_string),
         payload,
         created_at: read_trimmed_value(delivery, &["created_at", "createdAt"])
             .unwrap_or_default()
@@ -10402,7 +10216,8 @@ fn upsert_local_task_delivery_from_upstream(delivery: &Value) -> Result<(), ApiE
         updated_at: read_trimmed_value(delivery, &["updated_at", "updatedAt"])
             .unwrap_or_default()
             .to_string(),
-        reported_at: read_trimmed_value(delivery, &["reported_at", "reportedAt"]).map(ToString::to_string),
+        reported_at: read_trimmed_value(delivery, &["reported_at", "reportedAt"])
+            .map(ToString::to_string),
         acknowledged_at: read_trimmed_value(delivery, &["acknowledged_at", "acknowledgedAt"])
             .map(ToString::to_string),
     })
@@ -10410,24 +10225,25 @@ fn upsert_local_task_delivery_from_upstream(delivery: &Value) -> Result<(), ApiE
     let local = assignment_store::get_task_delivery(id)
         .map_err(storage_error)?
         .ok_or_else(|| storage_error("同步本地任务投递失败"))?;
-    let (notification_type, severity) = match local.delivery_kind.trim().to_ascii_lowercase().as_str() {
-        "progress" => ("progress", "info"),
-        "anomaly" => ("anomaly", "error"),
-        "final" => {
-            if local
-                .summary_text
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some()
-            {
-                ("summary", "success")
-            } else {
-                ("completed", "success")
+    let (notification_type, severity) =
+        match local.delivery_kind.trim().to_ascii_lowercase().as_str() {
+            "progress" => ("progress", "info"),
+            "anomaly" => ("anomaly", "error"),
+            "final" => {
+                if local
+                    .summary_text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some()
+                {
+                    ("summary", "success")
+                } else {
+                    ("completed", "success")
+                }
             }
-        }
-        _ => ("system", "info"),
-    };
+            _ => ("system", "info"),
+        };
     let title_prefix = match notification_type {
         "progress" => "任务进展",
         "anomaly" => "任务异常",
@@ -10435,7 +10251,10 @@ fn upsert_local_task_delivery_from_upstream(delivery: &Value) -> Result<(), ApiE
         "completed" => "任务完成",
         _ => "任务通知",
     };
-    let task_name = local.task_name.clone().unwrap_or_else(|| "未命名任务".to_string());
+    let task_name = local
+        .task_name
+        .clone()
+        .unwrap_or_else(|| "未命名任务".to_string());
     let mut detail_lines = Vec::new();
     if let Some(agent_name) = local
         .report_actor_agent_name
@@ -10450,10 +10269,20 @@ fn upsert_local_task_delivery_from_upstream(delivery: &Value) -> Result<(), ApiE
     if let Some(run_count) = local.run_count {
         detail_lines.push(format!("执行轮次：第 {run_count} 次"));
     }
-    if let Some(summary) = local.summary_text.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(summary) = local
+        .summary_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         detail_lines.push(summary.to_string());
     }
-    if let Some(error_text) = local.error_text.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(error_text) = local
+        .error_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         detail_lines.push(error_text.to_string());
     }
     let source_domain = if local
@@ -10505,20 +10334,28 @@ fn upsert_local_task_delivery_from_upstream(delivery: &Value) -> Result<(), ApiE
 }
 
 fn sync_capability_job_notifications_from_store() -> Result<(), ApiError> {
-    let jobs = assignment_store::list_capability_jobs(None, None, Some(300)).map_err(storage_error)?;
+    let jobs =
+        assignment_store::list_capability_jobs(None, None, Some(300)).map_err(storage_error)?;
     for job in jobs {
         let status = job.status.trim().to_ascii_lowercase();
-        let (notification_type, severity) = if matches!(status.as_str(), "failed" | "error" | "cancelled") {
-            ("failed", "error")
-        } else if matches!(status.as_str(), "completed" | "succeeded" | "done") {
-            if job.summary.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_some() {
-                ("summary", "success")
+        let (notification_type, severity) =
+            if matches!(status.as_str(), "failed" | "error" | "cancelled") {
+                ("failed", "error")
+            } else if matches!(status.as_str(), "completed" | "succeeded" | "done") {
+                if job
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some()
+                {
+                    ("summary", "success")
+                } else {
+                    ("completed", "success")
+                }
             } else {
-                ("completed", "success")
-            }
-        } else {
-            ("progress", "info")
-        };
+                ("progress", "info")
+            };
         let source_domain = if job
             .job_type
             .as_deref()
@@ -10542,19 +10379,37 @@ fn sync_capability_job_notifications_from_store() -> Result<(), ApiError> {
         );
         let mut detail_lines = vec![
             format!("发送智能体：{}", job.owner_agent_id),
-            format!("关联任务：{}", job.title.clone().unwrap_or_else(|| job.job_id.clone())),
+            format!(
+                "关联任务：{}",
+                job.title.clone().unwrap_or_else(|| job.job_id.clone())
+            ),
             format!("状态：{}", job.status),
         ];
-        if let Some(stage) = job.stage.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(stage) = job
+            .stage
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             detail_lines.push(format!("阶段：{stage}"));
         }
         if let Some(progress) = job.progress_percent {
             detail_lines.push(format!("进度：{}%", progress.round() as i64));
         }
-        if let Some(summary) = job.summary.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(summary) = job
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             detail_lines.push(summary.to_string());
         }
-        if let Some(error_message) = job.error_message.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(error_message) = job
+            .error_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             detail_lines.push(error_message.to_string());
         }
         assignment_store::upsert_notification(assignment_store::UpsertNotificationInput {
@@ -10609,11 +10464,7 @@ fn notification_delivery_attempts(status: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn notification_attempt_exists(
-    attempts: &[Value],
-    channel: &str,
-    source_updated_at: &str,
-) -> bool {
+fn notification_attempt_exists(attempts: &[Value], channel: &str, source_updated_at: &str) -> bool {
     attempts.iter().any(|item| {
         read_trimmed_value(item, &["channel"]) == Some(channel)
             && read_trimmed_value(item, &["source_updated_at", "sourceUpdatedAt"])
@@ -10718,7 +10569,9 @@ async fn deliver_notification_to_channel(
 
     let result = match binding.as_ref() {
         Some(binding) => dispatch_channel_notification(binding, &targets, &rendered).await,
-        None if resolved_channel == "whatsapp" => send_whatsapp_notification(&targets, &rendered).await,
+        None if resolved_channel == "whatsapp" => {
+            send_whatsapp_notification(&targets, &rendered).await
+        }
         None => Err(format!("暂不支持的渠道类型: {resolved_channel}")),
     };
 
@@ -10754,18 +10607,19 @@ async fn dispatch_notifications_from_store() -> Result<(), ApiError> {
         .get("fallback_to_system")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let notifications = assignment_store::list_notifications(&assignment_store::NotificationListQuery {
-        unread_only: false,
-        include_archived: false,
-        notification_type: None,
-        source_domain: None,
-        agent_id: None,
-        query: None,
-        created_from: None,
-        created_to: None,
-        limit: Some(200),
-    })
-    .map_err(storage_error)?;
+    let notifications =
+        assignment_store::list_notifications(&assignment_store::NotificationListQuery {
+            unread_only: false,
+            include_archived: false,
+            notification_type: None,
+            source_domain: None,
+            agent_id: None,
+            query: None,
+            created_from: None,
+            created_to: None,
+            limit: Some(200),
+        })
+        .map_err(storage_error)?;
 
     for record in notifications {
         let source_updated_at = notification_source_updated_at(&record);
@@ -10773,12 +10627,16 @@ async fn dispatch_notifications_from_store() -> Result<(), ApiError> {
         let mut changed = false;
         let mut fallback_needed = false;
 
-        for channel in enabled_channels.iter().filter(|item| item.as_str() != "system") {
+        for channel in enabled_channels
+            .iter()
+            .filter(|item| item.as_str() != "system")
+        {
             if notification_attempt_exists(&attempts, channel, &source_updated_at) {
                 continue;
             }
             let target = notification_settings_target(&settings, channel);
-            let attempt = deliver_notification_to_channel(&record, channel, target.as_deref()).await;
+            let attempt =
+                deliver_notification_to_channel(&record, channel, target.as_deref()).await;
             if read_trimmed_value(&attempt, &["status"]) == Some("failed") {
                 fallback_needed = true;
             }
@@ -10818,15 +10676,18 @@ async fn sync_notifications_from_runtime(state: &Arc<AppState>) -> Result<(), Ap
     for target_kind in ["pc_notice", "chat_message"] {
         let payload = timeout(
             Duration::from_secs(MANAGED_TASK_DELIVERY_UPSTREAM_TIMEOUT_SECS),
-            state
-                .openfang
-                .get_json_with_query("/api/tasks/deliveries/pending", &[(
-                    "target_kind".to_string(),
-                    target_kind.to_string(),
-                )]),
+            state.openfang.get_json_with_query(
+                "/api/tasks/deliveries/pending",
+                &[("target_kind".to_string(), target_kind.to_string())],
+            ),
         )
         .await
-        .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "同步通知 pending deliveries 超时"))??;
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "同步通知 pending deliveries 超时",
+            )
+        })??;
         if let Some(rows) = payload.as_array() {
             for row in rows {
                 let _ = upsert_local_task_delivery_from_upstream(row);
@@ -11408,8 +11269,6 @@ pub struct ChatMessageRequest {
     pub session_label: Option<String>,
     pub request_origin: Option<String>,
     #[serde(default)]
-    pub current_task_draft: Option<chat_task_draft::ChatTaskDraftPayload>,
-    #[serde(default)]
     pub attachments: Vec<ChatMessageAttachmentRequest>,
 }
 
@@ -11450,14 +11309,7 @@ fn resolve_upstream_request_origin(
 }
 
 fn webot_chat_blocked_tools() -> Vec<&'static str> {
-    vec![
-        "cron_create",
-        "cron_list",
-        "cron_delete",
-        "schedule_create",
-        "schedule_list",
-        "schedule_delete",
-    ]
+    Vec::new()
 }
 
 async fn get_openfang_agent_session_id(
@@ -11750,6 +11602,11 @@ fn resolve_agent_system_prompt(
 ) -> Result<Option<String>, ApiError> {
     // 读取 profile 中保存的 system_prompt（系统提示词 Tab 内容）
     let profile = assignment_store::get_agent_profile_override(agent_id).map_err(storage_error)?;
+    let workspace_segment = profile
+        .as_ref()
+        .and_then(|item| item.english_name.as_deref())
+        .and_then(normalize_workspace_segment)
+        .unwrap_or_else(|| agent_id.trim().to_string());
     let base_system_prompt = profile
         .and_then(|item| item.system_prompt)
         .map(|value| value.trim().to_string())
@@ -11791,6 +11648,7 @@ fn resolve_agent_system_prompt(
             }
         }
     }
+    identity_blocks.extend(load_extra_workspace_markdown_blocks(agent_id, &workspace_segment));
 
     // 合并：构造一个封闭的系统配置区域
     let mut final_parts = Vec::new();
@@ -11831,6 +11689,101 @@ fn resolve_agent_system_prompt(
     } else {
         Ok(Some(trimmed))
     }
+}
+
+fn load_extra_workspace_markdown_blocks(agent_id: &str, workspace_segment: &str) -> Vec<String> {
+    let trimmed_agent_id = agent_id.trim();
+    let trimmed_workspace_segment = workspace_segment.trim();
+    if trimmed_agent_id.is_empty() || trimmed_workspace_segment.is_empty() {
+        return Vec::new();
+    }
+
+    let workspace_root = match path_resolver::workspaces_root() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(agent_id = %trimmed_agent_id, error = %err, "resolve workspace root failed");
+            return Vec::new();
+        }
+    };
+    let private_workspace = workspace_root.join(trimmed_workspace_segment);
+    let entries = match fs::read_dir(&private_workspace) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(
+                agent_id = %trimmed_agent_id,
+                workspace = %private_workspace.display(),
+                error = %err,
+                "read private workspace failed"
+            );
+            return Vec::new();
+        }
+    };
+
+    let known_names: HashSet<String> = KNOWN_CONTEXT_FILES
+        .iter()
+        .map(|item| item.to_ascii_lowercase())
+        .collect();
+    let mut extra_files: Vec<(String, PathBuf)> = Vec::new();
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %trimmed_agent_id,
+                    workspace = %private_workspace.display(),
+                    error = %err,
+                    "iterate private workspace entry failed"
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let lowered = file_name.to_ascii_lowercase();
+        if !lowered.ends_with(".md") || known_names.contains(&lowered) {
+            continue;
+        }
+        extra_files.push((file_name.to_string(), path));
+    }
+
+    extra_files.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let mut blocks = Vec::new();
+    for (file_name, path) in extra_files {
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                blocks.push(format!(
+                    "<WORKSPACE_MARKDOWN_FILE name=\"{}\" title=\"工作区附加 Markdown\">\n{}\n</WORKSPACE_MARKDOWN_FILE>",
+                    file_name, trimmed
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %trimmed_agent_id,
+                    file = %path.display(),
+                    error = %err,
+                    "read extra workspace markdown failed"
+                );
+            }
+        }
+    }
+
+    blocks
 }
 
 fn extract_user_address_from_user_md(content: &str) -> Option<String> {
@@ -12233,6 +12186,516 @@ async fn should_include_bootstrap_for_turn(state: &Arc<AppState>, agent_id: &str
     }
 }
 
+
+#[derive(Debug, Clone)]
+struct DailyOpeningContext {
+    temporal_context: String,
+    opening_context: Option<String>,
+    is_first_chat_today_with_agent: bool,
+}
+
+fn parse_json_timestamp_utc(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    match value {
+        Value::String(text) => parse_rfc3339_utc(text.trim()),
+        Value::Number(number) => {
+            let raw = number.as_i64()?;
+            let (seconds, nanos) = if raw.abs() >= 1_000_000_000_000 {
+                let seconds = raw.div_euclid(1000);
+                let millis = raw.rem_euclid(1000) as u32;
+                (seconds, millis * 1_000_000)
+            } else {
+                (raw, 0)
+            };
+            chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos)
+        }
+        _ => None,
+    }
+}
+
+fn extract_timestamp_from_value(value: &Value, keys: &[&str]) -> Option<chrono::DateTime<chrono::Utc>> {
+    for key in keys {
+        if let Some(timestamp) = value.get(*key).and_then(parse_json_timestamp_utc) {
+            return Some(timestamp);
+        }
+    }
+    None
+}
+
+fn max_timestamp(
+    current: Option<chrono::DateTime<chrono::Utc>>,
+    next: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match (current, next) {
+        (Some(left), Some(right)) => Some(if right > left { right } else { left }),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn current_local_date_key() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn agent_daily_chat_cache() -> &'static Mutex<HashMap<String, String>> {
+    AGENT_DAILY_CHAT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn was_agent_seen_today_in_runtime(agent_id: &str, today_key: &str) -> bool {
+    let cache = agent_daily_chat_cache().lock().await;
+    cache
+        .get(agent_id)
+        .map(|value| value == today_key)
+        .unwrap_or(false)
+}
+
+async fn remember_agent_seen_today(agent_id: &str, today_key: &str) {
+    let mut cache = agent_daily_chat_cache().lock().await;
+    cache.insert(agent_id.to_string(), today_key.to_string());
+}
+
+fn utc_to_local_date_key(value: chrono::DateTime<chrono::Utc>) -> String {
+    value
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn local_weekday_label(now: &chrono::DateTime<chrono::Local>) -> &'static str {
+    match now.format("%u").to_string().as_str() {
+        "1" => "星期一",
+        "2" => "星期二",
+        "3" => "星期三",
+        "4" => "星期四",
+        "5" => "星期五",
+        "6" => "星期六",
+        _ => "星期日",
+    }
+}
+
+fn build_temporal_context(is_first_chat_today_with_agent: bool) -> String {
+    let now = chrono::Local::now();
+    let timezone = format!("UTC{}", now.format("%:z"));
+    let date_key = now.format("%Y-%m-%d").to_string();
+    [
+        "[system:temporal-context]".to_string(),
+        "时间定位必须先于身份定位。".to_string(),
+        format!("当前本地日期时间：{}", now.format("%Y年%m月%d日 %H:%M:%S")),
+        format!("当前本地时区：{timezone}"),
+        format!("当前星期：{}", local_weekday_label(&now)),
+        format!("当天日期键：{date_key}"),
+        format!(
+            "is_first_chat_today_with_agent={}",
+            if is_first_chat_today_with_agent { "true" } else { "false" }
+        ),
+    ]
+    .join("\n")
+}
+
+
+fn sanitize_opening_recall_text(text: &str) -> String {
+    let sanitized = sanitize_prompt_wrapped_user_text(text);
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() || is_legacy_task_draft_artifact(trimmed) || looks_like_protocol_only_text(trimmed) {
+        return String::new();
+    }
+
+    let filtered = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            !(lower.starts_with("[system:")
+                || lower.starts_with("[stage:")
+                || lower.starts_with("[/")
+                || lower.starts_with("[[context_slot:")
+                || lower.starts_with("[prompt-context v=")
+                || lower.starts_with("query:")
+                || lower.starts_with("tool:")
+                || lower.starts_with("args:")
+                || lower.starts_with("name:")
+                || lower.starts_with("id:")
+                || lower.starts_with("type:")
+                || lower.starts_with("debugprompt")
+                || lower.starts_with("phase:")
+                || lower.starts_with("event:")
+                || lower.starts_with("<tool_call"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    filtered.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_opening_summary_line(text: &str) -> Option<String> {
+    let cleaned = sanitize_opening_recall_text(text);
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let mut summary = String::new();
+    let mut char_count = 0usize;
+    let mut saw_sentence_end = false;
+    for ch in cleaned.chars() {
+        summary.push(ch);
+        char_count += 1;
+        if matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';') {
+            saw_sentence_end = true;
+            if char_count >= 18 {
+                break;
+            }
+        }
+        if char_count >= 48 {
+            break;
+        }
+    }
+
+    let mut summary = summary
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '-' | '*' | '•' | '`' | '"' | '\'' | '“' | '”'))
+        .to_string();
+    if summary.is_empty() || summary.chars().count() < 6 {
+        return None;
+    }
+    if summary.chars().count() < cleaned.chars().count() && !saw_sentence_end {
+        summary.push('…');
+    }
+    Some(summary)
+}
+
+fn extract_effective_history_text(row: &Value) -> Option<String> {
+    let role = row
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if role != "user" && role != "assistant" && role != "agent" {
+        return None;
+    }
+
+    row.get("content")
+        .and_then(extract_text_from_json)
+        .or_else(|| row.get("message").and_then(extract_text_from_json))
+        .and_then(|text| {
+            let cleaned = sanitize_opening_recall_text(&text);
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        })
+}
+
+fn latest_effective_timestamp_from_session(session: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    const TIMESTAMP_KEYS: &[&str] = &[
+        "updated_at",
+        "updatedAt",
+        "created_at",
+        "createdAt",
+        "timestamp",
+        "ts",
+        "time",
+        "message_time",
+        "messageTime",
+        "occurred_at",
+        "occurredAt",
+        "last_message_at",
+        "lastMessageAt",
+    ];
+
+    let mut latest = None;
+    let mut has_effective_history = false;
+    if let Some(rows) = session.get("messages").and_then(Value::as_array) {
+        for row in rows {
+            if extract_effective_history_text(row).is_none() {
+                continue;
+            }
+            has_effective_history = true;
+            latest = max_timestamp(latest, extract_timestamp_from_value(row, TIMESTAMP_KEYS));
+        }
+    }
+
+    if latest.is_some() {
+        latest
+    } else if has_effective_history {
+        extract_timestamp_from_value(session, TIMESTAMP_KEYS)
+    } else {
+        None
+    }
+}
+
+
+fn session_list_item_has_effective_history(item: &Value) -> bool {
+    if item
+        .get("message_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .is_some()
+    {
+        return true;
+    }
+    if item
+        .get("messageCount")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .is_some()
+    {
+        return true;
+    }
+
+    ["preview", "last_message", "lastMessage", "summary"]
+        .iter()
+        .filter_map(|key| item.get(*key).and_then(extract_text_from_json))
+        .any(|text| !sanitize_opening_recall_text(&text).is_empty())
+}
+
+fn latest_effective_timestamp_from_session_list(payload: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    const SESSION_KEYS: &[&str] = &[
+        "last_message_at",
+        "lastMessageAt",
+        "updated_at",
+        "updatedAt",
+        "created_at",
+        "createdAt",
+        "timestamp",
+        "ts",
+        "time",
+    ];
+
+    let rows = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("items").and_then(Value::as_array))
+        .or_else(|| payload.as_array());
+    let Some(rows) = rows else {
+        return None;
+    };
+
+    let mut latest = None;
+    for row in rows {
+        if !session_list_item_has_effective_history(row) {
+            continue;
+        }
+        latest = max_timestamp(latest, extract_timestamp_from_value(row, SESSION_KEYS));
+    }
+    latest
+}
+
+fn latest_effective_timestamp_from_memory_rows(rows: &[Value]) -> Option<chrono::DateTime<chrono::Utc>> {
+    const MEMORY_KEYS: &[&str] = &[
+        "updated_at",
+        "updatedAt",
+        "created_at",
+        "createdAt",
+        "timestamp",
+        "ts",
+        "time",
+        "memory_time",
+        "memoryTime",
+        "occurred_at",
+        "occurredAt",
+        "last_seen_at",
+        "lastSeenAt",
+    ];
+
+    let mut latest = None;
+    for row in rows {
+        let Some(content) = row.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if sanitize_opening_recall_text(content).is_empty() {
+            continue;
+        }
+        latest = max_timestamp(latest, extract_timestamp_from_value(row, MEMORY_KEYS));
+    }
+    latest
+}
+
+fn collect_opening_summary_from_session(session: &Value, limit: usize) -> Vec<String> {
+    let Some(rows) = session.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut summaries = Vec::new();
+    for row in rows.iter().rev() {
+        let Some(text) = extract_effective_history_text(row) else {
+            continue;
+        };
+        let Some(summary) = build_opening_summary_line(&text) else {
+            continue;
+        };
+        summaries.push(summary);
+        if summaries.len() >= limit {
+            break;
+        }
+    }
+    summaries.reverse();
+    summaries
+}
+
+fn collect_opening_summary_from_memory(rows: &[Value], limit: usize) -> Vec<String> {
+    let mut summaries = Vec::new();
+    for row in rows {
+        let Some(content) = row.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(summary) = build_opening_summary_line(content) else {
+            continue;
+        };
+        summaries.push(summary);
+        if summaries.len() >= limit {
+            break;
+        }
+    }
+    summaries
+}
+
+fn normalize_opening_summary_key(summary: &str) -> String {
+    summary
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '。' | '，' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';' | ':' | '：' | '-' | '_' | '"' | '\''))
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn merge_opening_summaries(session_summaries: Vec<String>, memory_summaries: Vec<String>) -> Vec<String> {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for summary in session_summaries.into_iter().chain(memory_summaries.into_iter()) {
+        let key = normalize_opening_summary_key(&summary);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        merged.push(summary);
+        if merged.len() >= 3 {
+            break;
+        }
+    }
+    merged
+}
+
+fn build_opening_context(summaries: &[String]) -> String {
+    let mut lines = vec![
+        "[system:opening-context]".to_string(),
+        "检测到：这是当前智能体今天第一次有效会话。".to_string(),
+        "开篇策略：先轻量问安，再自然带出当前时间语境，再按需要衔接近期连续性信息。".to_string(),
+        "如果用户首句只是寒暄、继续、在吗、早安、晚安或空泛开启语：先问安，用 1 到 2 句总结最近相关进展，最后询问今天想先做什么。".to_string(),
+        "如果用户首句已经是明确任务或问题：最多一句轻量问安或连续性提示，随后直接回答或执行，不要额外反问接下来要做什么。".to_string(),
+        "如果当前没有可安全复用的近期记忆：保留时间定位和轻问安，直接进入需求确认或任务处理，不要编造历史回顾。".to_string(),
+        "禁止把协议文本、旧 prompt、系统包装文本、工具日志、阶段标记或检索细节当成历史回顾内容。".to_string(),
+    ];
+
+    if summaries.is_empty() {
+        lines.push("近期可复用记忆摘要：当前没有可安全复用的近期记忆摘要。".to_string());
+    } else {
+        lines.push("近期可复用记忆摘要（最多参考 1 到 3 条）：".to_string());
+        lines.extend(summaries.iter().map(|summary| format!("- {summary}")));
+    }
+
+    lines.join("\n")
+}
+
+async fn fetch_recent_opening_memory_rows(state: &Arc<AppState>, agent_id: &str) -> Option<Vec<Value>> {
+    match fetch_semantic_memory_rows(state, agent_id, "", 6, 0.0).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %error.message,
+                "opening-context: recent memory lookup skipped due to error"
+            );
+            None
+        }
+    }
+}
+
+async fn build_daily_opening_context(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    include_bootstrap: bool,
+) -> DailyOpeningContext {
+    let current_session = match state
+        .openfang
+        .get_json(&format!("/api/agents/{agent_id}/session"))
+        .await
+    {
+        Ok(payload) => Some(payload),
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %error.message,
+                "opening-context: failed to fetch current session"
+            );
+            None
+        }
+    };
+    let session_list = match state
+        .openfang
+        .get_json(&format!("/api/agents/{agent_id}/sessions"))
+        .await
+    {
+        Ok(payload) => Some(payload),
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %error.message,
+                "opening-context: failed to fetch session list"
+            );
+            None
+        }
+    };
+    let recent_memory_rows = fetch_recent_opening_memory_rows(state, agent_id).await;
+
+    let latest_session_time = max_timestamp(
+        current_session
+            .as_ref()
+            .and_then(latest_effective_timestamp_from_session),
+        session_list
+            .as_ref()
+            .and_then(latest_effective_timestamp_from_session_list),
+    );
+    let latest_memory_time = recent_memory_rows
+        .as_ref()
+        .and_then(|rows| latest_effective_timestamp_from_memory_rows(rows));
+    let today_key = current_local_date_key();
+    let runtime_seen_today = was_agent_seen_today_in_runtime(agent_id, &today_key).await;
+    let is_first_chat_today_with_agent = if runtime_seen_today {
+        false
+    } else {
+        latest_session_time
+            .map(utc_to_local_date_key)
+            .or_else(|| latest_memory_time.map(utc_to_local_date_key))
+            .map(|date_key| date_key != today_key)
+            .unwrap_or(false)
+    };
+
+    let temporal_context = build_temporal_context(is_first_chat_today_with_agent);
+    let opening_context = if include_bootstrap || !is_first_chat_today_with_agent {
+        None
+    } else {
+        let session_summaries = current_session
+            .as_ref()
+            .map(|session| collect_opening_summary_from_session(session, 2))
+            .unwrap_or_default();
+        let memory_summaries = recent_memory_rows
+            .as_ref()
+            .map(|rows| collect_opening_summary_from_memory(rows, 3))
+            .unwrap_or_default();
+        Some(build_opening_context(&merge_opening_summaries(
+            session_summaries,
+            memory_summaries,
+        )))
+    };
+
+    DailyOpeningContext {
+        temporal_context,
+        opening_context,
+        is_first_chat_today_with_agent,
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 struct UserProfilePatch {
     user_address: Option<String>,
@@ -12314,18 +12777,164 @@ fn is_invalid_user_address(value: &str, agent_id: &str) -> bool {
 
 fn extract_user_message_segment(message: &str) -> String {
     let normalized = message.replace("\r\n", "\n");
-    let segment = if let Some(index) = normalized.rfind("\n[user]\n") {
+    let segment = if let Some(task_input) = extract_task_input_from_prompt_context(&normalized) {
+        task_input
+    } else if let Some(index) = normalized.rfind("\n[user]\n") {
         normalized[index + "\n[user]\n".len()..].trim().to_string()
     } else if let Some(index) = normalized.rfind("[user]\n") {
         normalized[index + "[user]\n".len()..].trim().to_string()
     } else {
         message.trim().to_string()
     };
-    let lowered = segment.to_ascii_lowercase();
+    let sanitized = sanitize_prompt_wrapped_user_text(&segment);
+    let lowered = sanitized.to_ascii_lowercase();
     if lowered.starts_with("[system:auto-idle]") || lowered.starts_with("[system:") {
         return String::new();
     }
-    segment
+    sanitized
+}
+
+fn extract_tagged_prompt_block(content: &str, open_tag: &str, close_tag: &str) -> Option<String> {
+    let start = content.rfind(open_tag)?;
+    let remainder = &content[start + open_tag.len()..];
+    let end = remainder.find(close_tag)?;
+    let value = remainder[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn extract_task_input_from_prompt_context(message: &str) -> Option<String> {
+    let normalized = message.replace("\r\n", "\n");
+    let candidates = [
+        ("[task_input]\n", "\n[/task_input]"),
+        ("[task_input]", "[/task_input]"),
+        ("[[CONTEXT_SLOT:task_input]]\n", "\n[[/CONTEXT_SLOT]]"),
+        ("[[CONTEXT_SLOT:task_input]]", "[[/CONTEXT_SLOT]]"),
+    ];
+    for (open_tag, close_tag) in candidates {
+        if let Some(value) = extract_tagged_prompt_block(&normalized, open_tag, close_tag) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn is_legacy_task_draft_artifact(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && (trimmed.contains("分析这条消息是否是在创建或补充聊天任务草案")
+            || trimmed.contains("当前智能体的任务草案分析暂时不可用，本次没有生成任务卡"))
+}
+
+fn sanitize_prompt_wrapped_user_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if is_legacy_task_draft_artifact(trimmed) {
+        return String::new();
+    }
+
+    if trimmed
+        .to_ascii_lowercase()
+        .starts_with("[prompt-context v=")
+    {
+        return extract_task_input_from_prompt_context(trimmed)
+            .unwrap_or_else(|| trimmed.to_string());
+    }
+
+    if let Some(index) = trimmed.find("[prompt-context v=") {
+        if let Some(task_input) = extract_task_input_from_prompt_context(&trimmed[index..]) {
+            let prefix = trimmed[..index].trim();
+            return if prefix.is_empty() {
+                task_input
+            } else {
+                format!("{prefix} {task_input}").trim().to_string()
+            };
+        }
+    }
+
+    if trimmed.contains("[task_input]") || trimmed.contains("[[CONTEXT_SLOT:task_input]]") {
+        if let Some(task_input) = extract_task_input_from_prompt_context(trimmed) {
+            return task_input;
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn build_sanitized_session_messages(session: &Value) -> Option<Vec<Value>> {
+    let rows = session.get("messages").and_then(Value::as_array)?;
+    let mut changed = false;
+    let mut messages = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let Some(raw_role) = row.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        let normalized_role = match raw_role.trim().to_ascii_lowercase().as_str() {
+            "system" => "system",
+            "user" => "user",
+            "assistant" | "agent" => "assistant",
+            _ => continue,
+        };
+        let Some(original_text) = row
+            .get("content")
+            .and_then(extract_text_from_json)
+            .or_else(|| row.get("message").and_then(extract_text_from_json))
+        else {
+            continue;
+        };
+        let original_trimmed = original_text.trim();
+        if original_trimmed.is_empty() {
+            continue;
+        }
+
+        let sanitized_content = if normalized_role == "user" {
+            sanitize_prompt_wrapped_user_text(original_trimmed)
+        } else {
+            original_trimmed.to_string()
+        };
+        let final_content = if sanitized_content.trim().is_empty() {
+            original_trimmed.to_string()
+        } else {
+            sanitized_content.trim().to_string()
+        };
+        if final_content != original_trimmed {
+            changed = true;
+        }
+        messages.push(json!({
+            "role": normalized_role,
+            "content": final_content,
+        }));
+    }
+
+    if changed { Some(messages) } else { None }
+}
+
+async fn maybe_sanitize_current_openfang_session(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    session_id: Option<&str>,
+) -> Result<bool, ApiError> {
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(false);
+    };
+    let session_path = format!("/api/agents/{agent_id}/session");
+    let session = state.openfang.get_json(&session_path).await?;
+    let Some(messages) = build_sanitized_session_messages(&session) else {
+        return Ok(false);
+    };
+
+    let path = format!("/api/sessions/{session_id}/content");
+    state
+        .openfang
+        .put_json(&path, json!({ "messages": messages }))
+        .await?;
+    Ok(true)
 }
 
 fn extract_user_address_from_message(message: &str, agent_id: &str) -> Option<String> {
@@ -12738,6 +13347,611 @@ async fn resolve_collaboration_prompt(
     ))
 }
 
+fn parse_frontend_prompt_slots(message: &str) -> ParsedFrontendPromptSlots {
+    let mut parsed = ParsedFrontendPromptSlots::default();
+    let mut cursor = message;
+    while let Some(open_index) = cursor.find(CONTEXT_SLOT_OPEN_PREFIX) {
+        let after_open = &cursor[open_index + CONTEXT_SLOT_OPEN_PREFIX.len()..];
+        let Some(name_end) = after_open.find("]]") else {
+            break;
+        };
+        let slot_name = after_open[..name_end].trim().to_ascii_lowercase();
+        let content_start = open_index + CONTEXT_SLOT_OPEN_PREFIX.len() + name_end + 2;
+        let remainder = &cursor[content_start..];
+        let Some(close_index) = remainder.find(CONTEXT_SLOT_CLOSE) else {
+            break;
+        };
+        let content = remainder[..close_index].trim().to_string();
+        if !content.is_empty() {
+            parsed.slot_sources.push(format!("frontend:{slot_name}"));
+            match slot_name.as_str() {
+                "global_policy" => parsed.global_policy = Some(content),
+                "execution_protocol" => parsed.execution_protocol = Some(content),
+                "capability_context" => parsed.capability_context = Some(content),
+                "session_context" => parsed.session_context = Some(content),
+                "task_input" => parsed.task_input = Some(content),
+                _ => {}
+            }
+        }
+        cursor = &remainder[close_index + CONTEXT_SLOT_CLOSE.len()..];
+    }
+    parsed
+}
+
+fn wrap_final_prompt_slot(slot: &PromptContextSlot) -> String {
+    format!("[{}]\n{}\n[/{}]", slot.slot, slot.content.trim(), slot.slot)
+}
+
+fn truncate_utf8_by_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
+fn truncate_prompt_block_by_bytes(content: &str, max_bytes: usize) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.len() <= max_bytes {
+        return trimmed.to_string();
+    }
+
+    if max_bytes <= PROMPT_TRUNCATION_NOTICE.len() + 16 {
+        return truncate_utf8_by_bytes(trimmed, max_bytes).trim().to_string();
+    }
+
+    let keep_bytes = max_bytes.saturating_sub(PROMPT_TRUNCATION_NOTICE.len());
+    let prefix = truncate_utf8_by_bytes(trimmed, keep_bytes).trim_end();
+    format!("{prefix}{PROMPT_TRUNCATION_NOTICE}").trim().to_string()
+}
+
+fn prompt_slot_soft_cap_bytes(slot: &str) -> Option<usize> {
+    match slot {
+        "host_policy" => Some(8 * 1024),
+        "global_policy" => Some(4 * 1024),
+        "execution_protocol" => Some(4 * 1024),
+        "temporal_context" => Some(2 * 1024),
+        "opening_context" => Some(3 * 1024),
+        "identity_context" => Some(32 * 1024),
+        "capability_context" => Some(8 * 1024),
+        "memory_context" => Some(6 * 1024),
+        "session_context" => Some(8 * 1024),
+        "task_input" => Some(4 * 1024),
+        _ => None,
+    }
+}
+
+fn apply_prompt_slot_soft_caps(slots: &mut [PromptContextSlot]) {
+    for slot in slots {
+        if let Some(limit) = prompt_slot_soft_cap_bytes(&slot.slot) {
+            slot.content = truncate_prompt_block_by_bytes(&slot.content, limit);
+        }
+    }
+}
+
+fn enforce_prompt_budget(mut slots: Vec<PromptContextSlot>) -> Vec<PromptContextSlot> {
+    apply_prompt_slot_soft_caps(&mut slots);
+
+    let byte_len = |items: &[PromptContextSlot]| {
+        render_prompt_context_envelope(&PromptContextEnvelope {
+            version: "structured-context/v1".to_string(),
+            slots: items.to_vec(),
+        })
+        .bytes
+    };
+
+    if byte_len(&slots) <= OPENFANG_PROMPT_MAX_BYTES {
+        return slots;
+    }
+
+    let shrink_plan: [(&str, usize); 10] = [
+        ("memory_context", 3 * 1024),
+        ("opening_context", 2 * 1024),
+        ("session_context", 3 * 1024),
+        ("capability_context", 4 * 1024),
+        ("host_policy", 4 * 1024),
+        ("global_policy", 2 * 1024),
+        ("execution_protocol", 2 * 1024),
+        ("temporal_context", 1024),
+        ("identity_context", 20 * 1024),
+        ("task_input", 2 * 1024),
+    ];
+    for (slot_name, target_bytes) in shrink_plan {
+        if byte_len(&slots) <= OPENFANG_PROMPT_MAX_BYTES {
+            break;
+        }
+        if let Some(slot) = slots.iter_mut().find(|item| item.slot == slot_name) {
+            slot.content = truncate_prompt_block_by_bytes(&slot.content, target_bytes);
+        }
+    }
+
+    let remove_order = [
+        "memory_context",
+        "opening_context",
+        "session_context",
+        "capability_context",
+        "global_policy",
+        "execution_protocol",
+        "temporal_context",
+        "host_policy",
+    ];
+    for slot_name in remove_order {
+        if byte_len(&slots) <= OPENFANG_PROMPT_MAX_BYTES {
+            break;
+        }
+        slots.retain(|item| item.slot != slot_name);
+    }
+
+    if byte_len(&slots) > OPENFANG_PROMPT_MAX_BYTES {
+        if let Some(slot) = slots.iter_mut().find(|item| item.slot == "identity_context") {
+            slot.content = truncate_prompt_block_by_bytes(&slot.content, 12 * 1024);
+        }
+    }
+    if byte_len(&slots) > OPENFANG_PROMPT_MAX_BYTES {
+        if let Some(slot) = slots.iter_mut().find(|item| item.slot == "task_input") {
+            slot.content = truncate_prompt_block_by_bytes(&slot.content, 1024);
+        }
+    }
+    if byte_len(&slots) > OPENFANG_PROMPT_MAX_BYTES {
+        slots.retain(|item| item.slot == "identity_context" || item.slot == "task_input");
+    }
+    if byte_len(&slots) > OPENFANG_PROMPT_MAX_BYTES {
+        if let Some(slot) = slots.iter_mut().find(|item| item.slot == "identity_context") {
+            slot.content = truncate_prompt_block_by_bytes(&slot.content, 6 * 1024);
+        }
+    }
+    if byte_len(&slots) > OPENFANG_PROMPT_MAX_BYTES {
+        if let Some(slot) = slots.iter_mut().find(|item| item.slot == "task_input") {
+            slot.content = truncate_prompt_block_by_bytes(&slot.content, 512);
+        }
+    }
+
+    slots
+}
+
+fn compact_prompt_block(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n");
+    let mut lines = Vec::new();
+    let mut prev_blank = false;
+
+    for line in normalized.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.trim().is_empty() {
+            if prev_blank {
+                continue;
+            }
+            prev_blank = true;
+            lines.push(String::new());
+            continue;
+        }
+        prev_blank = false;
+        lines.push(trimmed_end.to_string());
+    }
+
+    lines.join("\n").trim().to_string()
+}
+
+fn resolve_host_policy_prompt() -> (Option<String>, bool) {
+    match fs::read_to_string(HOST_POLICY_AGENTS_PATH) {
+        Ok(content) => {
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                (None, false)
+            } else {
+                (Some(trimmed), true)
+            }
+        }
+        Err(_) => (None, false),
+    }
+}
+
+fn build_visible_reply_requirement_block() -> String {
+    [
+        "[system:require-visible-reply]",
+        "这是用户在当前聊天窗口主动发起的一次明确提问或指令。",
+        "必须给出面向用户的可见正文回复。",
+        "禁止仅返回 NO_REPLY、[[silent]]、空字符串，或只有工具/记忆日志。",
+        "如果需要先检索记忆、调用工具或做中间步骤，完成后仍必须继续输出最终正文。",
+        "当前轮次只是聊天交互，不代表任何任务、提醒、监控、定时器已经创建、发布、启动或设置完成。",
+        "只有在你已经实际调用工具成功创建了任务后，才能明确告知“已创建”“已开始监控”“提醒已设置完成”；否则只能说明计划、理解或待确认参数。",
+        "当用户表达监控、提醒、定时、周期执行诉求时，你必须先判断用户是否真的要创建任务，而不是把所有相关聊天都当成任务。",
+        "如果创建意图不明确，或你不确定用户是在聊天、举例、讨论方案，还是要求立即创建任务，必须先用自然语言追问确认。",
+        "如果用户明确要创建任务，但频率、触发条件、执行时长、目标对象等关键参数不足，必须先补问缺失参数。",
+        "只有当用户明确同意创建且关键参数已经足够时，才可以调用调度相关工具创建任务；创建失败时要如实说明失败原因。",
+    ]
+    .join("\n")
+}
+
+fn format_string_list_block(title: &str, items: &[String], empty_text: &str) -> String {
+    if items.is_empty() {
+        return format!("{title}\n- {empty_text}");
+    }
+    let mut lines = vec![title.to_string()];
+    lines.extend(items.iter().map(|item| format!("- {item}")));
+    lines.join("\n")
+}
+
+fn format_capability_binding_line(
+    binding: &assignment_store::AgentCapabilityBindingRecord,
+) -> String {
+    let provider = binding
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default");
+    format!(
+        "{} | scope={} | provider={} | binding_type={}",
+        binding.capability_key, binding.capability_scope, provider, binding.binding_type
+    )
+}
+
+async fn resolve_capability_context(
+    _state: &Arc<AppState>,
+    agent_id: &str,
+    frontend_capability_context: Option<&str>,
+    collaboration_prompt: Option<&str>,
+) -> Result<(Option<String>, AgentCapabilitySnapshot, Vec<String>), ApiError> {
+    let enabled_skills =
+        assignment_store::list_agent_enabled_skills(agent_id).map_err(storage_error)?;
+    let enabled_mcp_servers = strip_workspace_mcp_names(
+        assignment_store::list_agent_enabled_mcp_servers(agent_id).map_err(storage_error)?,
+    );
+    let capability_bindings = assignment_store::list_agent_capability_bindings(Some(agent_id))
+        .map_err(storage_error)?
+        .into_iter()
+        .filter(|item| item.enabled)
+        .collect::<Vec<_>>();
+    let provider_bindings = assignment_store::list_capability_provider_bindings()
+        .map_err(storage_error)?
+        .into_iter()
+        .filter(|item| item.enabled)
+        .collect::<Vec<_>>();
+    let providers = assignment_store::list_capability_providers(false)
+        .map_err(storage_error)?
+        .into_iter()
+        .filter(|item| item.enabled && !item.is_removed)
+        .collect::<Vec<_>>();
+    let blocked_tools = webot_chat_blocked_tools()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let provider_health = assignment_store::list_provider_health_states().map_err(storage_error)?;
+    let mut capability_sources = vec![
+        "frontend:capability_context".to_string(),
+        "backend:enabled_skills".to_string(),
+        "backend:enabled_mcp_servers".to_string(),
+        "backend:agent_capability_bindings".to_string(),
+        "backend:capability_provider_bindings".to_string(),
+        "backend:capability_providers".to_string(),
+        "backend:blocked_tools".to_string(),
+    ];
+    if collaboration_prompt.is_some() {
+        capability_sources.push("backend:multi_agent_acl".to_string());
+    }
+
+    let capability_lines = capability_bindings
+        .iter()
+        .map(format_capability_binding_line)
+        .collect::<Vec<_>>();
+    let provider_route_lines = provider_bindings
+        .iter()
+        .map(|item| {
+            format!(
+                "{} | scope={} | provider={}",
+                item.capability_key, item.capability_scope, item.provider_id
+            )
+        })
+        .collect::<Vec<_>>();
+    let provider_lines = providers
+        .iter()
+        .map(|item| {
+            let capability_text = item
+                .capabilities
+                .iter()
+                .map(|cap| format!("{}:{}", cap.key, cap.scope))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{} | type={} | scopes={} | capabilities={}",
+                item.provider_id,
+                item.provider_type,
+                if item.supported_scopes.is_empty() {
+                    "none".to_string()
+                } else {
+                    item.supported_scopes.join(", ")
+                },
+                if capability_text.is_empty() {
+                    "none".to_string()
+                } else {
+                    capability_text
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let provider_health_lines = provider_health
+        .iter()
+        .map(|item| {
+            let message = item
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("no message");
+            format!(
+                "{} | health={} | {}",
+                item.provider_id, item.health_state, message
+            )
+        })
+        .collect::<Vec<_>>();
+    let runtime_scope_lines = providers
+        .iter()
+        .flat_map(|item| item.supported_scopes.iter().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let mut sections = Vec::new();
+    if let Some(frontend_context) = frontend_capability_context {
+        let trimmed = frontend_context.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!(
+                "[capability:tool-routing-and-component-runtime]\n{}",
+                trimmed
+            ));
+        }
+    }
+    if let Some(collaboration) = collaboration_prompt {
+        let trimmed = collaboration.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        }
+    }
+    sections.push(format_string_list_block(
+        "[capability:enabled-skills]",
+        &enabled_skills,
+        "当前未启用额外 skills",
+    ));
+    sections.push(format_string_list_block(
+        "[capability:enabled-mcp-servers]",
+        &enabled_mcp_servers,
+        "当前未启用额外 MCP servers",
+    ));
+    sections.push(format_string_list_block(
+        "[capability:agent-bindings]",
+        &capability_lines,
+        "当前未绑定额外 capability providers",
+    ));
+    sections.push(format_string_list_block(
+        "[capability:provider-routes]",
+        &provider_route_lines,
+        "当前未配置 capability provider routes",
+    ));
+    sections.push(format_string_list_block(
+        "[capability:runtime-providers]",
+        &provider_lines,
+        "当前未发现已启用 capability providers",
+    ));
+    sections.push(format_string_list_block(
+        "[capability:runtime-scopes]",
+        &runtime_scope_lines,
+        "当前未发现额外 runtime scopes",
+    ));
+    sections.push(format_string_list_block(
+        "[capability:provider-health]",
+        &provider_health_lines,
+        "当前没有 provider health 记录",
+    ));
+    sections.push(format_string_list_block(
+        "[capability:blocked-tools]",
+        &blocked_tools,
+        "当前没有额外 blocked tools",
+    ));
+    sections.push(format!(
+        "[capability:runtime-restrictions]\n- 能验证的事实必须优先走已启用的底层能力验证。\n- 若当前能力快照未列出某项能力，则禁止伪造可调用。\n- 若调用失败，必须保留错误上下文并明确说明降级路径。"
+    ));
+
+    let snapshot = AgentCapabilitySnapshot {
+        agent_id: agent_id.to_string(),
+        enabled_skills: enabled_skills.clone(),
+        enabled_mcp_servers: enabled_mcp_servers.clone(),
+        enabled_capabilities: capability_lines.clone(),
+        blocked_tools: blocked_tools.clone(),
+    };
+    let merged = sections.join("\n\n");
+    let merged = merged.trim().to_string();
+    if merged.is_empty() {
+        Ok((None, snapshot, capability_sources))
+    } else {
+        Ok((Some(merged), snapshot, capability_sources))
+    }
+}
+
+fn compose_prompt_context_envelope(
+    _agent_id: &str,
+    raw_message: &str,
+    raw_user_message: Option<&str>,
+    parsed_frontend_slots: ParsedFrontendPromptSlots,
+    temporal_context: Option<String>,
+    opening_context: Option<String>,
+    identity_context: Option<String>,
+    memory_context: Option<String>,
+    capability_context: Option<String>,
+) -> (PromptContextEnvelope, PromptAssemblyDebug) {
+    let (host_policy, host_policy_loaded) = resolve_host_policy_prompt();
+    let mut debug = PromptAssemblyDebug {
+        host_policy_loaded,
+        prompt_slots: Vec::new(),
+        prompt_sources: Vec::new(),
+        prompt_total_bytes: 0,
+        prompt_slot_sizes: Vec::new(),
+        capability_sources: Vec::new(),
+        available_skills: Vec::new(),
+        available_mcp_servers: Vec::new(),
+        available_capabilities: Vec::new(),
+        blocked_tools: Vec::new(),
+    };
+    let ParsedFrontendPromptSlots {
+        global_policy,
+        execution_protocol,
+        capability_context: _frontend_capability_slot,
+        session_context,
+        task_input,
+        slot_sources,
+    } = parsed_frontend_slots;
+    debug.prompt_sources.extend(slot_sources);
+    let fallback_task = raw_user_message
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| raw_message.trim())
+        .to_string();
+    let final_task_input = task_input
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| fallback_task.clone());
+    let session_slot = {
+        let mut blocks = Vec::new();
+        if let Some(session_context) = session_context {
+            let trimmed = session_context.trim();
+            if !trimmed.is_empty() {
+                blocks.push(trimmed.to_string());
+            }
+        }
+        blocks.push(build_visible_reply_requirement_block());
+        Some(blocks.join("\n\n"))
+    };
+
+    let ordered = vec![
+        (
+            "host_policy",
+            "host:C:\\Users\\Administrator\\.webot\\AGENTS.md".to_string(),
+            host_policy,
+        ),
+        (
+            "global_policy",
+            "frontend:global_policy".to_string(),
+            global_policy,
+        ),
+        (
+            "execution_protocol",
+            "frontend:execution_protocol".to_string(),
+            execution_protocol,
+        ),
+        (
+            "temporal_context",
+            "backend:temporal_context".to_string(),
+            temporal_context,
+        ),
+        (
+            "opening_context",
+            "backend:opening_context".to_string(),
+            opening_context,
+        ),
+        (
+            "identity_context",
+            "backend:agent_identity_context".to_string(),
+            identity_context,
+        ),
+        (
+            "capability_context",
+            "backend:capability_context".to_string(),
+            capability_context,
+        ),
+        (
+            "memory_context",
+            "backend:memory_context".to_string(),
+            memory_context,
+        ),
+        (
+            "session_context",
+            "merged:session_context".to_string(),
+            session_slot,
+        ),
+        (
+            "task_input",
+            "frontend_or_request:task_input".to_string(),
+            Some(final_task_input.clone()),
+        ),
+    ];
+
+    let mut slots = Vec::new();
+    for (slot, source, content) in ordered {
+        let Some(content) = content else {
+            continue;
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = if slot == "task_input" {
+            trimmed.to_string()
+        } else {
+            compact_prompt_block(trimmed)
+        };
+        if normalized.is_empty() {
+            continue;
+        }
+        slots.push(PromptContextSlot {
+            slot: slot.to_string(),
+            source: source.clone(),
+            content: normalized,
+        });
+        debug.prompt_slots.push(slot.to_string());
+        debug.prompt_sources.push(source);
+    }
+
+    let slots = enforce_prompt_budget(slots);
+    let envelope = PromptContextEnvelope {
+        version: "structured-context/v1".to_string(),
+        slots,
+    };
+    debug.prompt_slots = envelope
+        .slots
+        .iter()
+        .map(|slot| slot.slot.clone())
+        .collect::<Vec<_>>();
+    debug.prompt_sources = envelope
+        .slots
+        .iter()
+        .map(|slot| slot.source.clone())
+        .collect::<Vec<_>>();
+    (envelope, debug)
+}
+
+fn render_prompt_context_envelope(envelope: &PromptContextEnvelope) -> RenderedPromptContext {
+    let mut blocks = Vec::with_capacity(envelope.slots.len() + 1);
+    blocks.push(format!("[prompt-context v={}]", envelope.version));
+
+    let mut slot_sizes = Vec::with_capacity(envelope.slots.len());
+    for slot in &envelope.slots {
+        let rendered = wrap_final_prompt_slot(slot);
+        slot_sizes.push(PromptSlotSizeDebug {
+            slot: slot.slot.clone(),
+            source: slot.source.clone(),
+            content_bytes: slot.content.len(),
+            rendered_bytes: rendered.len(),
+        });
+        blocks.push(rendered);
+    }
+
+    let message = blocks.join("\n");
+    RenderedPromptContext {
+        bytes: message.len(),
+        message,
+        slot_sizes,
+    }
+}
+
+#[allow(dead_code)]
 fn apply_system_prompt_guard(
     message: &str,
     system_prompt: Option<&str>,
@@ -12777,6 +13991,7 @@ fn apply_system_prompt_guard(
     format!("{}\n\n{}", blocks.join("\n\n"), message)
 }
 
+#[allow(dead_code)]
 fn ensure_visible_reply_for_chat_turn(message: &str) -> String {
     let trimmed = message.trim();
     if trimmed.is_empty() || message.contains("[system:require-visible-reply]") {
@@ -12784,16 +13999,9 @@ fn ensure_visible_reply_for_chat_turn(message: &str) -> String {
     }
 
     [
-        "[system:require-visible-reply]",
-        "这是用户在当前聊天窗口主动发起的一次明确提问或指令。",
-        "必须给出面向用户的可见正文回复。",
-        "禁止仅返回 NO_REPLY、[[silent]]、空字符串，或只有工具/记忆日志。",
-        "如果需要先检索记忆、调用工具或做中间步骤，完成后仍必须继续输出最终正文。",
-        "当前轮次只是聊天交互，不代表任何任务、提醒、监控、定时器已经创建、发布、启动或设置完成。",
-        "除非系统已经明确返回任务卡片确认结果，或明确返回任务创建成功结果，否则禁止宣称“已为你设置”“已开始监控”“提醒已创建”“监控设置完成”。",
-        "当用户表达监控、提醒、定时、周期执行诉求时，未完成任务确认前，只能继续澄清参数、输出待确认方案，或提示需要确认，不能擅自执行。",
-        "",
-        message,
+        build_visible_reply_requirement_block(),
+        "".to_string(),
+        message.to_string(),
     ]
     .join("\n")
 }
@@ -12857,7 +14065,8 @@ async fn resolve_semantic_memory_prompt(
         let Some(content) = row.get("content").and_then(Value::as_str).map(str::trim) else {
             continue;
         };
-        if content.is_empty() {
+        let cleaned_content = sanitize_prompt_wrapped_user_text(content);
+        if cleaned_content.is_empty() {
             continue;
         }
         let confidence = row
@@ -12922,7 +14131,7 @@ async fn resolve_semantic_memory_prompt(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("统一记忆召回");
-        let summary = truncate_for_prompt(content, 180);
+        let summary = truncate_for_prompt(&cleaned_content, 180);
         let mut prefix = format!(
             "- #{idx} [kind={kind}] [score={score:.2}] [confidence={confidence:.2}] [scope={scope}] [source={source}]",
             idx = index + 1
@@ -13664,6 +14873,12 @@ fn looks_like_protocol_only_text(text: &str) -> bool {
     if normalized.is_empty() {
         return true;
     }
+    if normalized
+        .to_ascii_lowercase()
+        .starts_with("[prompt-context v=")
+    {
+        return true;
+    }
     if normalized.to_ascii_lowercase().starts_with("<tool_call>") {
         return true;
     }
@@ -13793,11 +15008,22 @@ pub async fn chat_message(
     if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &agent_id).await {
         tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message: auto-init skipped due to error");
     }
-    if let Err(err) = maybe_persist_user_profile_patch(&state, &agent_id, &payload.message).await {
+    let semantic_input_message = payload
+        .raw_user_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(payload.message.as_str())
+        .to_string();
+    if let Err(err) =
+        maybe_persist_user_profile_patch(&state, &agent_id, &semantic_input_message).await
+    {
         tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message: auto-profile skipped due to error");
     }
     let include_bootstrap = should_include_bootstrap_for_turn(&state, &agent_id).await;
-    let system_prompt = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
+    let daily_opening_context = build_daily_opening_context(&state, &agent_id, include_bootstrap).await;
+    remember_agent_seen_today(&agent_id, &current_local_date_key()).await;
+    let identity_context = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
     let collaboration_prompt = match resolve_collaboration_prompt(&state, &agent_id).await {
         Ok(value) => value,
         Err(error) => {
@@ -13808,7 +15034,7 @@ pub async fn chat_message(
     let semantic_memory_context = match resolve_semantic_memory_prompt(
         &state,
         &agent_id,
-        &payload.message,
+        &semantic_input_message,
     )
     .await
     {
@@ -13826,18 +15052,26 @@ pub async fn chat_message(
             "chat_message: semantic memory recalled"
         );
     }
-
-    if let Some(task_draft_response) =
-        maybe_resolve_inline_chat_task_draft(&state, &agent_id, &payload).await
-    {
-        let (bound_session_id, bound_session_label) =
-            resolve_inline_chat_task_draft_binding(&state, &agent_id, &payload).await;
-        return Ok(Json(build_inline_chat_task_draft_json(
-            &task_draft_response,
-            bound_session_id.as_deref(),
-            bound_session_label.as_deref(),
-        )));
-    }
+    let parsed_frontend_slots = parse_frontend_prompt_slots(&payload.message);
+    let (capability_context, capability_snapshot, capability_sources) =
+        match resolve_capability_context(
+            &state,
+            &agent_id,
+            parsed_frontend_slots.capability_context.as_deref(),
+            collaboration_prompt.as_deref(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(agent_id = %agent_id, error = %error.message, "chat_message: capability context skipped due to error");
+                (
+                    None,
+                    AgentCapabilitySnapshot::default(),
+                    vec!["backend:capability_context:error".to_string()],
+                )
+            }
+        };
 
     let session_ctx = ensure_switched_to_session_target(
         &state,
@@ -13848,18 +15082,46 @@ pub async fn chat_message(
     .await?;
     let session_path = format!("/api/agents/{agent_id}/session");
     let current_session = state.openfang.get_json(&session_path).await.ok();
-    let include_prompt_blocks = should_inject_prompt_blocks_for_session(current_session.as_ref());
+    let _include_prompt_blocks = should_inject_prompt_blocks_for_session(current_session.as_ref());
 
-    let guarded_message = apply_system_prompt_guard(
+    let memory_context = semantic_memory_context
+        .as_ref()
+        .map(|item| item.prompt.clone());
+    let (envelope, mut prompt_debug) = compose_prompt_context_envelope(
+        &agent_id,
         &payload.message,
-        system_prompt.as_deref(),
-        collaboration_prompt.as_deref(),
-        semantic_memory_context
-            .as_ref()
-            .map(|item| item.prompt.as_str()),
-        include_prompt_blocks,
+        payload.raw_user_message.as_deref(),
+        parsed_frontend_slots,
+        Some(daily_opening_context.temporal_context.clone()),
+        daily_opening_context.opening_context.clone(),
+        identity_context,
+        memory_context,
+        capability_context,
     );
-    let outgoing_message = ensure_visible_reply_for_chat_turn(&guarded_message);
+    if daily_opening_context.is_first_chat_today_with_agent {
+        tracing::info!(
+            agent_id = %agent_id,
+            include_bootstrap,
+            "chat_message: first effective chat today detected for current agent"
+        );
+    }
+    prompt_debug.capability_sources = capability_sources;
+    prompt_debug.available_skills = capability_snapshot.enabled_skills.clone();
+    prompt_debug.available_mcp_servers = capability_snapshot.enabled_mcp_servers.clone();
+    prompt_debug.available_capabilities = capability_snapshot.enabled_capabilities.clone();
+    prompt_debug.blocked_tools = capability_snapshot.blocked_tools.clone();
+    let rendered_prompt = render_prompt_context_envelope(&envelope);
+    prompt_debug.prompt_total_bytes = rendered_prompt.bytes;
+    prompt_debug.prompt_slot_sizes = rendered_prompt.slot_sizes.clone();
+    if prompt_debug.prompt_total_bytes >= OPENFANG_PROMPT_WARN_THRESHOLD_BYTES {
+        tracing::warn!(
+            agent_id = %agent_id,
+            prompt_bytes = prompt_debug.prompt_total_bytes,
+            slot_sizes = ?prompt_debug.prompt_slot_sizes,
+            "chat_message: large upstream prompt assembled"
+        );
+    }
+    let outgoing_message = rendered_prompt.message;
     let attachments = build_openfang_attachment_payload(&payload.attachments);
     let request_origin = resolve_upstream_request_origin(
         payload.request_origin.as_deref(),
@@ -13897,6 +15159,17 @@ pub async fn chat_message(
         .as_deref()
         .map(normalize_session_label)
         .filter(|value| !value.is_empty());
+
+    if let Err(error) =
+        maybe_sanitize_current_openfang_session(&state, &agent_id, bound_session_id.as_deref())
+            .await
+    {
+        tracing::warn!(
+            agent_id = %agent_id,
+            error = %error.message,
+            "chat_message: session sanitize skipped due to error"
+        );
+    }
 
     if session_ctx.switched {
         let _ = switch_openfang_session(&state, &agent_id, &session_ctx.original_session_id).await;
@@ -13945,6 +15218,46 @@ pub async fn chat_message(
                 Value::String(session_label.clone()),
             );
         }
+        object.insert(
+            "debugPromptSlots".to_string(),
+            json!(prompt_debug.prompt_slots),
+        );
+        object.insert(
+            "debugPromptSources".to_string(),
+            json!(prompt_debug.prompt_sources),
+        );
+        object.insert(
+            "debugPromptBytes".to_string(),
+            json!(prompt_debug.prompt_total_bytes),
+        );
+        object.insert(
+            "debugPromptSlotSizes".to_string(),
+            json!(prompt_debug.prompt_slot_sizes),
+        );
+        object.insert(
+            "debugHostPolicyLoaded".to_string(),
+            json!(prompt_debug.host_policy_loaded),
+        );
+        object.insert(
+            "debugCapabilitySources".to_string(),
+            json!(prompt_debug.capability_sources),
+        );
+        object.insert(
+            "debugAvailableSkills".to_string(),
+            json!(prompt_debug.available_skills),
+        );
+        object.insert(
+            "debugAvailableMcpServers".to_string(),
+            json!(prompt_debug.available_mcp_servers),
+        );
+        object.insert(
+            "debugAvailableCapabilities".to_string(),
+            json!(prompt_debug.available_capabilities),
+        );
+        object.insert(
+            "debugBlockedTools".to_string(),
+            json!(prompt_debug.blocked_tools),
+        );
     }
 
     Ok(Json(data))
@@ -13972,11 +15285,22 @@ pub async fn chat_message_stream(
     if let Err(err) = maybe_auto_initialize_agent_identity_once(&state, &agent_id).await {
         tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message_stream: auto-init skipped due to error");
     }
-    if let Err(err) = maybe_persist_user_profile_patch(&state, &agent_id, &payload.message).await {
+    let semantic_input_message = payload
+        .raw_user_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(payload.message.as_str())
+        .to_string();
+    if let Err(err) =
+        maybe_persist_user_profile_patch(&state, &agent_id, &semantic_input_message).await
+    {
         tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message_stream: auto-profile skipped due to error");
     }
     let include_bootstrap = should_include_bootstrap_for_turn(&state, &agent_id).await;
-    let system_prompt = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
+    let daily_opening_context = build_daily_opening_context(&state, &agent_id, include_bootstrap).await;
+    remember_agent_seen_today(&agent_id, &current_local_date_key()).await;
+    let identity_context = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
     let collaboration_prompt = match resolve_collaboration_prompt(&state, &agent_id).await {
         Ok(value) => value,
         Err(error) => {
@@ -13987,7 +15311,7 @@ pub async fn chat_message_stream(
     let semantic_memory_context = match resolve_semantic_memory_prompt(
         &state,
         &agent_id,
-        &payload.message,
+        &semantic_input_message,
     )
     .await
     {
@@ -14012,61 +15336,71 @@ pub async fn chat_message_stream(
         session_id: requested_session_id,
         session_label: requested_session_label,
         request_origin: requested_request_origin,
-        current_task_draft: requested_current_task_draft,
         attachments: requested_attachments,
     } = payload;
-    if let Some(task_draft_response) = maybe_resolve_inline_chat_task_draft(
-        &state,
-        &agent_id,
-        &ChatMessageRequest {
-            message: user_message.clone(),
-            raw_user_message: raw_user_message.clone(),
-            session_id: requested_session_id.clone(),
-            session_label: requested_session_label.clone(),
-            request_origin: requested_request_origin.clone(),
-            current_task_draft: requested_current_task_draft.clone(),
-            attachments: requested_attachments.clone(),
-        },
-    )
-    .await
-    {
-        let inline_payload = ChatMessageRequest {
-            message: user_message.clone(),
-            raw_user_message: raw_user_message.clone(),
-            session_id: requested_session_id.clone(),
-            session_label: requested_session_label.clone(),
-            request_origin: requested_request_origin.clone(),
-            current_task_draft: requested_current_task_draft.clone(),
-            attachments: requested_attachments.clone(),
+    let parsed_frontend_slots = parse_frontend_prompt_slots(&user_message);
+    let (capability_context, capability_snapshot, capability_sources) =
+        match resolve_capability_context(
+            &state,
+            &agent_id,
+            parsed_frontend_slots.capability_context.as_deref(),
+            collaboration_prompt.as_deref(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(agent_id = %agent_id, error = %error.message, "chat_message_stream: capability context skipped due to error");
+                (
+                    None,
+                    AgentCapabilitySnapshot::default(),
+                    vec!["backend:capability_context:error".to_string()],
+                )
+            }
         };
-        let (bound_session_id, bound_session_label) =
-            resolve_inline_chat_task_draft_binding(&state, &agent_id, &inline_payload).await;
-        let body = build_inline_chat_task_draft_json(
-            &task_draft_response,
-            bound_session_id.as_deref(),
-            bound_session_label.as_deref(),
-        );
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(8);
-        tokio::spawn(async move {
-            let _ = send_sse_json_event(&tx, "done", body).await;
-        });
-        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-        let body = Body::from_stream(stream);
-        let response = axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/event-stream")
-            .header("cache-control", "no-cache")
-            .body(body)
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        return Ok(response);
-    }
     let openfang = state.openfang.clone();
     let state_for_post_process = state.clone();
     let public_agent_id = public_agent_id;
     let agent_id = agent_id;
     let semantic_memory_context = semantic_memory_context;
+    let memory_context = semantic_memory_context
+        .as_ref()
+        .map(|item| item.prompt.clone());
+    let (envelope, mut prompt_debug) = compose_prompt_context_envelope(
+        &agent_id,
+        &user_message,
+        raw_user_message.as_deref(),
+        parsed_frontend_slots,
+        Some(daily_opening_context.temporal_context.clone()),
+        daily_opening_context.opening_context.clone(),
+        identity_context,
+        memory_context,
+        capability_context,
+    );
+    if daily_opening_context.is_first_chat_today_with_agent {
+        tracing::info!(
+            agent_id = %agent_id,
+            include_bootstrap,
+            "chat_message_stream: first effective chat today detected for current agent"
+        );
+    }
+    prompt_debug.capability_sources = capability_sources;
+    prompt_debug.available_skills = capability_snapshot.enabled_skills.clone();
+    prompt_debug.available_mcp_servers = capability_snapshot.enabled_mcp_servers.clone();
+    prompt_debug.available_capabilities = capability_snapshot.enabled_capabilities.clone();
+    prompt_debug.blocked_tools = capability_snapshot.blocked_tools.clone();
+    let rendered_prompt = render_prompt_context_envelope(&envelope);
+    prompt_debug.prompt_total_bytes = rendered_prompt.bytes;
+    prompt_debug.prompt_slot_sizes = rendered_prompt.slot_sizes.clone();
+    if prompt_debug.prompt_total_bytes >= OPENFANG_PROMPT_WARN_THRESHOLD_BYTES {
+        tracing::warn!(
+            agent_id = %agent_id,
+            prompt_bytes = prompt_debug.prompt_total_bytes,
+            slot_sizes = ?prompt_debug.prompt_slot_sizes,
+            "chat_message_stream: large upstream prompt assembled"
+        );
+    }
+    let outgoing_message = rendered_prompt.message;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(128);
     tokio::spawn(async move {
@@ -14167,6 +15501,22 @@ pub async fn chat_message_stream(
             .as_deref()
             .map(normalize_session_label)
             .filter(|value| !value.is_empty());
+        let sanitize_and_restore = || async {
+            if let Err(error) = maybe_sanitize_current_openfang_session(
+                &state_for_post_process,
+                &agent_id,
+                bound_session_id.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %error.message,
+                    "chat_message_stream: session sanitize skipped due to error"
+                );
+            }
+            restore_original_session().await;
+        };
 
         let session_ready_detail = if session_ctx.switched {
             Some(format!(
@@ -14197,18 +15547,6 @@ pub async fn chat_message_stream(
             return;
         }
 
-        let include_prompt_blocks =
-            should_inject_prompt_blocks_for_session(current_session.as_ref());
-        let guarded_message = apply_system_prompt_guard(
-            &user_message,
-            system_prompt.as_deref(),
-            collaboration_prompt.as_deref(),
-            semantic_memory_context
-                .as_ref()
-                .map(|item| item.prompt.as_str()),
-            include_prompt_blocks,
-        );
-        let outgoing_message = ensure_visible_reply_for_chat_turn(&guarded_message);
         let attachments = build_openfang_attachment_payload(&requested_attachments);
         let request_origin = resolve_upstream_request_origin(
             requested_request_origin.as_deref(),
@@ -14223,6 +15561,27 @@ pub async fn chat_message_stream(
             &tx,
             "upstream_connecting",
             Some("会话已准备完成，正在连接上游模型流。".to_string()),
+        )
+        .await
+        {
+            restore_and_cleanup().await;
+            return;
+        }
+        if !send_sse_json_event(
+            &tx,
+            "prompt_debug",
+            json!({
+                "debugPromptSlots": prompt_debug.prompt_slots,
+                "debugPromptSources": prompt_debug.prompt_sources,
+                "debugPromptBytes": prompt_debug.prompt_total_bytes,
+                "debugPromptSlotSizes": prompt_debug.prompt_slot_sizes,
+                "debugHostPolicyLoaded": prompt_debug.host_policy_loaded,
+                "debugCapabilitySources": prompt_debug.capability_sources,
+                "debugAvailableSkills": prompt_debug.available_skills,
+                "debugAvailableMcpServers": prompt_debug.available_mcp_servers,
+                "debugAvailableCapabilities": prompt_debug.available_capabilities,
+                "debugBlockedTools": prompt_debug.blocked_tools,
+            }),
         )
         .await
         {
@@ -14280,51 +15639,83 @@ pub async fn chat_message_stream(
         let mut upstream_done_input_tokens: Option<u64> = None;
         let mut upstream_done_output_tokens: Option<u64> = None;
         let message = outgoing_message;
+        let heartbeat_interval = Duration::from_secs(STREAM_PROXY_HEARTBEAT_INTERVAL_SECS);
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_forwarded_at = Instant::now();
 
-        while let Some(chunk) = upstream_stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    if tx.send(Ok(bytes.clone())).await.is_err() {
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if last_forwarded_at.elapsed() < heartbeat_interval {
+                        continue;
+                    }
+                    if !send_sse_json_event(
+                        &tx,
+                        "heartbeat",
+                        json!({
+                            "alive": true,
+                            "stage": "upstream_waiting",
+                            "idle_seconds": last_forwarded_at.elapsed().as_secs(),
+                        }),
+                    )
+                    .await
+                    {
                         restore_and_cleanup().await;
                         return;
                     }
+                    last_forwarded_at = Instant::now();
+                }
+                maybe_chunk = upstream_stream.next() => {
+                    let Some(chunk) = maybe_chunk else {
+                        break;
+                    };
+                    match chunk {
+                        Ok(bytes) => {
+                            if tx.send(Ok(bytes.clone())).await.is_err() {
+                                restore_and_cleanup().await;
+                                return;
+                            }
+                            last_forwarded_at = Instant::now();
 
-                    frame_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some((index, delimiter_len)) = find_sse_frame_boundary(&frame_buffer)
-                    {
-                        let frame = frame_buffer[..index].to_string();
-                        frame_buffer = frame_buffer[index + delimiter_len..].to_string();
+                            frame_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            while let Some((index, delimiter_len)) = find_sse_frame_boundary(&frame_buffer)
+                            {
+                                let frame = frame_buffer[..index].to_string();
+                                frame_buffer = frame_buffer[index + delimiter_len..].to_string();
 
-                        if let Some((event_name, data)) = parse_sse_event_frame(&frame) {
-                            if event_name == "chunk" || event_name == "message" {
-                                append_renderable_stream_text(&mut streamed_text, &data);
-                            }
-                            if event_name == "tool_result" {
-                                saw_tool_result = true;
-                            }
-                            if event_name == "error" {
-                                saw_upstream_error = true;
-                            }
-                            if event_name == "done" {
-                                saw_upstream_done = true;
-                                let (input_tokens, output_tokens) =
-                                    extract_done_usage_tokens(&data);
-                                if input_tokens.is_some() {
-                                    upstream_done_input_tokens = input_tokens;
+                                if let Some((event_name, data)) = parse_sse_event_frame(&frame) {
+                                    if event_name == "chunk" || event_name == "message" {
+                                        append_renderable_stream_text(&mut streamed_text, &data);
+                                    }
+                                    if event_name == "tool_result" {
+                                        saw_tool_result = true;
+                                    }
+                                    if event_name == "error" {
+                                        saw_upstream_error = true;
+                                    }
+                                    if event_name == "done" {
+                                        saw_upstream_done = true;
+                                        let (input_tokens, output_tokens) =
+                                            extract_done_usage_tokens(&data);
+                                        if input_tokens.is_some() {
+                                            upstream_done_input_tokens = input_tokens;
+                                        }
+                                        if output_tokens.is_some() {
+                                            upstream_done_output_tokens = output_tokens;
+                                        }
+                                        append_renderable_stream_text(&mut streamed_text, &data);
+                                    }
                                 }
-                                if output_tokens.is_some() {
-                                    upstream_done_output_tokens = output_tokens;
-                                }
-                                append_renderable_stream_text(&mut streamed_text, &data);
                             }
                         }
+                        Err(err) => {
+                            let _ = send_sse_json_event(&tx, "error", json!({ "error": err.to_string() }))
+                                .await;
+                            restore_and_cleanup().await;
+                            return;
+                        }
                     }
-                }
-                Err(err) => {
-                    let _ = send_sse_json_event(&tx, "error", json!({ "error": err.to_string() }))
-                        .await;
-                    restore_and_cleanup().await;
-                    return;
                 }
             }
         }
@@ -14339,7 +15730,7 @@ pub async fn chat_message_stream(
                 &final_streamed_text,
             )
             .await;
-            restore_original_session().await;
+            sanitize_and_restore().await;
             return;
         }
 
@@ -14384,7 +15775,7 @@ pub async fn chat_message_stream(
                     &text,
                 )
                 .await;
-                restore_original_session().await;
+                sanitize_and_restore().await;
                 return;
             }
         }
@@ -14430,7 +15821,7 @@ pub async fn chat_message_stream(
                 }),
             )
             .await;
-            restore_original_session().await;
+            sanitize_and_restore().await;
             return;
         }
 
@@ -14439,7 +15830,7 @@ pub async fn chat_message_stream(
                 agent_id = %agent_id,
                 "chat stream finished with tool_result only; skipping empty-stream error"
             );
-            restore_original_session().await;
+            sanitize_and_restore().await;
             return;
         }
 
@@ -14448,7 +15839,7 @@ pub async fn chat_message_stream(
                 agent_id = %agent_id,
                 "chat stream finished with upstream error event; skipping empty-stream error"
             );
-            restore_original_session().await;
+            sanitize_and_restore().await;
             return;
         }
 
@@ -14465,7 +15856,7 @@ pub async fn chat_message_stream(
         )
         .await;
 
-        restore_original_session().await;
+        sanitize_and_restore().await;
     });
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
@@ -14910,10 +16301,7 @@ async fn probe_model_via_chat_completion(
                     format!("HTTP {status}")
                 } else {
                     let snippet: String = body.chars().take(200).collect();
-                    format!(
-                        "HTTP {status}: {}",
-                        snippet
-                    )
+                    format!("HTTP {status}: {}", snippet)
                 };
             }
             Err(err) => {
@@ -17620,9 +19008,12 @@ fn resolve_notification_targets(
     match binding.channel_type.as_str() {
         "telegram" => read_string_list(config.and_then(|value| value.get("allowed_users"))),
         "qqbot" | "whatsapp" => {
-            let mut targets = read_string_list(config.and_then(|value| value.get("default_targets")));
+            let mut targets =
+                read_string_list(config.and_then(|value| value.get("default_targets")));
             if targets.is_empty() {
-                if let Some(target) = read_string(config.and_then(|value| value.get("default_target"))) {
+                if let Some(target) =
+                    read_string(config.and_then(|value| value.get("default_target")))
+                {
                     targets = split_notification_targets(Some(target.as_str()));
                 }
             }
@@ -18019,10 +19410,7 @@ async fn send_qqbot_notification(
     Ok(delivered)
 }
 
-async fn send_whatsapp_notification(
-    targets: &[String],
-    text: &str,
-) -> Result<Vec<String>, String> {
+async fn send_whatsapp_notification(targets: &[String], text: &str) -> Result<Vec<String>, String> {
     let gateway_url = env::var("WHATSAPP_GATEWAY_URL")
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -18180,7 +19568,9 @@ pub async fn send_channel_notification(
     let rendered = notification_text(title, message, payload.level.as_deref());
     let delivery_result = match binding.as_ref() {
         Some(binding) => dispatch_channel_notification(binding, &targets, &rendered).await,
-        None if resolved_channel == "whatsapp" => send_whatsapp_notification(&targets, &rendered).await,
+        None if resolved_channel == "whatsapp" => {
+            send_whatsapp_notification(&targets, &rendered).await
+        }
         None => Err(format!("暂不支持的渠道类型: {resolved_channel}")),
     };
     match delivery_result {
@@ -18948,4 +20338,5 @@ mod tests {
         assert!(parse_http_byte_range_header("items=0-1", 1_000).is_err());
         assert!(parse_http_byte_range_header("bytes=0-1,4-5", 1_000).is_err());
     }
+
 }

@@ -17,6 +17,7 @@ import {
 } from '@/services/management-client';
 import { listChatGroups } from '@/services/group-client';
 import type { ChatGroup } from '@/types/group';
+import { buildAgentLastUsedMap, sortAgentsByLastUsed } from '@/services/agent-recency';
 
 const HIDDEN_COLLAB_TAGS = new Set(['webot:collab_discoverable', 'webot:collab_dispatcher']);
 
@@ -24,11 +25,15 @@ function filterCollaborationTags(tags: string[]): string[] {
   return tags.filter((tag) => !HIDDEN_COLLAB_TAGS.has(tag.trim().toLowerCase()));
 }
 
-function formatOutputTime(lastOutputAt?: string): string {
-  if (!lastOutputAt) return '';
-  const parsed = new Date(lastOutputAt);
+function formatRecentUsedTime(lastUsedAt?: number): string {
+  if (!lastUsedAt || !Number.isFinite(lastUsedAt)) return '';
+  const parsed = new Date(lastUsedAt);
   if (Number.isNaN(parsed.getTime())) return '';
-  return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const now = new Date();
+  const isSameDay = parsed.toDateString() === now.toDateString();
+  return parsed.toLocaleString([], isSameDay
+    ? { hour: '2-digit', minute: '2-digit' }
+    : { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
 function mapStateToStatus(state: string): Agent['status'] {
@@ -97,7 +102,7 @@ export function HomePage() {
   const { t } = useTranslation();
   const { activeTab } = useHomeTab();
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [lastOutputAtMap] = useState<Record<string, string>>({});
+  const [lastUsedAtMap, setLastUsedAtMap] = useState<Record<string, number>>({});
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [tasksLoadError, setTasksLoadError] = useState('');
@@ -119,7 +124,10 @@ export function HomePage() {
           const rows = await listManagementAgents();
           if (cancelled) return;
           if (rows.length > 0 || attempt === retryDelays.length) {
-            setAgents(rows.map(mapSummaryToAgent));
+            const mappedAgents = rows.map(mapSummaryToAgent);
+            const nextLastUsedAtMap = buildAgentLastUsedMap(mappedAgents.map((agent) => agent.id));
+            setLastUsedAtMap(nextLastUsedAtMap);
+            setAgents(sortAgentsByLastUsed(mappedAgents, nextLastUsedAtMap));
             setAgentsLoading(false);
             return;
           }
@@ -380,11 +388,11 @@ export function HomePage() {
                 <div className="pt-4 mt-auto border-t border-border/10 w-full flex flex-col items-center shrink-0 relative z-30 opacity-0 group-hover:opacity-100 translate-y-4 group-hover:translate-y-0 transition-all duration-500 delay-100">
                   <StatusIndicator agent={agent} />
                   {(() => {
-                    const outputTime = formatOutputTime(lastOutputAtMap[agent.id]);
-                    if (!outputTime) return null;
+                    const recentUsedTime = formatRecentUsedTime(lastUsedAtMap[agent.id]);
+                    if (!recentUsedTime) return null;
                     return (
                       <p className="mt-2 text-[10px] text-muted-foreground/50 text-center px-2 font-mono">
-                        {t('home.recentOutput', { time: outputTime })}
+                        {t('home.recentUsed', { time: recentUsedTime })}
                       </p>
                     );
                   })()}

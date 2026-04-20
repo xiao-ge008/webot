@@ -166,6 +166,10 @@ const COMPONENT_TYPE_ALIASES: Record<string, string> = {
   profilecard: 'ProfileIntroCard',
   profile_intro_card: 'ProfileIntroCard',
   profile_intro: 'ProfileIntroCard',
+  groupupgrade: 'GroupUpgradeCard',
+  group_upgrade: 'GroupUpgradeCard',
+  'group.upgrade': 'GroupUpgradeCard',
+  'group-upgrade': 'GroupUpgradeCard',
 };
 
 const RESPONSE_WRAPPER_TYPES = new Set(['response', 'done', 'response_fallback', 'response_tool_fallback', 'response_retry_fallback']);
@@ -173,8 +177,9 @@ const UI_JSON_OPEN_TAG_PATTERN = /<ui[-_]json>/i;
 const UI_JSON_BLOCK_PATTERN = /<ui[-_]json>\s*([\s\S]*?)\s*<\/ui[-_]json>/gi;
 const TOOL_CALL_TAG_PATTERN = /<\/?(?:[a-z0-9_.-]+:)?tool_call\b[^>]*>/gi;
 const TOOL_CALL_OPEN_WITH_CONTENT_PATTERN = /<(?:[a-z0-9_.-]+:)?tool_call>\s*=?\s*[^\n\r]*/gi;
-const LEGACY_COMPONENT_TAG_PATTERN = /<([a-z][a-z0-9_-]*)(\s+[\s\S]*?)(?:>|(?=\s*<\/\1>))\s*<\/\1>/gi;
+const LEGACY_COMPONENT_TAG_PATTERN = /<([A-Za-z][A-Za-z0-9_-]*)(\s+[\s\S]*?)(?:>|(?=\s*<\/\1>))\s*<\/\1>/gi;
 const LEGACY_COMPONENT_ATTRIBUTE_PATTERN = /([A-Za-z_:][\w:.-]*)\s*=\s*("([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s"'=<>`]+))/g;
+const STRUCTURED_COMPONENT_BLOCK_PATTERN = /<([A-Za-z][A-Za-z0-9_-]*)>\s*([\s\S]*?)\s*<\/\1>/gi;
 const COMMON_HTML_TAG_NAMES = new Set([
   'a',
   'article',
@@ -240,6 +245,18 @@ type LegacyComponentTagMatch = {
   tagName: string;
 };
 
+type StructuredComponentBlockMatch = {
+  content: string;
+  end: number;
+  fullMatch: string;
+  start: number;
+  tagName: string;
+};
+
+const STRUCTURED_COMPONENT_TAG_TYPES: Record<string, string> = {
+  groupupgrade: 'GroupUpgradeCard',
+};
+
 export function isRecordValue(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -252,7 +269,7 @@ function isLikelyLegacyComponentTagName(tagName: string): boolean {
   const normalized = tagName.trim().toLowerCase();
   if (!normalized) return false;
   if (COMMON_HTML_TAG_NAMES.has(normalized)) return false;
-  return /^[a-z][a-z0-9_-]*$/.test(normalized);
+  return /^[A-Za-z][A-Za-z0-9_-]*$/.test(tagName.trim());
 }
 
 function decodeLegacyAttributeValue(raw: string): string {
@@ -292,6 +309,63 @@ function parseLegacyComponentAttributes(attributesText: string): Record<string, 
   }
 
   return attributes;
+}
+
+function normalizeStructuredFieldName(rawName: string): string {
+  return rawName.replace(/[:._-]+([a-zA-Z0-9])/g, (_, char: string) => char.toUpperCase());
+}
+
+function normalizeStructuredComponentTagName(tagName: string): string {
+  return tagName.trim().toLowerCase().replace(/[\s_.-]+/g, '');
+}
+
+function coerceStructuredComponentValue(raw: string): unknown {
+  const trimmed = decodeLegacyAttributeValue(raw.trim());
+  if (!trimmed) {
+    return '';
+  }
+  const parsed = parseJsonSafely<unknown>(trimmed);
+  if (parsed !== null) {
+    return parsed;
+  }
+  if (/^(?:true|false)$/i.test(trimmed)) {
+    return trimmed.toLowerCase() === 'true';
+  }
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+  return trimmed;
+}
+
+function parseStructuredComponentFields(content: string): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  let match: RegExpExecArray | null;
+  STRUCTURED_COMPONENT_BLOCK_PATTERN.lastIndex = 0;
+
+  while ((match = STRUCTURED_COMPONENT_BLOCK_PATTERN.exec(content)) !== null) {
+    const rawName = (match[1] || '').trim();
+    if (!rawName) {
+      continue;
+    }
+    const fieldName = normalizeStructuredFieldName(rawName);
+    const value = coerceStructuredComponentValue(match[2] || '');
+    const previous = fields[fieldName];
+    if (previous === undefined) {
+      fields[fieldName] = value;
+      continue;
+    }
+    if (Array.isArray(previous)) {
+      previous.push(value);
+      fields[fieldName] = previous;
+      continue;
+    }
+    fields[fieldName] = [previous, value];
+  }
+
+  return fields;
 }
 
 function legacyTagNameToComponentType(tagName: string): string {
@@ -348,6 +422,31 @@ function findLegacyComponentTagMatches(raw: string): LegacyComponentTagMatch[] {
   return matches;
 }
 
+function findStructuredComponentBlockMatches(raw: string): StructuredComponentBlockMatch[] {
+  const matches: StructuredComponentBlockMatch[] = [];
+  let match: RegExpExecArray | null;
+  STRUCTURED_COMPONENT_BLOCK_PATTERN.lastIndex = 0;
+
+  while ((match = STRUCTURED_COMPONENT_BLOCK_PATTERN.exec(raw)) !== null) {
+    const tagName = (match[1] || '').trim();
+    const normalizedTagName = normalizeStructuredComponentTagName(tagName);
+    if (!STRUCTURED_COMPONENT_TAG_TYPES[normalizedTagName]) {
+      continue;
+    }
+    const fullMatch = match[0] || '';
+    const start = match.index;
+    matches.push({
+      content: match[2] || '',
+      end: start + fullMatch.length,
+      fullMatch,
+      start,
+      tagName,
+    });
+  }
+
+  return matches;
+}
+
 function buildLegacyComponentSpec(tagName: string, attributesText: string): unknown | undefined {
   const type = canonicalizeComponentType(legacyTagNameToComponentType(tagName));
   if (!type || NON_UI_TYPES.has(type.toLowerCase())) {
@@ -364,6 +463,19 @@ function buildLegacyComponentSpec(tagName: string, attributesText: string): unkn
   };
 }
 
+function buildStructuredComponentSpec(tagName: string, content: string): unknown | undefined {
+  const type = STRUCTURED_COMPONENT_TAG_TYPES[normalizeStructuredComponentTagName(tagName)];
+  if (!type || NON_UI_TYPES.has(type.toLowerCase())) {
+    return undefined;
+  }
+
+  const props = parseStructuredComponentFields(content);
+  return {
+    type,
+    props,
+  };
+}
+
 function extractLegacyComponentSpecs(raw: string): { matches: LegacyComponentTagMatch[]; specs: unknown[] } {
   const matches = findLegacyComponentTagMatches(raw);
   if (matches.length === 0) {
@@ -377,8 +489,37 @@ function extractLegacyComponentSpecs(raw: string): { matches: LegacyComponentTag
   return { matches, specs };
 }
 
+function extractStructuredComponentSpecs(raw: string): { matches: StructuredComponentBlockMatch[]; specs: unknown[] } {
+  const matches = findStructuredComponentBlockMatches(raw);
+  if (matches.length === 0) {
+    return { matches: [], specs: [] };
+  }
+
+  const specs = matches
+    .map((match) => normalizeUiSpecCandidate(buildStructuredComponentSpec(match.tagName, match.content)))
+    .filter((item): item is unknown => item !== undefined);
+
+  return { matches, specs };
+}
+
 function stripLegacyComponentTags(raw: string): string {
   const matches = findLegacyComponentTagMatches(raw);
+  if (matches.length === 0) {
+    return raw;
+  }
+
+  let cursor = 0;
+  let output = '';
+  for (const match of matches) {
+    output += raw.slice(cursor, match.start);
+    cursor = match.end;
+  }
+  output += raw.slice(cursor);
+  return output;
+}
+
+function stripStructuredComponentTags(raw: string): string {
+  const matches = findStructuredComponentBlockMatches(raw);
   if (matches.length === 0) {
     return raw;
   }
@@ -1382,6 +1523,11 @@ export function findUiBoundary(raw: string): number {
     implicitCandidates.push(legacyMatches[0].start);
   }
 
+  const structuredMatches = findStructuredComponentBlockMatches(raw);
+  if (structuredMatches.length > 0) {
+    implicitCandidates.push(structuredMatches[0].start);
+  }
+
   if (implicitCandidates.length === 0) return -1;
   const best = Math.min(...implicitCandidates);
   if (raw.slice(best, best + 3) === '```') {
@@ -1795,7 +1941,9 @@ export function cleanupAssistantText(rawText: string, spec?: unknown): string {
   const withoutUiBlock = withoutThinking
     .replace(/<ui[-_]json>[\s\S]*?<\/ui[-_]json>/gi, '')
     .replace(/<ui[-_]json>[\s\S]*$/gi, '');
-  const slicedByBoundary = spec ? stripLegacyComponentTags(withoutUiBlock) : withoutUiBlock;
+  const slicedByBoundary = spec
+    ? stripStructuredComponentTags(stripLegacyComponentTags(withoutUiBlock))
+    : withoutUiBlock;
   const text = sanitizeAssistantText(slicedByBoundary);
   if (!text) return '';
   if (!spec) return text;
@@ -1823,6 +1971,9 @@ export function cleanupAssistantText(rawText: string, spec?: unknown): string {
     'markdownpreviewcard',
     'jobprogresscard',
   ]).has(specType);
+  if (specType === 'optionselector') {
+    return stripMarkdownOptionSelectorText(cleaned);
+  }
   if (!shouldStripAssetMarkdown) {
     return cleaned;
   }
@@ -1913,6 +2064,175 @@ export function buildRenderableSpecFromMarkdownMedia(rawText: string): unknown |
   };
 }
 
+type MarkdownOptionEntry = {
+  id: string;
+  label: string;
+  hint: string;
+  prompt: string;
+  value: string;
+  strong: boolean;
+};
+
+type MarkdownOptionSelectorExtraction = {
+  spec: {
+    type: 'OptionSelector';
+    props: {
+      mode: 'single';
+      submitAction: 'submit_option';
+      title: string;
+      description?: string;
+      options: Array<{
+        id: string;
+        label: string;
+        hint: string;
+        prompt: string;
+        value: string;
+      }>;
+    };
+  };
+  startLine: number;
+  endLine: number;
+};
+
+function parseMarkdownOptionLine(rawLine: string, index: number): MarkdownOptionEntry | null {
+  const original = rawLine.trim();
+  if (!original) {
+    return null;
+  }
+
+  let content = original;
+  let strong = false;
+
+  if (/^[【\[]/.test(content)) {
+    strong = true;
+  }
+
+  const listPrefixMatch = content.match(/^(?:[-*•]\s+|\d{1,2}[.)、]\s+|[A-Za-z][.)、]\s+)/);
+  if (listPrefixMatch) {
+    strong = true;
+    content = content.slice(listPrefixMatch[0].length).trim();
+  }
+
+  let label = '';
+  let hint = '';
+
+  const bracketMatch = content.match(/^[【\[]\s*([^】\]]{1,40})\s*[】\]]\s*(?:[:：-]\s*(.+))?$/);
+  if (bracketMatch) {
+    label = (bracketMatch[1] || '').trim();
+    hint = (bracketMatch[2] || '').trim();
+  } else {
+    const colonMatch = content.match(/^([^:：]{1,40})\s*[:：]\s*(.+)$/);
+    if (!colonMatch) {
+      return null;
+    }
+    label = (colonMatch[1] || '').trim();
+    hint = (colonMatch[2] || '').trim();
+  }
+
+  label = label.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
+  hint = hint.replace(/^[-:：\s]+/, '').trim();
+  if (!label || label.length > 40) {
+    return null;
+  }
+
+  const finalHint = hint || label;
+  const prompt = finalHint === label ? label : `${label}：${finalHint}`;
+  return {
+    id: `markdown-option-${index + 1}`,
+    label,
+    hint: finalHint,
+    prompt,
+    value: prompt,
+    strong,
+  };
+}
+
+function extractMarkdownOptionSelectorSpec(rawText: string): MarkdownOptionSelectorExtraction | undefined {
+  const text = unwrapResponseEnvelopeText(rawText).trim();
+  if (!text) {
+    return undefined;
+  }
+
+  const lines = text.split(/\r?\n/);
+  for (let start = 0; start < lines.length; start += 1) {
+    const first = parseMarkdownOptionLine(lines[start] || '', 0);
+    if (!first) {
+      continue;
+    }
+
+    const entries: MarkdownOptionEntry[] = [first];
+    let strongCount = first.strong ? 1 : 0;
+    let end = start;
+
+    for (let cursor = start + 1; cursor < lines.length; cursor += 1) {
+      const currentLine = lines[cursor] || '';
+      if (!currentLine.trim()) {
+        end = cursor;
+        continue;
+      }
+      const nextEntry = parseMarkdownOptionLine(currentLine, entries.length);
+      if (!nextEntry) {
+        break;
+      }
+      entries.push(nextEntry);
+      if (nextEntry.strong) {
+        strongCount += 1;
+      }
+      end = cursor;
+    }
+
+    if (entries.length < 2 || entries.length > 8) {
+      continue;
+    }
+    if (strongCount < 2 && entries.length < 3) {
+      continue;
+    }
+
+    const introLines = lines
+      .slice(0, start)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const contextLine = introLines.length > 0 ? introLines[introLines.length - 1] : '';
+    const title = contextLine && contextLine.length <= 36 ? contextLine : '请选择下一步';
+    const description = contextLine && contextLine.length > 36 && contextLine.length <= 80
+      ? contextLine
+      : undefined;
+
+    return {
+      spec: {
+        type: 'OptionSelector',
+        props: {
+          mode: 'single',
+          submitAction: 'submit_option',
+          title,
+          ...(description ? { description } : {}),
+          options: entries.map((entry) => ({
+            id: entry.id,
+            label: entry.label,
+            hint: entry.hint,
+            prompt: entry.prompt,
+            value: entry.value,
+          })),
+        },
+      },
+      startLine: start,
+      endLine: end,
+    };
+  }
+
+  return undefined;
+}
+
+function stripMarkdownOptionSelectorText(rawText: string): string {
+  const extracted = extractMarkdownOptionSelectorSpec(rawText);
+  if (!extracted) {
+    return rawText;
+  }
+  const lines = rawText.split(/\r?\n/);
+  const kept = lines.filter((_, index) => index < extracted.startLine || index > extracted.endLine);
+  return sanitizeAssistantText(kept.join('\n'));
+}
+
 export function tryParseInlineSpecFromText(rawText: string): unknown | undefined {
   const text = unwrapResponseEnvelopeText(rawText).trim();
   if (!text) return undefined;
@@ -1951,6 +2271,14 @@ export function tryParseInlineSpecFromText(rawText: string): unknown | undefined
     }
   }
 
+  const structuredComponents = extractStructuredComponentSpecs(segment);
+  if (structuredComponents.specs.length > 0) {
+    const mergedStructured = mergeUiSpecs(structuredComponents.specs);
+    if (mergedStructured) {
+      return mergedStructured;
+    }
+  }
+
   const firstJson = extractFirstJsonObject(segment);
   const firstNormalized = firstJson ? normalizeUiSpecCandidate(parseJsonSafely<unknown>(firstJson)) : undefined;
   if (firstNormalized) {
@@ -1963,6 +2291,10 @@ export function tryParseInlineSpecFromText(rawText: string): unknown | undefined
   const mergedAll = mergeUiSpecs(allCandidates);
   if (mergedAll) {
     return mergedAll;
+  }
+  const markdownOptionSpec = extractMarkdownOptionSelectorSpec(text)?.spec;
+  if (markdownOptionSpec) {
+    return markdownOptionSpec;
   }
   const markdownMediaSpec = normalizeUiSpecCandidate(buildRenderableSpecFromMarkdownMedia(text));
   if (markdownMediaSpec) {

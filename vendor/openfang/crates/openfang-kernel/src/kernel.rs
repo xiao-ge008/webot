@@ -1499,13 +1499,14 @@ impl OpenFangKernel {
         quota_scope: SchedulerQuotaScope,
         blocked_tools: Vec<String>,
     ) -> KernelResult<AgentLoopResult> {
-        let (mut rx, join_handle) = self.send_message_streaming_with_quota_scope_and_blocked_tools(
-            agent_id,
-            message,
-            kernel_handle,
-            quota_scope,
-            blocked_tools,
-        )?;
+        let (mut rx, join_handle) = self
+            .send_message_streaming_with_quota_scope_and_blocked_tools(
+                agent_id,
+                message,
+                kernel_handle,
+                quota_scope,
+                blocked_tools,
+            )?;
         let mut streamed_text = String::new();
         while let Some(event) = rx.recv().await {
             if let StreamEvent::TextDelta { text } = event {
@@ -6565,7 +6566,9 @@ impl OpenFangKernel {
             .and_then(|meta| meta.job.next_run.map(|value| value.to_rfc3339()))
     }
 
-    fn managed_task_context_role_label(role: openfang_types::message::Role) -> Option<&'static str> {
+    fn managed_task_context_role_label(
+        role: openfang_types::message::Role,
+    ) -> Option<&'static str> {
         match role {
             openfang_types::message::Role::User => Some("用户"),
             openfang_types::message::Role::Assistant => Some("智能体"),
@@ -6664,7 +6667,13 @@ impl OpenFangKernel {
             lines.push(format!("历史运行次数：{} 次", detail.runtime.run_count));
         }
 
-        if let Some(last_run) = detail.runtime.last_run.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(last_run) = detail
+            .runtime
+            .last_run
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             lines.push(format!("上次运行时间：{last_run}"));
         }
 
@@ -6736,7 +6745,10 @@ impl OpenFangKernel {
         }
 
         if detail.runtime.consecutive_errors > 0 {
-            lines.push(format!("当前连续异常次数：{}", detail.runtime.consecutive_errors));
+            lines.push(format!(
+                "当前连续异常次数：{}",
+                detail.runtime.consecutive_errors
+            ));
         }
 
         if lines.is_empty() {
@@ -6753,16 +6765,25 @@ impl OpenFangKernel {
     ) -> String {
         let trimmed = prompt.trim();
         let mut lines: Vec<String> = Vec::new();
-        if let Some(context) = context_excerpt.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(context) = context_excerpt
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             lines.push("你正在执行一个从聊天中确认下来的任务。先理解下面的原始聊天上下文，再决定如何调用工具和如何执行。".to_string());
             lines.push("不要只看关键词，必须结合上下文语义完成任务。".to_string());
             lines.push("【原聊天上下文】".to_string());
             lines.push(context.to_string());
             lines.push(String::new());
         }
-        if let Some(task_memory) = task_memory_context.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(task_memory) = task_memory_context
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             lines.push("【任务态记忆】".to_string());
-            lines.push("下面是这个任务最近几轮的连续观察状态。先吸收这些状态，再决定本轮是否发生变化。".to_string());
+            lines.push(
+                "下面是这个任务最近几轮的连续观察状态。先吸收这些状态，再决定本轮是否发生变化。"
+                    .to_string(),
+            );
             lines.push(task_memory.to_string());
             lines.push(String::new());
         }
@@ -6895,10 +6916,7 @@ impl OpenFangKernel {
             .unwrap_or_else(|| "-".to_string());
         format!(
             "status={} | alert={} | summary={} | details={}",
-            status,
-            alert,
-            summary,
-            details
+            status, alert, summary, details
         )
     }
 
@@ -7231,7 +7249,8 @@ impl OpenFangKernel {
             };
             detail.runtime.last_error = None;
             detail.runtime.disabled_reason = None;
-            detail.runtime.latest_summary = Some("检测到运行时重启，上次执行被中断，任务已恢复调度。".to_string());
+            detail.runtime.latest_summary =
+                Some("检测到运行时重启，上次执行被中断，任务已恢复调度。".to_string());
             detail.spec.updated_at = Self::managed_task_now();
 
             self.memory
@@ -7733,8 +7752,7 @@ impl OpenFangKernel {
             .memory
             .task_list_runs_managed(task_id)
             .unwrap_or_default();
-        let task_memory_context =
-            Self::build_managed_task_memory_context(&detail, &recent_runs);
+        let task_memory_context = Self::build_managed_task_memory_context(&detail, &recent_runs);
 
         let run_id = uuid::Uuid::new_v4().to_string();
         let start_time = Self::managed_task_now();
@@ -7933,11 +7951,8 @@ impl OpenFangKernel {
                 }
                 let summary =
                     Self::summarize_task_output(&clean_output, "任务执行成功", task_result);
-                let observation_snapshot = Self::build_task_observation_snapshot(
-                    &clean_output,
-                    &summary,
-                    task_result,
-                );
+                let observation_snapshot =
+                    Self::build_task_observation_snapshot(&clean_output, &summary, task_result);
                 detail.runtime.run_count = current_run_no;
                 detail.runtime.consecutive_errors = 0;
                 detail.runtime.last_run = Some(end_time.clone());
@@ -9771,9 +9786,9 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
 mod tests {
     use super::*;
     use openfang_types::tasks::{
-        ManagedTaskAction, ManagedTaskCapabilities, ManagedTaskDeliveryConfig,
-        ManagedTaskDetail, ManagedTaskRuntime, ManagedTaskSchedule, ManagedTaskSourceType,
-        ManagedTaskSpec, ManagedTaskState, ManagedTaskStatus,
+        ManagedTaskAction, ManagedTaskCapabilities, ManagedTaskDeliveryConfig, ManagedTaskDetail,
+        ManagedTaskRuntime, ManagedTaskSchedule, ManagedTaskSourceType, ManagedTaskSpec,
+        ManagedTaskState, ManagedTaskStatus,
     };
     use std::collections::HashMap;
 

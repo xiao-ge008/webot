@@ -115,6 +115,16 @@ function cloneMessage(message: Message): Message {
     debugWatchdogTriggered: undefined,
     debugLastChunkKind: undefined,
     debugLastEvent: undefined,
+    promptDebug: message.promptDebug ? {
+      promptSlots: [...(message.promptDebug.promptSlots ?? [])],
+      promptSources: [...(message.promptDebug.promptSources ?? [])],
+      hostPolicyLoaded: message.promptDebug.hostPolicyLoaded,
+      capabilitySources: [...(message.promptDebug.capabilitySources ?? [])],
+      availableSkills: [...(message.promptDebug.availableSkills ?? [])],
+      availableMcpServers: [...(message.promptDebug.availableMcpServers ?? [])],
+      availableCapabilities: [...(message.promptDebug.availableCapabilities ?? [])],
+      blockedTools: [...(message.promptDebug.blockedTools ?? [])],
+    } : undefined,
   };
 }
 
@@ -521,6 +531,48 @@ function normalizeMessage(raw: unknown, index: number): Message | null {
       .filter((trace): trace is MessageTrace => trace != null);
     if (traces.length > 0) {
       message.toolTrace = traces;
+    }
+  }
+  if (isRecord(item.promptDebug)) {
+    message.promptDebug = {
+      promptSlots: Array.isArray(item.promptDebug.promptSlots) ? item.promptDebug.promptSlots.filter((value): value is string => typeof value === 'string') : undefined,
+      promptSources: Array.isArray(item.promptDebug.promptSources) ? item.promptDebug.promptSources.filter((value): value is string => typeof value === 'string') : undefined,
+      hostPolicyLoaded: typeof item.promptDebug.hostPolicyLoaded === 'boolean' ? item.promptDebug.hostPolicyLoaded : undefined,
+      capabilitySources: Array.isArray(item.promptDebug.capabilitySources) ? item.promptDebug.capabilitySources.filter((value): value is string => typeof value === 'string') : undefined,
+      availableSkills: Array.isArray(item.promptDebug.availableSkills) ? item.promptDebug.availableSkills.filter((value): value is string => typeof value === 'string') : undefined,
+      availableMcpServers: Array.isArray(item.promptDebug.availableMcpServers) ? item.promptDebug.availableMcpServers.filter((value): value is string => typeof value === 'string') : undefined,
+      availableCapabilities: Array.isArray(item.promptDebug.availableCapabilities) ? item.promptDebug.availableCapabilities.filter((value): value is string => typeof value === 'string') : undefined,
+      blockedTools: Array.isArray(item.promptDebug.blockedTools) ? item.promptDebug.blockedTools.filter((value): value is string => typeof value === 'string') : undefined,
+    };
+  } else {
+    const promptSlots = Array.isArray(item.debugPromptSlots) ? item.debugPromptSlots.filter((value): value is string => typeof value === 'string') : undefined;
+    const promptSources = Array.isArray(item.debugPromptSources) ? item.debugPromptSources.filter((value): value is string => typeof value === 'string') : undefined;
+    const capabilitySources = Array.isArray(item.debugCapabilitySources) ? item.debugCapabilitySources.filter((value): value is string => typeof value === 'string') : undefined;
+    const availableSkills = Array.isArray(item.debugAvailableSkills) ? item.debugAvailableSkills.filter((value): value is string => typeof value === 'string') : undefined;
+    const availableMcpServers = Array.isArray(item.debugAvailableMcpServers) ? item.debugAvailableMcpServers.filter((value): value is string => typeof value === 'string') : undefined;
+    const availableCapabilities = Array.isArray(item.debugAvailableCapabilities) ? item.debugAvailableCapabilities.filter((value): value is string => typeof value === 'string') : undefined;
+    const blockedTools = Array.isArray(item.debugBlockedTools) ? item.debugBlockedTools.filter((value): value is string => typeof value === 'string') : undefined;
+    const hostPolicyLoaded = typeof item.debugHostPolicyLoaded === 'boolean' ? item.debugHostPolicyLoaded : undefined;
+    if (
+      promptSlots?.length
+      || promptSources?.length
+      || capabilitySources?.length
+      || availableSkills?.length
+      || availableMcpServers?.length
+      || availableCapabilities?.length
+      || blockedTools?.length
+      || hostPolicyLoaded !== undefined
+    ) {
+      message.promptDebug = {
+        promptSlots,
+        promptSources,
+        hostPolicyLoaded,
+        capabilitySources,
+        availableSkills,
+        availableMcpServers,
+        availableCapabilities,
+        blockedTools,
+      };
     }
   }
   if (isRecord(item.taskCard)) {

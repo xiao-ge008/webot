@@ -39,7 +39,6 @@ import {
 import {
   getAgentSkillAssignments,
 } from "@/services/management-client";
-import type { ChatTaskDraftStatePayload } from "@/services/chat-task-draft-client";
 
 function isTauriRuntime(): boolean {
   if (typeof window === "undefined") {
@@ -712,38 +711,17 @@ function parseSpecFromEventPayload(
   return parseSpecFromText(textCandidate);
 }
 
-function parseTaskDraftMetaFromPayload(
+function parseTaskCardMetaFromPayload(
   payload: Record<string, unknown> | null | undefined,
 ): {
   taskCard?: unknown;
-  taskDraftState?: unknown;
-  taskDraftMatched?: boolean;
-  taskDraftCancelled?: boolean;
-  taskDraftReadyToConfirm?: boolean;
 } {
   if (!payload) {
     return {};
   }
-  const taskDraftMatched = toBooleanValue(
-    payload.task_draft_matched,
-    toBooleanValue(payload.taskDraftMatched, false),
-  );
-  const taskDraftCancelled = toBooleanValue(
-    payload.task_draft_cancelled,
-    toBooleanValue(payload.taskDraftCancelled, false),
-  );
-  const taskDraftReadyToConfirm = toBooleanValue(
-    payload.task_draft_ready_to_confirm,
-    toBooleanValue(payload.taskDraftReadyToConfirm, false),
-  );
-  const taskDraftState = payload.task_draft ?? payload.taskDraftState;
   const taskCard = payload.task_card ?? payload.taskCard;
   return {
     ...(taskCard !== undefined ? { taskCard } : {}),
-    ...(taskDraftState !== undefined ? { taskDraftState } : {}),
-    ...(taskDraftMatched ? { taskDraftMatched } : {}),
-    ...(taskDraftCancelled ? { taskDraftCancelled } : {}),
-    ...(taskDraftReadyToConfirm ? { taskDraftReadyToConfirm } : {}),
   };
 }
 
@@ -770,27 +748,6 @@ function buildOutgoingAttachmentRefs(
       filename: (item.filename || "").trim(),
       content_type: (item.contentType || "").trim(),
     }));
-}
-
-function normalizeOutgoingCurrentTaskDraft(
-  draft: AgentChatInput["currentTaskDraft"] | undefined,
-): Record<string, unknown> | undefined {
-  if (!isRecord(draft)) {
-    return undefined;
-  }
-  const taskDraft = draft as ChatTaskDraftStatePayload;
-  return {
-    objective: taskDraft.objective,
-    report_condition: taskDraft.reportCondition,
-    every_ms: taskDraft.everyMs,
-    max_runs: taskDraft.maxRuns,
-    duration_ms: taskDraft.durationMs,
-    schedule_text: taskDraft.scheduleText,
-    source_message_text: taskDraft.sourceMessageText,
-    created_at: taskDraft.createdAt,
-    missing_slots: taskDraft.missingSlots,
-    ready_to_confirm: taskDraft.readyToConfirm,
-  };
 }
 
 function normalizeSessionLabelComponent(raw: string, maxLen: number): string {
@@ -1263,10 +1220,13 @@ async function buildStructuredPromptContext(
     components.length > 0
       ? `Available custom dynamic components right now: ${components.join(", ")}.`
       : "No custom dynamic component is currently available.",
-    "Use plain Markdown unless a valid UI block is required.",
+    "Use plain Markdown for ordinary prose, but interactive choices must be rendered as A2UI cards.",
     "Custom dynamic UI components are compatibility-only local render helpers; they are not the primary capability protocol.",
     "Prefer runtime tools and standardized `presentable_result` / `job_result`; only use UI_JSON when an explicit local interactive card is truly required.",
     "Standard media/document outputs are provided by runtime `presentable_result`; do not synthesize preview cards in UI_JSON.",
+    "If you are presenting next-step choices, branching paths, candidate actions, confirm/cancel decisions, or any list meant to be clicked in app/web/desktop/gui chat, do not output a Markdown list. Output a single OptionSelector card instead.",
+    'For an OptionSelector card, use `{"type":"OptionSelector","props":{"mode":"single","submitAction":"submit_option","title":"...","description":"...","options":[{"label":"...","hint":"...","prompt":"...","value":"..."}]}}`.',
+    "Every option in OptionSelector must include label, hint, prompt, and value. The prompt must be a complete natural-language instruction that can be sent back directly after the user clicks.",
     "When using UI_JSON, each block must contain exactly one complete valid JSON object and nothing else.",
     "Never output response envelopes, result JSON, tool_call XML, YAML, comments, explanations about the schema, or any wrapper object around the UI object.",
     "If you output UI_JSON, it must be directly parseable by JSON.parse without any preprocessing and must use ASCII punctuation.",
@@ -1281,13 +1241,17 @@ async function buildStructuredPromptContext(
     "[system:reasoning-flow]",
     "Before producing the final answer, internally organize your work in this order and keep the chain coherent across the whole turn.",
     "Step 0. Connection/bootstrap: recognize the current chat request has started, note any frontend-provided UI/runtime context, and treat it as part of the execution environment.",
-    "Step 1. Identity check: first determine who you are in this turn, your current identity boundary, and whether the interaction is roleplay, simulation, or real-world task handling.",
-    "Step 2. User intent understanding: deeply understand the user's semantics, emotional state, hidden expectations, and the concrete outcome they actually want.",
-    "Step 3. Memory recall: proactively recall relevant memory, summarize what memory returned, and integrate it into the next action instead of ignoring it.",
-    "Step 4. Tool reasoning: when tools are needed, decide which tools to call, inspect what they returned, and ground the answer in those returned results.",
-    "Step 5. Render/output decision: before finalizing, decide what client you are in, what output format is most suitable, whether A2UI/json-render should be used, and what the final visible output should look like.",
+    "Step 1. Time grounding: first locate the current local time context, including local date, local clock time, weekday, timezone, date key, and whether this is the current agent's first effective chat today.",
+    "Step 2. Identity check: after time grounding, determine who you are in this turn, your current identity boundary, and whether the interaction is roleplay, simulation, or real-world task handling.",
+    "Step 3. User intent understanding: deeply understand the user's semantics, emotional state, hidden expectations, and the concrete outcome they actually want.",
+    "Step 4. Memory recall: proactively recall relevant memory, summarize what memory returned, and integrate it into the next action instead of ignoring it.",
+    "Step 5. Tool reasoning: when tools are needed, decide which tools to call, inspect what they returned, and ground the answer in those returned results.",
+    "Step 6. Render/output decision: before finalizing, decide what client you are in, what output format is most suitable, whether A2UI/json-render should be used, and what the final visible output should look like.",
+    "If this is the current agent's first effective chat today, apply a light opening protocol: greet naturally, acknowledge the time context, optionally mention 1-2 brief continuity cues, then decide whether to ask what to do next or to directly execute the user's explicit task.",
+    "If the user's first line is only a greeting, 'continue', '在吗', or another open-ended opener, use the opening protocol and then ask what they want to push forward today.",
+    "If the user's first line already contains a clear task or question, at most give one light greeting or continuity cue and then answer directly; do not bounce the task back with an unnecessary follow-up.",
     "Do not expose this full internal chain verbatim unless the product explicitly asks for it, but make your reasoning and tool choices actually follow this structure.",
-    "If the model supports hidden reasoning text or `<think>` blocks, keep the chain observable with compact private checkpoints in this exact style when you reach each stage: `[stage:identity] ...`, `[stage:intent] ...`, `[stage:memory] ...`, `[stage:tools] ...`, `[stage:render] ...`.",
+    "If the model supports hidden reasoning text or `<think>` blocks, keep the chain observable with compact private checkpoints in this exact style when you reach each stage: `[stage:time] ...`, `[stage:identity] ...`, `[stage:intent] ...`, `[stage:memory] ...`, `[stage:tools] ...`, `[stage:render] ...`.",
     "Each private checkpoint should be 1-2 short lines, concrete, and consistent with the actual next action. Do not leak these stage markers into the final visible answer outside hidden reasoning or tool logs.",
   ].join("\n");
 
@@ -2021,11 +1985,7 @@ async function sendAgentChatStreamOnce(
     const sessionLabel =
       typeof input.sessionLabel === "string" ? input.sessionLabel.trim() : "";
     const requestOrigin = input.requestOrigin;
-    const currentTaskDraft = input.currentTaskDraft;
-    const outgoingCurrentTaskDraft = normalizeOutgoingCurrentTaskDraft(
-      currentTaskDraft,
-    );
-    let taskDraftMeta: ReturnType<typeof parseTaskDraftMetaFromPayload> = {};
+    let taskCardMeta: ReturnType<typeof parseTaskCardMetaFromPayload> = {};
 
     // 聊天统一走 service-rs SSE 代理，避免桌面端直连 OpenFang WS 时绕过
     // blocked_tools、聊天安全守卫与会话绑定逻辑。
@@ -2046,6 +2006,10 @@ async function sendAgentChatStreamOnce(
               .toLowerCase();
             const parsedPayload = parseJsonSafely<unknown>(frame.data);
             const payload = isRecord(parsedPayload) ? parsedPayload : null;
+
+            if (eventName === "heartbeat") {
+              return;
+            }
 
             if (eventName === "chunk" || eventName === "message") {
               const textDelta = payload
@@ -2167,7 +2131,7 @@ async function sendAgentChatStreamOnce(
               clearCompletionAbortTimer();
               restoreDefaultIdleWindow();
               donePayload = payload ?? {};
-              taskDraftMeta = parseTaskDraftMetaFromPayload(payload);
+              taskCardMeta = parseTaskCardMetaFromPayload(payload);
               if (payload) {
                 resolvedSessionId =
                   toStringValue(payload.session_id, resolvedSessionId).trim() ||
@@ -2227,7 +2191,6 @@ async function sendAgentChatStreamOnce(
                 session_id: sessionId || undefined,
                 session_label: sessionLabel || undefined,
                 request_origin: requestOrigin,
-                current_task_draft: outgoingCurrentTaskDraft,
               },
               signal: controller.signal,
             },
@@ -2412,7 +2375,7 @@ async function sendAgentChatStreamOnce(
               clearCompletionAbortTimer();
               restoreDefaultIdleWindow();
               donePayload = payload;
-              taskDraftMeta = parseTaskDraftMetaFromPayload(payload);
+              taskCardMeta = parseTaskCardMetaFromPayload(payload);
               const responseText = toStringValue(payload.content).trim();
               if (responseText) {
                 fullText = responseText;
@@ -2493,7 +2456,6 @@ async function sendAgentChatStreamOnce(
                 raw_user_message: input.message,
                 attachments:
                   attachmentRefs.length > 0 ? attachmentRefs : undefined,
-                current_task_draft: outgoingCurrentTaskDraft,
               },
               signal: controller.signal,
             },
@@ -2504,7 +2466,7 @@ async function sendAgentChatStreamOnce(
             toStringValue(response.content),
           );
           donePayload = response;
-          taskDraftMeta = parseTaskDraftMetaFromPayload(response);
+          taskCardMeta = parseTaskCardMetaFromPayload(response);
           doneSpec = parseSpecFromEventPayload(response);
         }
       }
@@ -2592,12 +2554,11 @@ async function sendAgentChatStreamOnce(
               body: {
                 message: outgoingMessage,
                 raw_user_message: input.message,
-                current_task_draft: outgoingCurrentTaskDraft,
               },
               signal: controller.signal,
             },
           );
-          taskDraftMeta = parseTaskDraftMetaFromPayload(retryResponse);
+          taskCardMeta = parseTaskCardMetaFromPayload(retryResponse);
           const retryText = toStringValue(
             retryResponse.response,
             toStringValue(retryResponse.content),
@@ -2651,7 +2612,7 @@ async function sendAgentChatStreamOnce(
         rawPayload: JSON.stringify(
           donePayload ?? { text: fullText, spec: doneSpec ?? null },
         ),
-        ...taskDraftMeta,
+        ...taskCardMeta,
         ...(appearanceUpdated ? { appearanceUpdated } : {}),
       },
     });
@@ -2662,7 +2623,15 @@ async function sendAgentChatStreamOnce(
       text: fullText,
       uiRawText: extractUiRawText(fullText),
       spec: doneSpec,
-      ...taskDraftMeta,
+      debugPromptSlots: Array.isArray(donePayload?.debugPromptSlots) ? donePayload.debugPromptSlots.filter((value): value is string => typeof value === "string") : undefined,
+      debugPromptSources: Array.isArray(donePayload?.debugPromptSources) ? donePayload.debugPromptSources.filter((value): value is string => typeof value === "string") : undefined,
+      debugHostPolicyLoaded: typeof donePayload?.debugHostPolicyLoaded === "boolean" ? donePayload.debugHostPolicyLoaded : undefined,
+      debugCapabilitySources: Array.isArray(donePayload?.debugCapabilitySources) ? donePayload.debugCapabilitySources.filter((value): value is string => typeof value === "string") : undefined,
+      debugAvailableSkills: Array.isArray(donePayload?.debugAvailableSkills) ? donePayload.debugAvailableSkills.filter((value): value is string => typeof value === "string") : undefined,
+      debugAvailableMcpServers: Array.isArray(donePayload?.debugAvailableMcpServers) ? donePayload.debugAvailableMcpServers.filter((value): value is string => typeof value === "string") : undefined,
+      debugAvailableCapabilities: Array.isArray(donePayload?.debugAvailableCapabilities) ? donePayload.debugAvailableCapabilities.filter((value): value is string => typeof value === "string") : undefined,
+      debugBlockedTools: Array.isArray(donePayload?.debugBlockedTools) ? donePayload.debugBlockedTools.filter((value): value is string => typeof value === "string") : undefined,
+      ...taskCardMeta,
       appearanceUpdated,
       sessionId: resolvedSessionId || undefined,
       sessionLabel: resolvedSessionLabel || undefined,
@@ -2783,9 +2752,6 @@ export async function sendAgentChat(
           ? requestInput.sessionLabel.trim()
           : "";
       const requestOrigin = requestInput.requestOrigin;
-      const outgoingCurrentTaskDraft = normalizeOutgoingCurrentTaskDraft(
-        requestInput.currentTaskDraft,
-      );
       const timeoutMs =
         typeof requestInput.timeoutMs === "number" &&
         Number.isFinite(requestInput.timeoutMs) &&
@@ -2803,7 +2769,6 @@ export async function sendAgentChat(
             session_id: nextSessionId || undefined,
             session_label: nextSessionLabel || undefined,
             request_origin: requestOrigin,
-            current_task_draft: outgoingCurrentTaskDraft,
           },
           signal: controller.signal,
           timeoutMs,
@@ -2811,12 +2776,20 @@ export async function sendAgentChat(
       );
       const body = isRecord(result) ? result : {};
       const content = toStringValue(body.response, toStringValue(body.content));
-      const taskDraftMeta = parseTaskDraftMetaFromPayload(body);
+      const taskCardMeta = parseTaskCardMetaFromPayload(body);
       return {
         success: true,
         content,
         text: content,
-        ...taskDraftMeta,
+        debugPromptSlots: Array.isArray(body.debugPromptSlots) ? body.debugPromptSlots.filter((value): value is string => typeof value === "string") : undefined,
+        debugPromptSources: Array.isArray(body.debugPromptSources) ? body.debugPromptSources.filter((value): value is string => typeof value === "string") : undefined,
+        debugHostPolicyLoaded: typeof body.debugHostPolicyLoaded === "boolean" ? body.debugHostPolicyLoaded : undefined,
+        debugCapabilitySources: Array.isArray(body.debugCapabilitySources) ? body.debugCapabilitySources.filter((value): value is string => typeof value === "string") : undefined,
+        debugAvailableSkills: Array.isArray(body.debugAvailableSkills) ? body.debugAvailableSkills.filter((value): value is string => typeof value === "string") : undefined,
+        debugAvailableMcpServers: Array.isArray(body.debugAvailableMcpServers) ? body.debugAvailableMcpServers.filter((value): value is string => typeof value === "string") : undefined,
+        debugAvailableCapabilities: Array.isArray(body.debugAvailableCapabilities) ? body.debugAvailableCapabilities.filter((value): value is string => typeof value === "string") : undefined,
+        debugBlockedTools: Array.isArray(body.debugBlockedTools) ? body.debugBlockedTools.filter((value): value is string => typeof value === "string") : undefined,
+        ...taskCardMeta,
         sessionId: toStringValue(body.session_id) || undefined,
         sessionLabel: toStringValue(body.session_label) || undefined,
         recoveredRemoteSessionId: toStringValue(body.session_id) || undefined,

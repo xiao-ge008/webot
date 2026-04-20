@@ -251,138 +251,6 @@ function summarizeThinkingDetail(detail?: string): string | undefined {
   return clampLogText(detail);
 }
 
-type SyntheticThinkingStage = 'identity' | 'semantic' | 'render';
-
-const SYNTHETIC_THINKING_STAGE_MARKERS: Record<SyntheticThinkingStage, RegExp[]> = {
-  identity: [
-    /\[stage:(?:identity|role|persona)\]\s*(.+)/gi,
-    /(?:^|\n)\s*step\s*1\b[^\n]*(?:identity|role|persona)[^\n]*[:：-]?\s*(.+)/gi,
-    /(?:^|\n)\s*步骤?\s*1\b[^\n]*(?:身份|角色|边界)[^\n]*[:：-]?\s*(.+)/gi,
-  ],
-  semantic: [
-    /\[stage:(?:intent|semantic|user)\]\s*(.+)/gi,
-    /(?:^|\n)\s*step\s*2\b[^\n]*(?:intent|semantic|user)[^\n]*[:：-]?\s*(.+)/gi,
-    /(?:^|\n)\s*步骤?\s*2\b[^\n]*(?:意图|语义|用户)[^\n]*[:：-]?\s*(.+)/gi,
-  ],
-  render: [
-    /\[stage:(?:render|output)\]\s*(.+)/gi,
-    /(?:^|\n)\s*step\s*5\b[^\n]*(?:render|output|format)[^\n]*[:：-]?\s*(.+)/gi,
-    /(?:^|\n)\s*步骤?\s*5\b[^\n]*(?:渲染|输出|格式)[^\n]*[:：-]?\s*(.+)/gi,
-  ],
-};
-
-const SYNTHETIC_THINKING_STAGE_KEYWORDS: Record<SyntheticThinkingStage, RegExp> = {
-  identity: /身份|角色|persona|identity|边界|扮演|真实世界|当前我是|当前应以/i,
-  semantic: /意图|语义|诉求|目标|情绪|期望|用户想要|隐藏期待/i,
-  render: /渲染|输出|格式|markdown|json|ui|卡片|呈现|最终回答/i,
-};
-
-function normalizeSyntheticThinkingSnippet(value: string): string | undefined {
-  const normalized = value
-    .replace(/^\[(?:stage:[^\]]+)\]\s*/i, '')
-    .replace(/^\s*step\s*\d+\b[^:：-]*[:：-]?\s*/i, '')
-    .replace(/^\s*步骤?\s*\d+\b[^:：-]*[:：-]?\s*/i, '')
-    .trim();
-  if (!normalized) {
-    return undefined;
-  }
-  return clampLogText(normalized, 120);
-}
-
-function splitThinkingEvidenceSegments(detail: string): string[] {
-  return detail
-    .split(/\r?\n+/)
-    .map((segment) => normalizeSyntheticThinkingSnippet(segment))
-    .filter((segment): segment is string => Boolean(segment))
-    .filter((segment) => !isHiddenSystemPromptText(segment));
-}
-
-function extractSyntheticThinkingEvidence(
-  rows: MessageTrace[],
-  stage: SyntheticThinkingStage,
-): string | undefined {
-  const hits: string[] = [];
-  const markerPatterns = SYNTHETIC_THINKING_STAGE_MARKERS[stage];
-  const keywordPattern = SYNTHETIC_THINKING_STAGE_KEYWORDS[stage];
-
-  for (const row of rows) {
-    const detail = (row.detail || '').trim();
-    if (!detail) {
-      continue;
-    }
-
-    for (const pattern of markerPatterns) {
-      const matches = Array.from(detail.matchAll(pattern));
-      for (const match of matches) {
-        const snippet = normalizeSyntheticThinkingSnippet(match[1] || match[0] || '');
-        if (snippet) {
-          hits.push(snippet);
-        }
-      }
-    }
-
-    if (hits.length > 0) {
-      continue;
-    }
-
-    const segments = splitThinkingEvidenceSegments(detail);
-    for (const segment of segments) {
-      if (keywordPattern.test(segment)) {
-        hits.push(segment);
-      }
-    }
-  }
-
-  const unique = Array.from(new Set(hits)).slice(0, 3);
-  return unique.length > 0 ? unique.join('\n') : undefined;
-}
-
-function buildSyntheticThinkingRows(
-  sourceRows: MessageTrace[],
-  stage: SyntheticThinkingStage,
-  title: string,
-  id: string,
-): MessageTrace[] {
-  const detail = extractSyntheticThinkingEvidence(sourceRows, stage);
-  if (!detail) {
-    return [];
-  }
-  return [{
-    id,
-    title,
-    detail,
-    at: sourceRows[0]?.at || new Date().toISOString(),
-  }];
-}
-
-function inferIdentityStageRows(
-  msg: Message,
-  agent: Agent,
-  id: string,
-): MessageTrace[] {
-  const identityName = (msg.agentName || agent.name || agent.title || agent.id).trim();
-  const channel = (msg.debugPromptChannel || 'app').trim();
-  const renderMode = (msg.debugRenderMode || 'json-render').trim();
-  const expertise = agent.expertise.filter(Boolean).slice(0, 2).join('、');
-  const description = agent.description.trim();
-  const summaryParts = [
-    identityName ? `当前以 ${identityName} 的身份处理本轮请求。` : '当前以已选智能体身份处理本轮请求。',
-    `执行环境为 ${channel} 聊天通道，渲染模式 ${renderMode}。`,
-    '按真实任务处理边界响应，不把本轮对话视为纯角色扮演。',
-  ];
-  if (expertise) {
-    summaryParts.push(`当前优先使用的能力侧重：${expertise}。`);
-  } else if (description) {
-    summaryParts.push(clampLogText(`当前身份职责：${description}`, 120));
-  }
-  return [{
-    id,
-    title: '身份判断',
-    detail: summaryParts.join('\n'),
-    at: msg.timestamp || new Date().toISOString(),
-  }];
-}
-
 function summarizeFinalOutput(msg: Message): string | undefined {
   const text = cleanupAssistantText(msg.text || '', msg.spec).trim();
   if (text && !looksLikeProtocolOnlyText(text)) {
@@ -536,6 +404,99 @@ function summarizeConnectionStage(msg: Message): string {
     extra.push(`检测到结构化 UI 数据流，当前 UI 状态：${streamState}。`);
   }
   return extra.join('\n');
+}
+
+function summarizePromptDebugSlotEvidence(msg: Message): string | undefined {
+  const slots = msg.promptDebug?.promptSlots ?? [];
+  const promptSources = msg.promptDebug?.promptSources ?? [];
+  const host = msg.promptDebug?.hostPolicyLoaded;
+  const parts: string[] = [];
+  if (slots.length > 0) {
+    parts.push(`结构化上下文已装配：${slots.join(' -> ')}。`);
+  }
+  if (host === true) {
+    parts.push('宿主级 AGENTS 已优先加载。');
+  } else if (host === false) {
+    parts.push('宿主级 AGENTS 未加载或内容为空。');
+  }
+  if (promptSources.length > 0) {
+    parts.push(`来源：${promptSources.slice(0, 6).join('、')}。`);
+  }
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+function summarizePromptDebugCapabilityEvidence(msg: Message): string | undefined {
+  const skills = msg.promptDebug?.availableSkills ?? [];
+  const mcps = msg.promptDebug?.availableMcpServers ?? [];
+  const capabilities = msg.promptDebug?.availableCapabilities ?? [];
+  const blockedTools = msg.promptDebug?.blockedTools ?? [];
+  const parts: string[] = [];
+  if (skills.length > 0) {
+    parts.push(`skills：${skills.join('、')}。`);
+  }
+  if (mcps.length > 0) {
+    parts.push(`MCP：${mcps.join('、')}。`);
+  }
+  if (capabilities.length > 0) {
+    parts.push(`capabilities：${capabilities.slice(0, 4).join('；')}。`);
+  }
+  if (blockedTools.length > 0) {
+    parts.push(`blocked tools：${blockedTools.join('、')}。`);
+  }
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+type StructuredPromptSlotName =
+  | 'host_policy'
+  | 'global_policy'
+  | 'execution_protocol'
+  | 'identity_context'
+  | 'capability_context'
+  | 'memory_context'
+  | 'session_context'
+  | 'task_input';
+
+const STRUCTURED_PROMPT_SLOT_ORDER: StructuredPromptSlotName[] = [
+  'host_policy',
+  'global_policy',
+  'execution_protocol',
+  'identity_context',
+  'capability_context',
+  'memory_context',
+  'session_context',
+  'task_input',
+];
+
+const STRUCTURED_PROMPT_SLOT_LABELS: Record<StructuredPromptSlotName, string> = {
+  host_policy: '宿主规则',
+  global_policy: '全局协议',
+  execution_protocol: '执行协议',
+  identity_context: '身份上下文',
+  capability_context: '能力上下文',
+  memory_context: '记忆上下文',
+  session_context: '会话上下文',
+  task_input: '任务输入',
+};
+
+function buildStructuredPromptRows(msg: Message): MessageTrace[] {
+  const slots = new Set((msg.promptDebug?.promptSlots ?? []).map((slot) => slot.trim().toLowerCase()));
+  if (slots.size === 0) {
+    return [];
+  }
+  const availableSkills = msg.promptDebug?.availableSkills ?? [];
+  const baseAt = Number.isFinite(new Date(msg.timestamp).getTime()) ? new Date(msg.timestamp).getTime() : Date.now();
+  const injectedSlots = STRUCTURED_PROMPT_SLOT_ORDER.filter((slot) => slots.has(slot));
+  const detailLines = [
+    `已注入槽位：${injectedSlots.map((slot) => STRUCTURED_PROMPT_SLOT_LABELS[slot]).join(' -> ')}`,
+    msg.promptDebug?.hostPolicyLoaded ? '宿主规则：已加载宿主级 AGENTS。' : '宿主规则：未加载或为空。',
+    availableSkills.length > 0 ? `能力：${availableSkills.join('、')}` : '',
+  ].filter(Boolean);
+  return [{
+    id: `${msg.id}-structured-context-summary`,
+    title: '上下文装配',
+    detail: detailLines.join('\n'),
+    at: new Date(baseAt).toISOString(),
+  }];
 }
 
 function summarizeRenderDecisionStage(msg: Message, renderThinkingRows: MessageTrace[]): string {
@@ -999,6 +960,7 @@ function hasRuntimeLogData(msg: Message): boolean {
     (msg.tools ?? []).some((tool) => hasVisibleToolDetail(tool))
     || hasVisibleTraceDetail(msg.thinkingTrace, 'thinking')
     || hasVisibleTraceDetail(msg.toolTrace, 'tool')
+    || (msg.promptDebug?.promptSlots?.length ?? 0) > 0
   );
 }
 
@@ -2636,35 +2598,11 @@ export function ChatConversationPane({
     ].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
 
     const connectionRows = normalizedToolRows.filter(isConnectionToolRow);
-    const identityRows = normalizedThinkingRows.filter((row) => isIdentityThinkingRow(row) && hasSubstantiveThinkingDetail(row));
     const renderDecisionRows = normalizedThinkingRows.filter((row) => isRenderDecisionThinkingRow(row) && hasSubstantiveThinkingDetail(row));
-    const semanticRows = normalizedThinkingRows.filter((row) => (
-      !isIdentityThinkingRow(row)
-      && !isRenderDecisionThinkingRow(row)
-      && !isGenericProgressThinkingRow(row)
-      && hasSubstantiveThinkingDetail(row)
-    ));
-    const identityStageRows = identityRows.length > 0
-      ? identityRows
-      : (() => {
-        const syntheticRows = buildSyntheticThinkingRows(
-          normalizedThinkingRows,
-          'identity',
-          '身份判断',
-          `${msg.id}-runtime-stage-1-synthetic`,
-        );
-        return syntheticRows.length > 0
-          ? syntheticRows
-          : inferIdentityStageRows(msg, agent, `${msg.id}-runtime-stage-1-inferred`);
-      })();
-    const semanticStageRows = semanticRows.length > 0
-      ? semanticRows
-      : buildSyntheticThinkingRows(normalizedThinkingRows, 'semantic', '理解用户', `${msg.id}-runtime-stage-2-synthetic`);
-    const renderStageRows = renderDecisionRows.length > 0
-      ? renderDecisionRows
-      : buildSyntheticThinkingRows(normalizedThinkingRows, 'render', '渲染与输出', `${msg.id}-runtime-stage-5-synthetic`);
+    const renderStageRows = renderDecisionRows;
     const memoryRows = normalizedToolRows.filter(isMemoryTraceRow);
     const toolRows = normalizedToolRows.filter((row) => !isMemoryTraceRow(row) && !isConnectionToolRow(row));
+    const promptCapabilityEvidence = summarizePromptDebugCapabilityEvidence(msg);
 
     const hasAnyMemory = memoryRows.length > 0;
     const hasAnyTool = toolRows.length > 0;
@@ -2689,67 +2627,45 @@ export function ChatConversationPane({
       ));
     }
 
-    if (identityStageRows.length > 0 || includeAllStages) {
-      stageRows.push(createStageTrace(
-        `${msg.id}-runtime-stage-1`,
-        '身份判断',
-        identityStageRows.length > 0
-          ? `${identityRows.length > 0 ? '已进入本轮执行身份判断，当前判断如下：' : '当前未单独输出身份节点，已从统一思考流提取如下：'}\n${summarizeThinkingStageEvidence(identityStageRows)}`
-          : '本轮未显式输出身份判断内容。',
-        identityStageRows,
-        (msg.generationStartedAt ?? baseAt) + 100,
-      ));
-    }
-
-    if (semanticStageRows.length > 0 || includeAllStages) {
-      stageRows.push(createStageTrace(
-        `${msg.id}-runtime-stage-2`,
-        '理解用户',
-        semanticStageRows.length > 0
-          ? `${semanticRows.length > 0 ? '已进入本轮用户语义理解，当前收敛如下：' : '当前未单独输出语义节点，已从统一思考流提取如下：'}\n${summarizeThinkingStageEvidence(semanticStageRows)}`
-          : '本轮未显式输出语义理解内容。',
-        semanticStageRows,
-        (msg.generationStartedAt ?? baseAt) + 200,
-      ));
-    }
-
     if (hasAnyMemory || hasAnyTool || hasFinalOutput || includeAllStages) {
       stageRows.push(createStageTrace(
-        `${msg.id}-runtime-stage-3`,
+        `${msg.id}-runtime-stage-1`,
         '召回记忆',
         hasAnyMemory
           ? summarizeMemoryStageEvidence(memoryRows)
           : '本轮未触发记忆召回。',
         memoryRows,
-        (msg.generationStartedAt ?? baseAt) + 300,
+        (msg.generationStartedAt ?? baseAt) + 100,
       ));
     }
 
     if (hasAnyTool || hasFinalOutput || includeAllStages) {
       stageRows.push(createStageTrace(
-        `${msg.id}-runtime-stage-4`,
+        `${msg.id}-runtime-stage-2`,
         '调用工具',
         hasAnyTool
           ? summarizeToolStageEvidence(toolRows)
-          : '本轮未显式调用外部工具。',
+          : promptCapabilityEvidence
+            ? `本轮未显式调用外部工具。\n当前能力快照如下：\n${promptCapabilityEvidence}`
+            : '本轮未显式调用外部工具。',
         toolRows,
-        (msg.generationStartedAt ?? baseAt) + 400,
+        (msg.generationStartedAt ?? baseAt) + 200,
       ));
     }
 
     if (hasFinalOutput || renderStageRows.length > 0 || includeAllStages) {
       stageRows.push(createStageTrace(
-        `${msg.id}-runtime-stage-5`,
+        `${msg.id}-runtime-stage-3`,
         '渲染与输出',
         hasFinalOutput
           ? summarizeRenderDecisionStage(msg, renderStageRows)
           : renderStageRows.length > 0
-            ? `当前未单独输出渲染决策节点，已从统一思考流提取如下：\n${summarizeThinkingStageEvidence(renderStageRows)}`
-          : '本轮暂未形成最终输出内容。',
+            ? `已收到模型显式渲染阶段信号：\n${summarizeThinkingStageEvidence(renderStageRows)}`
+            : '本轮暂未形成最终输出内容，且未收到模型显式渲染阶段信号。',
         renderStageRows,
         msg.generationStartedAt && typeof msg.generationElapsedMs === 'number'
           ? msg.generationStartedAt + msg.generationElapsedMs
-          : baseAt + 500,
+          : baseAt + 300,
       ));
     }
 
@@ -2777,12 +2693,17 @@ export function ChatConversationPane({
     if (!items.some((item) => hasRuntimeLogData(item))) {
       return null;
     }
+    const structuredRows = items
+      .flatMap((item) => buildStructuredPromptRows(item))
+      .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
     const rows = buildRuntimeLogRowsForMessages(items, true);
-    if (rows.length === 0) {
+    if (rows.length === 0 && structuredRows.length === 0) {
       return null;
     }
     const live = items.some((item) => item.streaming || item.thinking || item.uiStreamState === 'streaming');
-    return renderTraceBlock(`${key}-runtime-log`, '执行过程', rows, live);
+    const mergedRows = [...structuredRows, ...rows]
+      .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+    return renderTraceBlock(`${key}-runtime-log`, '上下文与执行', mergedRows, live);
   }, [buildRuntimeLogRowsForMessages, renderTraceBlock]);
 
   const renderLiveTraceTicker = useCallback((msg: Message) => {

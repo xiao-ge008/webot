@@ -231,6 +231,7 @@
     "connectNow": "立即连接",
     "powerOn": "开机",
     "powerOff": "关机",
+    "recentUsed": "最近使用 {{time}}",
     "recentOutput": "最近输出 {{time}}",
     "tabs": {
       "agents": "智能体",

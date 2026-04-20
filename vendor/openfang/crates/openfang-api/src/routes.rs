@@ -296,11 +296,11 @@ pub async fn send_message(
     };
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
-    const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024; // 100KB
     if req.message.len() > MAX_MESSAGE_SIZE {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+            Json(serde_json::json!({"error": "Message too large (max 100KB)"})),
         );
     }
 
@@ -1031,11 +1031,11 @@ pub async fn send_message_stream(
     use openfang_runtime::llm_driver::StreamEvent;
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
-    const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024; // 100KB
     if req.message.len() > MAX_MESSAGE_SIZE {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+            Json(serde_json::json!({"error": "Message too large (max 100KB)"})),
         )
             .into_response();
     }
@@ -11402,10 +11402,10 @@ pub async fn comms_send(
     }
 
     // SECURITY: Limit message size
-    if req.message.len() > 64 * 1024 {
+    if req.message.len() > 100 * 1024 {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+            Json(serde_json::json!({"error": "Message too large (max 100KB)"})),
         );
     }
 
