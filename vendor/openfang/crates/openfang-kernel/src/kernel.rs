@@ -253,6 +253,8 @@ pub struct OpenFangKernel {
     /// Hot-reloadable default model override (set via config hot-reload, read at agent spawn).
     pub default_model_override:
         std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
+    /// Hot-reloadable runtime config snapshot used by LLM driver resolution.
+    pub runtime_config_override: std::sync::RwLock<Option<KernelConfig>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1114,6 +1116,7 @@ impl OpenFangKernel {
             whatsapp_gateway_pid: Arc::new(std::sync::Mutex::new(None)),
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
+            runtime_config_override: std::sync::RwLock::new(None),
             self_handle: OnceLock::new(),
         };
 
@@ -1341,37 +1344,7 @@ impl OpenFangKernel {
 
         // Overlay kernel default_model onto agent if agent didn't explicitly choose.
         // Treat empty or "default" as "use the kernel's configured default_model".
-        // This allows bundled agents to defer to the user's configured provider/model,
-        // even if the agent manifest specifies an api_key_env (which is just a hint
-        // about which env var to check, not a hard lock on provider/model).
-        {
-            let is_default_provider =
-                manifest.model.provider.is_empty() || manifest.model.provider == "default";
-            let is_default_model =
-                manifest.model.model.is_empty() || manifest.model.model == "default";
-            if is_default_provider && is_default_model {
-                // Check hot-reloaded override first, fall back to boot-time config
-                let override_guard = self
-                    .default_model_override
-                    .read()
-                    .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                let dm = override_guard
-                    .as_ref()
-                    .unwrap_or(&self.config.default_model);
-                if !dm.provider.is_empty() {
-                    manifest.model.provider = dm.provider.clone();
-                }
-                if !dm.model.is_empty() {
-                    manifest.model.model = dm.model.clone();
-                }
-                if !dm.api_key_env.is_empty() && manifest.model.api_key_env.is_none() {
-                    manifest.model.api_key_env = Some(dm.api_key_env.clone());
-                }
-                if dm.base_url.is_some() && manifest.model.base_url.is_none() {
-                    manifest.model.base_url.clone_from(&dm.base_url);
-                }
-            }
-        }
+        self.apply_effective_default_model(&mut manifest);
 
         // Normalize: strip provider prefix from model name if present
         let normalized = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
@@ -1919,16 +1892,17 @@ impl OpenFangKernel {
         let tools = self.available_tools(agent_id);
         let tools = entry.mode.filter_tools(tools);
         let tools = filter_blocked_tool_definitions(tools, &blocked_tools);
-        let driver = self.resolve_driver(&entry.manifest)?;
+        let mut manifest = entry.manifest.clone();
+        self.apply_effective_default_model(&mut manifest);
+        let driver = self.resolve_driver(&manifest)?;
 
         // Look up model's actual context window from the catalog
         let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&entry.manifest.model.model)
+            cat.find_model(&manifest.model.model)
                 .map(|m| m.context_window as usize)
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
-        let mut manifest = entry.manifest.clone();
         if let Some(ctx) = memory_turn_context {
             if let Ok(v) = serde_json::to_value(ctx) {
                 manifest
@@ -2447,6 +2421,7 @@ impl OpenFangKernel {
 
         // Apply model routing if configured (disabled in Stable mode)
         let mut manifest = entry.manifest.clone();
+        self.apply_effective_default_model(&mut manifest);
         if let Some(ctx) = memory_turn_context {
             if let Ok(v) = serde_json::to_value(ctx) {
                 manifest
@@ -3212,8 +3187,10 @@ impl OpenFangKernel {
             ));
         }
 
-        let driver = self.resolve_driver(&entry.manifest)?;
-        let model = entry.manifest.model.model.clone();
+        let mut manifest = entry.manifest.clone();
+        self.apply_effective_default_model(&mut manifest);
+        let driver = self.resolve_driver(&manifest)?;
+        let model = manifest.model.model.clone();
 
         let result = compact_session(driver, &model, &session, &config)
             .await
@@ -3568,6 +3545,43 @@ impl OpenFangKernel {
         }
     }
 
+    fn effective_config(&self) -> KernelConfig {
+        self.runtime_config_override
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.config.clone())
+    }
+
+    pub fn effective_config_snapshot(&self) -> KernelConfig {
+        self.effective_config()
+    }
+
+    fn apply_effective_default_model(&self, manifest: &mut AgentManifest) {
+        let is_default_provider =
+            manifest.model.provider.trim().is_empty() || manifest.model.provider == "default";
+        let is_default_model =
+            manifest.model.model.trim().is_empty() || manifest.model.model == "default";
+        if !is_default_provider && !is_default_model {
+            return;
+        }
+
+        let config = self.effective_config();
+        let dm = &config.default_model;
+        if is_default_provider && !dm.provider.is_empty() {
+            manifest.model.provider = dm.provider.clone();
+        }
+        if is_default_model && !dm.model.is_empty() {
+            manifest.model.model = dm.model.clone();
+        }
+        if !dm.api_key_env.is_empty() && manifest.model.api_key_env.is_none() {
+            manifest.model.api_key_env = Some(dm.api_key_env.clone());
+        }
+        if dm.base_url.is_some() && manifest.model.base_url.is_none() {
+            manifest.model.base_url.clone_from(&dm.base_url);
+        }
+    }
+
     /// Reload configuration: read the config file, diff against current, and
     /// apply hot-reloadable actions. Returns the reload plan for API response.
     pub fn reload_config(&self) -> Result<crate::config_reload::ReloadPlan, String> {
@@ -3588,12 +3602,15 @@ impl OpenFangKernel {
             return Err(format!("Validation failed: {}", errors.join("; ")));
         }
 
-        // Build the reload plan
-        let plan = build_reload_plan(&self.config, &new_config);
+        // Build the reload plan against the last hot-reloaded snapshot, not only
+        // the boot-time config. Otherwise switching back to the boot-time default
+        // would look like "no changes" and leave a stale runtime override active.
+        let old_config = self.effective_config();
+        let plan = build_reload_plan(&old_config, &new_config);
         plan.log_summary();
 
         // Apply hot actions if the reload mode allows it
-        if should_apply_hot(self.config.reload.mode, &plan) {
+        if should_apply_hot(old_config.reload.mode, &plan) {
             self.apply_hot_actions(&plan, &new_config);
         }
 
@@ -3607,6 +3624,22 @@ impl OpenFangKernel {
         new_config: &openfang_types::config::KernelConfig,
     ) {
         use crate::config_reload::HotAction;
+
+        if plan.hot_actions.iter().any(|action| {
+            matches!(
+                action,
+                HotAction::UpdateDefaultModel
+                    | HotAction::ReloadFallbackProviders
+                    | HotAction::ReloadProviderUrls
+                    | HotAction::ReloadProviders
+            )
+        }) {
+            let mut guard = self
+                .runtime_config_override
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(new_config.clone());
+        }
 
         for action in &plan.hot_actions {
             match action {
@@ -3630,6 +3663,17 @@ impl OpenFangKernel {
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
                     catalog.apply_url_overrides(&new_config.provider_urls);
+                }
+                HotAction::ReloadProviders => {
+                    info!(
+                        "Hot-reload: applying provider configs (count={})",
+                        new_config.providers.len()
+                    );
+                    let mut catalog = self
+                        .model_catalog
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    catalog.apply_provider_configs(&new_config.providers);
                 }
                 HotAction::UpdateDefaultModel => {
                     info!(
@@ -4377,16 +4421,27 @@ impl OpenFangKernel {
     /// a dedicated driver is created. Otherwise the kernel's default driver is reused.
     /// If fallback models are configured, wraps the primary in a `FallbackDriver`.
     fn resolve_driver(&self, manifest: &AgentManifest) -> KernelResult<Arc<dyn LlmDriver>> {
-        let agent_provider = &manifest.model.provider;
-        let default_provider = &self.config.default_model.provider;
+        let config = self.effective_config();
+        let mut effective_manifest = manifest.clone();
+        self.apply_effective_default_model(&mut effective_manifest);
+        let agent_provider = &effective_manifest.model.provider;
+        let default_provider = &config.default_model.provider;
         let provider_env_key =
             |provider: &str| format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
 
         // If agent uses same provider as kernel default and has no custom overrides, reuse
-        let has_custom_key = manifest.model.api_key_env.is_some();
-        let has_custom_url = manifest.model.base_url.is_some();
+        let has_custom_key = effective_manifest.model.api_key_env.is_some();
+        let has_custom_url = effective_manifest.model.base_url.is_some();
+        let can_reuse_boot_default_driver = agent_provider == &self.config.default_model.provider
+            && config.default_model.provider == self.config.default_model.provider
+            && config.default_model.api_key_env == self.config.default_model.api_key_env
+            && config.default_model.base_url == self.config.default_model.base_url;
 
-        let primary = if agent_provider == default_provider && !has_custom_key && !has_custom_url {
+        let primary = if agent_provider == default_provider
+            && can_reuse_boot_default_driver
+            && !has_custom_key
+            && !has_custom_url
+        {
             Arc::clone(&self.default_driver)
         } else {
             // Create a dedicated driver for this agent.
@@ -4394,28 +4449,24 @@ impl OpenFangKernel {
             // IMPORTANT: When the agent's provider differs from the default,
             // we must NOT pass the default provider's API key. Instead, pass None
             // so create_driver() can look up the correct env var for the target provider.
-            let provider_cfg = self
-                .config
-                .providers
-                .iter()
-                .find(|p| p.id == *agent_provider);
+            let provider_cfg = config.providers.iter().find(|p| p.id == *agent_provider);
 
             let api_key = if has_custom_key {
                 // Agent explicitly set an API key env var  ?use it
-                manifest
+                effective_manifest
                     .model
                     .api_key_env
                     .as_ref()
                     .and_then(|env| std::env::var(env).ok())
             } else if agent_provider == default_provider {
                 // Same provider  ?use default key
-                std::env::var(&self.config.default_model.api_key_env)
+                std::env::var(&config.default_model.api_key_env)
                     .ok()
                     .or_else(|| provider_cfg.and_then(|p| p.api_key.clone()))
             } else {
                 // Different provider  ?check auth profiles first, then let
                 // create_driver() look up the correct env var automatically.
-                if let Some(profiles) = self.config.auth_profiles.get(agent_provider.as_str()) {
+                if let Some(profiles) = config.auth_profiles.get(agent_provider.as_str()) {
                     let mut sorted: Vec<_> = profiles.iter().collect();
                     sorted.sort_by_key(|p| p.priority);
                     sorted
@@ -4430,22 +4481,18 @@ impl OpenFangKernel {
 
             // Don't inherit default provider's base_url when switching providers
             let base_url = if has_custom_url {
-                manifest.model.base_url.clone()
+                effective_manifest.model.base_url.clone()
             } else if let Some(cfg) = provider_cfg.and_then(|p| p.base_url.clone()) {
                 Some(cfg)
             } else if agent_provider == default_provider {
-                self.config.default_model.base_url.clone().or_else(|| {
-                    self.config
-                        .provider_urls
-                        .get(agent_provider.as_str())
-                        .cloned()
-                })
+                config
+                    .default_model
+                    .base_url
+                    .clone()
+                    .or_else(|| config.provider_urls.get(agent_provider.as_str()).cloned())
             } else {
                 // Check provider_urls before falling back to hardcoded defaults
-                self.config
-                    .provider_urls
-                    .get(agent_provider.as_str())
-                    .cloned()
+                config.provider_urls.get(agent_provider.as_str()).cloned()
             };
 
             let driver_config = DriverConfig {
@@ -4467,7 +4514,7 @@ impl OpenFangKernel {
                 String,
             )> = vec![(primary.clone(), String::new())];
             for fb in &manifest.fallback_models {
-                let provider_cfg = self.config.providers.iter().find(|p| p.id == fb.provider);
+                let provider_cfg = config.providers.iter().find(|p| p.id == fb.provider);
                 let env_key = provider_env_key(&fb.provider);
                 let config = DriverConfig {
                     provider: fb.provider.clone(),

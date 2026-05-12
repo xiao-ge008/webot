@@ -43,6 +43,8 @@ pub enum HotAction {
     ReloadFallbackProviders,
     /// Provider base URL overrides changed.
     ReloadProviderUrls,
+    /// Provider configuration entries changed.
+    ReloadProviders,
     /// Default model changed — update in-place without restart.
     UpdateDefaultModel,
 }
@@ -239,6 +241,10 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
 
     if field_changed(&old.provider_urls, &new.provider_urls) {
         plan.hot_actions.push(HotAction::ReloadProviderUrls);
+    }
+
+    if field_changed(&old.providers, &new.providers) {
+        plan.hot_actions.push(HotAction::ReloadProviders);
     }
 
     // ----- No-op fields -----

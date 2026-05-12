@@ -1206,6 +1206,7 @@ function isGroupScopedSessionLabel(label: string): boolean {
 
 const GROUP_SESSION_ROTATE_MESSAGE_THRESHOLD = 24;
 const GROUP_SESSION_ROTATE_CHAR_THRESHOLD = 32_000;
+const GROUP_SESSION_ROTATE_TOKEN_THRESHOLD = 24_000;
 const GROUP_QUEUE_HISTORY_LIMIT = 18;
 const GROUP_SESSION_COMPACT_COOLDOWN_MS = 60_000;
 
@@ -1229,6 +1230,21 @@ function compactSessionDigestLine(raw: string, maxLen = 120): string {
     const normalized = raw.replace(/\s+/g, ' ').trim();
     if (!normalized) return '';
     return normalized.length > maxLen ? `${normalized.slice(0, maxLen)}...` : normalized;
+}
+
+function getSessionDigestRows(session: ChatSession | null | undefined): Message[] {
+    if (!session) return [];
+    const offset = typeof session.remoteContextOffset === 'number' && Number.isFinite(session.remoteContextOffset)
+        ? Math.max(0, Math.min(session.messages.length, Math.floor(session.remoteContextOffset)))
+        : 0;
+    return session.messages
+        .slice(offset)
+        .filter((item) => item.role === 'user' || item.role === 'agent')
+        .filter((item) => Boolean((item.text || '').trim()));
+}
+
+function hasSessionDigestSourceRows(session: ChatSession | null | undefined): boolean {
+    return getSessionDigestRows(session).length > 0;
 }
 
 function getRemoteSessionId(session: StoredChatSession | null | undefined): string {
@@ -3425,6 +3441,7 @@ export function ChatPage({
     const lastStreamVisualFlushAtRef = useRef(0);
     const pendingSilentCountRef = useRef(0);
     const compactingSessionIdsRef = useRef<Set<string>>(new Set());
+    const compactingSessionPromisesRef = useRef<Map<string, Promise<boolean>>>(new Map());
     const requestGroupQueueMapRef = useRef<Map<string, { sessionId: string; itemId: string; speakerId: string }>>(new Map());
     const agentDirectoryRef = useRef<Map<string, AgentDirectoryItem>>(new Map());
     const agentReadinessRef = useRef<Map<string, AgentChatReadinessMeta>>(new Map());
@@ -3606,15 +3623,29 @@ export function ChatPage({
         () => sessions.find((session) => session.id === activeSessionId) ?? null,
         [sessions, activeSessionId],
     );
-    const sessionContextDigestText = useMemo(() => {
-        const summary = activeSession?.contextDigest?.summary?.trim() || '';
-        if (!summary) return '';
+    const buildSessionContextDigestText = useCallback((sessionId?: string): string => {
+        if (groupRuntimeEnabled) {
+            return '';
+        }
+        const sid = (sessionId || activeSessionIdRef.current || '').trim();
+        if (!sid) {
+            return '';
+        }
+        const runtimeState = chatRuntimeStore.getAgentState(runtimeAgentIdRef.current);
+        const session = runtimeState.sessions.find((item) => item.id === sid) ?? null;
+        const summary = session?.contextDigest?.summary?.trim() || '';
+        if (!summary) {
+            return '';
+        }
         return [
             '[system:session-context-digest]',
-            '以下为当前会话的阶段摘要。请优先沿用此摘要理解上下文，避免重复展开历史噪音：',
+            '以下为当前会话压缩后的阶段摘要。请优先沿用此摘要理解上下文，避免重复展开已折叠的历史噪音；若与更晚的新消息冲突，以最新消息为准：',
             summary,
         ].join('\n');
-    }, [activeSession?.contextDigest?.summary]);
+    }, [groupRuntimeEnabled]);
+    const sessionContextDigestText = useMemo(() => {
+        return buildSessionContextDigestText(activeSessionId);
+    }, [activeSessionId, buildSessionContextDigestText]);
     const systemPreamble = [
         baseSystemPreamble,
         groupUpgradePreamble,
@@ -3626,6 +3657,7 @@ export function ChatPage({
         agentId: string,
         message: string,
         mode: 'primary' | 'mention' | 'extra',
+        sessionId?: string,
     ): string | undefined => {
         const resolved = resolveSystemPreambleRef.current?.({
             agentId,
@@ -3633,7 +3665,11 @@ export function ChatPage({
             mode,
         })?.trim() || '';
         const basePreamble = resolved || systemPreambleRef.current || '';
-        const combined = [basePreamble].filter(Boolean).join('\n\n').trim();
+        const liveSessionDigest = buildSessionContextDigestText(sessionId);
+        const combined = [basePreamble, liveSessionDigest]
+            .filter(Boolean)
+            .join('\n\n')
+            .trim();
         return combined || undefined;
     };
     const messages = useMemo(() => activeSession?.messages ?? [], [activeSession]);
@@ -3646,6 +3682,9 @@ export function ChatPage({
         }
         const nextDigest = buildSessionContextDigest(activeSession);
         const currentDigest = activeSession.contextDigest;
+        if (!nextDigest && currentDigest?.summary?.trim() && !hasSessionDigestSourceRows(activeSession)) {
+            return;
+        }
         const nextSummary = nextDigest?.summary || '';
         const currentSummary = currentDigest?.summary || '';
         const nextIntent = nextDigest?.lastUserIntent || '';
@@ -4744,31 +4783,33 @@ export function ChatPage({
 
     const buildSessionContextDigest = (session: ChatSession | null | undefined): ChatSession['contextDigest'] => {
         if (!session) return undefined;
-        const offset = typeof session.remoteContextOffset === 'number' && Number.isFinite(session.remoteContextOffset)
-            ? Math.max(0, Math.min(session.messages.length, Math.floor(session.remoteContextOffset)))
-            : 0;
-        const rows = session.messages
-            .slice(offset)
-            .filter((item) => item.role === 'user' || item.role === 'agent')
-            .filter((item) => Boolean((item.text || '').trim()))
-            .slice(-8);
+        const rows = getSessionDigestRows(session).slice(-8);
         if (rows.length === 0) {
             return undefined;
         }
         const lastUser = [...rows].reverse().find((item) => item.role === 'user');
+        const lastAgent = [...rows].reverse().find((item) => item.role === 'agent');
+        const latestRow = rows[rows.length - 1];
+        const currentIntent = lastUser ? compactSessionDigestLine(lastUser.text || '', 120) : '';
+        const latestConclusion = lastAgent ? compactSessionDigestLine(lastAgent.text || '', 120) : '';
+        const pendingFocus = latestRow?.role === 'user'
+            ? compactSessionDigestLine(latestRow.text || '', 120)
+            : '';
         const recentTurns = rows
             .slice(-4)
             .map((item) => `${item.role === 'user' ? '用户' : (item.agentName || item.agentId || '助手')}: ${compactSessionDigestLine(item.text || '', 96)}`)
             .filter(Boolean)
             .join(' | ');
         const summary = [
-            lastUser ? `当前诉求：${compactSessionDigestLine(lastUser.text || '', 120)}` : '',
+            currentIntent ? `当前诉求：${currentIntent}` : '',
+            latestConclusion && latestConclusion !== currentIntent ? `已有结论：${latestConclusion}` : '',
+            pendingFocus && pendingFocus !== currentIntent && pendingFocus !== latestConclusion ? `待续焦点：${pendingFocus}` : '',
             recentTurns ? `最近进展：${compactSessionDigestLine(recentTurns, 220)}` : '',
         ].filter(Boolean).join('\n');
         if (!summary) return undefined;
         return {
             summary,
-            lastUserIntent: lastUser ? compactSessionDigestLine(lastUser.text || '', 120) : undefined,
+            lastUserIntent: currentIntent || undefined,
             updatedAt: new Date().toISOString(),
         };
     };
@@ -4885,6 +4926,11 @@ export function ChatPage({
         if (!session) {
             return false;
         }
+        const sessionId = (session.id || '').trim();
+        const activeSessionTokenPressure = sessionId
+            && sessionId === activeSessionIdRef.current
+            && activeSessionContextTokens != null
+            && activeSessionContextTokens >= GROUP_SESSION_ROTATE_TOKEN_THRESHOLD;
         const lastCompactedAtRaw = groupRuntimeEnabled
             ? session.groupRuntime?.lastCompactedAt
             : session.lastCompactedAt;
@@ -4894,6 +4940,8 @@ export function ChatPage({
         }
         const pressure = getSessionContextPressure(session);
         return (
+            activeSessionTokenPressure
+            ||
             pressure.messageCount >= GROUP_SESSION_ROTATE_MESSAGE_THRESHOLD
             || pressure.charCount >= GROUP_SESSION_ROTATE_CHAR_THRESHOLD
         );
@@ -4934,71 +4982,78 @@ export function ChatPage({
         if (!forceCompact && !shouldCompactSessionBeforeSend(session)) {
             return false;
         }
-        if (compactingSessionIdsRef.current.has(sid)) {
-            return true;
+        const inFlightCompact = compactingSessionPromisesRef.current.get(sid);
+        if (inFlightCompact) {
+            return inFlightCompact;
         }
 
-        compactingSessionIdsRef.current.add(sid);
-        try {
-            const sessionLabel = (session?.sessionLabel || resolveSessionLabel(sid) || '').trim();
-            const sessionRemoteId = getRemoteSessionId(session);
-            const candidateAgentIds = Array.from(new Set(
-                (participantAgentIds ?? [])
-                    .map((item) => item.trim())
-                    .filter(Boolean),
-            ));
-            if (candidateAgentIds.length === 0) {
-                candidateAgentIds.push(chatAgentId);
-            }
-
-            let compacted = false;
-            const errors: string[] = [];
-            for (const targetAgentId of candidateAgentIds) {
-                const result = await compactAgentSession({
-                    agentId: targetAgentId,
-                    sessionLabel: sessionLabel || undefined,
-                    sessionId: !sessionLabel && targetAgentId === chatAgentId ? (sessionRemoteId || undefined) : undefined,
-                });
-                if (result.success) {
-                    compacted = true;
-                } else if (result.message) {
-                    errors.push(result.message);
+        const compactPromise = (async () => {
+            compactingSessionIdsRef.current.add(sid);
+            try {
+                const sessionLabel = (session?.sessionLabel || resolveSessionLabel(sid) || '').trim();
+                const sessionRemoteId = getRemoteSessionId(session);
+                const candidateAgentIds = Array.from(new Set(
+                    (participantAgentIds ?? [])
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                ));
+                if (candidateAgentIds.length === 0) {
+                    candidateAgentIds.push(chatAgentId);
                 }
-            }
 
-            if (compacted) {
-                setSessions((prev) => prev.map((item) => {
-                    if (item.id !== sid) return item;
-                    const nowIso = new Date().toISOString();
-                    return {
-                        ...item,
-                        remoteContextOffset: item.messages.length,
-                        contextDigest: buildSessionContextDigest(item),
-                        lastCompactedAt: nowIso,
-                        groupRuntime: item.groupRuntime
-                            ? {
-                                ...item.groupRuntime,
-                                lastCompactedAt: nowIso,
-                                lastEventAt: nowIso,
-                            }
-                            : item.groupRuntime,
-                    };
-                }));
-                appendSessionSystemMessage(
-                    sid,
-                    '已自动压缩上下文',
-                );
-                void refreshActiveSessionContextTokens(sid, { silent: true });
-                return true;
-            }
+                let compacted = false;
+                const errors: string[] = [];
+                for (const targetAgentId of candidateAgentIds) {
+                    const result = await compactAgentSession({
+                        agentId: targetAgentId,
+                        sessionLabel: sessionLabel || undefined,
+                        sessionId: !sessionLabel && targetAgentId === chatAgentId ? (sessionRemoteId || undefined) : undefined,
+                    });
+                    if (result.success) {
+                        compacted = true;
+                    } else if (result.message) {
+                        errors.push(result.message);
+                    }
+                }
 
-            if (errors.length > 0) {
-                appendSessionSystemMessage(sid, '压缩失败');
+                if (compacted) {
+                    setSessions((prev) => prev.map((item) => {
+                        if (item.id !== sid) return item;
+                        const nowIso = new Date().toISOString();
+                        return {
+                            ...item,
+                            remoteContextOffset: item.messages.length,
+                            contextDigest: buildSessionContextDigest(item),
+                            lastCompactedAt: nowIso,
+                            groupRuntime: item.groupRuntime
+                                ? {
+                                    ...item.groupRuntime,
+                                    lastCompactedAt: nowIso,
+                                    lastEventAt: nowIso,
+                                }
+                                : item.groupRuntime,
+                        };
+                    }));
+                    appendSessionSystemMessage(
+                        sid,
+                        '已自动压缩上下文',
+                    );
+                    void refreshActiveSessionContextTokens(sid, { silent: true });
+                    return true;
+                }
+
+                if (errors.length > 0) {
+                    appendSessionSystemMessage(sid, '压缩失败');
+                }
+                return false;
+            } finally {
+                compactingSessionIdsRef.current.delete(sid);
+                compactingSessionPromisesRef.current.delete(sid);
             }
-            return false;
-        } finally {
-            compactingSessionIdsRef.current.delete(sid);
-        }
+        })();
+
+        compactingSessionPromisesRef.current.set(sid, compactPromise);
+        return compactPromise;
     };
 
     useEffect(() => {
@@ -6464,7 +6519,12 @@ export function ChatPage({
                     sessionId: requestSessionTarget.sessionId,
                     sessionLabel: requestSessionTarget.sessionLabel,
                     requestOrigin,
-                    systemPreamble: getSystemPreambleForRequest(dispatchAgentId, text, 'primary'),
+                    systemPreamble: getSystemPreambleForRequest(
+                        dispatchAgentId,
+                        text,
+                        'primary',
+                        requestSessionIdForRequest,
+                    ),
                 }, {
                     channel: CHAT_CHANNELS.app,
                     renderMode: CHAT_RENDER_MODES.jsonRender,
@@ -7284,7 +7344,12 @@ export function ChatPage({
                                 sessionId: requestSessionTarget.sessionId,
                                 sessionLabel: requestSessionTarget.sessionLabel,
                                 requestOrigin: 'group_auto',
-                                systemPreamble: getSystemPreambleForRequest(targetId, buildGroupDispatchHandoffMessage(msg), 'mention'),
+                                systemPreamble: getSystemPreambleForRequest(
+                                    targetId,
+                                    buildGroupDispatchHandoffMessage(msg),
+                                    'mention',
+                                    activeSessionIdRef.current,
+                                ),
                             }, {
                                 channel: CHAT_CHANNELS.app,
                                 renderMode: CHAT_RENDER_MODES.jsonRender,
@@ -7626,7 +7691,12 @@ export function ChatPage({
                         sessionId: requestSessionTarget.sessionId,
                         sessionLabel: requestSessionTarget.sessionLabel,
                         requestOrigin: 'group_auto',
-                        systemPreamble: getSystemPreambleForRequest(extraId, transformed.trim(), 'extra'),
+                        systemPreamble: getSystemPreambleForRequest(
+                            extraId,
+                            transformed.trim(),
+                            'extra',
+                            activeSessionIdRef.current,
+                        ),
                     }, {
                         channel: CHAT_CHANNELS.app,
                         renderMode: CHAT_RENDER_MODES.jsonRender,

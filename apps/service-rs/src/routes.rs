@@ -15826,10 +15826,33 @@ pub async fn chat_message_stream(
         }
 
         if saw_tool_result {
+            let fallback_text = "本次请求只返回了工具/记忆日志，未生成正文回复，请重试。";
             tracing::info!(
                 agent_id = %agent_id,
-                "chat stream finished with tool_result only; skipping empty-stream error"
+                "chat stream finished with tool_result only; emitted fallback reply"
             );
+            let _ = send_sse_json_event(
+                &tx,
+                "chunk",
+                json!({
+                    "content": fallback_text,
+                    "done": false,
+                    "fallback": "tool_result_only"
+                }),
+            )
+            .await;
+            let _ = send_sse_json_event(
+                &tx,
+                "done",
+                json!({
+                    "done": true,
+                    "content": fallback_text,
+                    "session_id": bound_session_id.clone(),
+                    "session_label": bound_session_label.clone(),
+                    "fallback": "tool_result_only"
+                }),
+            )
+            .await;
             sanitize_and_restore().await;
             return;
         }
@@ -17103,6 +17126,48 @@ async fn clear_runtime_agent_model_selection(
     Ok(())
 }
 
+async fn set_runtime_agent_model_selection(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    provider_id: &str,
+    model_name: &str,
+) -> Result<(), ApiError> {
+    let path = format!("/api/agents/{agent_id}/config");
+    state
+        .openfang
+        .patch_json(
+            &path,
+            json!({
+                "provider": provider_id,
+                "model": model_name
+            }),
+        )
+        .await?;
+
+    let detail_path = format!("/api/agents/{agent_id}");
+    let detail = state.openfang.get_json(&detail_path).await?;
+    let provider = detail
+        .pointer("/model/provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let model = detail
+        .pointer("/model/model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if !provider.eq_ignore_ascii_case(provider_id) || model != model_name {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("更新智能体模型失败，当前仍为 {}/{}", provider, model),
+        ));
+    }
+    Ok(())
+}
+
 async fn clear_runtime_agent_model_assignments_for_provider(
     state: &Arc<AppState>,
     provider_id: &str,
@@ -17135,6 +17200,95 @@ async fn clear_runtime_agent_model_assignments_for_provider(
     }
 
     Ok(cleared_agent_ids)
+}
+
+async fn clear_runtime_agent_model_assignments_for_model(
+    state: &Arc<AppState>,
+    model_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let Some((provider_id, model_name)) = model_id.split_once("::") else {
+        return Ok(Vec::new());
+    };
+    ensure_online(state).await?;
+    let payload = state.openfang.get_json("/api/agents").await?;
+    let agent_rows = payload.as_array().cloned().unwrap_or_default();
+    let mut cleared_agent_ids = Vec::new();
+
+    for row in agent_rows {
+        let Some(agent_id) = row.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if agent_id.is_empty() {
+            continue;
+        }
+        let detail_path = format!("/api/agents/{agent_id}");
+        let detail = state.openfang.get_json(&detail_path).await?;
+        let bound_provider = detail
+            .pointer("/model/provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let bound_model = detail
+            .pointer("/model/model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !bound_provider.eq_ignore_ascii_case(provider_id) || bound_model != model_name {
+            continue;
+        }
+        clear_runtime_agent_model_selection(state, agent_id).await?;
+        cleared_agent_ids.push(agent_id.to_string());
+    }
+
+    Ok(cleared_agent_ids)
+}
+
+async fn rebind_runtime_agent_model_assignments(
+    state: &Arc<AppState>,
+    from_model_id: &str,
+    to_provider_id: &str,
+    to_model_name: &str,
+) -> Result<Vec<String>, ApiError> {
+    let Some((from_provider_id, from_model_name)) = from_model_id.split_once("::") else {
+        return Ok(Vec::new());
+    };
+    ensure_online(state).await?;
+    let payload = state.openfang.get_json("/api/agents").await?;
+    let agent_rows = payload.as_array().cloned().unwrap_or_default();
+    let mut rebound_agent_ids = Vec::new();
+
+    for row in agent_rows {
+        let Some(agent_id) = row.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if agent_id.is_empty() {
+            continue;
+        }
+        let detail_path = format!("/api/agents/{agent_id}");
+        let detail = state.openfang.get_json(&detail_path).await?;
+        let bound_provider = detail
+            .pointer("/model/provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let bound_model = detail
+            .pointer("/model/model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !bound_provider.eq_ignore_ascii_case(from_provider_id) || bound_model != from_model_name
+        {
+            continue;
+        }
+        set_runtime_agent_model_selection(state, agent_id, to_provider_id, to_model_name).await?;
+        rebound_agent_ids.push(agent_id.to_string());
+    }
+
+    Ok(rebound_agent_ids)
 }
 
 pub async fn discover_provider_models(
@@ -17433,12 +17587,30 @@ pub async fn update_provider_enabled(
         ));
     }
 
+    let mut default_model_cleared = false;
+    let mut cleared_agent_ids = Vec::new();
+    if !payload.enabled {
+        cleared_agent_ids =
+            clear_runtime_agent_model_assignments_for_provider(&_state, &provider_id).await?;
+        let current_default = assignment_store::get_default_model().map_err(storage_error)?;
+        default_model_cleared = current_default
+            .as_deref()
+            .and_then(|value| value.split_once("::"))
+            .map(|(provider, _)| provider.eq_ignore_ascii_case(&provider_id))
+            .unwrap_or(false);
+        if default_model_cleared {
+            assignment_store::clear_default_model().map_err(storage_error)?;
+        }
+    }
+
     assignment_store::set_provider_enabled(&provider_id, payload.enabled).map_err(storage_error)?;
-    let _ = sync_provider_configs_to_runtime(&_state).await;
+    sync_provider_configs_to_runtime(&_state).await?;
     Ok(Json(json!({
         "status": "ok",
         "provider_id": provider_id,
-        "enabled": payload.enabled
+        "enabled": payload.enabled,
+        "default_model_cleared": default_model_cleared,
+        "cleared_agent_ids": cleared_agent_ids
     })))
 }
 
@@ -17455,19 +17627,30 @@ pub async fn update_model_enabled(
         ));
     }
 
+    let mut default_model_cleared = false;
+    let mut cleared_agent_ids = Vec::new();
+    if !payload.enabled {
+        cleared_agent_ids =
+            clear_runtime_agent_model_assignments_for_model(&_state, &model_id).await?;
+    }
+
     assignment_store::set_model_enabled(&model_id, payload.enabled).map_err(storage_error)?;
 
     if !payload.enabled {
         let current_default = assignment_store::get_default_model().map_err(storage_error)?;
         if current_default.as_deref() == Some(model_id.as_str()) {
             assignment_store::clear_default_model().map_err(storage_error)?;
+            default_model_cleared = true;
         }
     }
+    sync_provider_configs_to_runtime(&_state).await?;
 
     Ok(Json(json!({
         "status": "ok",
         "model_id": model_id,
-        "enabled": payload.enabled
+        "enabled": payload.enabled,
+        "default_model_cleared": default_model_cleared,
+        "cleared_agent_ids": cleared_agent_ids
     })))
 }
 
@@ -17597,13 +17780,32 @@ pub async fn update_default_model(
         ));
     }
 
+    let previous_default = assignment_store::get_default_model().map_err(storage_error)?;
     assignment_store::set_model_enabled(&model_id, true).map_err(storage_error)?;
     assignment_store::set_default_model(&model_id).map_err(storage_error)?;
     sync_provider_configs_to_runtime(&_state).await?;
+    let rebound_agent_ids = if previous_default.as_deref() != Some(model_id.as_str()) {
+        match previous_default.as_deref() {
+            Some(previous) => {
+                rebind_runtime_agent_model_assignments(
+                    &_state,
+                    previous,
+                    &hit.provider_id,
+                    &hit.model_name,
+                )
+                .await?
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(json!({
         "status": "ok",
-        "default_model_id": model_id
+        "default_model_id": model_id,
+        "previous_default_model_id": previous_default,
+        "rebound_agent_ids": rebound_agent_ids
     })))
 }
 
@@ -20338,5 +20540,4 @@ mod tests {
         assert!(parse_http_byte_range_header("items=0-1", 1_000).is_err());
         assert!(parse_http_byte_range_header("bytes=0-1,4-5", 1_000).is_err());
     }
-
 }

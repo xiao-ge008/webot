@@ -121,7 +121,8 @@ pub async fn spawn_agent(
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Snapshot catalog once for enrichment
     let catalog = state.kernel.model_catalog.read().ok();
-    let dm = &state.kernel.config.default_model;
+    let effective_config = state.kernel.effective_config_snapshot();
+    let dm = &effective_config.default_model;
 
     let agents: Vec<serde_json::Value> = state
         .kernel
@@ -529,6 +530,8 @@ pub async fn kill_agent(
 
 /// GET /api/status — Kernel status.
 pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let effective_config = state.kernel.effective_config_snapshot();
+    let dm = &effective_config.default_model;
     let agents: Vec<serde_json::Value> = state
         .kernel
         .registry
@@ -541,8 +544,16 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 "state": format!("{:?}", e.state),
                 "mode": e.mode,
                 "created_at": e.created_at.to_rfc3339(),
-                "model_provider": e.manifest.model.provider,
-                "model_name": e.manifest.model.model,
+                "model_provider": if e.manifest.model.provider.is_empty() || e.manifest.model.provider == "default" {
+                    dm.provider.clone()
+                } else {
+                    e.manifest.model.provider.clone()
+                },
+                "model_name": if e.manifest.model.model.is_empty() || e.manifest.model.model == "default" {
+                    dm.model.clone()
+                } else {
+                    e.manifest.model.model.clone()
+                },
                 "profile": e.manifest.profile,
             })
         })
@@ -554,13 +565,13 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "running",
         "agent_count": agent_count,
-        "default_provider": state.kernel.config.default_model.provider,
-        "default_model": state.kernel.config.default_model.model,
+        "default_provider": effective_config.default_model.provider,
+        "default_model": effective_config.default_model.model,
         "uptime_seconds": uptime,
-        "api_listen": state.kernel.config.api_listen,
-        "home_dir": state.kernel.config.home_dir.display().to_string(),
-        "log_level": state.kernel.config.log_level,
-        "network_enabled": state.kernel.config.network_enabled,
+        "api_listen": effective_config.api_listen,
+        "home_dir": effective_config.home_dir.display().to_string(),
+        "log_level": effective_config.log_level,
+        "network_enabled": effective_config.network_enabled,
         "agents": agents,
     }))
 }
@@ -5071,7 +5082,7 @@ pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse
 /// GET /api/config — Get kernel configuration (secrets redacted).
 pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Return a redacted view of the kernel config
-    let config = &state.kernel.config;
+    let config = state.kernel.effective_config_snapshot();
     Json(serde_json::json!({
         "home_dir": config.home_dir.to_string_lossy(),
         "data_dir": config.data_dir.to_string_lossy(),
