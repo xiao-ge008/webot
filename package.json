@@ -1,7 +1,7 @@
 {
   "name": "webot-app",
   "private": true,
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Webot 基础工程（以 mvptest 为参考）",
   "workspaces": [
     "apps/*",

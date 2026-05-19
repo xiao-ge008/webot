@@ -11648,7 +11648,10 @@ fn resolve_agent_system_prompt(
             }
         }
     }
-    identity_blocks.extend(load_extra_workspace_markdown_blocks(agent_id, &workspace_segment));
+    identity_blocks.extend(load_extra_workspace_markdown_blocks(
+        agent_id,
+        &workspace_segment,
+    ));
 
     // 合并：构造一个封闭的系统配置区域
     let mut final_parts = Vec::new();
@@ -12186,7 +12189,6 @@ async fn should_include_bootstrap_for_turn(state: &Arc<AppState>, agent_id: &str
     }
 }
 
-
 #[derive(Debug, Clone)]
 struct DailyOpeningContext {
     temporal_context: String,
@@ -12212,7 +12214,10 @@ fn parse_json_timestamp_utc(value: &Value) -> Option<chrono::DateTime<chrono::Ut
     }
 }
 
-fn extract_timestamp_from_value(value: &Value, keys: &[&str]) -> Option<chrono::DateTime<chrono::Utc>> {
+fn extract_timestamp_from_value(
+    value: &Value,
+    keys: &[&str],
+) -> Option<chrono::DateTime<chrono::Utc>> {
     for key in keys {
         if let Some(timestamp) = value.get(*key).and_then(parse_json_timestamp_utc) {
             return Some(timestamp);
@@ -12286,17 +12291,23 @@ fn build_temporal_context(is_first_chat_today_with_agent: bool) -> String {
         format!("当天日期键：{date_key}"),
         format!(
             "is_first_chat_today_with_agent={}",
-            if is_first_chat_today_with_agent { "true" } else { "false" }
+            if is_first_chat_today_with_agent {
+                "true"
+            } else {
+                "false"
+            }
         ),
     ]
     .join("\n")
 }
 
-
 fn sanitize_opening_recall_text(text: &str) -> String {
     let sanitized = sanitize_prompt_wrapped_user_text(text);
     let trimmed = sanitized.trim();
-    if trimmed.is_empty() || is_legacy_task_draft_artifact(trimmed) || looks_like_protocol_only_text(trimmed) {
+    if trimmed.is_empty()
+        || is_legacy_task_draft_artifact(trimmed)
+        || looks_like_protocol_only_text(trimmed)
+    {
         return String::new();
     }
 
@@ -12388,7 +12399,9 @@ fn extract_effective_history_text(row: &Value) -> Option<String> {
         })
 }
 
-fn latest_effective_timestamp_from_session(session: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+fn latest_effective_timestamp_from_session(
+    session: &Value,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     const TIMESTAMP_KEYS: &[&str] = &[
         "updated_at",
         "updatedAt",
@@ -12426,7 +12439,6 @@ fn latest_effective_timestamp_from_session(session: &Value) -> Option<chrono::Da
     }
 }
 
-
 fn session_list_item_has_effective_history(item: &Value) -> bool {
     if item
         .get("message_count")
@@ -12451,7 +12463,9 @@ fn session_list_item_has_effective_history(item: &Value) -> bool {
         .any(|text| !sanitize_opening_recall_text(&text).is_empty())
 }
 
-fn latest_effective_timestamp_from_session_list(payload: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+fn latest_effective_timestamp_from_session_list(
+    payload: &Value,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     const SESSION_KEYS: &[&str] = &[
         "last_message_at",
         "lastMessageAt",
@@ -12483,7 +12497,9 @@ fn latest_effective_timestamp_from_session_list(payload: &Value) -> Option<chron
     latest
 }
 
-fn latest_effective_timestamp_from_memory_rows(rows: &[Value]) -> Option<chrono::DateTime<chrono::Utc>> {
+fn latest_effective_timestamp_from_memory_rows(
+    rows: &[Value],
+) -> Option<chrono::DateTime<chrono::Utc>> {
     const MEMORY_KEYS: &[&str] = &[
         "updated_at",
         "updatedAt",
@@ -12555,15 +12571,41 @@ fn collect_opening_summary_from_memory(rows: &[Value], limit: usize) -> Vec<Stri
 fn normalize_opening_summary_key(summary: &str) -> String {
     summary
         .chars()
-        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '。' | '，' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';' | ':' | '：' | '-' | '_' | '"' | '\''))
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '。' | '，'
+                        | '！'
+                        | '？'
+                        | '；'
+                        | ','
+                        | '.'
+                        | '!'
+                        | '?'
+                        | ';'
+                        | ':'
+                        | '：'
+                        | '-'
+                        | '_'
+                        | '"'
+                        | '\''
+                )
+        })
         .collect::<String>()
         .to_ascii_lowercase()
 }
 
-fn merge_opening_summaries(session_summaries: Vec<String>, memory_summaries: Vec<String>) -> Vec<String> {
+fn merge_opening_summaries(
+    session_summaries: Vec<String>,
+    memory_summaries: Vec<String>,
+) -> Vec<String> {
     let mut merged = Vec::new();
     let mut seen = HashSet::new();
-    for summary in session_summaries.into_iter().chain(memory_summaries.into_iter()) {
+    for summary in session_summaries
+        .into_iter()
+        .chain(memory_summaries.into_iter())
+    {
         let key = normalize_opening_summary_key(&summary);
         if key.is_empty() || !seen.insert(key) {
             continue;
@@ -12597,7 +12639,10 @@ fn build_opening_context(summaries: &[String]) -> String {
     lines.join("\n")
 }
 
-async fn fetch_recent_opening_memory_rows(state: &Arc<AppState>, agent_id: &str) -> Option<Vec<Value>> {
+async fn fetch_recent_opening_memory_rows(
+    state: &Arc<AppState>,
+    agent_id: &str,
+) -> Option<Vec<Value>> {
     match fetch_semantic_memory_rows(state, agent_id, "", 6, 0.0).await {
         Ok(rows) => rows,
         Err(error) => {
@@ -12912,7 +12957,11 @@ fn build_sanitized_session_messages(session: &Value) -> Option<Vec<Value>> {
         }));
     }
 
-    if changed { Some(messages) } else { None }
+    if changed {
+        Some(messages)
+    } else {
+        None
+    }
 }
 
 async fn maybe_sanitize_current_openfang_session(
@@ -13404,12 +13453,16 @@ fn truncate_prompt_block_by_bytes(content: &str, max_bytes: usize) -> String {
     }
 
     if max_bytes <= PROMPT_TRUNCATION_NOTICE.len() + 16 {
-        return truncate_utf8_by_bytes(trimmed, max_bytes).trim().to_string();
+        return truncate_utf8_by_bytes(trimmed, max_bytes)
+            .trim()
+            .to_string();
     }
 
     let keep_bytes = max_bytes.saturating_sub(PROMPT_TRUNCATION_NOTICE.len());
     let prefix = truncate_utf8_by_bytes(trimmed, keep_bytes).trim_end();
-    format!("{prefix}{PROMPT_TRUNCATION_NOTICE}").trim().to_string()
+    format!("{prefix}{PROMPT_TRUNCATION_NOTICE}")
+        .trim()
+        .to_string()
 }
 
 fn prompt_slot_soft_cap_bytes(slot: &str) -> Option<usize> {
@@ -13490,7 +13543,10 @@ fn enforce_prompt_budget(mut slots: Vec<PromptContextSlot>) -> Vec<PromptContext
     }
 
     if byte_len(&slots) > OPENFANG_PROMPT_MAX_BYTES {
-        if let Some(slot) = slots.iter_mut().find(|item| item.slot == "identity_context") {
+        if let Some(slot) = slots
+            .iter_mut()
+            .find(|item| item.slot == "identity_context")
+        {
             slot.content = truncate_prompt_block_by_bytes(&slot.content, 12 * 1024);
         }
     }
@@ -13503,7 +13559,10 @@ fn enforce_prompt_budget(mut slots: Vec<PromptContextSlot>) -> Vec<PromptContext
         slots.retain(|item| item.slot == "identity_context" || item.slot == "task_input");
     }
     if byte_len(&slots) > OPENFANG_PROMPT_MAX_BYTES {
-        if let Some(slot) = slots.iter_mut().find(|item| item.slot == "identity_context") {
+        if let Some(slot) = slots
+            .iter_mut()
+            .find(|item| item.slot == "identity_context")
+        {
             slot.content = truncate_prompt_block_by_bytes(&slot.content, 6 * 1024);
         }
     }
@@ -15021,7 +15080,8 @@ pub async fn chat_message(
         tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message: auto-profile skipped due to error");
     }
     let include_bootstrap = should_include_bootstrap_for_turn(&state, &agent_id).await;
-    let daily_opening_context = build_daily_opening_context(&state, &agent_id, include_bootstrap).await;
+    let daily_opening_context =
+        build_daily_opening_context(&state, &agent_id, include_bootstrap).await;
     remember_agent_seen_today(&agent_id, &current_local_date_key()).await;
     let identity_context = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
     let collaboration_prompt = match resolve_collaboration_prompt(&state, &agent_id).await {
@@ -15298,7 +15358,8 @@ pub async fn chat_message_stream(
         tracing::warn!(agent_id = %agent_id, error = %err.message, "chat_message_stream: auto-profile skipped due to error");
     }
     let include_bootstrap = should_include_bootstrap_for_turn(&state, &agent_id).await;
-    let daily_opening_context = build_daily_opening_context(&state, &agent_id, include_bootstrap).await;
+    let daily_opening_context =
+        build_daily_opening_context(&state, &agent_id, include_bootstrap).await;
     remember_agent_seen_today(&agent_id, &current_local_date_key()).await;
     let identity_context = resolve_agent_system_prompt(&agent_id, include_bootstrap)?;
     let collaboration_prompt = match resolve_collaboration_prompt(&state, &agent_id).await {
@@ -16112,15 +16173,22 @@ fn mask_api_key(api_key: &str) -> String {
     )
 }
 
-fn to_models_endpoint(base_url: &str) -> Option<String> {
-    let trimmed = base_url.trim().trim_end_matches('/');
+fn to_models_endpoint(provider_id: &str, protocol: &str, base_url: &str) -> Option<String> {
+    let normalized = crate::normalize_llm_provider_base_url(provider_id, protocol, base_url)?;
+    let trimmed = normalized.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return None;
+    }
+    if matches!(
+        protocol.trim().to_ascii_lowercase().as_str(),
+        "claude" | "anthropic"
+    ) {
+        return Some(format!("{trimmed}/v1/models"));
     }
     if trimmed.ends_with("/v1") {
         return Some(format!("{trimmed}/models"));
     }
-    Some(format!("{trimmed}/v1/models"))
+    Some(format!("{trimmed}/models"))
 }
 
 fn provider_uses_manual_model_configuration(provider_id: &str, base_url: &str) -> bool {
@@ -16168,8 +16236,8 @@ async fn discover_models_from_provider(
     base_url: &str,
     api_key: &str,
 ) -> Result<Vec<String>, String> {
-    let endpoint =
-        to_models_endpoint(base_url).ok_or_else(|| "base_url 为空，无法探测模型".to_string())?;
+    let endpoint = to_models_endpoint(provider_id, protocol, base_url)
+        .ok_or_else(|| "base_url 为空，无法探测模型".to_string())?;
     let mut header_candidates: Vec<HeaderMap> = Vec::new();
 
     let mut h1 = HeaderMap::new();
@@ -16244,7 +16312,12 @@ async fn probe_model_via_chat_completion(
     api_key: &str,
     model: &str,
 ) -> Result<(), String> {
-    let trimmed_base_url = base_url.trim().trim_end_matches('/');
+    let Some(normalized_base_url) =
+        crate::normalize_llm_provider_base_url(provider_id, protocol, base_url)
+    else {
+        return Err("base_url 为空，无法测试模型".to_string());
+    };
+    let trimmed_base_url = normalized_base_url.trim().trim_end_matches('/');
     if trimmed_base_url.is_empty() {
         return Err("base_url 为空，无法测试模型".to_string());
     }
@@ -16253,7 +16326,15 @@ async fn probe_model_via_chat_completion(
         return Err("model 为空，无法测试模型".to_string());
     }
 
-    let endpoint = format!("{trimmed_base_url}/chat/completions");
+    let is_claude_protocol = matches!(
+        protocol.trim().to_ascii_lowercase().as_str(),
+        "claude" | "anthropic"
+    );
+    let endpoint = if is_claude_protocol {
+        format!("{trimmed_base_url}/v1/messages")
+    } else {
+        format!("{trimmed_base_url}/chat/completions")
+    };
     let mut header_candidates: Vec<HeaderMap> = Vec::new();
 
     let mut bearer_headers = HeaderMap::new();
@@ -16294,15 +16375,26 @@ async fn probe_model_via_chat_completion(
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
 
-    let request_body = json!({
-        "model": trimmed_model,
-        "messages": [
-            { "role": "user", "content": "Hi" }
-        ],
-        "max_tokens": 1,
-        "temperature": 0.0,
-        "stream": false
-    });
+    let request_body = if is_claude_protocol {
+        json!({
+            "model": trimmed_model,
+            "messages": [
+                { "role": "user", "content": "Hi" }
+            ],
+            "max_tokens": 1,
+            "stream": false
+        })
+    } else {
+        json!({
+            "model": trimmed_model,
+            "messages": [
+                { "role": "user", "content": "Hi" }
+            ],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": false
+        })
+    };
 
     let mut last_error = String::new();
     for headers in header_candidates {
@@ -17400,7 +17492,8 @@ pub async fn create_custom_provider(
     let base_url = payload
         .base_url
         .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .and_then(|value| crate::normalize_llm_provider_base_url(&provider_id, protocol, &value));
     let api_key = payload
         .api_key
         .map(|v| v.trim().to_string())
@@ -17472,7 +17565,9 @@ pub async fn update_provider_config(
             .to_string();
     }
     if let Some(base_url) = payload.base_url {
-        let base_url = base_url.trim().trim_end_matches('/').to_string();
+        let base_url =
+            crate::normalize_llm_provider_base_url(&provider_id, &record.protocol, &base_url)
+                .unwrap_or_default();
         record.base_url = if base_url.is_empty() {
             None
         } else {

@@ -165,15 +165,18 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
             "protocol".to_string(),
             toml::Value::String(cfg.protocol.trim().to_ascii_lowercase()),
         );
-        if let Some(base_url) = cfg
+        let normalized_base_url = cfg
             .base_url
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-        {
+            .and_then(|base_url| {
+                normalize_llm_provider_base_url(&provider_id, &cfg.protocol, base_url)
+            });
+        if let Some(base_url) = normalized_base_url.as_deref() {
             provider_table.insert(
                 "base_url".to_string(),
-                toml::Value::String(base_url.trim_end_matches('/').to_string()),
+                toml::Value::String(base_url.to_string()),
             );
         }
         if let Some(api_key) = cfg
@@ -233,16 +236,16 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
             if !api_key_env.is_empty() {
                 default_table.insert("api_key_env".to_string(), toml::Value::String(api_key_env));
             }
-            if let Some(base_url) = provider_config
-                .as_ref()
-                .and_then(|cfg| cfg.base_url.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                default_table.insert(
-                    "base_url".to_string(),
-                    toml::Value::String(base_url.trim_end_matches('/').to_string()),
-                );
+            if let Some(base_url) = provider_config.as_ref().and_then(|cfg| {
+                cfg.base_url.as_deref().and_then(|base_url| {
+                    normalize_llm_provider_base_url(
+                        &normalized_provider_id,
+                        &cfg.protocol,
+                        base_url,
+                    )
+                })
+            }) {
+                default_table.insert("base_url".to_string(), toml::Value::String(base_url));
             }
             root.insert(
                 "default_model".to_string(),
@@ -259,6 +262,168 @@ pub fn reconcile_runtime_config_from_storage() -> Result<(), String> {
         toml::to_string_pretty(&root).map_err(|e| format!("序列化 OpenFang 配置失败: {e}"))?;
     fs::write(&config_path, output).map_err(|e| format!("写入 OpenFang 配置失败: {e}"))?;
     Ok(())
+}
+
+pub fn normalize_llm_provider_base_url(
+    provider_id: &str,
+    protocol: &str,
+    base_url: &str,
+) -> Option<String> {
+    let mut value = base_url.trim().trim_end_matches('/').to_string();
+    if value.is_empty() {
+        return None;
+    }
+
+    for suffix in [
+        "/v1/chat/completions",
+        "/chat/completions",
+        "/v1/messages",
+        "/messages",
+        "/v1/models",
+        "/models",
+        "/v1/responses",
+        "/responses",
+    ] {
+        if value.to_ascii_lowercase().ends_with(suffix) {
+            let next_len = value.len().saturating_sub(suffix.len());
+            value.truncate(next_len);
+            value = value.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+
+    let normalized_protocol = protocol.trim().to_ascii_lowercase();
+    if matches!(normalized_protocol.as_str(), "claude" | "anthropic") {
+        if value.to_ascii_lowercase().ends_with("/v1") {
+            value.truncate(value.len().saturating_sub("/v1".len()));
+            value = value.trim_end_matches('/').to_string();
+        }
+        return if value.is_empty() { None } else { Some(value) };
+    }
+
+    let lower = value.to_ascii_lowercase();
+    if openai_compatible_base_url_has_api_version(&lower) {
+        return Some(value);
+    }
+
+    let provider = provider_id.trim().to_ascii_lowercase();
+    let suffix = if provider == "groq" || lower.contains("api.groq.com") {
+        Some("openai/v1")
+    } else if provider == "openrouter" || lower.contains("openrouter.ai") {
+        if lower.ends_with("/api") {
+            Some("v1")
+        } else {
+            Some("api/v1")
+        }
+    } else if provider == "qwen"
+        || provider == "dashscope"
+        || lower.contains("dashscope.aliyuncs.com")
+    {
+        Some("compatible-mode/v1")
+    } else if provider == "fireworks" || lower.contains("api.fireworks.ai") {
+        Some("inference/v1")
+    } else if provider == "zhipu_coding" || provider == "codegeex" {
+        Some("api/coding/paas/v4")
+    } else if provider == "zhipu" || provider == "glm" || lower.contains("open.bigmodel.cn") {
+        Some("api/paas/v4")
+    } else if provider == "zai_coding" {
+        Some("api/coding/paas/v4")
+    } else if provider == "zai" || lower.contains("api.z.ai") {
+        Some("api/paas/v4")
+    } else if provider == "qianfan" || provider == "baidu" || lower.contains("qianfan.baidubce.com")
+    {
+        Some("v2")
+    } else if provider == "volcengine_coding" {
+        Some("api/coding/v3")
+    } else if provider == "volcengine"
+        || provider == "doubao"
+        || lower.contains("ark.cn-beijing.volces.com")
+    {
+        Some("api/v3")
+    } else if !base_url_has_non_empty_path(&lower) || lower.ends_with("/api") {
+        Some("v1")
+    } else {
+        None
+    };
+
+    suffix.map_or(Some(value.clone()), |path| {
+        Some(format!("{}/{}", value.trim_end_matches('/'), path))
+    })
+}
+
+fn base_url_has_non_empty_path(lower_url: &str) -> bool {
+    let without_scheme = lower_url
+        .split_once("://")
+        .map(|(_, tail)| tail)
+        .unwrap_or(lower_url);
+    without_scheme
+        .split_once('/')
+        .map(|(_, path)| !path.trim_matches('/').is_empty())
+        .unwrap_or(false)
+}
+
+fn openai_compatible_base_url_has_api_version(lower_url: &str) -> bool {
+    [
+        "/v1",
+        "/v2",
+        "/v3",
+        "/v4",
+        "/openai/v1",
+        "/api/v1",
+        "/api/v3",
+        "/compatible-mode/v1",
+        "/inference/v1",
+        "/api/paas/v4",
+        "/api/coding/paas/v4",
+        "/api/coding/v3",
+    ]
+    .iter()
+    .any(|suffix| lower_url.ends_with(suffix))
+}
+
+#[cfg(test)]
+mod llm_provider_url_tests {
+    use super::normalize_llm_provider_base_url;
+
+    #[test]
+    fn normalizes_openai_root_to_v1() {
+        assert_eq!(
+            normalize_llm_provider_base_url("openai", "openai", "https://api.openai.com"),
+            Some("https://api.openai.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_full_chat_endpoint_before_storage() {
+        assert_eq!(
+            normalize_llm_provider_base_url(
+                "custom-openai",
+                "openai",
+                "https://llm.example.com/v1/chat/completions"
+            ),
+            Some("https://llm.example.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalizes_claude_base_to_messages_root() {
+        assert_eq!(
+            normalize_llm_provider_base_url(
+                "custom-claude",
+                "claude",
+                "https://api.anthropic.com/v1/messages"
+            ),
+            Some("https://api.anthropic.com".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_provider_specific_non_v1_paths() {
+        assert_eq!(
+            normalize_llm_provider_base_url("zhipu", "openai", "https://open.bigmodel.cn"),
+            Some("https://open.bigmodel.cn/api/paas/v4".to_string())
+        );
+    }
 }
 
 fn resolve_provider_api_key_env(

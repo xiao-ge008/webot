@@ -26,7 +26,7 @@ impl OpenAIDriver {
     pub fn new(api_key: String, base_url: String) -> Self {
         Self {
             api_key: Zeroizing::new(api_key),
-            base_url,
+            base_url: normalize_openai_compatible_base_url(&base_url),
             client: reqwest::Client::builder()
                 .user_agent(crate::USER_AGENT)
                 .build()
@@ -45,6 +45,18 @@ impl OpenAIDriver {
         self.extra_headers = headers;
         self
     }
+}
+
+fn normalize_openai_compatible_base_url(base_url: &str) -> String {
+    let mut normalized = base_url.trim().trim_end_matches('/').to_string();
+    for suffix in ["/chat/completions", "/models", "/responses"] {
+        if normalized.to_ascii_lowercase().ends_with(suffix) {
+            normalized.truncate(normalized.len().saturating_sub(suffix.len()));
+            normalized = normalized.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    normalized
 }
 
 #[derive(Debug, Serialize)]
@@ -1418,11 +1430,73 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openfang_types::message::Message;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn test_openai_driver_creation() {
         let driver = OpenAIDriver::new("test-key".to_string(), "http://localhost".to_string());
         assert_eq!(driver.api_key.as_str(), "test-key");
+    }
+
+    #[test]
+    fn test_normalize_openai_compatible_base_url_strips_endpoint_suffix() {
+        assert_eq!(
+            normalize_openai_compatible_base_url("https://llm.example.com/v1/chat/completions"),
+            "https://llm.example.com/v1"
+        );
+        assert_eq!(
+            normalize_openai_compatible_base_url("https://llm.example.com/v1/models"),
+            "https://llm.example.com/v1"
+        );
+    }
+
+    fn spawn_openai_mock_server() -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            request.lines().next().unwrap_or_default().to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_openai_driver_does_not_duplicate_chat_completions_path() {
+        let (base, handle) = spawn_openai_mock_server();
+        let driver = OpenAIDriver::new(
+            "test-key".to_string(),
+            format!("{base}/v1/chat/completions"),
+        );
+        let response = driver
+            .complete(CompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![Message::user("Hi")],
+                tools: Vec::new(),
+                max_tokens: 1,
+                temperature: 0.0,
+                system: None,
+                thinking: None,
+            })
+            .await
+            .expect("mock completion succeeds");
+
+        assert_eq!(response.text(), "ok");
+        let request_line = handle.join().expect("mock server thread joins");
+        assert_eq!(request_line, "POST /v1/chat/completions HTTP/1.1");
     }
 
     #[test]

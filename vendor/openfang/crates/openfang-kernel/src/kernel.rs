@@ -80,6 +80,19 @@ impl LlmDriver for StubDriver {
     }
 }
 
+fn driver_provider_for_config(
+    provider: &str,
+    provider_cfg: Option<&openfang_types::config::ProviderConfigEntry>,
+) -> String {
+    match provider_cfg
+        .map(|cfg| cfg.protocol.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("claude") | Some("anthropic") => "anthropic".to_string(),
+        _ => provider.to_string(),
+    }
+}
+
 fn detect_known_vision_support(
     catalog: &openfang_runtime::model_catalog::ModelCatalog,
     raw_model: &str,
@@ -705,8 +718,9 @@ impl OpenFangKernel {
         let driver_config = {
             let provider = &config.default_model.provider;
             let p_cfg = config.providers.iter().find(|p| p.id == *provider);
+            let driver_provider = driver_provider_for_config(provider, p_cfg);
             DriverConfig {
-                provider: provider.clone(),
+                provider: driver_provider,
                 api_key: p_cfg
                     .and_then(|p| p.api_key.clone())
                     .or_else(|| std::env::var(&config.default_model.api_key_env).ok()),
@@ -739,8 +753,9 @@ impl OpenFangKernel {
             let fb_config = {
                 let provider = &fb.provider;
                 let p_cfg = config.providers.iter().find(|p| p.id == *provider);
+                let driver_provider = driver_provider_for_config(provider, p_cfg);
                 DriverConfig {
-                    provider: provider.clone(),
+                    provider: driver_provider,
                     api_key: p_cfg.and_then(|p| p.api_key.clone()).or_else(|| {
                         if fb.api_key_env.is_empty() {
                             None
@@ -4495,8 +4510,9 @@ impl OpenFangKernel {
                 config.provider_urls.get(agent_provider.as_str()).cloned()
             };
 
+            let driver_provider = driver_provider_for_config(agent_provider, provider_cfg);
             let driver_config = DriverConfig {
-                provider: agent_provider.clone(),
+                provider: driver_provider,
                 api_key,
                 base_url,
             };
@@ -4516,8 +4532,9 @@ impl OpenFangKernel {
             for fb in &manifest.fallback_models {
                 let provider_cfg = config.providers.iter().find(|p| p.id == fb.provider);
                 let env_key = provider_env_key(&fb.provider);
-                let config = DriverConfig {
-                    provider: fb.provider.clone(),
+                let driver_provider = driver_provider_for_config(&fb.provider, provider_cfg);
+                let fb_driver_config = DriverConfig {
+                    provider: driver_provider,
                     api_key: fb
                         .api_key_env
                         .as_ref()
@@ -4528,9 +4545,9 @@ impl OpenFangKernel {
                         .base_url
                         .clone()
                         .or_else(|| provider_cfg.and_then(|p| p.base_url.clone()))
-                        .or_else(|| self.config.provider_urls.get(&fb.provider).cloned()),
+                        .or_else(|| config.provider_urls.get(&fb.provider).cloned()),
                 };
-                match drivers::create_driver(&config) {
+                match drivers::create_driver(&fb_driver_config) {
                     Ok(d) => chain.push((d, fb.model.clone())),
                     Err(e) => {
                         warn!("Fallback driver '{}' failed to init: {e}", fb.provider);

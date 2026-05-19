@@ -26,10 +26,22 @@ impl AnthropicDriver {
     pub fn new(api_key: String, base_url: String) -> Self {
         Self {
             api_key: Zeroizing::new(api_key),
-            base_url,
+            base_url: normalize_anthropic_base_url(&base_url),
             client: reqwest::Client::new(),
         }
     }
+}
+
+fn normalize_anthropic_base_url(base_url: &str) -> String {
+    let mut normalized = base_url.trim().trim_end_matches('/').to_string();
+    for suffix in ["/v1/messages", "/messages", "/v1/models", "/models", "/v1"] {
+        if normalized.to_ascii_lowercase().ends_with(suffix) {
+            normalized.truncate(normalized.len().saturating_sub(suffix.len()));
+            normalized = normalized.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    normalized
 }
 
 /// Anthropic Messages API request body.
@@ -644,12 +656,70 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn test_convert_message_text() {
         let msg = Message::user("Hello");
         let api_msg = convert_message(&msg);
         assert_eq!(api_msg.role, "user");
+    }
+
+    #[test]
+    fn test_normalize_anthropic_base_url_strips_messages_suffix() {
+        assert_eq!(
+            normalize_anthropic_base_url("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_anthropic_base_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com"
+        );
+    }
+
+    fn spawn_anthropic_mock_server() -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            request.lines().next().unwrap_or_default().to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_driver_does_not_duplicate_messages_path() {
+        let (base, handle) = spawn_anthropic_mock_server();
+        let driver = AnthropicDriver::new("test-key".to_string(), format!("{base}/v1/messages"));
+        let response = driver
+            .complete(CompletionRequest {
+                model: "claude-test".to_string(),
+                messages: vec![Message::user("Hi")],
+                tools: Vec::new(),
+                max_tokens: 1,
+                temperature: 0.0,
+                system: None,
+                thinking: None,
+            })
+            .await
+            .expect("mock completion succeeds");
+
+        assert_eq!(response.text(), "ok");
+        let request_line = handle.join().expect("mock server thread joins");
+        assert_eq!(request_line, "POST /v1/messages HTTP/1.1");
     }
 
     #[test]
